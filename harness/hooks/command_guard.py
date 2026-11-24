@@ -2674,23 +2674,26 @@ def remove_worktree(path, authenticated=False, expect_head=None, policy=None, *,
 
 
 def _clean_reason(reason):
-    """A verifier reason made safe to print: printable ASCII only, 160 characters, no path."""
+    """A verifier reason made safe to print: printable ASCII only, 160 characters. Its text is the verifier's own, so it
+    may name a remote or up to five ignored files of the worktree, as it did before goodqa#16943."""
     return re.sub(r'[^\x20-\x7e]', '?', str(reason))[:160]
 
 
 WORKTREE_ROUTE_HOSTS = ('t2-dev',)  # the remote hosts `ah worktree-remove` serves (ah_worktree.REMOTE_HOSTS)
-# goodqa#16943, #333 review rounds 1 and 2: the refusal never prints a concrete path, host or remote, because any value
-# the guard resolves can differ from what the kernel or git resolves (symlinked parents with `..`, a stale working
-# directory, another host's ~, a container's filesystem). It names the route in fixed text with placeholders; the verifier
-# the route runs decides the real path.
+# goodqa#16943, #333 review rounds 1 to 3: the route advice and the prune step are constant text with placeholders. The
+# guard fills in no path, host or remote of its own, because any value it resolves can differ from what the kernel or git
+# resolves (symlinked parents with `..`, a stale working directory, another host's ~, a container's filesystem); the
+# verifier the route runs decides the real path. The verifier reason printed before them is unchanged by this and may
+# still name a remote, ignored files or the target's basename, as it did before.
 WORKTREE_ROUTE = ('python3 -I ~/.claude/hooks/ah.py worktree-remove --host <local|%s> --path <absolute path of the '
                   'worktree> --reason "<why>" [--remote-auth] (one worktree per call, no --force, audited; add '
                   '--remote-auth when the repository is private, so the host reads its remote with its own credentials)'
                   % '|'.join(WORKTREE_ROUTE_HOSTS))
 WORKTREE_PRUNE_STEP = ('run `git fetch --prune <the remote that holds the deleted branch>` in the registry repository (the '
-                       'checkout the worktree was added from) first; not on a mirror-style remote (fetch refspec '
-                       '+refs/*:refs/* or +refs/heads/*:refs/heads/*) or with pruneTags set, where prune deletes local '
-                       'branches or tags')
+                       'checkout the worktree was added from) first, but only when every fetch refspec of that remote '
+                       'writes under refs/remotes/<that remote>/ and pruneTags is not set; prune deletes local branches '
+                       'or tags through any other destination (for example +refs/*:refs/* or '
+                       '+refs/heads/*:refs/heads/up/*)')
 
 
 def _worktree_instead(reason):
@@ -3866,9 +3869,6 @@ class Ctx:
         self.origin_cwd = cwd  # the payload's working directory, None when the host sent none
         self.cwd_known = bool(cwd)  # becomes True after an absolute or home `cd` in the command
         self.work_refusal = False
-        # True while analysing an ssh payload or a container, chroot or namespace command: paths there are not this
-        # machine's, so wording that rests on this machine's disk (H6) is not used (#333 review rounds 1 and 2)
-        self.foreign_view = False
         self.token_sink_ok = False
         self.token_allowed = 0
         self.top_commands = 0
@@ -3905,7 +3905,7 @@ class Ctx:
 
     # what one reading of a script can change; findings accumulate across readings and the rest is not analysis state
     NOT_STATE = ('findings', 'budget', 'c', 'marker', 'raw_top', 'ps', 'tail_visible', 'fork_depth', 'readings_capped',
-                 'fs_cache', 'seen_texts', 'foreign_view')
+                 'fs_cache', 'seen_texts')
 
     def state(self):
         return {k: (v.copy() if isinstance(v, (set, dict, list)) else v) for k, v in vars(self).items()
@@ -5029,20 +5029,19 @@ class Analyzer:
                 self.inner_words(args[pos[1]:], depth, pl, idx)
             return True
         if name in ('unshare', 'script'):
-            run = self.script if name == 'script' else (lambda *a, **k: self._in_foreign_view(self.script, *a, **k))
             for k, t in enumerate(texts):
                 if (t in ('-c', '--command') or name == 'script' and re.fullmatch(r'-[A-Za-z]*c', t)) \
                         and k + 1 < len(texts):
-                    run(texts[k + 1], depth + 1, tail_visible=True)
+                    self.script(texts[k + 1], depth + 1, tail_visible=True)
                     return True
                 if t.startswith('--command='):
-                    run(t.split('=', 1)[1], depth + 1, tail_visible=True)
+                    self.script(t.split('=', 1)[1], depth + 1, tail_visible=True)
                     return True
             k = 0
             while k < len(texts) and texts[k].startswith('-'):
                 k += 1
             if name == 'unshare' and k < len(args):
-                self._in_foreign_view(self.inner_words, args[k:], depth, pl, idx)
+                self.inner_words(args[k:], depth, pl, idx)
             return True
         if name == 'parallel':
             if ':::' in texts:
@@ -5144,10 +5143,7 @@ class Analyzer:
         elif name in ('watch',):
             pass
         if i < len(args):
-            if name in ('chroot', 'nsenter'):  # another filesystem view: advice from inside names no local path
-                self._in_foreign_view(self.inner_words, args[i:], depth, pl, idx)
-            else:
-                self.inner_words(args[i:], depth, pl, idx)
+            self.inner_words(args[i:], depth, pl, idx)
 
     def xargs_input(self, args, cmd):
         """xargs deleting what its own input names: a here-string, `< <(..)` or `-a <(..)`."""
@@ -5348,22 +5344,9 @@ class Analyzer:
         if rest and rest[0] == '--':
             rest = rest[1:]
         if rest:
-            self._in_foreign_view(self.script, ' '.join(rest), depth + 1, tail_visible=True)
-
-    def _in_foreign_view(self, analyse, *args, **kwargs):
-        """Analyse a command that runs on another host or inside a container, chroot or namespace: the analysis is
-        unchanged; only wording that rests on this machine's disk is not used there (ctx.foreign_view)."""
-        saved = self.ctx.foreign_view
-        self.ctx.foreign_view = True
-        try:
-            return analyse(*args, **kwargs)
-        finally:
-            self.ctx.foreign_view = saved
+            self.script(' '.join(rest), depth + 1, tail_visible=True)
 
     def container(self, name, args, words, depth, pl, idx):
-        return self._in_foreign_view(self._container, name, args, words, depth, pl, idx)
-
-    def _container(self, name, args, words, depth, pl, idx):
         texts = [a.text for a in args]
         if name in ('docker', 'podman', 'nerdctl'):
             if 'exec' in texts:
@@ -7200,18 +7183,6 @@ class Analyzer:
                  'ancestor': 'a directory that contains protected logs', 'unknown':
                  'a path the guard cannot resolve that points at protected logs'}[cls]
         name = posixpath.basename(path.rstrip('/')) or path
-        if cls == 'root' and literal and not ctx.foreign_view and self._work_state_file(path):
-            # goodqa#16943 (H6): durable work state, not a log. Same refusal, but the advice is the documented place for
-            # disposable files instead of the log-backup procedure (docs/operations.md, "Under ~/.agent-harness/work").
-            ctx.add(LOG_DELETE, 'log-delete',
-                    ('%s targets durable harness work state under ~/.agent-harness/work (%s). It is not a log, but files '
-                     'there (packets, kits, evidence) are kept: only the git worktree you work in and a task folder\'s '
-                     'tmp/ are deletable' % (what, name[:60]))[:300],
-                    instead or 'make disposable files in ~/.agent-harness/work/<session>/<task>/tmp/ (rm and mv of a '
-                    'literal path there are allowed) and move them from there, or copy (cp) instead of moving; '
-                    'retired task and session folders are removed by python3 ~/.claude/hooks/workdir.py prune --apply'
-                    + self._clone_hint(path))
-            return True
         ctx.add(LOG_DELETE, 'log-delete',
                 ('%s targets %s (%s). Claude/Codex/harness logs and state are never deleted, moved or truncated '
                  'without a verified backup' % (what, label, name[:60]))[:300],
@@ -7434,20 +7405,6 @@ class Analyzer:
         if any(s in self.c.keep_segments for s in rest[:-1]):
             return 'write to a differently named folder instead; files under a folder named state are kept'
         return None
-
-    def _work_state_file(self, path):
-        """True only when `path` is proven to be one plain work-state file: below ~/.agent-harness/work, an existing
-        regular file (not a directory, link or missing path, which may hold or name WALs, kits or *.jsonl), and a plain
-        work file by _plain_work_file (no kept name, WAL shape or .keep). Anything else keeps the log wording (#333
-        review F5)."""
-        if self._under_work(path) is None or self._kept(path):
-            return False
-        try:
-            if not stat.S_ISREG(os.lstat(path).st_mode):
-                return False
-        except (OSError, ValueError):
-            return False
-        return self._plain_work_file(path)
 
     def _plain_work_file(self, path):
         """A plain file at least two levels below ~/.agent-harness/work or ~/.agent-harness/scratch, both as typed

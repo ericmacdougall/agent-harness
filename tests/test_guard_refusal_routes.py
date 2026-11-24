@@ -1,14 +1,12 @@
 """goodqa#16943: guard refusals name the sanctioned route instead of the log-backup procedure.
 
 H7: every refused `git worktree remove` (a compound line, --force, an ssh payload, a container) names the
-`ah worktree-remove` route in FIXED text with placeholders only, and a stale-tracking-ref refusal names a fixed
-`git fetch --prune <the remote that holds the deleted branch>` step with a mirror-remote warning. The refusal never
-prints a path, host or remote taken from the command or the repository: two review rounds of PR 333 showed that any value
-the guard resolves can differ from what the kernel or git resolves. H6: a refused move or delete of ONE plain work-state
-file under ~/.agent-harness/work, on this machine, says it is not a log and names the task tmp/ folder. Every refusal
-stays a refusal, and logs, WALs, transcripts, kits, directories and remote or container paths keep the log wording
-(must-fail controls). Real temporary repositories under a temporary HOME, fake network and ssh only; commands are data
-passed to decide()."""
+`ah worktree-remove` route as CONSTANT text with placeholders, and a stale-tracking-ref refusal names a constant
+`git fetch --prune <the remote that holds the deleted branch>` step that states when pruning is safe. The route advice
+fills in no path, host or remote of its own: review rounds of PR 333 showed that any value the guard resolves can differ
+from what the kernel or git resolves. The verifier reason printed before the advice is the verifier's own text, unchanged
+by this ticket, and may name a remote or ignored files of the worktree (asserted below). Every refusal stays a refusal.
+Real temporary repositories under a temporary HOME, fake network and ssh only; commands are data passed to decide()."""
 
 import json
 import os
@@ -30,18 +28,18 @@ REMOTE = ah_worktree.REMOTE_HOSTS[0]  # the one remote host the route serves; ne
 GIT_ENV = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
 GIT_ENV.update(GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_NOSYSTEM='1', GIT_AUTHOR_NAME='t',
                GIT_AUTHOR_EMAIL='t@example.invalid', GIT_COMMITTER_NAME='t', GIT_COMMITTER_EMAIL='t@example.invalid')
-LOG_WORDING = 'Claude/Codex/harness logs and state are never deleted'
 # the fixed advice, spelled out here so a change to it is a visible test change (byte-stable)
 ROUTE = ('python3 -I ~/.claude/hooks/ah.py worktree-remove --host <local|%s> --path <absolute path of the worktree> '
          '--reason "<why>" [--remote-auth] (one worktree per call, no --force, audited; add --remote-auth when the '
          'repository is private, so the host reads its remote with its own credentials)' % REMOTE)
+SAFE_PRUNE = ('but only when every fetch refspec of that remote writes under refs/remotes/<that remote>/ and pruneTags is '
+              'not set; prune deletes local branches or tags through any other destination (for example +refs/*:refs/* '
+              'or +refs/heads/*:refs/heads/up/*)')
 PRUNE = ('run `git fetch --prune <the remote that holds the deleted branch>` in the registry repository (the checkout '
-         'the worktree was added from) first; not on a mirror-style remote (fetch refspec +refs/*:refs/* or '
-         '+refs/heads/*:refs/heads/*) or with pruneTags set, where prune deletes local branches or tags')
+         'the worktree was added from) first, ' + SAFE_PRUNE)
 NEXT_STALE = ('run `git fetch --prune <the remote that holds the deleted branch>` in the registry repository (the '
-              'checkout the worktree was added from) on the same host first; not on a mirror-style remote (fetch refspec '
-              '+refs/*:refs/* or +refs/heads/*:refs/heads/*) or with pruneTags set, where prune deletes local branches '
-              'or tags. Then repeat the same ah worktree-remove call')
+              'checkout the worktree was added from) on the same host first, ' + SAFE_PRUNE +
+              '. Then repeat the same ah worktree-remove call')
 
 
 def git(cwd, *args):
@@ -175,8 +173,42 @@ class WorktreeRoutes(Home):
         git(self.primary, 'update-ref', 'refs/remotes/upstream/gone', self.head)
         self.stale_ref()
         message = self.blocked('git worktree remove ' + str(self.linked), self.primary)
-        self.assertIn('mirror-style remote', message)
+        self.assertIn('every fetch refspec of that remote writes under refs/remotes/<that remote>/', message)
         self.assert_no_concrete_value(message, 'mirror')
+
+    def assert_values_only_in_the_verifier_reason(self, reason, message, values):
+        """The narrowed rule (round 3 F2): the verifier's own reason is printed unchanged and may name repository
+        values; the advice after it is constant text and names none of them."""
+        for value in values:
+            self.assertIn(value, reason, value)
+        shown = 'verifier: %s. ' % cg._clean_reason(reason)
+        self.assertIn(shown, message)
+        self.assertEqual(cg._worktree_instead(reason),
+                         shown + (cg._worktree_next_step(reason) + '; then ' if cg._worktree_next_step(reason) else '')
+                         + ROUTE)
+        rest = message.replace(shown, '')
+        for value in values:
+            self.assertNotIn(value, rest, value)
+
+    def test_a_remote_off_the_known_hosts_is_named_only_by_the_verifier_reason(self):
+        git(self.primary, 'remote', 'add', 'evil-remote', 'https://git.example.invalid/x.git')
+        reason = cg.linked_worktree_remove_refusal(str(self.linked), str(self.primary), self.policy)
+        self.assertIn('not on a known hosting service', reason)
+        message = self.blocked('git worktree remove ' + str(self.linked), self.primary)
+        self.assert_values_only_in_the_verifier_reason(reason, message, ['evil-remote'])
+
+    def test_an_ignored_file_is_named_only_by_the_verifier_reason(self):
+        (self.linked / '.gitignore').write_text('.env\n')
+        git(self.linked, 'add', '.gitignore')
+        git(self.linked, 'commit', '-q', '-m', 'ignore')
+        head = git(self.linked, 'rev-parse', 'HEAD')
+        git(self.primary, 'update-ref', 'refs/remotes/origin/linked', head)
+        self.live['refs/heads/linked'] = head
+        (self.linked / '.env').write_text('X=1\n')
+        reason = cg.linked_worktree_remove_refusal(str(self.linked), str(self.primary), self.policy)
+        self.assertIn('ignored file', reason)
+        message = self.blocked('git worktree remove ' + str(self.linked), self.primary)
+        self.assert_values_only_in_the_verifier_reason(reason, message, ['.env'])
 
     def test_the_route_shape_with_its_placeholders_filled_is_allowed_by_the_guard(self):
         filled = (ROUTE.split(' (one worktree')[0].replace('<local|%s>' % REMOTE, 'local')
@@ -219,76 +251,6 @@ class StaleRefNextStep(unittest.TestCase):
 
     def test_no_next_step_for_other_refusals(self):
         self.assertNotIn('next', self.run_remove(self.stale(reason='the working tree is not clean')))
-
-
-class WorkStateWording(Home):
-    """H6: durable work state keeps its refusal but not the log wording; logs keep both (must-fail controls)."""
-
-    def test_moving_or_deleting_a_work_file_is_refused_with_the_tmp_folder_advice(self):
-        (self.work / 'spec.tmp').write_text('x\n')
-        (self.work / 'T').mkdir()
-        (self.work / 'T/packet.md').write_text('x\n')
-        for command in ('mv %s %s' % (self.work / 'spec.tmp', self.home / 'elsewhere.md'),
-                        'rm %s' % (self.work / 'spec.tmp'),
-                        'mv %s %s' % (self.work / 'T/packet.md', self.work / 'T/p2.md')):
-            message = self.blocked(command)
-            self.assertIn('It is not a log', message, command)
-            self.assertIn('/<task>/tmp/', message, command)
-            self.assertNotIn('back up to Dropbox', message, command)
-            self.assertNotIn(LOG_WORDING, message, command)
-
-    def test_the_task_tmp_folder_stays_movable(self):
-        (self.work / 'T/tmp').mkdir(parents=True)
-        (self.work / 'T/tmp/spec.tmp').write_text('x\n')
-        self.assertEqual(self.decide('mv %s %s' % (self.work / 'T/tmp/spec.tmp', self.work / 'T/spec.md'))[0], 'allow')
-
-    def test_a_directory_or_missing_path_keeps_the_log_wording(self):
-        # a directory may hold WALs, kits or *.jsonl files, and a path that does not exist (or a link) proves nothing
-        (self.work / 'T/wal').mkdir(parents=True)
-        (self.work / 'T/wal/main.jsonl').write_text('x\n')
-        (self.work / 'U').mkdir()
-        (self.work / 'U/notes.md').write_text('x\n')
-        (self.work / 'U/kit.json').write_text('{}\n')
-        (self.work / 'V').mkdir()
-        (self.work / 'V/a.md').write_text('x\n')
-        os.symlink(str(self.work / 'U/kit.json'), str(self.work / 'V/link.md'))
-        for command in ('rm -r %s' % (self.work / 'T'), 'rm -rf %s' % (self.work / 'U'),
-                        'mv %s %s' % (self.work / 'U', self.home / 'moved'), 'rm -r %s' % (self.work / 'V'),
-                        'rm %s' % (self.work / 'V/link.md'), 'rm %s' % (self.work / 'V/missing.md')):
-            message = self.blocked(command)
-            self.assertNotIn('It is not a log', message, command)
-            self.assertIn(LOG_WORDING, message, command)
-
-    def test_a_path_on_another_host_or_in_a_container_keeps_the_log_wording(self):
-        # round 2 F3: this machine's lstat proves nothing about a remote or container path, even when a local file of
-        # the same name exists
-        (self.work / 'T').mkdir()
-        (self.work / 'T/x.md').write_text('x\n')
-        for command in ("ssh %s 'rm ~/.agent-harness/work/S/T/x.md'" % REMOTE,
-                        'ssh %s rm %s' % (REMOTE, self.work / 'T/x.md'),
-                        'docker exec box rm %s' % (self.work / 'T/x.md'),
-                        'chroot /srv rm %s' % (self.work / 'T/x.md'),
-                        'unshare -m rm %s' % (self.work / 'T/x.md')):
-            message = self.blocked(command)
-            self.assertNotIn('It is not a log', message, command)
-        # and the flag does not leak to a command after the wrapper
-        message = self.blocked('docker exec box true; rm %s' % (self.work / 'T/x.md'))
-        self.assertIn('It is not a log', message)
-
-    def test_logs_wals_transcripts_and_kits_keep_the_log_refusal(self):
-        paths = [self.home / '.claude/wals/S/main.jsonl', self.home / '.claude/projects/p/S.jsonl',
-                 self.work / 'T/wal/note.txt', self.work / 'T/run.wal.jsonl', self.work / 'T/kit.json',
-                 self.work / 'T/notes.jsonl', self.work / 'T/state/x.json', self.home / '.agent-harness/state/a.json',
-                 self.home / '.claude/agents/owner.md']
-        for path in paths:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text('x\n')
-            for command in ('rm %s' % path, 'mv %s %s' % (path, self.home / 'moved')):
-                message = self.blocked(command)
-                self.assertIn(LOG_WORDING, message, command)
-                self.assertNotIn('It is not a log', message, command)
-            # truncation may meet a stronger rule first (transcript forgery); it is refused either way
-            self.assertNotIn('It is not a log', self.blocked(': > %s' % path))
 
 
 if __name__ == '__main__':

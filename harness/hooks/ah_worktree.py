@@ -189,9 +189,10 @@ def remove(host, path, reason, authenticated=False, session="", agent="", home=N
 
 
 NEXT_STALE = ("run `git fetch --prune <the remote that holds the deleted branch>` in the registry repository (the checkout "
-              "the worktree was added from) on the same host first; not on a mirror-style remote (fetch refspec "
-              "+refs/*:refs/* or +refs/heads/*:refs/heads/*) or with pruneTags set, where prune deletes local branches or "
-              "tags. Then repeat the same ah worktree-remove call")
+              "the worktree was added from) on the same host first, but only when every fetch refspec of that remote "
+              "writes under refs/remotes/<that remote>/ and pruneTags is not set; prune deletes local branches or tags "
+              "through any other destination (for example +refs/*:refs/* or +refs/heads/*:refs/heads/up/*). Then "
+              "repeat the same ah worktree-remove call")
 
 
 def next_step(result):
