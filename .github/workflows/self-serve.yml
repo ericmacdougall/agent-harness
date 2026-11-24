@@ -7,6 +7,10 @@ on:
       - "harness/hooks/self_serve.py"
       - "harness/hooks/ah_parity.py"
       - "harness/hooks/ah_ops.py"
+      - "harness/hooks/ah_install.py"
+      - "harness/hooks/guard_files.py"
+      - "harness/hooks/supervisor_grant.py"
+      - "harness/hooks/supervisor_policy.json"
       - "harness/hooks/ah.py"
       - "harness/hooks/command_guard*.py"
       - "harness/hooks/merge_gate.py"
@@ -41,6 +45,10 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Toolchain
         run: python3 --version && git --version
+      - name: Signing dependency (pinned)
+        # self_serve.py and enable-agent-ops.py sign and verify the policy with Ed25519 from `cryptography`; the user's Mac
+        # /usr/bin/python3 ships 50.0.2, so CI pins the same release and refuses a source build.
+        run: python3 -m pip install --disable-pip-version-check --only-binary=:all: "cryptography==50.0.2"
       - name: Syntax of the self-serve modules
         shell: bash
         run: |
@@ -53,7 +61,7 @@ jobs:
         shell: bash
         run: |
           ran=0
-          for pattern in 'test_self_serve*.py' 'test_ah_ops*.py' 'test_enable_agent_ops*.py'; do
+          for pattern in 'test_self_serve*.py' 'test_ah_ops*.py' 'test_enable_agent_ops*.py' 'test_supervisor_grant*.py' 'test_guard_files*.py'; do
             if ls tests/$pattern >/dev/null 2>&1; then
               python3 -m unittest discover -s tests -p "$pattern" -v
               ran=$((ran+1))
