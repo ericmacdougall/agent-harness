@@ -11,6 +11,7 @@ import os
 import sys
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -217,9 +218,53 @@ class Scan(unittest.TestCase):
                                     "check": "liveness"}}
         cfg = dict(self.cfg, liveness=dict(self.cfg["liveness"], scan_budget_s=0))
         out = ow.check_liveness(cfg, self.state, lambda *a, **kw: (1, ""), self.now)
-        self.assertEqual([a["key"] for a in out], [k])
+        self.assertEqual([a["key"] for a in out], [k, "ops-watch:liveness-scan-truncated"])
         self.assertEqual((out[0]["severity"], out[0]["message"]), ("high", "owner dropped: agent-a1"))
         self.assertEqual(self.calls, [])
+
+    def _budgeted(self, sessions, budget=150, cost=100):
+        """Non-stable (live) sessions under a clock that advances `cost` s per ah.owners call; deadline `budget` s."""
+        clock = [0.0]
+        for s in sessions:
+            self.wal(s)
+            self.rows[s] = [live("a1")]
+        real = self.fake_owners
+
+        def timed(home, session, now=None, comments=None):
+            clock[0] += cost
+            return real(home, session, now, comments)
+        shim = types.SimpleNamespace(monotonic=lambda: clock[0], time=time.time, sleep=time.sleep)
+        cfg = dict(self.cfg, liveness=dict(self.cfg["liveness"], scan_budget_s=budget))
+        return cfg, timed, shim
+
+    def test_budget_rotates_so_every_non_stable_session_is_reached(self):
+        """F1: under a budget that fits two of four live sessions, the sessions skipped in one run come first in the
+        next, so all four are read within two runs (alphabetical order would starve the last two for ever)."""
+        names = [f"{c * 8}-1111-4222-8333-444444444444" for c in "abcd"]
+        cfg, timed, shim = self._budgeted(names)
+        reached = set()
+        with mock.patch.object(ah, "owners", side_effect=timed), mock.patch.object(ow, "time", shim):
+            for _ in range(2):
+                self.calls.clear()
+                ow.check_liveness(cfg, self.state, lambda *a, **k: (1, ""), self.now)
+                reached |= set(self.calls)
+        self.assertEqual(reached, set(names))
+
+    def test_truncated_scan_raises_a_warning_naming_the_count(self):
+        names = [f"{c * 8}-1111-4222-8333-444444444444" for c in "abc"]
+        cfg, timed, shim = self._budgeted(names)
+        with mock.patch.object(ah, "owners", side_effect=timed), mock.patch.object(ow, "time", shim):
+            out = {a["key"]: a for a in ow.check_liveness(cfg, self.state, lambda *a, **k: (1, ""), self.now)}
+        a = out["ops-watch:liveness-scan-truncated"]
+        self.assertEqual((a["severity"], a["detail"]["skipped"], a["detail"]["sessions"]), ("warning", 1, 3))
+        self.assertIn("1 of 3", a["message"])
+
+    def test_a_complete_scan_raises_no_truncation_warning(self):
+        names = [f"{c * 8}-1111-4222-8333-444444444444" for c in "ab"]
+        cfg, timed, shim = self._budgeted(names, budget=1000)
+        with mock.patch.object(ah, "owners", side_effect=timed), mock.patch.object(ow, "time", shim):
+            out = ow.check_liveness(cfg, self.state, lambda *a, **k: (1, ""), self.now)
+        self.assertNotIn("ops-watch:liveness-scan-truncated", [a["key"] for a in out])
 
     def test_stale_sessions_leave_the_scan_cache(self):
         self.wal(SESS)
@@ -354,6 +399,21 @@ class OwnersCache(test_ahd.Scratch):
         for _ in range(3):
             self.tick(d, 60)
         self.assertEqual(self.spawns(), 3)
+
+    def test_session_with_a_time_dependent_row_is_asked_every_tick(self):
+        """F3: a live, silent or timed-wait row changes with the clock alone, so it is never served from the cache."""
+        for row in (test_ahd.owner("a1111111111111111", "live", idle=60),
+                    test_ahd.owner("a1111111111111111", "SILENT"),
+                    dict(test_ahd.owner("a1111111111111111", "DROPPED"), disposition={"kind": "waiting", "until": 9e9})):
+            self.owners([row])
+            d = ahd.Daemon(policy=self.policy)
+            self.assertTrue(d.acquire())
+            self.addCleanup(d.release)
+            before = self.spawns()
+            for _ in range(3):
+                self.tick(d, 60)
+            self.assertEqual(self.spawns() - before, 3, row)
+            d.release()
 
     def test_failed_call_is_retried_next_tick(self):
         (self.fake / f"owners-{test_ahd.SESSION}.json").write_text("not json")

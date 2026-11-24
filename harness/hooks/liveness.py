@@ -113,6 +113,22 @@ def disposition_live(disp: dict | None, now: float, last_activity: float = 0.0, 
 ENDING_DISPOSITIONS = frozenset(("reassigned", "closed", "superseded", "wontdo", "legacy"))
 
 
+STABLE_STATES = ("done", "handoff", "returned", "DROPPED")  # classify states that only a WAL or ledger write can leave
+
+
+def row_time_independent(row: dict) -> bool:
+    """goodqa#17100: True when this `ah owners` row cannot change state while its WALs and the ledger stay as they
+    are: a finished or dropped owner whose disposition (if any) is permanent. live/quiet/SILENT/waiting rows age into
+    other states and a timed wait or resume expires, so a result holding such a row must not be reused or cached.
+    ops-watch (scan reuse) and ahd (owners cache) share this one rule."""
+    if row.get("type") == "task-wal":
+        return False  # task-named WALs carry their own clock
+    if row.get("state") not in STABLE_STATES or row.get("decision_required") is True:
+        return False
+    disp = row.get("disposition")
+    return not isinstance(disp, dict) or (disp.get("kind") in ENDING_DISPOSITIONS and not disp.get("until"))
+
+
 def row_disposed(row: dict) -> bool:
     """goodqa#15322: an `ah owners` row whose owner main already disposed of (the work moved, ended or was written off)
     raises no liveness alert, whether or not the replacement is live right now. A time-boxed wait or resume only excuses

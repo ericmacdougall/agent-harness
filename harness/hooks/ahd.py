@@ -816,7 +816,8 @@ class Daemon:
     def owner_docs(self, sessions: list, deadline: float) -> dict:
         """`ah owners --all` per session, reused while the session's WAL/ledger fingerprint is unchanged and the TTL
         has not passed (goodqa#17100: one interpreter per session per 60 s tick was the daemon's whole cost).
-        Only a complete read (read.state ok) is cached; a failure or partial read is refetched on the next tick."""
+        Only a complete read (read.state ok) of a session with no time-dependent row is cached; anything else is
+        refetched on the next tick."""
         docs = {}
         cache = self.owner_cache
         for gone in set(cache) - set(sessions):
@@ -832,7 +833,11 @@ class Daemon:
             rc, doc = self.call("owners", ["--session", s, "--all"], deadline)  # ahd needs every row, not the recent view
             if rc == 0 and isinstance(doc, dict) and isinstance(doc.get("owners"), list):
                 docs[s] = doc
-                if fp is not None and (doc.get("read") or {}).get("state") == "ok":
+                # only a session whose every row is finished or dropped with a permanent disposition: the row fields of a
+                # live, silent, finishing or timed-wait owner (idle_s, DROPPED after the grace, expiry) change with the
+                # clock alone, so ahd asks `ah` for those every tick (liveness.row_time_independent, shared with ops-watch)
+                if fp is not None and (doc.get("read") or {}).get("state") == "ok" \
+                        and all(isinstance(r, dict) and liveness.row_time_independent(r) for r in doc["owners"]):
                     cache[s] = (fp, mono(), doc)
         return docs
 

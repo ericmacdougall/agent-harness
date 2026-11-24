@@ -1858,21 +1858,6 @@ class TicketLookup:
             self.cache.pop(ref, None)
 
 
-STABLE_STATES = ("done", "handoff", "returned", "DROPPED")  # liveness.classify states that only a WAL or ledger write can leave
-
-
-def row_time_independent(row: dict, liveness) -> bool:
-    """True when this `ah owners` row cannot change state while its WALs and the ledger stay as they are: a finished
-    or dropped owner whose disposition (if any) is permanent. live/quiet/SILENT/waiting rows age into other states
-    and a timed wait or resume expires, so those rows are always rescanned."""
-    if row.get("type") == "task-wal":
-        return False  # task-named WALs are judged by _task_wal_alert, which has its own clock
-    if row.get("state") not in STABLE_STATES or row.get("decision_required") is True:
-        return False
-    disp = row.get("disposition")
-    return not isinstance(disp, dict) or (disp.get("kind") in liveness.ENDING_DISPOSITIONS and not disp.get("until"))
-
-
 def _owner_alerts(home, session, tickets, now, info=None):
     """Sub-agent owners, through the one shared rule (ah.owners and liveness.classify). A stop followed by later
     WAL or transcript activity is not a stop, a just-stopped owner gets liveness.FINISH_GRACE_S, and helpers
@@ -1885,7 +1870,7 @@ def _owner_alerts(home, session, tickets, now, info=None):
     except ah.AhError:
         return []
     if info is not None:  # the caller's reuse decision: complete read, and nothing here changes with the clock alone
-        info["stable"] = all(row_time_independent(row, liveness) for row in rows)
+        info["stable"] = all(liveness.row_time_independent(row) for row in rows)
     out = []
     for row in rows:
         state = row.get("state", "")
@@ -1990,7 +1975,7 @@ class LedgerDigests:
             return None
 
 
-def _session_owner_alerts(home, session, files, tickets, now, state, scan, ledger_fp, deadline, lc):
+def _session_owner_alerts(home, session, files, tickets, now, state, scan, ledger_fp, deadline, lc, seen, skipped):
     """_owner_alerts with two bounds (goodqa#17100). (1) A session whose WALs and relevant ledger rows are unchanged
     and whose owners are all time-independent (finished or dropped) reuses its last result for up to reuse_max_s,
     so owners already reported dropped are not re-read every run; any WAL write or disposition changes the
@@ -1999,13 +1984,16 @@ def _session_owner_alerts(home, session, files, tickets, now, state, scan, ledge
     fp = ledger_fp.fingerprint(session, files)
     ent = scan.get(session) or {}
     if fp and ent.get("fp") == fp and 0 <= now - ent.get("at", 0) < float(lc.get("reuse_max_s", 3600)):
+        seen[session] = now
         return [alert("liveness", k, sev, msg, det) for k, sev, msg, det in ent.get("alerts", [])]
     if time.monotonic() >= deadline:
+        skipped.append(session)  # reported by check_liveness as liveness-scan-truncated; not marked as seen
         prefix = f"liveness:{session[:8]}/agent-"
         return [alert("liveness", k, v.get("severity", "warning"), v.get("message", ""), v.get("detail") or {})
                 for k, v in sorted((state.get("active") or {}).items()) if k.startswith(prefix)]
     info = {}
     got = _owner_alerts(home, session, tickets, now, info)
+    seen[session] = now
     if fp and info.get("stable"):
         scan[session] = {"fp": fp, "at": now,
                          "alerts": [[a["key"], a["severity"], a["message"], a["detail"]] for a in got]}
@@ -2033,9 +2021,11 @@ def check_liveness(cfg, state, runner, now):
     scan = state.setdefault("liveness_scan", {})
     deadline = time.monotonic() + float(lc.get("scan_budget_s", 240))
     ledger_fp = LedgerDigests(home)
-    visited = set()
-    # least recently scanned first, so a run that hits its budget leaves the freshest results for the next one
-    for sess in sorted(sessions, key=lambda e: ((scan.get(e.name) or {}).get("at", 0), e.name)):
+    visited, skipped = set(), []
+    # last time each session was actually covered, kept apart from the reuse cache (which only stable sessions have),
+    # so a run that hits its budget starts next time with the sessions it did not reach (goodqa#17100 F1)
+    seen = state.setdefault("liveness_seen", {})
+    for sess in sorted(sessions, key=lambda e: (seen.get(e.name, 0), e.name)):
         try:
             files = [f for f in os.scandir(sess.path) if f.is_file(follow_symlinks=False) and f.name.endswith(".jsonl")]
             newest = max((f.stat().st_mtime for f in files), default=0)
@@ -2046,7 +2036,7 @@ def check_liveness(cfg, state, runner, now):
             continue
         visited.add(sess.name)
         if root == home / ".claude" / "wals" and any(f.name == "main.jsonl" for f in files):
-            out += _session_owner_alerts(home, sess.name, files, tickets, now, state, scan, ledger_fp, deadline, lc)
+            out += _session_owner_alerts(home, sess.name, files, tickets, now, state, scan, ledger_fp, deadline, lc, seen, skipped)
         for f in sorted(files, key=lambda e: e.name):
             if f.name == "main.jsonl" or f.name.startswith("agent-"):
                 continue
@@ -2057,8 +2047,15 @@ def check_liveness(cfg, state, runner, now):
             if found:
                 out.append(found)
     tickets.prune()
-    for name in [k for k in scan if k not in visited]:  # a session out of its horizon is history: drop its cache
-        scan.pop(name)
+    for cache in (scan, seen):
+        for name in [k for k in cache if k not in visited]:  # a session out of its horizon is history: drop its cache
+            cache.pop(name)
+    if skipped:
+        out.append(alert("liveness", "ops-watch:liveness-scan-truncated", "warning",
+                         f"liveness scan truncated: {len(skipped)} of {len(visited)} session(s) not reached within the "
+                         f"{round(float(lc.get('scan_budget_s', 240)))}s budget; their previous alerts are kept and "
+                         "they are read first next run",
+                         {"skipped": len(skipped), "sessions": len(visited)}))
     return out
 
 
