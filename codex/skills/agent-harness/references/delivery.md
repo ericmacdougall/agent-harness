@@ -62,10 +62,15 @@ The local Stop decision is made at its final interrupt-marker read, after durabl
 
 ## Commit policy at delivery
 
-- `deliver.py prepare` checks only when it creates a new generation. It checks the owner's commits (head minus baseline minus `origin/<branch>`), the PR title and body, and ticket freshness.
+- `deliver.py prepare` checks only when it creates a new generation. It checks the owner's commits (head minus baseline minus `origin/<remote-branch>`, the remote base: see below), the PR title and body, and ticket freshness.
   - `BLOCKED_COMMIT_POLICY` (exit 2) means you should fix the commits, the PR text or the ticket comments and re-run.
   - `TICKETS_UNVERIFIED` (exit 6) means GoodQA was unreachable. Retry, or record a `tickets` waiver for that head.
   - Neither result creates state.
 - `deliver.py finish` comments on each referenced ticket with the stage (merged or local only), the delivered SHA and the checks.
   - Exit 5 means the delivery succeeded but a ticket comment is pending. Re-run finish, which is idempotent. Do not start recovery.
 - After a deploy, post evidence with `commit_policy.py notify --stage deployed`.
+
+## Remote base branch and scoped Go checks
+
+- `--remote-branch <name>` (on `prepare` and `finish`) names the branch on `origin` that PRs target and finish applies, when it is not named like `--original-branch` (for example local `main` delivering to `release/owned-sandbox`). Resolution order: the flag, then the original branch's configured `origin` upstream (`branch.<b>.remote`/`.merge`), then the local branch name. A prepared generation keeps the base it was prepared against (a stored value wins over a changed upstream, and `finish` needs no flag); a different explicit `--remote-branch` is refused with `BLOCKED_POLICY` reason `REMOTE_BRANCH_MISMATCH`, and a source branch equal to the base is refused (`SOURCE_IS_BASE`). Output (`PR_READY`, `LOCAL_READY`) reports `remote_branch` and `remote_branch_source` (`flag`, `upstream`, `local`, or `prepared` on resume); a base taken from the upstream also prints a warning. Pinned merged commit, ancestry, clean-checkout and journaled-apply checks are unchanged.
+- `approved_check` also accepts scoped `go vet <pkg...>` and `go test [-race|-count=1|-v] <pkg...>`, where each package is a relative `./` pattern (`./pkg`, `./pkg/...`, `./...`) made of `[A-Za-z0-9_][A-Za-z0-9_.-]*` segments; flags after packages, other flags, absolute, `..` or shell-metacharacter patterns are refused. A fleet `testrun` receipt is not accepted in place of a check.
