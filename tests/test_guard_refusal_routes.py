@@ -10,6 +10,7 @@ temporary HOME, fake network and ssh only; commands are data passed to decide().
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -29,6 +30,8 @@ GIT_ENV.update(GIT_CONFIG_GLOBAL='/dev/null', GIT_CONFIG_NOSYSTEM='1', GIT_AUTHO
                GIT_AUTHOR_EMAIL='t@example.invalid', GIT_COMMITTER_NAME='t', GIT_COMMITTER_EMAIL='t@example.invalid')
 LOG_WORDING = 'Claude/Codex/harness logs and state are never deleted'
 ROUTE = 'ah.py worktree-remove --host '
+ADVISED_ROUTE = re.compile(r'python3 -I ~/\.claude/hooks/ah\.py worktree-remove --host (\S+) --path (\S+) --reason "<why>"')
+FOREIGN = 'inside a container, chroot or namespace'
 
 
 def git(cwd, *args):
@@ -80,17 +83,70 @@ class WorktreeRoutes(Home):
         patch.start()
         self.addCleanup(patch.stop)
 
+    def stale_ref(self, remote='origin'):
+        """A remote-tracking ref for a branch the remote no longer has, at a commit only that ref reaches."""
+        git(self.primary, 'checkout', '-q', '-b', 'side-' + remote)
+        (self.primary / ('b-%s.txt' % remote)).write_text('two\n')
+        git(self.primary, 'add', 'b-%s.txt' % remote)
+        git(self.primary, 'commit', '-q', '-m', 'side')
+        git(self.primary, 'update-ref', 'refs/remotes/%s/gone' % remote, git(self.primary, 'rev-parse', 'HEAD'))
+        git(self.primary, 'checkout', '-q', 'main')
+        self.assertIn('stale', cg.linked_worktree_remove_refusal(str(self.linked), str(self.primary), self.policy))
+
     def test_the_exemption_is_unchanged_for_the_verified_standalone_form(self):
         self.assertEqual(self.decide('git worktree remove ' + str(self.linked), self.primary)[0], 'allow')
 
     def test_a_compound_or_forced_removal_names_the_route_with_the_literal_path(self):
         for command in ('cd %s && git worktree remove --force %s' % (self.primary, self.linked),
                         'git worktree remove %s && echo done' % self.linked,
-                        'W=%s; git worktree remove $W/linked' % (self.work / 'T')):
+                        'git worktree remove --force ../linked',
+                        'cd %s && git worktree remove --force ../linked' % self.primary):
             message = self.blocked(command, self.primary)
             self.assertIn(ROUTE + 'local --path %s ' % self.linked, message, command)
             self.assertNotIn('back up to Dropbox', message, command)
             self.assertIn('no --force', message, command)
+
+    def test_a_path_the_guard_cannot_prove_is_a_placeholder_never_a_resolved_guess(self):
+        # #333 review F1: after cd "$X", cd -, popd or a git -C, a relative spelling resolves against a directory the
+        # analysis no longer knows, so the advice could name a DIFFERENT worktree; variables and globs are not printed
+        for command in ('cd "$OTHER" && git worktree remove --force ../linked',
+                        'cd - && git worktree remove --force ../linked',
+                        'pushd /var && popd; git worktree remove --force ../linked',
+                        'git -C %s worktree remove --force ../linked' % self.linked,
+                        'W=%s; git worktree remove --force $W/linked' % (self.work / 'T'),
+                        'git worktree remove --force %s/lin*' % (self.work / 'T')):
+            message = self.blocked(command, self.primary)
+            self.assertIn(ROUTE + 'local --path <abs path> ', message, command)
+            self.assertNotIn('--path %s ' % self.linked, message, command)
+
+    def test_inside_a_container_chroot_or_namespace_no_local_route_is_printed(self):
+        # #333 review F4: the path belongs to another filesystem view; --host local would point at this machine
+        for command in ('docker exec box git worktree remove --force /srv/wt',
+                        'podman exec -u u box git worktree remove --force /srv/wt',
+                        'chroot /srv git worktree remove --force /wt',
+                        'nsenter -t 1 -m git worktree remove --force /srv/wt',
+                        'unshare -m git worktree remove --force /srv/wt'):
+            message = self.blocked(command, self.primary)
+            self.assertNotIn(ROUTE, message, command)
+            self.assertIn(FOREIGN, message, command)
+        # and the sentinel does not leak to a command after the wrapper
+        message = self.blocked('docker exec box true; git worktree remove --force %s' % self.linked, self.primary)
+        self.assertIn(ROUTE + 'local --path %s ' % self.linked, message)
+
+    def test_every_advised_command_is_itself_allowed_by_the_guard(self):
+        self.stale_ref()
+        message = self.blocked('git worktree remove %s' % self.linked, self.primary)
+        prune = re.search(r'`(git -C \S+ fetch --prune --all)`', message)
+        route = ADVISED_ROUTE.search(message)
+        self.assertTrue(prune and route, message)
+        self.assertEqual(self.decide(prune.group(1), self.primary)[0], 'allow', prune.group(1))
+        filled = route.group(0).replace('<why>', 'merged and published')
+        self.assertEqual(self.decide(filled, self.primary)[0], 'allow', filled)
+        step = ah_worktree.next_step(REMOTE, '/home/u/scratch/wt', StaleRefNextStep.stale(), True)
+        fetch = re.search(r'`(ssh \S+ .+?)` first', step).group(1)
+        self.assertEqual(self.decide(fetch, self.primary)[0], 'allow', fetch)
+        again = ADVISED_ROUTE.search(step).group(0).replace('<why>', 'merged and published') + ' --remote-auth'
+        self.assertEqual(self.decide(again, self.primary)[0], 'allow', again)
 
     def test_an_ssh_payload_names_the_route_on_that_host(self):
         message = self.blocked("ssh %s 'git -C /home/u/repo worktree remove /home/u/scratch/wt'" % REMOTE)
@@ -121,7 +177,7 @@ class WorktreeRoutes(Home):
         git(self.primary, 'checkout', '-q', 'main')
         self.assertIn('stale', cg.linked_worktree_remove_refusal(str(self.linked), str(self.primary), self.policy))
         message = self.blocked('git worktree remove ' + str(self.linked), self.primary)
-        prune = 'git -C %s fetch --prune origin' % self.primary
+        prune = 'git -C %s fetch --prune --all' % self.primary
         self.assertIn(prune, message)
         self.assertLess(message.index(prune), message.index(ROUTE + 'local --path %s ' % self.linked))
 
@@ -129,10 +185,17 @@ class WorktreeRoutes(Home):
         self.assertEqual(tuple(cg.WORKTREE_ROUTE_HOSTS), tuple(ah_worktree.REMOTE_HOSTS))
 
     def test_prune_hint_refuses_values_that_are_not_plain_literals(self):
-        self.assertEqual(cg.worktree_prune_hint('/home/u/repo'), 'git -C /home/u/repo fetch --prune origin')
-        for repo, remote in (('/home/u/a b', 'origin'), ('/home/u/$(id)', 'origin'), ('relative/repo', 'origin'),
-                             ('/home/u/../etc', 'origin'), ('/home/u/repo', 'origin;id'), (None, 'origin')):
-            self.assertIsNone(cg.worktree_prune_hint(repo, remote), (repo, remote))
+        # #333 review F2, F3: --all clears a stale ref under any remote, and no remote name is ever printed
+        self.assertEqual(cg.worktree_prune_hint('/home/u/repo'), 'git -C /home/u/repo fetch --prune --all')
+        for repo in ('/home/u/a b', '/home/u/$(id)', 'relative/repo', '/home/u/../etc', '-C/x', None):
+            self.assertIsNone(cg.worktree_prune_hint(repo), repo)
+
+    def test_a_stale_ref_under_another_remote_gets_advice_that_clears_it(self):
+        git(self.primary, 'remote', 'add', 'upstream', URL)
+        self.stale_ref('upstream')
+        message = self.blocked('git worktree remove ' + str(self.linked), self.primary)
+        self.assertIn('git -C %s fetch --prune --all' % self.primary, message)
+        self.assertNotIn('fetch --prune origin', message)
 
 
 class StaleRefNextStep(unittest.TestCase):
@@ -160,16 +223,22 @@ class StaleRefNextStep(unittest.TestCase):
     def test_a_stale_ref_refusal_names_the_fetch_prune_on_the_same_host_then_the_same_removal(self):
         result = self.run_remove(self.stale(), authenticated=True)
         self.assertFalse(result['removed'])
-        self.assertIn("ssh %s 'git -C /home/u/repos/base fetch --prune origin'" % REMOTE, result['next'])
+        self.assertIn("ssh %s 'git -C /home/u/repos/base fetch --prune --all'" % REMOTE, result['next'])
         self.assertIn('worktree-remove --host %s --path /home/u/scratch/wt ' % REMOTE, result['next'])
         self.assertTrue(result['next'].endswith('--remote-auth'))
         local = self.run_remove(self.stale(), host='local')
-        self.assertIn('run `git -C /home/u/repos/base fetch --prune origin` first', local['next'])
+        self.assertIn('run `git -C /home/u/repos/base fetch --prune --all` first', local['next'])
+        # the remote names come from the repository: none is printed, whichever remote holds the stale ref
+        for urls in ({'upstream': [URL]}, {'--upload-pack=x': [URL]}, {'origin': [URL], 'up\u0441tream': [URL]}, {}):
+            step = self.run_remove(self.stale(urls=urls))['next']
+            self.assertIn('fetch --prune --all', step, urls)
+            for name in urls:
+                self.assertNotIn(name, step, urls)
 
     def test_no_next_step_for_other_refusals_or_for_values_that_are_not_plain(self):
         self.assertNotIn('next', self.run_remove(self.stale(reason='the working tree is not clean')))
         self.assertNotIn('next', self.run_remove(self.stale(repo='/home/u/$(id)')))
-        self.assertNotIn('next', self.run_remove(self.stale(urls={'or;igin': [URL]})))
+        self.assertNotIn('next', self.run_remove(self.stale(repo='/home/u/../etc')))
 
 
 class WorkStateWording(Home):
@@ -192,6 +261,24 @@ class WorkStateWording(Home):
         (self.work / 'T/tmp').mkdir(parents=True)
         (self.work / 'T/tmp/spec.tmp').write_text('x\n')
         self.assertEqual(self.decide('mv %s %s' % (self.work / 'T/tmp/spec.tmp', self.work / 'T/spec.md'))[0], 'allow')
+
+    def test_a_directory_or_missing_path_keeps_the_log_wording(self):
+        # #333 review F5: only one proven plain work file gets the "not a log" wording; a directory may hold WALs,
+        # kits or *.jsonl files, and a path that does not exist (or a link) proves nothing
+        (self.work / 'T/wal').mkdir(parents=True)
+        (self.work / 'T/wal/main.jsonl').write_text('x\n')
+        (self.work / 'U').mkdir()
+        (self.work / 'U/notes.md').write_text('x\n')
+        (self.work / 'U/kit.json').write_text('{}\n')
+        (self.work / 'V').mkdir()
+        (self.work / 'V/a.md').write_text('x\n')
+        os.symlink(str(self.work / 'U/kit.json'), str(self.work / 'V/link.md'))
+        for command in ('rm -r %s' % (self.work / 'T'), 'rm -rf %s' % (self.work / 'U'),
+                        'mv %s %s' % (self.work / 'U', self.home / 'moved'), 'rm -r %s' % (self.work / 'V'),
+                        'rm %s' % (self.work / 'V/link.md'), 'rm %s' % (self.work / 'V/missing.md')):
+            message = self.blocked(command)
+            self.assertNotIn('It is not a log', message, command)
+            self.assertIn(LOG_WORDING, message, command)
 
     def test_logs_wals_transcripts_and_kits_keep_the_log_refusal(self):
         paths = [self.home / '.claude/wals/S/main.jsonl', self.home / '.claude/projects/p/S.jsonl',

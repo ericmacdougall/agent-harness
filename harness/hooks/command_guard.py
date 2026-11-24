@@ -2690,6 +2690,9 @@ def _worktree_route(path=None, host=None):
     target = path if isinstance(path, str) and _ROUTE_PATH.fullmatch(path) and '..' not in path.split('/') \
         and len(path) <= 1024 else '<abs path>'
     where = 'local' if host is None else host
+    if where == '?':
+        return ('the target is inside a container, chroot or namespace, where this machine cannot verify it; remove the '
+                'worktree from a session on that system')
     if where != 'local' and where not in WORKTREE_ROUTE_HOSTS:
         return ('ah worktree-remove serves only this machine and %s; remove the worktree from a session on that host'
                 % ', '.join(WORKTREE_ROUTE_HOSTS))
@@ -2697,13 +2700,13 @@ def _worktree_route(path=None, host=None):
             'no --force, audited; add --remote-auth for a private repository)' % (where, target))
 
 
-def worktree_prune_hint(repo, remote='origin'):
-    """`git -C <registry repo> fetch --prune <remote>` for a stale-tracking-ref refusal, or None when the values are not
-    plain literal paths and names (they are printed for an agent to run, so nothing shell-active may reach the text)."""
-    if not (isinstance(repo, str) and _ROUTE_REPO.fullmatch(repo) and '..' not in repo.split('/')
-            and isinstance(remote, str) and re.fullmatch(r'[\w.-]{1,60}', remote)):
+def worktree_prune_hint(repo):
+    """`git -C <registry repo> fetch --prune --all` for a stale-tracking-ref refusal, or None when the repository is not
+    a plain literal path (it is printed for an agent to run, so nothing shell-active may reach the text). --all, not a
+    remote name: the verifier refuses a stale ref under any remote, and no remote name is printed (#333 review F2, F3)."""
+    if not (isinstance(repo, str) and _ROUTE_REPO.fullmatch(repo) and '..' not in repo.split('/')):
         return None
-    return 'git -C %s fetch --prune %s' % (repo, remote)
+    return 'git -C %s fetch --prune --all' % repo
 
 
 def _worktree_registry(path):
@@ -2731,7 +2734,7 @@ def _worktree_next_step(reason, repo=None):
     if 'stale or names a moved' in reason:
         prune = worktree_prune_hint(repo)
         return ('run `%s` first' % prune if prune else
-                'run `git -C <registry repo> fetch --prune origin` first (the repository the worktree was added from)')
+                'run `git -C <registry repo> fetch --prune --all` first (the repository the worktree was added from)')
     if 'did not answer' in reason:
         return ('the guard reads the remote without credentials; for a private repository use '
                 'python3 -I ~/.claude/hooks/ah.py worktree-remove --host local --path <abs path> --reason <why> '
@@ -3892,7 +3895,9 @@ class Ctx:
         self.origin_cwd = cwd  # the payload's working directory, None when the host sent none
         self.cwd_known = bool(cwd)  # becomes True after an absolute or home `cd` in the command
         self.work_refusal = False
-        self.ssh_host = None  # the host of the ssh payload being analysed (advice only: names the route's --host)
+        # where the command being analysed runs, for advice only: None is this machine, a name is an ssh payload's host,
+        # '?' is a container, chroot or namespace whose paths this machine cannot verify (#333 review F4)
+        self.ssh_host = None
         self.token_sink_ok = False
         self.token_allowed = 0
         self.top_commands = 0
@@ -5053,19 +5058,20 @@ class Analyzer:
                 self.inner_words(args[pos[1]:], depth, pl, idx)
             return True
         if name in ('unshare', 'script'):
+            run = self.script if name == 'script' else (lambda *a, **k: self._in_foreign_view(self.script, *a, **k))
             for k, t in enumerate(texts):
                 if (t in ('-c', '--command') or name == 'script' and re.fullmatch(r'-[A-Za-z]*c', t)) \
                         and k + 1 < len(texts):
-                    self.script(texts[k + 1], depth + 1, tail_visible=True)
+                    run(texts[k + 1], depth + 1, tail_visible=True)
                     return True
                 if t.startswith('--command='):
-                    self.script(t.split('=', 1)[1], depth + 1, tail_visible=True)
+                    run(t.split('=', 1)[1], depth + 1, tail_visible=True)
                     return True
             k = 0
             while k < len(texts) and texts[k].startswith('-'):
                 k += 1
             if name == 'unshare' and k < len(args):
-                self.inner_words(args[k:], depth, pl, idx)
+                self._in_foreign_view(self.inner_words, args[k:], depth, pl, idx)
             return True
         if name == 'parallel':
             if ':::' in texts:
@@ -5167,7 +5173,10 @@ class Analyzer:
         elif name in ('watch',):
             pass
         if i < len(args):
-            self.inner_words(args[i:], depth, pl, idx)
+            if name in ('chroot', 'nsenter'):  # another filesystem view: advice from inside names no local path
+                self._in_foreign_view(self.inner_words, args[i:], depth, pl, idx)
+            else:
+                self.inner_words(args[i:], depth, pl, idx)
 
     def xargs_input(self, args, cmd):
         """xargs deleting what its own input names: a here-string, `< <(..)` or `-a <(..)`."""
@@ -5375,7 +5384,20 @@ class Analyzer:
             finally:
                 self.ctx.ssh_host = saved
 
+    def _in_foreign_view(self, analyse, *args, **kwargs):
+        """Analyse a command that runs inside a container, chroot or namespace: the analysis is unchanged, but advice
+        printed from inside it names no local path or host (ctx.ssh_host '?'; #333 review F4)."""
+        saved = self.ctx.ssh_host
+        self.ctx.ssh_host = '?'
+        try:
+            return analyse(*args, **kwargs)
+        finally:
+            self.ctx.ssh_host = saved
+
     def container(self, name, args, words, depth, pl, idx):
+        return self._in_foreign_view(self._container, name, args, words, depth, pl, idx)
+
+    def _container(self, name, args, words, depth, pl, idx):
         texts = [a.text for a in args]
         if name in ('docker', 'podman', 'nerdctl'):
             if 'exec' in texts:
@@ -5875,7 +5897,7 @@ class Analyzer:
                     continue
                 # goodqa#16943: every refused removal names the sanctioned route with this target and host filled in
                 reason = getattr(self, '_worktree_reason', None) if one_target else None
-                route, repo = self._worktree_advice(w, reason)
+                route, repo = self._worktree_advice(w, reason, cwd_words)
                 refused = self.refuse('git worktree remove', w, instead=_worktree_instead(reason, route, repo) or route)
                 if not refused:
                     step = _worktree_next_step(reason, repo)
@@ -7213,7 +7235,7 @@ class Analyzer:
                  'ancestor': 'a directory that contains protected logs', 'unknown':
                  'a path the guard cannot resolve that points at protected logs'}[cls]
         name = posixpath.basename(path.rstrip('/')) or path
-        if cls == 'root' and self._under_work(path) is not None and not self._kept(path):
+        if cls == 'root' and literal and self._work_state_file(path):
             # goodqa#16943 (H6): durable work state, not a log. Same refusal, but the advice is the documented place for
             # disposable files instead of the log-backup procedure (docs/operations.md, "Under ~/.agent-harness/work").
             ctx.add(LOG_DELETE, 'log-delete',
@@ -7223,7 +7245,6 @@ class Analyzer:
                     instead or 'make disposable files in ~/.agent-harness/work/<session>/<task>/tmp/ (rm and mv of a '
                     'literal path there are allowed) and move them from there, or copy (cp) instead of moving; '
                     'retired task and session folders are removed by python3 ~/.claude/hooks/workdir.py prune --apply'
-                    + ('' if literal else '; spell out the literal path, globs and variables are judged as protected')
                     + self._clone_hint(path))
             return True
         ctx.add(LOG_DELETE, 'log-delete',
@@ -7286,30 +7307,44 @@ class Analyzer:
         self._worktree_reason = reason
         return reason is None
 
-    def _worktree_advice(self, word, reason):
+    def _worktree_advice(self, word, reason, cwd_words=()):
         """(the exact `ah worktree-remove` command for this target, the registry repository for a fetch --prune hint).
-        The path is filled in only when the guard resolved it to a literal path; inside an ssh payload the host is the
-        payload's host, and the remote repository is unknown here."""
+        Advice is printed for an agent to run, so every concrete part comes from _route_target, the one place that
+        decides whether a path may be printed at all (#333 review F1, F4); anything unproven is a placeholder."""
         host = self.ctx.ssh_host
-        try:
-            cls, path, literal = self.target_class(word)
-        except Blocked:
-            raise
-        except Exception:  # noqa: BLE001 - advice only; the refusal itself does not depend on it
-            path, literal = None, False
-        if word.dynamic or word.subs or word.glob:
-            path = None
-        elif host is not None:
-            # an ssh payload's path belongs to the remote host: ~ and variables would resolve to THIS machine's values,
-            # so only a plain absolute spelling with no variable is printed
-            spelled = word.raw.strip('\'"') if isinstance(word.raw, str) else None
-            path = word.text if spelled == word.text and str(word.text).startswith('/') and not word.vars else None
-        elif not literal:
-            path = None
+        path = self._route_target(word, host, cwd_words)
         repo = None
         if path and host is None and reason and 'stale or names a moved' in str(reason) and not self._foreign_home(path):
             repo = _worktree_registry(path)
         return _worktree_route(path, host), repo
+
+    def _route_target(self, word, host, cwd_words=()):
+        """The target path to print in a runnable command, or None (the caller prints a placeholder). Printed only when
+        every part is proven: one alternative, no variable, substitution or glob, a known host, and for this machine a
+        literal path the guard resolved that is either spelled absolute (or from ~) or relative to a working directory
+        the analysis still knows, with no `git -C` (which moves the base). On another host only a plain absolute
+        spelling counts, because ~ and variables would resolve to this machine's values. Inside a container, chroot or
+        namespace (host '?') nothing is printed."""
+        if host == '?' or word.dynamic or word.subs or word.glob or word.vars or len(word.alts) != 1:
+            return None
+        spelled = word.raw.strip('\'"') if isinstance(word.raw, str) else None
+        if host is not None:
+            return word.text if spelled == word.text and str(word.text).startswith('/') else None
+        try:
+            _cls, path, literal = self.target_class(word)
+        except Blocked:
+            raise
+        except Exception:  # noqa: BLE001 - advice only; the refusal itself does not depend on it
+            return None
+        if not literal or not isinstance(path, str):
+            return None
+        text = str(word.text)
+        if text.startswith(('/', '~/')):
+            return path
+        ctx = self.ctx
+        if cwd_words or not ctx.cwd_known or ctx.cwd_unknown or not ctx.cwd:
+            return None  # a relative spelling whose base the analysis no longer knows (cd "$X", cd -, popd, readings)
+        return path
 
     def _dash_c_refusal(self, path, repo):
         """With a -C the verification ran from the -C directory. Red-team F1: the shell may itself stand inside the
@@ -7473,6 +7508,20 @@ class Analyzer:
         if any(s in self.c.keep_segments for s in rest[:-1]):
             return 'write to a differently named folder instead; files under a folder named state are kept'
         return None
+
+    def _work_state_file(self, path):
+        """True only when `path` is proven to be one plain work-state file: below ~/.agent-harness/work, an existing
+        regular file (not a directory, link or missing path, which may hold or name WALs, kits or *.jsonl), and a plain
+        work file by _plain_work_file (no kept name, WAL shape or .keep). Anything else keeps the log wording (#333
+        review F5)."""
+        if self._under_work(path) is None or self._kept(path):
+            return False
+        try:
+            if not stat.S_ISREG(os.lstat(path).st_mode):
+                return False
+        except (OSError, ValueError):
+            return False
+        return self._plain_work_file(path)
 
     def _plain_work_file(self, path):
         """A plain file at least two levels below ~/.agent-harness/work or ~/.agent-harness/scratch, both as typed

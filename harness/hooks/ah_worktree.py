@@ -190,16 +190,16 @@ def remove(host, path, reason, authenticated=False, session="", agent="", home=N
 
 def next_step(host, path, result, authenticated=False):
     """The exact commands that clear a stale-tracking-ref refusal (goodqa#16943): the verifier keeps that rule; the caller
-    gets `git -C <registry repo> fetch --prune <remote>` on the same host, then this same removal. None otherwise, and None
-    when the verifier's repository or remote name is not a plain literal (it is printed for an agent to run)."""
+    gets `git -C <registry repo> fetch --prune --all` on the same host, then this same removal. None otherwise, and None
+    when the verifier's repository is not a plain literal (it is printed for an agent to run). --all and no remote name:
+    the verifier refuses a stale ref under any remote, and a remote name from the repository is never printed (#333
+    review F2, F3)."""
     if result.get("removable") is not False or "stale or names a moved" not in str(result.get("reason") or ""):
         return None
-    repo, urls = result.get("repo"), result.get("urls") if isinstance(result.get("urls"), dict) else {}
-    remote = "origin" if "origin" in urls else next(iter(urls), "origin")
-    if not (isinstance(repo, str) and PATH_RE.fullmatch(repo) and ".." not in repo.split("/")
-            and isinstance(remote, str) and re.fullmatch(r"[\w.-]{1,60}", remote)):
+    repo = result.get("repo")
+    if not (isinstance(repo, str) and PATH_RE.fullmatch(repo) and ".." not in repo.split("/")):
         return None
-    fetch = "git -C %s fetch --prune %s" % (repo, remote)
+    fetch = "git -C %s fetch --prune --all" % repo
     if host != "local":
         fetch = "ssh %s %s" % (host, shlex.quote(fetch))
     return ("run `%s` first (the registry repository keeps refs of deleted branches), then repeat: python3 -I "
