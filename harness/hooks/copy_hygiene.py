@@ -70,6 +70,8 @@ WHAT.
                     reading cannot see inside $X;
                   - whether the host is really another machine: `ssh localhost '...'` or an alias of this machine
                     copies onto this disk uncounted (the hook does no DNS or ssh-config reading);
+                  - a redirect of the remote output onto this disk: `ssh devbox 'tar c dir' > local.tar` writes
+                    remote data here and is not counted;
                   - the far host's own floor.
   scratch       `copy_hygiene.py scratch [--key <name>]` creates and prints a private (0700) disk-backed scratch
                 directory, ~/.agent-harness/scratch/<session>, the replacement for /dev/shm:
@@ -821,9 +823,10 @@ def simple_commands(cmd: str) -> list:
 # from the text alone: an ssh that runs only on the far host (_plain_remote_ssh). Nothing is relaxed by listing bad
 # shapes; a shape this section does not recognise keeps the base reading (goodqa#16811 round 2).
 
-# ssh options that make the LOCAL machine run a command; an ssh carrying one keeps the strict reading. `-F` names a
-# config file that may hold one, and the hook reads no ssh config.
-SSH_LOCAL_COMMAND = re.compile(r"proxycommand|localcommand|knownhostscommand|^-F", re.I)
+# ssh options that make the LOCAL machine run or load something; an ssh carrying one keeps the strict reading. `-F`
+# names a config file that may hold one, and the hook reads no ssh config. PKCS11Provider and SecurityKeyProvider load a
+# local library; they are matched here as well as in SSH_LOCAL_KEYWORDS, so a quoted keyword cannot slip past.
+SSH_LOCAL_COMMAND = re.compile(r"proxycommand|localcommand|knownhostscommand|pkcs11provider|securitykeyprovider|^-F", re.I)
 # The program words trusted to be the system ssh: `ssh` looked up on PATH (see LOOKUP_VARIABLES) or its usual
 # absolute paths. `./ssh`, `bin/ssh` or `~/bin/ssh` may be any local script.
 SSH_PROGRAMS = frozenset(("ssh", "/usr/bin/ssh", "/bin/ssh", "/usr/local/bin/ssh", "/opt/homebrew/bin/ssh"))
@@ -893,7 +896,9 @@ def _ssh_option(value):
 def _ssh_value_ok(letter, value) -> bool:
     if letter != "o":
         return True
-    keyword = re.split(r"[=\s]", value.strip(), maxsplit=1)[0].lower()
+    # OpenSSH strips double quotes from a -o keyword (`-o '"PKCS11Provider" x.so'` sets PKCS11Provider; `ssh -G`
+    # on 9.6 shows it), so they are dropped before the lookup. A keyword ssh would reject is refused here too.
+    keyword = re.split(r"[=\s]", value.replace('"', "").strip(), maxsplit=1)[0].lower()
     return keyword not in SSH_LOCAL_KEYWORDS and "\n" not in value and "\r" not in value
 
 
@@ -1027,7 +1032,8 @@ def _plain_remote_ssh(segment) -> bool:
     The caller also requires a verified line on which nothing redefines a program (_line_redefines).
 
     Not proven: that the host is another machine. `ssh localhost '...'` or an ssh alias of this machine copies onto
-    this disk and is not counted (documented gap; the hook does no DNS or ssh-config reading)."""
+    this disk and is not counted (documented gap; the hook does no DNS or ssh-config reading). Not counted either:
+    a redirect of the remote output onto this disk, `ssh devbox 'tar c dir' > local.tar` (documented gap)."""
     prefix, rest = _command_words(segment)
     if not rest or not _spelled_out(rest[0]) or rest[0].value not in SSH_PROGRAMS:
         return False
