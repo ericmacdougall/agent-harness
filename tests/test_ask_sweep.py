@@ -1,9 +1,11 @@
 """GoodQA #15565: ask_sweep lists asks the user answered (by ask id, structured answers), closes only what main names, and never
 records an approval."""
+import ast
 import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -11,7 +13,9 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "harness" / "hooks"))
+import ask_evidence  # noqa: E402
 import ask_sweep as sw  # noqa: E402
+import provenance  # noqa: E402
 
 SESSION = "11111111-1111-4111-8111-111111111111"
 T0 = "2026-11-08T10:00:00+00:00"
@@ -106,13 +110,26 @@ class Plan(Base):
 
 
 class Close(Base):
-    def test_close_runs_wal_note_with_an_answer_source_no_decision_and_a_tool_mark(self):
-        argv = sw.answered_argv("sess-1", Path("/w/main.jsonl"), {"ask": "w00000000001", "turn": "u1-uuid",
-                                                                   "answer": 'My "own" product'})
-        self.assertEqual(argv[argv.index("--source") + 1], "answer:sess-1/u1-uuid \"My 'own' product\"")
+    def test_close_runs_wal_note_with_the_cited_source_no_decision_and_a_tool_mark(self):
+        wal, tr = self.files([ask("w00000000001")], [answer_record("u1", {"[ask:w00000000001] Q?": 'My "own" product'})])
+        item = sw.plan(wal, tr, NOW, session=SESSION)["answered"][0]
+        argv = sw.answered_argv(SESSION, wal, item)
+        source = argv[argv.index("--source") + 1]
+        # #170 round 2 F3: the inner quotes are escaped, never swapped for ', and provenance reads back the exact words
+        self.assertEqual(source, 'answer:%s/u1 "My \\"own\\" product"' % SESSION)
+        self.assertEqual(provenance.parse_excerpt(source.split(" ", 1)[1]), 'My "own" product')
         self.assertEqual(argv[argv.index("--by") + 1], "ask-sweep")
         self.assertNotIn("--decision", argv)
         self.assertNotIn("--outcome", argv)
+
+    def test_an_answer_provenance_would_not_accept_goes_to_short_with_no_close(self):
+        wal, tr = self.files([ask("w00000000001"), ask("w00000000002")],
+                             [answer_record("u1", {"[ask:w00000000001] Q?": "Okay... sure... fine by me",
+                                                   "[ask:w00000000002] R?": "Yes... ship it to staging now"})])
+        got = sw.plan(wal, tr, NOW, session=SESSION)
+        self.assertEqual([(s["ask"], "by hand" in s["reason"]) for s in got["short"]], [("w00000000001", True)])
+        self.assertEqual([(a["ask"], a["elided"], a["source"].split(" ", 1)[1]) for a in got["answered"]],
+                         [("w00000000002", True, '"...ship it to staging now"')])
 
     def test_a_refused_close_carries_wal_note_s_message(self):
         got = sw.run_close("w00000000001", ["x"], runner=lambda a: (2, "", '{"status": "REFUSED", "problem": "nope"}'))
@@ -131,7 +148,7 @@ class RealProvenance(Base):
         self.assertFalse(sw.verified("22222222-2222-4222-8222-222222222222", "u1", home))  # no transcript
 
 
-class Cli(Base):
+class CliBase(Base):
     def setUp(self):
         super().setUp()
         self.home = self.root / "home"
@@ -144,7 +161,7 @@ class Cli(Base):
         (proj / f"{SESSION}.jsonl").write_text("".join(json.dumps(answer_record("u1", {
             "[ask:w00000000001] Q one?": "Answer number one", "[ask:w00000000002] Q two?": "Answer number two"})) + "\n"))
         self.calls = []
-        patches = [mock.patch.dict(os.environ, {"AH_HOME": str(self.home)}),
+        patches = [mock.patch.dict(os.environ, {"AH_HOME": str(self.home), "HOME": str(self.home)}),
                    mock.patch.object(sw, "verified", lambda *a: True),
                    mock.patch.object(sw, "_default_runner", lambda argv: self.calls.append(argv) or (0, "{}", ""))]
         for p in patches:
@@ -157,6 +174,8 @@ class Cli(Base):
             code = sw.main(["--session", SESSION, *args])
         return code, json.loads(out.getvalue())
 
+
+class Cli(CliBase):
     def test_listing_closes_nothing_and_apply_needs_only(self):
         code, doc = self.run_main()
         self.assertEqual((code, sorted(a["ask"] for a in doc["answered"])), (0, ["w00000000001", "w00000000002"]))
@@ -201,7 +220,7 @@ def bash_input(uuid, ts, command):
             "message": {"role": "user", "content": f"<bash-input>{command}</bash-input>"}}
 
 
-class WalEvidence(unittest.TestCase):
+class WalBase(unittest.TestCase):
     """GoodQA goodqa#16944: answers that arrive as decision rows, successor-session closes, SUPERSEDES asks or the user's
     own terminal commands. Listed for main; a close is bookkeeping (no --decision) and a terminal match needs CONFIRM."""
 
@@ -225,6 +244,8 @@ class WalEvidence(unittest.TestCase):
     def items(self, related=()):
         return {i["ask"]: i for i in sw.wal_evidence(self.home, S1, related)["items"]}
 
+
+class WalEvidence(WalBase):
     def test_decision_row_citing_the_users_answer_resolves_without_a_decision(self):
         self.wal(S1, [wrow("ask", "w00000000a01", "2026-11-23T19:06:00+00:00", "U6: may reviews attempt Astra?"),
                       wrow("decision", "w00000000d01", "2026-11-23T22:04:00+00:00",
@@ -354,7 +375,7 @@ class WalEvidence(unittest.TestCase):
                            source=f'answer:{S1}/5 "Yes, both"')])
         self.transcript(S1, [])
         calls = []
-        with mock.patch.dict(os.environ, {"AH_HOME": str(self.home)}), \
+        with mock.patch.dict(os.environ, {"AH_HOME": str(self.home), "HOME": str(self.home)}), \
                 mock.patch.object(sw, "_default_runner", lambda argv: calls.append(argv) or (0, "{}", "")), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(sw.main(["--session", S1]), 0)
@@ -363,24 +384,205 @@ class WalEvidence(unittest.TestCase):
         self.assertEqual({i["pin"] for i in listed["evidence"]}, {"w00000000a10=w00000000d10", "w00000000a11=w00000000d10"})
         self.assertNotIn("closed", listed)
         self.assertEqual(calls, [])
-        with mock.patch.dict(os.environ, {"AH_HOME": str(self.home)}), \
+        with mock.patch.dict(os.environ, {"AH_HOME": str(self.home), "HOME": str(self.home)}), \
                 mock.patch.object(sw, "_default_runner", lambda argv: calls.append(argv) or (0, "{}", "")), \
                 contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(sw.main(["--session", S1, "--apply", "--only", "w00000000a10=w00000000d10"]), 0)
         self.assertEqual([a[a.index("--ref") + 1] for a in calls], ["w00000000a10"])
 
 
-class OneRule(unittest.TestCase):
-    """Class 2 guard: the SUPERSEDES match and the file reading live in ask_evidence.py only."""
+REAL_RUNNER = sw._default_runner
 
-    def test_neither_tool_reimplements_the_shared_rules(self):
-        hooks = Path(sw.__file__).resolve().parent
-        for name in ("ask_sweep.py", "wal_note.py"):
-            text = (hooks / name).read_text()
-            self.assertNotIn("SUPERSEDES\\s", text, name)
-            self.assertIn("ask_evidence", text, name)
-        self.assertNotIn('open(path, "rb")', (hooks / "ask_sweep.py").read_text())
-        self.assertNotIn('open(transcript, "rb")', (hooks / "ask_sweep.py").read_text())
+
+class Home(CliBase):
+    """#170 round 2 F7: ask_sweep, wal_note.py, wal.append and provenance must read and write one home."""
+
+    def test_a_different_ah_home_or_config_dir_is_refused_and_nothing_runs(self):
+        other = self.root / "elsewhere"
+        other.mkdir()
+        for env in ({"AH_HOME": str(other)}, {"CLAUDE_CONFIG_DIR": str(other / ".claude")}):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env):
+                code, doc = self.run_main()
+                self.assertEqual((code, doc["ok"]), (2, False))
+                self.assertIn(next(iter(env)), doc["problem"])
+                code, doc = self.run_main("--apply", "--only", "w00000000001=u1")
+                self.assertEqual((code, self.calls), (2, []))
+
+    def test_the_same_home_by_another_spelling_is_accepted(self):
+        link = self.root / "home-link"
+        link.symlink_to(self.home)
+        with mock.patch.dict(os.environ, {"AH_HOME": str(link), "CLAUDE_CONFIG_DIR": str(link / ".claude")}):
+            self.assertIsNone(sw.home_problem())
+            self.assertEqual(self.run_main()[0], 0)
+        with mock.patch.dict(os.environ, {"AH_HOME": "", "CLAUDE_CONFIG_DIR": ""}):
+            self.assertIsNone(sw.home_problem())
+
+
+class ApplyErrors(CliBase):
+    """#170 round 2 F4: a timeout or a wal_note that cannot start never loses the report, and a rerun names closed asks."""
+
+    def test_the_runner_turns_a_timeout_and_an_os_error_into_refused_results(self):
+        with mock.patch.object(sw.subprocess, "run", side_effect=subprocess.TimeoutExpired(cmd="wal_note.py", timeout=60)):
+            rc, _out, err = REAL_RUNNER(["wal_note.py"])
+        self.assertEqual(rc, sw.RC_TIMEOUT)
+        self.assertIn("did not finish", err)
+        with mock.patch.object(sw.subprocess, "run", side_effect=FileNotFoundError("python")):
+            self.assertEqual(REAL_RUNNER(["wal_note.py"])[0], sw.RC_NOT_RUN)
+
+    def test_a_timeout_during_apply_still_prints_the_report_and_exits_1(self):
+        with mock.patch.object(sw, "_default_runner", REAL_RUNNER), \
+                mock.patch.object(sw.subprocess, "run", side_effect=subprocess.TimeoutExpired(cmd="wal_note.py", timeout=60)):
+            code, doc = self.run_main("--apply", "--only", "w00000000001=u1", "w00000000002=u1")
+        self.assertEqual(code, 1)
+        self.assertEqual([(c["ask"], c["rc"]) for c in doc["closed"]], [("w00000000001", 124), ("w00000000002", 124)])
+        self.assertIn("did not finish", doc["closed"][0]["refused"])
+
+    def test_a_close_written_before_the_timeout_is_reported_as_written(self):
+        wal = self.home / ".claude" / "wals" / SESSION / "main.jsonl"
+
+        def slow_writer(argv):
+            with open(wal, "a") as fh:
+                fh.write(json.dumps({"event": "ask_resolved", "id": "w0000000c001", "ref": argv[argv.index("--ref") + 1],
+                                     "source": argv[argv.index("--source") + 1], "by": "ask-sweep"}) + "\n")
+            return sw.RC_TIMEOUT, "", "wal_note.py did not finish"
+        with mock.patch.object(sw, "_default_runner", slow_writer):
+            code, doc = self.run_main("--apply", "--only", "w00000000001=u1")
+        self.assertEqual((code, doc["closed"][0]["rc"], doc["closed"][0]["written"]), (0, 0, "w0000000c001"))
+
+    def test_a_rerun_reports_an_already_closed_ask_as_resolved_and_writes_nothing(self):
+        wal = self.home / ".claude" / "wals" / SESSION / "main.jsonl"
+        with open(wal, "a") as fh:
+            fh.write(json.dumps({"event": "ask_resolved", "id": "w0000000c002", "ref": "w00000000002",
+                                 "source": 'answer:x/u1 "Answer number two"', "by": "ask-sweep",
+                                 "closed_by": "ask-sweep"}) + "\n")
+        code, doc = self.run_main("--apply", "--only", "w00000000002=u1")
+        self.assertEqual(code, 0)
+        self.assertEqual(doc["closed"], [{"ask": "w00000000002", "rc": 0, "already_resolved": "w0000000c002",
+                                          "closed_by": "ask-sweep", "note": "already closed; nothing was written"}])
+        self.assertEqual(self.calls, [])
+
+
+class Incomplete(CliBase):
+    """#170 round 2 F2 at the CLI: whatever the reader could not read makes the listing exit 2, and --apply refuses."""
+
+    def test_an_unparseable_wal_line_makes_the_listing_exit_2_and_apply_refuse(self):
+        agent = self.home / ".claude" / "wals" / SESSION / "agent-x.jsonl"
+        agent.write_text('{"event": "decision", "note": "torn\n')
+        code, doc = self.run_main()
+        self.assertEqual(code, 2)
+        self.assertEqual([(Path(u["source"]).name, u["reason"]) for u in doc["unread"]], [("agent-x.jsonl", "line-malformed")])
+        code, doc = self.run_main("--apply", "--only", "w00000000001=u1")
+        self.assertEqual((code, doc["closed"][0]["rc"], self.calls), (1, 3, []))
+        self.assertIn("incomplete", doc["closed"][0]["refused"])
+
+    def test_a_newer_answer_on_a_skipped_line_is_never_silently_missed(self):
+        proj = self.home / ".claude" / "projects" / "p" / f"{SESSION}.jsonl"
+        newer = answer_record("u9", {"[ask:w00000000001] Q one?": "A much newer answer " + "z" * 400})
+        with open(proj, "a") as fh:
+            fh.write(json.dumps(newer) + "\n")
+        with mock.patch.object(ask_evidence, "MAX_LINE", 400):
+            code, doc = self.run_main()
+            self.assertEqual(code, 2)  # the listing still shows the older u1, but it says it is not complete
+            self.assertEqual([(u["reason"], u["lines"]) for u in doc["unread"]], [("line-too-long", [2])])
+            code, doc = self.run_main("--apply", "--only", "w00000000001=u1")
+        self.assertEqual((code, self.calls), (1, []))
+
+
+S3 = "cccccccc-0000-4000-8000-000000000003"
+
+
+class Ranking(WalBase):
+    """#170 round 2 F6: the user's answer outranks a related-session close that carries an outcome."""
+
+    def test_an_answer_row_outranks_an_obsolete_close_elsewhere(self):
+        self.wal(S1, [wrow("ask", "w00000000a50", "2026-11-23T19:00:00+00:00", "may main release?"),
+                      wrow("decision", "w00000000d50", "2026-11-23T20:00:00+00:00", "Answer to ask w00000000a50: approved",
+                           source=f'answer:{S1}/1 "Yes, release it"')])
+        self.wal(S2, [wrow("ask_resolved", "w00000000r50", "2026-11-23T21:00:00+00:00", "obsolete there",
+                           ref="w00000000a50", source="wal:/x/main.jsonl#w00000000b50", outcome="obsolete")])
+        item = self.items([S2])["w00000000a50"]
+        self.assertEqual([e["ref"] for e in item["evidence"]], ["w00000000d50", "w00000000r50"])
+        argv = sw.close_argv(item)
+        self.assertNotIn("--outcome", argv)
+        self.assertEqual(argv[argv.index("--source") + 1], f'answer:{S1}/1 "Yes, release it"')
+
+    def test_a_human_close_is_not_hidden_behind_an_earlier_outcome_close(self):
+        self.wal(S1, [wrow("ask", "w00000000a51", "2026-11-23T19:00:00+00:00", "q")])
+        self.wal(S2, [wrow("ask_resolved", "w00000000r51", "2026-11-23T20:00:00+00:00", "obsolete there",
+                           ref="w00000000a51", source="wal:/x/main.jsonl#w00000000b51", outcome="obsolete")])
+        self.wal(S3, [wrow("ask_resolved", "w00000000r52", "2026-11-23T21:00:00+00:00", "answered there",
+                           ref="w00000000a51", source=f'user:{S3}/2 "Close it, it is done"')])
+        item = self.items([S2, S3])["w00000000a51"]
+        self.assertEqual([e["ref"] for e in item["evidence"]], ["w00000000r52", "w00000000r51"])
+        self.assertNotIn("--outcome", sw.close_argv(item))
+
+
+class OneRule(unittest.TestCase):
+    """Class 2 and class 4 guard (#170 round 2 F5): one reader, one fold, one quoting rule, one SUPERSEDES matcher.
+
+    - ask_sweep imports no hook module but ask_evidence and provenance, and reads no file itself;
+    - ask_evidence opens files in jsonl_records only, through safe_input.open_regular_file;
+    - ask_reminders.open_asks is ask_evidence.read_asks;
+    - wal_note reads --outcome evidence through provenance.wal_entry and matches through ask_evidence;
+    - no module swaps a double quote for a single one (the broken F3 substitution)."""
+
+    HOOKS = Path(sw.__file__).resolve().parent
+    READS = {"open", "read_text", "read_bytes", "fdopen", "pread", "readline", "readlines", "glob", "rglob", "scandir"}
+
+    def tree(self, name):
+        return ast.parse((self.HOOKS / name).read_text(), name)
+
+    def calls(self, node):
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Call):
+                func = sub.func
+                yield sub, func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else None
+
+    def function(self, tree, name):
+        return next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == name)
+
+    def test_ask_sweep_reads_nothing_itself_and_depends_only_on_the_shared_modules(self):
+        tree = self.tree("ask_sweep.py")
+        local = {p.stem for p in self.HOOKS.glob("*.py")}
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported |= {a.name.split(".")[0] for a in node.names}
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module.split(".")[0])
+        self.assertEqual(imported & local, {"ask_evidence", "provenance"})
+        self.assertEqual(sorted(name for _call, name in self.calls(tree) if name in self.READS), [])
+
+    def test_ask_evidence_opens_files_only_in_the_bounded_reader(self):
+        tree = self.tree("ask_evidence.py")
+        reader = self.function(tree, "jsonl_records")
+        inside = {id(c) for c, _ in self.calls(reader)}
+        outside = [name for call, name in self.calls(tree) if id(call) not in inside and name in self.READS | {"open_regular_file"}]
+        self.assertEqual(outside, [])
+        self.assertIn("open_regular_file", {name for _c, name in self.calls(reader)})
+        self.assertNotIn("open", {name for _c, name in self.calls(reader)})
+
+    def test_ask_reminders_open_asks_is_the_shared_fold(self):
+        names = {name for _c, name in self.calls(self.function(self.tree("ask_reminders.py"), "open_asks"))}
+        self.assertIn("read_asks", names)
+        self.assertFalse(names & self.READS, names)
+
+    def test_wal_note_reads_outcome_evidence_through_provenance_and_matches_through_ask_evidence(self):
+        text = (self.HOOKS / "wal_note.py").read_text()
+        self.assertNotIn("SUPERSEDES\\s", text)
+        names = {name for _c, name in self.calls(self.function(self.tree("wal_note.py"), "outcome_evidence_problem"))}
+        self.assertTrue({"wal_entry", "supersedes", "human_traced"} <= names, names)
+        self.assertFalse(names & self.READS, names)
+
+    def test_no_module_swaps_a_double_quote_for_a_single_one(self):
+        def is_char(node, char):
+            return ((isinstance(node, ast.Constant) and node.value == char)
+                    or (isinstance(node, ast.Call) and getattr(node.func, "id", None) == "chr" and len(node.args) == 1
+                        and isinstance(node.args[0], ast.Constant) and node.args[0].value == ord(char)))
+        for name in ("ask_sweep.py", "ask_evidence.py"):
+            swaps = [c.lineno for c, n in self.calls(self.tree(name)) if n == "replace" and len(c.args) == 2
+                     and is_char(c.args[0], '"') and is_char(c.args[1], "'")]
+            self.assertEqual(swaps, [], name)
 
 
 if __name__ == "__main__":

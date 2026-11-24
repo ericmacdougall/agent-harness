@@ -7,7 +7,6 @@ record what they sent through `ah`.
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 STAGES_S = (0, 30 * 60, 2 * 3600)   # then every REPEAT_S
@@ -40,25 +39,10 @@ def due(asks: list, now: float, sent: dict) -> list:
 
 
 def open_asks(wal_path: Path, parse_ts) -> list:
-    """Open asks of one session main WAL: `ask` entries with no later `ask_resolved` whose ref names them."""
-    asks, resolved = {}, set()
-    try:
-        with open(wal_path, "rb") as fh:
-            for raw in fh:
-                try:
-                    rec = json.loads(raw)
-                except ValueError:
-                    continue
-                if not isinstance(rec, dict):
-                    continue
-                if rec.get("event") == "ask" and isinstance(rec.get("id"), str):
-                    asks[rec["id"]] = {"id": rec["id"], "opened": parse_ts(rec.get("at")) or 0.0,
-                                       "note": rec.get("note") or "", "session": wal_path.parent.name}
-                elif rec.get("event") == "ask_resolved" and isinstance(rec.get("ref"), str):
-                    resolved.add(rec["ref"])
-    except OSError:
-        return []
-    return [a for k, a in asks.items() if k not in resolved]
+    """Open asks of one session main WAL: `ask` entries with no later `ask_resolved` whose ref names them. The one fold
+    is ask_evidence.read_asks (its bounded reader: regular files only, no symlinks, size, line and time caps)."""
+    import ask_evidence  # noqa: PLC0415
+    return ask_evidence.read_asks(wal_path, parse_ts)["open"]
 
 
 def render(reminders: list) -> str:

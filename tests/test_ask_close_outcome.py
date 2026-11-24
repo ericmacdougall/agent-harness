@@ -239,5 +239,35 @@ class OutcomeClose(unittest.TestCase):
         self.assertEqual(ask_reminders.open_asks(self.wal, lambda v: 0.0), [])
 
 
+class ProvenanceLineEntry(unittest.TestCase):
+    """#170 round 2 F1: the provenance.py change in this PR. A `wal:<path>#L<n>` entry is read with the id form's bounds:
+    the file's own folder as the root (a path swapped to a symlink after resolve_wal_path is refused) and the total byte
+    budget (a line past it is not read)."""
+
+    def setUp(self):
+        import provenance  # noqa: PLC0415
+        self.provenance = provenance
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        (root / "a").mkdir()
+        (root / "b").mkdir()
+        self.rows = "".join(json.dumps({"event": "decision", "id": "w%011d" % n, "note": "row"}) + "\n" for n in range(10))
+        self.inside = root / "a" / "main.jsonl"
+        self.inside.write_text(self.rows)
+        (root / "b" / "other.jsonl").write_text(self.rows)
+        self.swapped = root / "a" / "agent-x.jsonl"
+        self.swapped.symlink_to(root / "b" / "other.jsonl")
+
+    def test_a_line_entry_is_read_only_inside_its_own_folder(self):
+        self.assertEqual(self.provenance.wal_entry(self.inside, "L2")["id"], "w%011d" % 1)
+        self.assertEqual(self.provenance.wal_entry(self.swapped, "L2"), "malformed")  # resolves outside a/: refused
+
+    def test_a_line_entry_past_the_total_byte_budget_is_not_read(self):
+        with mock.patch.object(self.provenance, "MAX_SCAN_BYTES", 200):
+            self.assertIsNone(self.provenance.wal_entry(self.inside, "L8"))
+        self.assertEqual(self.provenance.wal_entry(self.inside, "L8")["id"], "w%011d" % 7)
+
+
 if __name__ == "__main__":
     unittest.main()
