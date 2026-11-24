@@ -849,6 +849,8 @@ def _run(host, ref, files, ticket, dry_run, home, session, agent, runner, poster
         # a guard file only at the ref (the Mac's hooks are older or newer than the ref): gate it now, still before any
         # remote write. A gate already decided covers the whole file set, so it is not asked twice (one stamp, one call).
         gate = guard_gate(host, ref, files, ticket, home, kind_, allow_older, forced=ref_guard, allow_remote=allow_remote)
+    elif gate is not None and ref_guard:  # the record lists the ref's guard files too, for a later --resume or --rollback (N1)
+        gate = dict(gate, guard_files=sorted(set(gate["guard_files"]) | set(ref_guard)))
     remote = Remote(host, runner)
     run = resume_of or new_run_id()
     names = order(files)

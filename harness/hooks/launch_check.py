@@ -162,8 +162,10 @@ def check(env: Env | None = None, allow_remote: bool = False):
         remote = facts["ssh_env"] + facts["ssh_ancestor"] + facts["mux_env"] + facts["mux_ancestor"]
         facts["allow_remote"] = bool(allow_remote)
         if remote and not allow_remote:
+            # the refusal does not name the flag: an agent that reached the user's terminal is not told the word to add
+            # (PR 345 review F14); the user's way is in docs/harness-repair.md
             return ("an ssh connection or a terminal multiplexer is present (%s); an agent can reach the user's terminal "
-                    "that way, so this needs --from-ssh-or-multiplexer typed by the user" % remote[0]), facts
+                    "that way, so this is refused here (docs/harness-repair.md, guard files)" % remote[0]), facts
         return None, facts
     except Exception as error:  # noqa: BLE001 - any surprise fails closed
         return "the launch check failed (%s)" % type(error).__name__, facts

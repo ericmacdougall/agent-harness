@@ -52,13 +52,16 @@ guard files: the registered PreToolUse and Stop hooks, the listed guard files, e
 files they read, and the install routes themselves (most of the installed names). The command checks two trees: this
 machine's hooks directory before anything is fetched, and the ref's own `harness/hooks` tree after the fetch and before
 any remote write, so a file that is a guard file only at the ref is still gated. `--resume` and `--rollback` also use the
-run's recorded gate. When a run names a guard file, it goes ahead only in one of two ways, and the audit row records which
-and the launch facts the check saw (tty, the qualifying ancestor, any ssh connection or multiplexer):
+run's recorded gate: the start row lists every guard file of the run by either tree, and a row written before PR 326a
+counts every file. The record only adds guard files; it never removes one this machine's tree counts. When a run names
+a guard file, it goes ahead only in one of two ways, and the audit row records which and the launch facts the check saw
+(tty, the qualifying ancestor, any ssh connection or multiplexer):
 
 - **Not launched by a recognised agent process.** `launch_check.py` looks for a terminal on stdin, none of the listed
   agent variables, no agent-named ancestor, a login session or terminal emulator as an ancestor, and no ssh connection
-  or multiplexer (tmux, screen) unless you type `--from-ssh-or-multiplexer`. stdout may be piped. **This is a speed bump
-  against careless agents, not a boundary.** An agent can meet it without forging anything, by starting the command in
+  or multiplexer (tmux, screen) unless you type `--from-ssh-or-multiplexer`. The refusal points here and does not name
+  the flag, so an agent that reached your terminal is not handed it (it is still in `--help`). stdout may be piped.
+  **This is a speed bump against careless agents, not a boundary.** An agent can meet it without forging anything, by starting the command in
   Terminal (`open` of a `.command` file, osascript `do script`), or over ssh or in your tmux server once the flag is
   typed (PR 345 review, F1). The control that closes those routes is the command guard refusing the install command
   inside ssh, multiplexer and script-launch bodies for every caller (goodqa#17065, guard lane). Until it lands, F1 is
