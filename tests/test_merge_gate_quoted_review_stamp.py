@@ -135,6 +135,10 @@ class UnsafeFormsMintNothing(MainHome):
         ("an unquoted comment, glob", BOUND + " # trailing comment"),
         ("given more than once", BOUND + " --pr 6"),
         ("does not name --github-repo OWNER/REPO", PREFIX + " --github-repo o/r --pr 5x"),
+        # Round 1 (F3): PowerShell reads curly quotes as quotes, so these `;` would separate statements there.
+        ("the non-ASCII quote, space or format character U+2019",
+         BOUND + " --repeat-reason ’x' ; true ; 'y’"),
+        ("an unquoted comment, glob", BOUND + " # it's a retry"),
     ]
 
     def test_every_unsafe_form_mints_nothing(self):
@@ -194,6 +198,75 @@ class NoStampNote(MainHome):
                 code, out, _ = self.hook(command)
                 self.assertEqual(code, 0)
                 self.assertEqual(out, "")
+
+
+PY = "python3 ~/.claude/hooks/peer_review.py --repeat-reason 'a;b' --github-repo o/r --pr 5 pr"
+
+
+class SubagentCannotHideABoundReview(MainHome):
+    """Round 1 (F2): a quoted `;` before the flags hid these launches from PEER_REVIEW_AUTH, and the token scan did
+    not read interpreter options or `sh -c` scripts, so a subagent could start a bound review (and take a stamp a
+    main run left behind)."""
+
+    SHAPES = [
+        'bash -c "' + PY + '"',
+        'sh -ec "' + PY + '"',
+        "zsh -c 'python3 ~/.claude/hooks/peer_review.py --repeat-reason \"a;b\" --github-repo o/r --pr 5 pr'",
+        "python3 -X utf8 ~/.claude/hooks/peer_review.py --repeat-reason 'a;b' --github-repo o/r --pr 5 pr",
+        "python3 -W ignore ~/.claude/hooks/peer_review.py --repeat-reason 'a;b' --github-repo o/r --pr 5 pr",
+        "python3 -O ~/.claude/hooks/peer_review.py --repeat-reason 'a;b' --pr 5 --github-repo o/r pr",
+        "python3.12 -I -X dev ~/.claude/hooks/peer_review.py --repeat-reason 'a;b' --github-repo=o/r --pr=5 pr",
+        "env A=1 " + PY,
+        "sudo -u ops " + PY,
+        "timeout 600 " + PY,
+        "/usr/bin/python3 ~/.claude/hooks/peer_review.py --repeat-reason 'a;b' --pr 5 pr --github-repo o/r",
+        "python3 -c 'import subprocess; subprocess.run([\"python3\", \"peer_review.py\", \"--github-repo\", "
+        "\"o/r\", \"--pr\", \"5\"])'",
+        "bash -c 'cd /w; python3 ~/.claude/hooks/peer_review.py --repeat-reason \"a;b\" --github-repo o/r --pr 5 pr'",
+        PY + " # it's the retry",
+        PY.replace("'a;b'", "’a;b’"),
+    ]
+
+    def subagent(self, command):
+        return mg.decide(dict(self.payload(command), agent_id="sub1"), fixture.FakeGh(fixture.SCENARIOS["green"]),
+                         Path(self.home) / "s")
+
+    def test_every_shape_is_blocked_for_a_subagent(self):
+        for command in self.SHAPES:
+            with self.subTest(command=command):
+                code, text = self.subagent(command)
+                self.assertEqual(code, 2, command)
+                self.assertIn("subagent cannot run the PR review", text)
+
+    def test_unbound_reviews_and_separate_mentions_still_run_for_a_subagent(self):
+        # Control: the subagent rule needs peer_review and a binding flag inside one command.
+        for command in ("python3 -X utf8 ~/.claude/hooks/peer_review.py --repeat-reason 'a;b' pr --packet /p",
+                        "bash -c 'python3 ~/.claude/hooks/peer_review.py pr --packet /p --expected-head x'",
+                        "grep -n peer_review notes.md && echo --pr 5"):
+            with self.subTest(command=command):
+                code, text = self.subagent(command)
+                self.assertEqual(code, 0, text)
+
+
+class OnlyAPosixShellMints(MainHome):
+    """Round 1 (F3): the quote rules are bash and zsh rules, so only a POSIX shell tool mints a stamp."""
+
+    def test_a_non_posix_shell_tool_mints_nothing_and_says_why(self):
+        for tool in ("PowerShell", "powershell", "write_stdin"):
+            with self.subTest(tool=tool):
+                notes = []
+                code, _ = self.decide(BOUND, notes, tool_name=tool)
+                self.assertEqual(code, 0)
+                self.assertIsNone(self.taken())
+                self.assertEqual(len(notes), 1, notes)
+                self.assertIn("is not a POSIX shell", notes[0])
+
+    def test_the_posix_shell_tools_still_mint(self):
+        # Control: the same plain command mints in each POSIX shell tool.
+        for tool in ("Bash", "shell", "local_shell", "exec_command", "unified_exec"):
+            with self.subTest(tool=tool):
+                self.decide(BOUND, tool_name=tool)
+                self.assertIsNotNone(self.taken(), tool)
 
 
 if __name__ == "__main__":
