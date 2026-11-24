@@ -123,6 +123,14 @@ class MustFail(GuardCase):
         for row in ('flock -w 5 /tmp/l {}', 'unshare -c {}', 'script -q /dev/null {}', 'timeout -s KILL 5 {}'):
             self.assertEqual(self.verdict(row.format(KILL)), alone, row)
 
+    def test_an_upper_case_kill_program_the_row_skipped_is_still_judged(self):
+        # a case-insensitive filesystem runs PKILL; only the exact signal name KILL after an option is exempt
+        import kill_guard as kg
+        loud = 'P' + KILL[1:2].upper() + 'ILL'
+        for command in ('timeout -s %s -f claude' % loud, 'timeout -s %s -f claude' % loud.lower()):
+            self.assertEqual(self.verdict(command), self.verdict(KILL), command)
+            self.assertEqual(kg.decide(command)[0], 'block', command)
+
     def test_a_variable_or_a_relative_path_behind_a_launcher_is_resolved_like_any_command(self):
         for command in ('D=~/.claude/projects; flock -Z x rm -rf "$D"', 'cd ~/.claude && flock -w 1 /tmp/l rm -rf projects',
                         'flock $X /tmp/l %s' % DELETE, 'flock "$X" /tmp/l %s' % DELETE):

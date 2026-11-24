@@ -5382,7 +5382,8 @@ class Analyzer:
         starts, texts = readings
         # with no row (an option word as the command) any word may be where the command starts
         end = len(args) if spec is OPTION_HEAD or not starts else min(max(starts), len(args))
-        skipped = [k for k in range(end) if k not in starts and _names_skipped_command(args[k])]
+        skipped = [k for k in range(end) if k not in starts
+                   and _names_skipped_command(args[k], args[k - 1] if k else None)]
         places = sorted(set(starts) | set(skipped))
         cwds = [None] + self._launch_cwds(spec, args, end)
         count = (len(places) * (2 if spec.joined else 1) + len(texts)) * len(cwds)
@@ -8231,13 +8232,15 @@ COMMAND_VERBS = frozenset(RM_CMDS | MV_CMDS | OVERWRITE_CMDS | SHELLS | PS_SHELL
 UNKNOWN_PROGRAM_VERBS = COMMAND_VERBS - KILLERS  # kill rules have their own analysis; a word `kill` is often data
 
 
-def _names_skipped_command(word):
-    """A launcher word the row skipped that is read as a command too. An upper-case kill word is a signal name given
-    as an option value (`timeout -s KILL 5 CMD`), not the kill command."""
+def _names_skipped_command(word, previous=None):
+    """A launcher word the row skipped that is read as a command too. The exact word `KILL` right after an option is
+    the signal name that option takes (`timeout -s KILL 5 CMD`), not the kill command; any other spelling (`kill`,
+    `PKILL`, which a case-insensitive filesystem still runs) is read as a command."""
     if _unsettled(word):
         return False
-    name = norm_name(word.text)
-    return name in COMMAND_VERBS and not (name in KILLERS and word.text.isupper())
+    if word.text == 'KILL' and previous is not None and previous.text.startswith('-') and not _unsettled(previous):
+        return False
+    return norm_name(word.text) in COMMAND_VERBS
 # Programs whose words are data, or that the analyser models itself: the unknown-program reading does not apply to
 # them. tmux, screen, parallel, at and batch run commands and are left out on purpose.
 READ_ONLY_PROGRAMS = {'man', 'which', 'whatis', 'apropos', 'info', 'tldr', 'type', 'whence', 'where', 'help', 'wc',
