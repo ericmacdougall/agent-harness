@@ -1465,7 +1465,8 @@ bound to main's tool call) that `mission_gate.py pretool` writes only when the P
 - The stamp carries the call's `tool_use_id`, main's transcript path and the transcript size at that moment
   (goodqa#15754 red-team F1). The command honours it only while that call is still running: once main's transcript
   holds the call's `tool_result` (the call ended, or another hook denied it, or the user rejected it), the stamp is
-  dead for every process. `mission_gate.py posttool` (PostToolUse, PostToolUseFailure and PermissionDenied, Bash) also
+  dead for every process. Claude Code's own copy records (`api-request-blob`, `data-flow-records`) do not count
+  (goodqa#16811 round 2: a `data-flow-records` line can name a call before its result). `mission_gate.py posttool` (PostToolUse, PostToolUseFailure and PermissionDenied, Bash) also
   deletes the call's unconsumed stamps. A payload without `tool_use_id` gets no stamp. Run main-only commands in the
   foreground: a `run_in_background` call returns its tool_result at once, so its command is refused.
 - `take_stamp` runs every check (purpose, TTL, the call still running) before it claims the stamp; a caller that fails

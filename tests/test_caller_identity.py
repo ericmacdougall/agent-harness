@@ -217,14 +217,26 @@ class BoundStamps(unittest.TestCase):
                 self.append(record)
                 self.assertIsNone(self.take(), name)
 
-    def test_copy_records_are_skipped_only_for_a_background_stamp(self):
+    def test_copy_records_are_skipped_for_both_kinds_of_stamp(self):
+        # A replay over 40 real main transcripts found a data-flow-records line naming the call before its own
+        # result in 3 of 5255 foreground calls; it must not end the call.
         copy = {"type": "api-request-blob", "message": {"content": [{"tool_use_id": CALL, "type": "tool_result"}]}}
+        flow = {"type": "data-flow-records", "records": [{"tool_name": "Bash", "tool_use_id": CALL}]}
         self.put(background=True)
-        self.append(started(), copy, dict(copy, type="data-flow-records"))
+        self.append(started(), copy, flow)
         self.assertIsNotNone(self.take())
         self.put()
-        self.append(copy)
-        self.assertIsNone(self.take(), "a foreground stamp still ends on any record naming the call")
+        self.append(flow, copy)
+        self.assertIsNotNone(self.take(), "control: copies alone do not end a foreground call")
+        self.put()
+        self.append(flow, {"type": "user", "message": {"content": [{"tool_use_id": CALL, "type": "tool_result"}]}})
+        self.assertIsNone(self.take(), "the call's own result still ends it")
+        self.put()
+        line = json.dumps(flow)
+        torn = line[: line.index(CALL) + len(CALL) + 1]
+        self.assertIn('"tool_use_id": "%s"' % CALL, torn, "fixture: the torn line names the call")
+        self.append(torn)
+        self.assertIsNone(self.take(), "a torn line naming the call still ends it")
 
     def test_post_tool_use_keeps_only_a_background_stamp(self):
         for background, event, kept in ((True, "PostToolUse", True), (True, "PostToolUseFailure", False),

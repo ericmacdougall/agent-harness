@@ -211,6 +211,15 @@ class StampBoundToMainsCall(unittest.TestCase):
         self.mint("toolu_01FOREGROUNDRUNNING0001")
         self.assertTrue(self.authorizes())
 
+    def test_a_copy_record_before_the_result_does_not_end_a_foreground_call(self):
+        # Positive control from real transcripts: Claude Code can write a data-flow-records line naming the call
+        # before the call's own result (3 of 5255 foreground calls in a replay over 40 main transcripts).
+        call = "toolu_01FOREGROUNDFLOW000001"
+        transcript = self.mint(call)
+        self.append(transcript, {"type": "data-flow-records", "v": 1, "sessionId": e2e.MAIN_SID,
+                                 "records": [{"tool_name": "Bash", "tool_use_id": call, "event_id": "e1"}]})
+        self.assertTrue(self.authorizes())
+
     def test_a_record_for_another_call_does_not_end_this_one(self):
         # Positive control: main's other calls finishing meanwhile do not matter.
         transcript = self.mint("toolu_01FOREGROUNDOTHER00001")

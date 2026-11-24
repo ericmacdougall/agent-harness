@@ -20,7 +20,9 @@ rejected it, `cd /nonexistent && ...` failed first) and the next process with th
 bound stamp also records main's tool_use_id, main's transcript path and that transcript's size when the stamp was
 written. take_stamp(bound=True) honours it only while that call is still running: Claude Code appends the call's
 tool_result (or the refusal) to main's transcript when the call ends or is refused, so a transcript that already holds
-`"tool_use_id":"<id>"` after the recorded offset means the call is over and the stamp is dead. mission_gate's
+`"tool_use_id":"<id>"` after the recorded offset means the call is over and the stamp is dead. Only the transcript's
+own copy records (COPY_RECORDS, goodqa#16811 round 2) are skipped: a data-flow-records line can name a call before its
+result. A line naming the call that does not parse also ends it. mission_gate's
 PostToolUse / PostToolUseFailure / PermissionDenied hook also deletes the call's stamp (drop_tool_stamps). A stamp
 without a tool_use_id, a missing or shrunken transcript, or more than BOUND_SCAN_BYTES of transcript growth is
 refused: the main-only path fails closed.
@@ -30,8 +32,7 @@ tool_result at once, saying it started in the background, so the plain rule abov
 the command's own process takes the stamp. A stamp put with background=True therefore accepts exactly one record
 naming the call after the offset, of exactly one shape (BACKGROUND_ACK: a "user" record whose only content block is
 the call's tool_result with is_error false, and whose toolUseResult is a mapping with a non-empty string
-backgroundTaskId and no interrupted flag). The transcript's own copies of a message (COPY_RECORDS) are skipped. Any
-other record naming the call (a hook denial, a rejected permission, a launch error, an is_error result, a second
+backgroundTaskId and no interrupted flag). COPY_RECORDS are skipped here too. Any other record naming the call (a hook denial, a rejected permission, a launch error, an is_error result, a second
 record) ends it, and so does a line naming the call that does not parse. mission_gate's PostToolUse hook, which runs
 at once for a background launch, leaves a background stamp alone; PostToolUseFailure and PermissionDenied still
 delete it. Limits, stated rather than controlled: a background stamp cannot see the command's process end, so until
@@ -223,14 +224,16 @@ def call_still_running(data) -> bool:
         os.close(fd)
     ended = re.compile(rb'"tool_use_id"\s*:\s*"' + re.escape(tool_use_id.encode()) + rb'"')
     grown = b"".join(chunks)
-    if data.get("background") is True:
-        return _only_background_ack(grown, ended, tool_use_id)
-    return not ended.search(grown)
+    if not ended.search(grown):
+        return True
+    return _records_say_running(grown, ended, tool_use_id, data.get("background") is True)
 
 
-def _only_background_ack(grown: bytes, ended, tool_use_id: str) -> bool:
-    """A background stamp's call is still running while the records naming it after the offset are none, or exactly
-    one BACKGROUND_ACK; COPY_RECORDS are skipped. A line naming the call that is not a whole JSON object ends it."""
+def _records_say_running(grown: bytes, ended, tool_use_id: str, background: bool) -> bool:
+    """Whether the records naming the call after the offset leave it running. COPY_RECORDS are skipped (Claude Code
+    writes a data-flow-records line naming a call before the call's own result: 3 of 5255 real foreground calls).
+    A foreground call is over at any other record naming it; a background call is running while that is exactly one
+    BACKGROUND_ACK. A line naming the call that is not a whole JSON object ends it."""
     acks = 0
     for line in grown.split(b"\n"):
         if not ended.search(line):
@@ -243,6 +246,8 @@ def _only_background_ack(grown: bytes, ended, tool_use_id: str) -> bool:
             return False
         if record.get("type") in COPY_RECORDS:
             continue
+        if not background:
+            return False
         acks += 1
         if acks > 1 or not _is_background_ack(record, tool_use_id):
             return False
