@@ -1273,7 +1273,7 @@ class Regenerable(Base):
         with mock.patch.object(S, "in_use_paths", return_value={nm}):
             r = wj.release(self.s, apply=True, regenerable=True)
         self.assertTrue(os.path.exists(nm))
-        self.assertTrue(any("in use" in k["why"] or "used" in k["why"] for k in r["kept"]), r["kept"])
+        self.assertTrue(any("process" in k["why"] for k in r["kept"]), r["kept"])
 
     def test_report_only_lists_and_removes_nothing(self):
         os.remove(os.path.join(self.home, ".agent-harness", "state", "copy-hygiene.json"))
