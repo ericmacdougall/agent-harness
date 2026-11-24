@@ -11,6 +11,7 @@ same OS user, so a route the guards cannot judge statically (a script already on
 a row. The guarantee that a sub-agent cannot forge a row main reads as its own belongs to a non-guard mechanism
 (goodqa#17019: rows authenticated with a key only main's hook can read, or WALs written by a separate process).
 """
+import fnmatch
 import hashlib
 import os
 import posixpath
@@ -81,19 +82,153 @@ def wal_roots(homes=None):
     return sorted(roots)
 
 
-def in_wal_tree(path, roots=None):
-    """True when the absolute `path` is a WAL tree root or anything inside one, as written or where it leads."""
+# goodqa#17155: the configuration files every session loads. Writes are refused like WAL writes; reads stay allowed.
+# A root's last segment may be a pattern (settings*.json covers settings.json and settings.local.json).
+CONFIG_NAMES_CLAUDE = ('CLAUDE.md', 'settings*.json')
+CONFIG_NAMES_CODEX = ('config.toml', 'hooks.json')
+
+
+def codex_dirs(homes=None):
+    """Every Codex home: <home>/.codex for each home, and CODEX_HOME when it is set."""
+    out = []
+    for home in list(homes or []) + [os.path.expanduser('~')]:
+        if isinstance(home, str) and home.startswith('/'):
+            out.append(posixpath.join(home, '.codex'))
+    configured = os.environ.get('CODEX_HOME')
+    if configured and configured.startswith('/'):
+        out.append(configured)
+    return out
+
+
+def config_roots(homes=None):
+    """The protected configuration file roots, casefolded: each name under each Claude and Codex home, with the home
+    as written and resolved (a link to the home is seen)."""
+    roots = set()
+    for dirs, names in ((claude_dirs(homes), CONFIG_NAMES_CLAUDE), (codex_dirs(homes), CONFIG_NAMES_CODEX)):
+        for d in dirs:
+            for form in _forms(d):
+                for name in names:
+                    roots.add(posixpath.join(form, name.casefold()))
+    return sorted(roots)
+
+
+IN, POSSIBLY_IN, ABOVE, POSSIBLY_ABOVE = 'in', 'possibly-in', 'above', 'possibly-above'
+_STRENGTH = {None: 0, POSSIBLY_ABOVE: 1, ABOVE: 2, POSSIBLY_IN: 3, IN: 4}
+LANDS = frozenset({IN, POSSIBLY_IN})        # a write here may land in a protected root
+REACHES = frozenset({ABOVE, POSSIBLY_ABOVE})  # a directory copy, extraction or link copy here may create one
+_GLOB = re.compile(r'[*?\[]')
+_BRACE = re.compile(r'\{([^{}]*,[^{}]*)\}')
+BRACE_LIMIT = 64
+
+
+def _braces(text):
+    """The brace expansions of `text`, at most BRACE_LIMIT; past the limit every brace group becomes `*`."""
+    out, todo = [], [text]
+    while todo:
+        t = todo.pop()
+        m = _BRACE.search(t)
+        if not m:
+            out.append(t)
+        else:
+            todo.extend(t[:m.start()] + alt + t[m.end():] for alt in m.group(1).split(','))
+        if len(out) + len(todo) > BRACE_LIMIT:
+            return [_BRACE.sub('*', text)]
+    return out
+
+
+def _seg_match(a, b):
+    """Two path segments (casefolded; either may be a glob) can name the same entry. A pattern the matcher cannot
+    parse may match anything."""
+    if a == b:
+        return True
+    ga, gb = bool(_GLOB.search(a)), bool(_GLOB.search(b))
+    if ga and gb:
+        return True
+    try:
+        if ga:
+            return fnmatch.fnmatchcase(b, a)
+        if gb:
+            return fnmatch.fnmatchcase(a, b)
+    except re.error:
+        return True
+    return False
+
+
+def _relation_one(path, roots, file_roots):
+    parts = [p for p in path.split('/') if p]
+    glob_at = next((k for k, p in enumerate(parts) if _GLOB.search(p)), None)
+    if glob_at is None:
+        forms = _forms(path)
+    else:
+        # the literal prefix is resolved like any path (a link in it is followed); the pattern rest is kept
+        head = '/' + '/'.join(parts[:glob_at])
+        rest = parts[glob_at:]
+        if '..' in rest:
+            # `..` after a pattern goes up from wherever the pattern leads: anything below the prefix's parent
+            forms = {posixpath.dirname(f) + '/*' * max(1, len(rest)) for f in _forms(head)}
+        else:
+            forms = {posixpath.join(f, *[r.casefold() for r in rest]) for f in _forms(head)}
+    best = None
+    for f in forms:
+        ps = [p for p in f.split('/') if p]
+        for r in roots:
+            rs = [p for p in r.split('/') if p]
+            n = min(len(ps), len(rs))
+            if not all(_seg_match(ps[k], rs[k]) for k in range(n)):
+                continue
+            globbed = any(_GLOB.search(p) for p in ps[:n])
+            if len(ps) >= len(rs):
+                if file_roots and len(ps) > len(rs):
+                    continue  # nothing lives inside a file
+                rel = POSSIBLY_IN if globbed else IN
+            else:
+                rel = POSSIBLY_ABOVE if globbed else ABOVE
+            if _STRENGTH[rel] > _STRENGTH[best]:
+                best = rel
+    return best
+
+
+def relation(path, roots, file_roots=False):
+    """Where an absolute `path` (it may hold glob segments and brace groups) stands to `roots`: IN (a root or inside
+    one), POSSIBLY_IN (a pattern that may name one or something inside), ABOVE (a proper ancestor of a root),
+    POSSIBLY_ABOVE (a pattern that may be one), or None. Segment by segment: a literal prefix is resolved the way the
+    kernel does (_real), a glob segment matches when fnmatch can match the root's segment, braces expand up to
+    BRACE_LIMIT alternatives (more: each group counts as `*`), and `..` after a pattern counts as anything below the
+    pattern's parent. File roots (the configuration files) have nothing inside them."""
     if not isinstance(path, str) or not path.startswith('/') or '\x00' in path:
-        return False
-    roots = wal_roots() if roots is None else roots
-    return any(f == r or f.startswith(r + '/') for f in _forms(path) for r in roots)
+        return None
+    best = None
+    for alt in _braces(path):
+        rel = _relation_one(alt, roots, file_roots)
+        if _STRENGTH[rel] > _STRENGTH[best]:
+            best = rel
+    return best
+
+
+def tree_relation(path, roots=None):
+    """relation() to the WAL tree roots."""
+    return relation(path, wal_roots() if roots is None else roots)
+
+
+def config_relation(path, roots=None):
+    """relation() to the protected configuration files (goodqa#17155)."""
+    return relation(path, config_roots() if roots is None else roots, file_roots=True)
+
+
+def in_wal_tree(path, roots=None):
+    """True when the absolute `path` is a WAL tree root or anything inside one, as written or where it leads (a
+    literal path; a pattern counts when it may name one). The file-tool rule and the shell rule share this test."""
+    return tree_relation(path, roots) in LANDS
 
 
 def below_toward_tree(path, roots=None):
     """When the absolute `path` is a proper ancestor of a WAL tree root (a recursive copy or an extraction there can
     create the tree's files), the name of the entry directly below `path` on the way to the root (`.claude` for the
-    home, `wals` for the Claude home); else None."""
-    if not isinstance(path, str) or not path.startswith('/') or '\x00' in path:
+    home, `wals` for the Claude home); else None. A pattern that may be an ancestor gives '*' (the entry is unknown)."""
+    rel = tree_relation(path, roots)
+    if rel == POSSIBLY_ABOVE:
+        return '*'
+    if rel != ABOVE:
         return None
     roots = wal_roots() if roots is None else roots
     for f in _forms(path):

@@ -167,7 +167,7 @@ CONFIG_ROWS = {rid for rid, _ in WRITES_NEXT if rid.startswith('C')}
 
 # the ratchet: rows still open at this commit (see the module docstring)
 PENDING_WRITES = frozenset({
-    'F1a', 'F1b', 'F1c', 'F1d', 'F2a', 'F2b', 'F2c', 'F2d', 'F2e', 'F2f', 'F2g', 'F3a', 'F3b', 'F3c', 'F3d', 'F4a',
+    'F2a', 'F2b', 'F2c', 'F2d', 'F2e', 'F2f', 'F2g', 'F3a', 'F3b', 'F3c', 'F3d', 'F4a',
     'F4b', 'F5a', 'F5b', 'F5c', 'F6a', 'F6b', 'F7a', 'F7b', 'F7c', 'F8a', 'F8b', 'F9a', 'F9b', 'F10', 'N1a', 'N1b',
     'N1c', 'N1d', 'N1e', 'N1f', 'N1g', 'N1h', 'N2a', 'N2b', 'N3', 'N4', 'N5', 'N6', 'N9', 'N10d', 'N10e', 'N11', 'N12a',
     'N12b', 'N12c', 'N12d', 'N14a', 'N14b', 'W1Da', 'W1Db', 'W1Dc', 'W1Dd', 'W1De', 'W1Df', 'W1Dg', 'C1', 'C2', 'C3',
