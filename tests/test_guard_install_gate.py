@@ -414,6 +414,14 @@ class Gate(Base):
 
     # --- must-fail cases
 
+    def test_a_guard_file_known_locally_is_refused_before_any_fetch(self):
+        """The local gate runs before the fetch: an agent with no stamp never reaches the network or the cache."""
+        before = self.before()
+        with mock.patch.object(ai, "fetch_source", side_effect=AssertionError("fetched before the gate")):
+            err = self.refused()
+        self.assertEqual(err.code, "guard_file")
+        self.assertEqual(self.before(), before)
+
     def test_a_sub_agent_gets_no_stamp_and_is_refused(self):
         self.stamp(self.line(), agent="a1234567890abcdef")
         self.assert_refused_unchanged(self.before())
