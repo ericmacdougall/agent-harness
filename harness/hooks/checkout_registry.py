@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""checkout_registry.py: hook-written ownership rows for the git checkouts agents create (goodqa#16947, spec v3).
+"""checkout_registry.py: hook-written ownership rows for the git checkouts agents create (goodqa#16947, spec v3.2).
 
 A Claude agent's `git clone` or `git worktree add` run through Bash on this machine, and each isolation worktree Claude
 Code makes for a subagent (`<repo>/.claude/worktrees/agent-<agent_id>`), gets at most ONE signed `created` row naming
@@ -11,19 +11,23 @@ call. Stream B's owner removal accepts only `held(identity)` as ownership proof;
      "btime_ns":N,"common_dir":<realpath>,"session":...,"agent":<agent id or null>,"task":null,"created_at":<utc>,
      "tool_use_id":<id or null for isolation>,"mac":<HMAC-SHA256>}
 
-IDENTITY is (host, dev, ino, btime_ns). ext4 reuses an inode number at once (40 of 40 on t2-dev), and a moved checkout
-keeps both inode and birth time, so: no btime means no row; a Bash row needs btime >= a clock mark taken at PreToolUse;
-a path seen absent retires every row for it ("observed-absent"); two created rows for one identity mean no owner. A
-row owns that one checkout, never what is nested under its path.
+IDENTITY is (host, dev, ino, btime_ns, gen). ext4 reuses an inode number at once (40 of 40 on t2-dev), even inside one
+clock tick (249 of 300 in-process rounds kept dev, ino and btime), and a moved checkout keeps inode and birth time. So:
+no btime, or on Linux no inode generation, means no row; a Bash row needs the checkout, its .git and a worktree's admin
+folder born between a Pre and a Post clock mark on the marker's filesystem; a path seen absent retires its rows (Rule
+14); two created rows for one identity mean no owner. A row owns that one checkout, never what is nested under it.
 
 THE RULE: a missing row is safe; a wrong row deletes someone's work. The command text only PROPOSES a path. A Bash
 row needs, all observed: Pre saw the path absent (ENOENT), pinned the nearest existing folder above it, took the clock
-mark and claimed the path under the lock with no other live claim; Post (PostToolUse or PostToolUseFailure) carries
-the same tool_use_id, session, agent and command hash as the signed pending record; the payload's transcript is the
-session's own and holds that Bash tool_use; the path is now a checkout top, not a link, under home, at the pinned
-folder (same dev and ino), born after the mark; a clone's origin is the command's URL, a worktree is linked and shares
-the named repo's common dir; nothing holds the identity yet. Anything unsure: no row, and one reason code in
-state/checkouts/decisions.jsonl.
+mark and claimed the path (NFC casefolded key) under the lock with no other live claim; Post (PostToolUse or
+PostToolUseFailure) carries the same tool_use_id, session, agent and command hash as the signed pending record; the
+payload's transcript is the session's own, and an agent's call is found in its own subagent file; the path is now a
+checkout top, not a link, under home, at exactly the expected realpath, the pinned folder unchanged, born inside the
+call; a clone's origin is the command's URL, a worktree is linked and shares the named repo's common dir; nothing
+holds the identity yet. Anything unsure: no row, and one reason code in state/checkouts/decisions.jsonl.
+
+GIT: no hook runs porcelain (status, log, diff, show, stash ...); _git refuses it. A repo whose own config names a
+program (filter, textconv, fsmonitor, hooksPath, gpg program) gets "keep" before any content-reading command runs.
 
 `mac(row)` and `verify(row)` are the only signing functions; `held(identity)` is the only ownership check (verify alone
 does not bind a row to its host file). Key: state/checkouts/registry.key, 32 random bytes, 0600, made O_EXCL through no
@@ -39,11 +43,13 @@ copies, the EnterWorktree tool, --bare/--mirror, clones inside scripts, run_in_b
 
     checkout_registry.py hook pretool|posttool|posttool-failure|denied|subagent-start|subagent-stop
     checkout_registry.py stat --path P     read-only JSON about one path
+    checkout_registry.py retire --path P   Rule 14 only: end ownership of a checkout that is gone
     checkout_registry.py list              read-only: verified rows, failures, what is held
 """
 from __future__ import annotations
 
 import argparse
+import array
 import contextlib
 import fcntl
 import glob
@@ -54,9 +60,11 @@ import os
 import re
 import shlex
 import stat as stat_mod
+import struct
 import subprocess
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
 VERSION = 1
@@ -66,8 +74,10 @@ KINDS = ("isolation", "worktree", "clone")
 GIT_TIMEOUT = 5
 STAT_TIMEOUT = 5
 PENDING_TTL = 2 * 3600
-ISO_WINDOW_NS = 300 * 10 ** 9
+ISO_WINDOW_NS = 120 * 10 ** 9       # transcript born 0..120 s after its isolation worktree (197 of 197 pairs <= 29 s)
 ISO_RETRY_S = 60                    # a failed isolation check is not repeated on every tool call
+LOCK_WAIT = 2.0
+LOCAL_FS_LINUX = {"ext2/ext3", "xfs", "btrfs", "tmpfs", "zfs", "f2fs", "bcachefs"}
 STOP_BUDGET = 15.0
 MAX_LINE = 8192
 MAX_FILE = 64 * 1024 * 1024
@@ -96,6 +106,14 @@ def _left(cap: float) -> float:
 
 class Unsure(Exception):
     """The command names a checkout this module cannot resolve with certainty: propose nothing."""
+
+
+class LockTimeout(Exception):
+    """The registry lock was not free within LOCK_WAIT: no row (code lock-timeout)."""
+
+
+class LedgerTooLarge(Exception):
+    """The ledger is over MAX_FILE: held() is None and the writer refuses (code ledger-too-large)."""
 
 
 # --------------------------------------------------------------------------- state, key and signing
@@ -241,13 +259,48 @@ def _safe(value, limit: int = 300) -> str:
 
 @contextlib.contextmanager
 def _locked():
-    """One exclusive lock per machine around every check-and-append and every claim."""
-    fd = os.open(str(state_dir() / ".lock"), os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    """Rule 13: one exclusive lock per machine around every re-check-and-append and every claim. The wait polls
+    LOCK_NB up to LOCK_WAIT (never past the hook deadline); then LockTimeout. A dead holder's flock is released by the
+    kernel."""
+    fd = os.open(str(state_dir() / "registry.lock"), os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        st = os.fstat(fd)
+        if not stat_mod.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+            raise LockTimeout("lock file is not a private regular file")
+        end = time.monotonic() + max(0.0, _left(LOCK_WAIT))
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= end:
+                    raise LockTimeout("registry lock busy")
+                time.sleep(0.02)
         yield
     finally:
         os.close(fd)
+
+
+def state_is_local() -> bool:
+    """Rule 13: the state folder must be on a local filesystem (flock over NFS, SMB or FUSE is not reliable)."""
+    d = str(state_dir())
+    try:
+        if sys.platform == "darwin":
+            r = subprocess.run(["/sbin/mount"], capture_output=True, text=True, timeout=_left(STAT_TIMEOUT),
+                               env={"LC_ALL": "C", "PATH": "/usr/bin:/bin:/sbin"}, stdin=subprocess.DEVNULL)
+            real, best, flags = os.path.realpath(d), "", ""
+            for line in r.stdout.splitlines():
+                m = re.match(r".+? on (/.*?) \((.*)\)$", line)
+                if m and (real == m.group(1) or real.startswith(m.group(1).rstrip("/") + "/")) \
+                        and len(m.group(1)) > len(best):
+                    best, flags = m.group(1), m.group(2)
+            return r.returncode == 0 and "local" in [f.strip() for f in flags.split(",")]
+        r = subprocess.run(["/usr/bin/stat", "-f", "-c", "%T", "--", d], capture_output=True, text=True,
+                           timeout=_left(STAT_TIMEOUT), env={"LC_ALL": "C", "PATH": "/usr/bin:/bin"},
+                           stdin=subprocess.DEVNULL)
+        return r.returncode == 0 and r.stdout.strip() in LOCAL_FS_LINUX
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
 
 
 def ledger_path(host: str = HOST) -> Path:
@@ -260,6 +313,9 @@ def rows(host: str = HOST, key: "bytes | None" = None) -> "tuple[list, int]":
     """(verified rows of this host's file, how many lines failed). The whole file is read (bounded at 64 MB). A row
     whose `host` names another host fails: a row pasted between files never counts."""
     key = key or read_key()
+    with contextlib.suppress(OSError):
+        if os.lstat(str(ledger_path(host))).st_size > MAX_FILE:
+            raise LedgerTooLarge(host)                  # never judge ownership from part of the file
     data = _read_secure(ledger_path(host), MAX_FILE)
     good, bad = [], 0
     for line in (data or b"").decode("utf-8", "replace").splitlines():
@@ -278,7 +334,7 @@ def rows(host: str = HOST, key: "bytes | None" = None) -> "tuple[list, int]":
 
 
 def identity(row: dict) -> tuple:
-    return (row.get("host"), row.get("dev"), row.get("ino"), row.get("btime_ns"))
+    return (row.get("host"), row.get("dev"), row.get("ino"), row.get("btime_ns"), row.get("gen"))
 
 
 def current(host: str = HOST, key: "bytes | None" = None) -> dict:
@@ -305,7 +361,10 @@ def held(ident: dict) -> "dict | None":
     host = ident.get("host")
     if host not in HOSTS:
         return None
-    return current(host).get(identity(ident))
+    try:
+        return current(host).get(identity(ident))
+    except LedgerTooLarge:
+        return None
 
 
 def _append(row: dict, key: bytes) -> dict:
@@ -336,24 +395,33 @@ def write_created(info: dict, kind: str, session: str, agent, tool_use_id) -> "t
     key = ensure_key()
     if not key or kind not in KINDS or not session:
         return None, "no-key"
+    if not state_is_local():
+        return None, "state-not-local"
+    if sys.platform != "darwin" and info.get("gen") is None:
+        return None, "no-generation"
     row = {"v": VERSION, "event": "created", "kind": kind, "host": HOST, "path": info["realpath"], "dev": info["dev"],
-           "ino": info["ino"], "btime_ns": info["btime_ns"], "common_dir": info.get("common_dir"), "session": session,
+           "ino": info["ino"], "btime_ns": info["btime_ns"], "gen": info.get("gen"), "common_dir": info.get("common_dir"), "session": session,
            "agent": agent or None, "task": None, "created_at": _utc(), "tool_use_id": tool_use_id or None}
-    with _locked():
-        live = current(HOST, key)
-        held_row = live.get(identity(row))
-        if held_row:
-            same = (held_row.get("session"), held_row.get("agent")) == (session, agent or None)
-            return None, "already-held" if same else "second-owner"
-        if any(identity(r) == identity(row) and r.get("event") == "created" for r in rows(HOST, key)[0]):
-            return None, "contested-identity"      # a created row exists but the identity counts as owned by no one
-        return _append(row, key), "written"
+    try:
+        with _locked():
+            live = current(HOST, key)
+            held_row = live.get(identity(row))
+            if held_row:
+                same = (held_row.get("session"), held_row.get("agent")) == (session, agent or None)
+                return None, "already-held" if same else "second-owner"
+            if any(identity(r) == identity(row) and r.get("event") == "created" for r in rows(HOST, key)[0]):
+                return None, "contested-identity"      # a created row exists but counts as owned by no one
+            return _append(row, key), "written"
+    except LockTimeout:
+        return None, "lock-timeout"
+    except LedgerTooLarge:
+        return None, "ledger-too-large"
 
 
 def _removed_row(held_row: dict, by: str, route: str) -> dict:
     return {"v": VERSION, "event": "removed", "kind": held_row["kind"], "host": held_row["host"],
             "path": held_row["path"], "dev": held_row["dev"], "ino": held_row["ino"],
-            "btime_ns": held_row["btime_ns"], "common_dir": held_row.get("common_dir"),
+            "btime_ns": held_row["btime_ns"], "gen": held_row.get("gen"), "common_dir": held_row.get("common_dir"),
             "session": held_row["session"], "agent": held_row.get("agent"), "task": held_row.get("task"),
             "by": _safe(by, 200), "route": _safe(route, 200), "removed_at": _utc()}
 
@@ -364,19 +432,42 @@ def append_removed(ident: dict, by: str, route: str) -> "dict | None":
     key = ensure_key()
     if not key or ident.get("host") not in HOSTS:
         return None
-    with _locked():
-        held_row = current(ident["host"], key).get(identity(ident))
-        return _append(_removed_row(held_row, by, route), key) if held_row else None
+    try:
+        with _locked():
+            held_row = current(ident["host"], key).get(identity(ident))
+            return _append(_removed_row(held_row, by, route), key) if held_row else None
+    except (LockTimeout, LedgerTooLarge):
+        return None
+
+
+def _absent_on(path: str, dev) -> bool:
+    """Rule 14 observation: `path` is ENOENT and the nearest existing folder above it is on st_dev `dev` (so an
+    unmounted volume or a missing mount never counts as the checkout being gone)."""
+    try:
+        os.lstat(path)
+        return False
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return False
+    a = _anchor(path)
+    return bool(a) and a["dev"] == dev
 
 
 def retire_absent(real: str, key: bytes) -> int:
-    """Caller has just seen `real` absent (ENOENT): every row still held for that path is dead."""
+    """Rule 14: retire every row held for exactly `real` when two lstats under the lock give ENOENT and the nearest
+    existing folder is on the row's own st_dev. Retirement only removes ownership; a retired row is never permission
+    to delete anything."""
     n = 0
-    with _locked():
-        for row in current(HOST, key).values():
-            if row.get("path") == real:
-                _append(_removed_row(row, "checkout_registry", "observed-absent"), key)
-                n += 1
+    try:
+        with _locked():
+            for row in current(HOST, key).values():
+                if row.get("path") == real and _absent_on(real, row.get("dev")) and _absent_on(real, row.get("dev")):
+                    _append(_removed_row(row, "checkout_registry", "observed-absent"), key)
+                    n += 1
+    except (LockTimeout, LedgerTooLarge) as e:
+        decide("lock-timeout" if isinstance(e, LockTimeout) else "ledger-too-large", path=real)
+        return 0
     if n:
         decide("observed-absent", path=real, rows=n)
     return n
@@ -386,20 +477,30 @@ def retire_absent(real: str, key: bytes) -> int:
 
 def _git_env() -> dict:
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"})
+    env.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C",
+                "GIT_NO_LAZY_FETCH": "1"})
     return env
+
+
+GIT_HARDEN = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "core.untrackedCache=false",
+              "-c", "log.showSignature=false", "-c", "protocol.allow=never", "--no-optional-locks")
+# Rule 12: a hook never runs a porcelain command that can start a repo-configured program (status, log, diff, stash
+# list, show). Every git call goes through _git, and _git refuses these.
+PORCELAIN = {"status", "log", "diff", "show", "stash", "blame", "grep", "archive", "fetch", "pull", "push", "commit",
+             "checkout", "switch", "merge", "rebase", "cherry-pick", "am", "apply", "gc", "maintenance"}
 
 
 def _git(path: str, *args, timeout: float = GIT_TIMEOUT, raw: bool = False) -> "str | None":
     """git hardened against the repo it reads: no fsmonitor, no hooks, no optional locks, no GIT_* from the caller.
     None (unsure) once the whole-hook deadline has passed. raw keeps the output byte-exact (porcelain -z starts with
     a significant space)."""
+    if not args or args[0] in PORCELAIN:
+        raise ValueError("porcelain git is not allowed in a hook: %r" % (args[:1],))
     timeout = _left(timeout)
     if timeout <= 0.2:
         return None
     try:
-        r = subprocess.run(["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
-                            "-c", "core.untrackedCache=false", "--no-optional-locks", "-C", path, *args],
+        r = subprocess.run(["git", *GIT_HARDEN, "-C", path, *args],
                            capture_output=True, text=True, timeout=timeout, env=_git_env(),
                            stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
@@ -435,16 +536,45 @@ def birth_ns(path: str) -> "int | None":
     return int(m.group(1)) * 10 ** 9 + int((m.group(2) or "0").ljust(9, "0"))
 
 
-def clock_mark() -> "int | None":
-    """The birth time of a fresh file: the same kernel clock that will stamp a checkout made after it."""
-    d = state_dir() / "pending"
+FS_IOC_GETVERSION = (2 << 30) | (struct.calcsize("l") << 16) | (ord("v") << 8) | 1     # _IOR('v', 1, long)
+
+
+def inode_generation(path: str) -> "int | None":
+    """Linux: the inode generation (FS_IOC_GETVERSION), which ext4 changes whenever it reuses an inode number, even
+    within one clock tick (probe P8: 249 of 300 in-process rounds had equal dev, ino and btime; the generation
+    differed in all). Unprivileged; kept across a rename. None when it cannot be read. Not used on macOS (APFS does
+    not reuse an inode number)."""
+    if sys.platform == "darwin":
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return None
+    try:
+        buf = array.array("l", [0])
+        fcntl.ioctl(fd, FS_IOC_GETVERSION, buf, True)
+        return buf[0] & 0xFFFFFFFF
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def clock_mark() -> "tuple[int, int] | None":
+    """(birth time in ns, st_dev) of a fresh file in state/checkouts/marks/: the clock that stamps a new checkout on
+    the same filesystem. Pre and Post each take one; a checkout must be born between them (Rule 8)."""
+    d = state_dir() / "marks"
     if not _secure_dir(d, create=True):
         return None
-    p = d / (".mark-%d-%s" % (os.getpid(), os.urandom(6).hex()))
+    p = d / ("mark-%d-%s" % (os.getpid(), os.urandom(6).hex()))
     try:
         fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
-        os.close(fd)
-        return birth_ns(str(p))
+        try:
+            dev = os.fstat(fd).st_dev
+        finally:
+            os.close(fd)
+        ns = birth_ns(str(p))
+        return (ns, dev) if ns else None
     except OSError:
         return None
     finally:
@@ -491,15 +621,19 @@ def stat_path(path: str) -> dict:
     real = os.path.realpath(p)
     h = os.path.realpath(str(home()))
     out.update({"realpath": real, "dev": st.st_dev, "ino": st.st_ino, "btime_ns": birth_ns(p),
+                "gen": inode_generation(p),
                 "in_home": real.startswith(h + os.sep)})
     dotgit = os.path.join(real, ".git")
     if not os.path.lexists(dotgit):
         return out
     top = _git(real, "rev-parse", "--show-toplevel")
     common = _git(real, "rev-parse", "--path-format=absolute", "--git-common-dir")
-    if top and os.path.realpath(top) == real and common:
-        out.update({"checkout": True, "linked": os.path.isfile(dotgit) and not os.path.islink(dotgit),
-                    "common_dir": os.path.realpath(common)})
+    admin = _git(real, "rev-parse", "--absolute-git-dir")
+    if top and os.path.realpath(top) == real and common and admin:
+        linked = os.path.isfile(dotgit) and not os.path.islink(dotgit)
+        out.update({"checkout": True, "linked": linked, "common_dir": os.path.realpath(common),
+                    "git_dir": os.path.realpath(admin), "dotgit_btime_ns": birth_ns(dotgit),
+                    "admin_btime_ns": birth_ns(os.path.realpath(admin)) if linked else None})
     return out
 
 
@@ -790,8 +924,15 @@ def _take_pending(tool_use_id: str, key: bytes) -> "tuple[dict | None, str]":
     return rec, "ok"
 
 
+def claim_key(expect: str) -> str:
+    """Rule 4: the expected path, NFC-normalized and casefolded. It does not depend on which ancestor existed at Pre,
+    and it matches case and normalization variants (APFS is insensitive to both; on Linux it only over-matches)."""
+    return unicodedata.normalize("NFC", expect).casefold()
+
+
 def _claim_file(kind: str, real: str) -> Path:
-    return state_dir() / kind / hashlib.sha256(("%s\0%s" % (HOST, real)).encode("utf-8")).hexdigest()
+    data = ("%s\0%s" % (HOST, claim_key(real))).encode("utf-8", "surrogateescape")    # non-UTF-8 path bytes hash
+    return state_dir() / kind / hashlib.sha256(data).hexdigest()
 
 
 def _fresh(p: Path) -> bool:
@@ -801,43 +942,54 @@ def _fresh(p: Path) -> bool:
         return False
 
 
-def _claim(real: str, tool_use_id: str) -> bool:
-    """Under the lock: one tool call at a time may expect a path. A second call expecting it marks it contested, and
-    then neither call writes a row."""
+def _claim(real: str, tool_use_id: str) -> str:
+    """Under the lock: one tool call at a time may expect a path (by claim_key). A second call expecting it marks it
+    contested, and then neither call writes a row. A claim file that exists but cannot be read counts as someone
+    else's live claim. Returns "ok", "contested" or "lock-timeout"."""
     for kind in ("claims", "contested"):
         if not _secure_dir(state_dir() / kind, create=True):
-            return False
-    with _locked():
-        claim = _claim_file("claims", real)
-        data = _read_secure(claim, 4096) if _fresh(claim) else None
-        holder = data.decode("utf-8", "replace") if data else None
-        if holder and holder != tool_use_id:
-            mark = _claim_file("contested", real)
-            fd = os.open(str(mark), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
-            os.close(fd)
-            os.utime(str(mark))
-            return False
-        if _fresh(_claim_file("contested", real)):
-            return False
-        tmp = claim.with_name(claim.name + ".%d.tmp" % os.getpid())
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
-        try:
-            os.write(fd, tool_use_id.encode("utf-8"))
-        finally:
-            os.close(fd)
-        os.replace(str(tmp), str(claim))
-    return True
+            return "contested"
+    try:
+        with _locked():
+            claim = _claim_file("claims", real)
+            holder = None
+            if _fresh(claim):
+                data = _read_secure(claim, 4096)
+                holder = data.decode("utf-8", "replace") if data else "\0unreadable"
+            if holder and holder != tool_use_id:
+                mark = _claim_file("contested", real)
+                fd = os.open(str(mark), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+                os.close(fd)
+                os.utime(str(mark))
+                return "contested"
+            if _fresh(_claim_file("contested", real)):
+                return "contested"
+            tmp = claim.with_name(claim.name + ".%d.tmp" % os.getpid())
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            try:
+                os.write(fd, tool_use_id.encode("utf-8"))
+            finally:
+                os.close(fd)
+            os.replace(str(tmp), str(claim))
+    except LockTimeout:
+        return "lock-timeout"
+    except OSError:
+        return "contested"
+    return "ok"
 
 
 def _release(real: str, tool_use_id: str) -> bool:
-    """Drop our claim; True when the path was contested meanwhile (then no row)."""
-    with _locked():
-        claim = _claim_file("claims", real)
-        data = _read_secure(claim, 4096)
-        if data and data.decode("utf-8", "replace") == tool_use_id:
-            with contextlib.suppress(OSError):
-                claim.unlink()
-        return _fresh(_claim_file("contested", real))
+    """Drop our claim; True when the path was contested meanwhile, or when that cannot be known (then no row)."""
+    try:
+        with _locked():
+            claim = _claim_file("claims", real)
+            data = _read_secure(claim, 4096)
+            if data and data.decode("utf-8", "replace") == tool_use_id:
+                with contextlib.suppress(OSError):
+                    claim.unlink()
+            return _fresh(_claim_file("contested", real))
+    except (LockTimeout, OSError):
+        return True
 
 
 # --------------------------------------------------------------------------- transcript binding
@@ -987,13 +1139,14 @@ def pretool(payload: dict) -> None:
             entry["repo_common"] = os.path.realpath(common)
         else:
             entry["url"] = c["url"]
-        if not _claim(expect, tid):
-            decide("contested", tool_use_id=tid, path=expect)
+        got = _claim(expect, tid)
+        if got != "ok":
+            decide(got, tool_use_id=tid, path=expect)
             continue
         keep.append(entry)
     if keep:
         _write_pending({"v": VERSION, "tool_use_id": tid, "session": session, "agent": agent, "at": time.time(),
-                        "cmd_sha": _sha(cmd), "mark_ns": mark, "cands": keep}, key)
+                        "cmd_sha": _sha(cmd), "mark_ns": mark[0], "mark_dev": mark[1], "cands": keep}, key)
 
 
 def _drop_pending(payload: dict, code: str) -> None:
@@ -1038,9 +1191,14 @@ def posttool(payload: dict) -> list:
                 _release(c["expect"], tid)
         decide(code, tool_use_id=tid)
         return []
+    post_mark = clock_mark()                 # Rule 8: taken before any Post observation, so a later object fails
     written = []
     for c in cands:
-        row, why = _check_and_write(c, rec, session, agent, tid)
+        if post_mark is None:
+            _release(c.get("expect") or "", tid)
+            decide("no-mark", tool_use_id=tid, path=c.get("expect"))
+            continue
+        row, why = _check_and_write(c, dict(rec, post_mark_ns=post_mark[0]), session, agent, tid)
         decide(why, tool_use_id=tid, path=c.get("expect"))
         if row:
             written.append(row)
@@ -1062,20 +1220,23 @@ def _check_and_write(c: dict, rec: dict, session: str, agent, tid: str) -> "tupl
         return None, "not-a-checkout"
     if f.get("in_home") is not True:
         return None, "outside-home"
-    if f.get("realpath") != expect:
+    if f.get("realpath") != expect:                  # byte for byte; casefolding is for the claim key only
         return None, "realpath-moved"
     if _dir_identity(c["anchor"]) != (c.get("anchor_dev"), c.get("anchor_ino")):
         return None, "anchor-changed"
-    if not f.get("btime_ns"):
-        return None, "no-btime"
-    if f["btime_ns"] < rec["mark_ns"]:
-        return None, "born-before-pre"
+    if f.get("dev") != rec.get("mark_dev"):
+        return None, "other-fs"
     if kind == "worktree":
         if not f.get("linked"):
             return None, "not-linked"
         if f.get("common_dir") != c.get("repo_common"):
             return None, "repo-mismatch"
-    else:
+    births = [f.get("btime_ns"), f.get("dotgit_btime_ns")] + ([f.get("admin_btime_ns")] if kind == "worktree" else [])
+    if not all(births):
+        return None, "no-btime"
+    if not all(rec["mark_ns"] <= b <= rec["post_mark_ns"] for b in births):
+        return None, "born-outside-call"
+    if kind == "clone":
         origin = _git(f["realpath"], "config", "--get", "remote.origin.url")
         url = c.get("url") or ""
         same = origin == url if _is_url(url) else (origin is not None and not _is_url(origin)
@@ -1142,9 +1303,9 @@ def register_isolation(path: str, session: str, agent: str) -> "dict | None":
     transcript = subagent_transcript(session, agent)
     t_birth = birth_ns(transcript) if transcript else None
     if not t_birth:
-        _note_failure(session, agent, "iso-no-transcript", path=real)
+        decide("iso-no-transcript", agent=agent, path=real)   # never cached: SubagentStart may precede the transcript
         return None
-    if not f.get("btime_ns") or abs(f["btime_ns"] - t_birth) > ISO_WINDOW_NS:
+    if not f.get("btime_ns") or not 0 <= t_birth - f["btime_ns"] <= ISO_WINDOW_NS:
         _note_failure(session, agent, "iso-window", path=real)
         return None
     row, why = write_created(f, "isolation", session, agent, None)
@@ -1203,31 +1364,77 @@ def _nested(row: dict, deadline: float) -> "tuple[list, bool]":
     return sorted(found), True
 
 
-def _porcelain_counts(z: str) -> dict:
-    """Counts from `git status --porcelain=v1 -z`: each entry is `XY path`; a rename or copy (X or Y in R/C) is
-    followed by one more NUL-separated original path, which is not an entry."""
+REPO_PROGRAM_KEY = re.compile(r"(filter\..+|diff\..+\.textconv|diff\.external|core\.fsmonitor|core\.hookspath"
+                              r"|gpg\.(.+\.)?program)", re.I)
+
+
+def _trusted_config_files() -> set:
+    """The user's own global git config files (Rule 12); everything else a checkout reads is the repo's own."""
+    xdg = os.environ.get("XDG_CONFIG_HOME") or str(home() / ".config")
+    return {os.path.realpath(str(home() / ".gitconfig")), os.path.realpath(os.path.join(xdg, "git", "config"))}
+
+
+def repo_programs(path: str, timeout: float) -> "list | None":
+    """Config keys that can make git start a program, set by the repo's own config (its local and worktree files and
+    anything they include). None when unknown. Reads config only; runs nothing."""
+    z = _git(path, "config", "--list", "--show-origin", "--includes", "-z", timeout=timeout, raw=True)
+    if z is None:
+        return None
     parts = z.split("\0")
-    out = {"changed": 0, "untracked": 0, "ignored": 0}
-    i = 0
-    while i < len(parts):
-        e = parts[i]
-        i += 1
-        if len(e) < 4 or e[2] != " ":
+    trusted = _trusted_config_files()
+    found = []
+    for i in range(0, len(parts) - 1, 2):
+        origin, entry = parts[i], parts[i + 1]
+        key = entry.split("\n", 1)[0]
+        if origin.startswith("command line:") or not REPO_PROGRAM_KEY.fullmatch(key):
             continue
-        xy = e[:2]
-        if xy == "??":
-            out["untracked"] += 1
-        elif xy == "!!":
-            out["ignored"] += 1
-        else:
-            out["changed"] += 1
-            if "R" in xy or "C" in xy:
-                i += 1
-    return out
+        if origin.startswith("file:") and os.path.realpath(origin[len("file:"):]) in trusted:
+            continue
+        found.append(key)
+    return found
+
+
+def _names(z: "str | None") -> "set | None":
+    return None if z is None else {n for n in z.split("\0") if n}
+
+
+def regenerable(top: str, entry: str) -> bool:
+    """An ignored entry that a build or install recreates: node_modules beside a package.json, a virtualenv (a folder
+    holding pyvenv.cfg), __pycache__ and *.pyc. Anything else ignored may be someone's only copy."""
+    full = os.path.join(top, entry.rstrip("/"))
+    if _regenerable_path(full):
+        return True
+    if not entry.endswith("/") or os.path.islink(full):
+        return False
+    # `ls-files --directory` collapses a folder that holds only ignored files into one entry: judge what is in it.
+    seen = 0
+    for dirpath, dirnames, filenames in os.walk(full):
+        dirnames[:] = [d for d in dirnames if not _regenerable_path(os.path.join(dirpath, d))]
+        for fn in filenames:
+            if not _regenerable_path(os.path.join(dirpath, fn)):
+                return False
+        seen += len(dirnames) + len(filenames)
+        if seen > NEST_SCAN_ENTRIES:
+            return False                                     # too much to judge: keep
+    return True
+
+
+def _regenerable_path(full: str) -> bool:
+    name = os.path.basename(full)
+    if os.path.islink(full):
+        return False
+    if name == "node_modules" and os.path.isfile(os.path.join(os.path.dirname(full), "package.json")):
+        return True
+    if os.path.isdir(full) and os.path.isfile(os.path.join(full, "pyvenv.cfg")):
+        return True
+    if name == "__pycache__" and os.path.isdir(full):
+        return True
+    return name.endswith(".pyc") and os.path.isfile(full)
 
 
 def verdict(row: dict, deadline: float) -> dict:
-    """The facts and the verdict for one held row. Read-only; hardened git; bounded by the deadline."""
+    """The facts and the verdict for one held row. Read-only. Rule 12: plumbing only, and nothing that reads file
+    content runs until the repo is known to configure no program."""
     def left():
         return deadline - time.monotonic()
     f = stat_path(row["path"])
@@ -1235,25 +1442,38 @@ def verdict(row: dict, deadline: float) -> dict:
         return {"state": "gone"}
     if identity(dict(f, host=HOST)) != identity(row) or not f.get("checkout"):
         return {"state": "replaced", "verdict": "keep: what is there now is not this row's checkout"}
+    top = row["path"]
     out = {"state": "present"}
-    st = _git(row["path"], "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored", timeout=left(),
-              raw=True)
-    branch = _git(row["path"], "rev-parse", "--abbrev-ref", "HEAD", timeout=left())
-    head = _git(row["path"], "rev-parse", "HEAD", timeout=left())
-    unpushed = _git(row["path"], "rev-list", "--count", "HEAD", "--not", "--remotes", timeout=left())
-    has_stash = _git(row["path"], "rev-parse", "--verify", "-q", "refs/stash", timeout=left())
-    stash = _git(row["path"], "rev-list", "--walk-reflogs", "--count", "refs/stash", timeout=left()) if has_stash else "0"
-    nested, complete = _nested(row, deadline) if left() > 1 else ([], False)
     reasons = []
-    if st is None:
-        reasons.append("status unknown")
-    else:
-        counts = _porcelain_counts(st)
-        out.update(counts)
-        if out["changed"]:
-            reasons.append("changes")
-        if out["untracked"]:
-            reasons.append("untracked files")
+    programs = repo_programs(top, left())
+    if programs is None:
+        reasons.append("config unknown")
+    elif programs:
+        reasons.append("repo config runs programs")
+    changed = untracked = ignored = None
+    if programs == []:
+        work = _names(_git(top, "diff-files", "--name-only", "-z", timeout=left(), raw=True))
+        staged = _names(_git(top, "diff-index", "--cached", "--name-only", "-z", "HEAD", timeout=left(), raw=True))
+        changed = None if work is None or staged is None else len(work | staged)
+        untracked = _names(_git(top, "ls-files", "--others", "--exclude-standard", "-z", timeout=left(), raw=True))
+        ignored = _names(_git(top, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z",
+                              timeout=left(), raw=True))
+        if changed is None or untracked is None or ignored is None:
+            reasons.append("status unknown")
+        else:
+            out.update({"changed": changed, "untracked": len(untracked), "ignored": len(ignored)})
+            if changed:
+                reasons.append("changes")
+            if untracked:
+                reasons.append("untracked files")
+            if any(not regenerable(top, e) for e in ignored):
+                reasons.append("ignored files")
+    branch = _git(top, "rev-parse", "--abbrev-ref", "HEAD", timeout=left())
+    head = _git(top, "rev-parse", "HEAD", timeout=left())
+    unpushed = _git(top, "rev-list", "--count", "HEAD", "--not", "--remotes", timeout=left())
+    has_stash = _git(top, "rev-parse", "--verify", "-q", "refs/stash", timeout=left())
+    stash = _git(top, "rev-list", "--walk-reflogs", "--count", "refs/stash", timeout=left()) if has_stash else "0"
+    nested, complete = _nested(row, deadline) if left() > 1 else ([], False)
     out.update({"branch": branch, "head": head, "unpushed": unpushed, "stash": stash, "nested": nested})
     if unpushed is None or not unpushed.isdigit():
         reasons.append("unpushed unknown")
@@ -1347,19 +1567,31 @@ def hook(event: str, stdin=None) -> int:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="Checkout registry (hook-written; this CLI only reads).")
+    ap = argparse.ArgumentParser(description="Checkout registry (hook-written; this CLI reads, and `retire` only ends "
+                                             "ownership of a checkout that is gone).")
     sub = ap.add_subparsers(dest="cmd", required=True)
     h = sub.add_parser("hook")
     h.add_argument("event", choices=("pretool", "posttool", "posttool-failure", "denied", "subagent-start",
                                       "subagent-stop"))
     s = sub.add_parser("stat")
     s.add_argument("--path", required=True)
+    r = sub.add_parser("retire", help="Rule 14: retire the rows of an absent path (removes ownership only)")
+    r.add_argument("--path", required=True)
     sub.add_parser("list")
     a = ap.parse_args(argv)
     if a.cmd == "hook":
         return hook(a.event)
     if a.cmd == "stat":
         print(json.dumps(stat_path(a.path)))
+        return 0
+    if a.cmd == "retire":
+        key = read_key()
+        p = os.path.abspath(os.path.expanduser(a.path))
+        anchor = _anchor(p) if not os.path.lexists(p) else None
+        if anchor:
+            p = anchor["realpath"].rstrip("/") + "/" + anchor["rest"]      # the same expected path Pre would compute
+        n = retire_absent(p, key) if key and anchor else 0
+        print(json.dumps({"path": p, "retired": n}))
         return 0
     good, bad = rows(HOST)
     print(json.dumps({HOST: {"rows": good, "failed_verification": bad, "held": len(current(HOST))}}, indent=1))

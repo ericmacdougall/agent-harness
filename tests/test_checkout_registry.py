@@ -183,8 +183,18 @@ class Writer(Base):
         self.clone(old)()
         time.sleep(0.05)
         q = os.path.join(self.home, "q")
-        self.assert_refused("born-before-pre", self.bash("git clone %s %s || mv %s %s" % (self.src, q, old, q),
-                                                         lambda: os.rename(old, q)))
+        self.assert_refused("born-outside-call", self.bash("git clone %s %s || mv %s %s" % (self.src, q, old, q),
+                                                           lambda: os.rename(old, q)))
+        old2 = os.path.join(self.home, "older")                 # a new folder, but the .git inside it is moved in
+        self.clone(old2)()
+        time.sleep(0.05)
+        r = os.path.join(self.home, "r")
+
+        def new_folder_old_git():
+            os.makedirs(r)
+            os.rename(os.path.join(old2, ".git"), os.path.join(r, ".git"))
+        self.assert_refused("born-outside-call", self.bash("git clone %s %s || true" % (self.src, r),
+                                                           new_folder_old_git))
         x = os.path.join(self.home, "x")
         self.assert_refused("not-a-checkout", self.bash("git -C %s worktree add %s || true" % (self.src, x),
                                                         lambda: os.makedirs(x)))
@@ -192,6 +202,37 @@ class Writer(Base):
         self.assert_refused("not-linked", self.bash("git -C %s worktree add %s || true" % (self.src, y),
                                                     self.clone(y)))
         self.assertEqual(len(self.held()), 1)
+
+    # NEG-16
+    def test_born_after_the_post_mark_or_on_another_filesystem_gets_no_row(self):
+        real = R.clock_mark
+        self.assert_one(self.bash("git clone %s %s/ok" % (self.src, self.home), self.clone(self.home + "/ok")))
+        marks = []
+
+        def early_post():                    # the Post mark reads earlier than the checkout's birth
+            m = real()
+            marks.append(m)
+            return m if len(marks) == 1 else (marks[0][0], m[1])
+        with mock.patch.object(R, "clock_mark", early_post):
+            self.assert_refused("born-outside-call", self.bash("git clone %s %s/late" % (self.src, self.home),
+                                                               lambda: (time.sleep(0.05),
+                                                                        self.clone(self.home + "/late")())))
+
+        def other_dev():
+            m = real()
+            return (m[0], m[1] + 1)
+        with mock.patch.object(R, "clock_mark", other_dev):
+            self.assert_refused("other-fs", self.bash("git clone %s %s/odev" % (self.src, self.home),
+                                                      self.clone(self.home + "/odev")))
+        self.assertEqual(len(self.held()), 1)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "the inode generation is read on Linux only")
+    def test_no_inode_generation_gets_no_row(self):
+        self.assert_one(self.bash("git clone %s %s/g1" % (self.src, self.home), self.clone(self.home + "/g1")))
+        self.assertIsInstance(self.held()[0]["gen"], int)
+        with mock.patch.object(R, "inode_generation", lambda p: None):
+            self.assert_refused("no-generation", self.bash("git clone %s %s/g2" % (self.src, self.home),
+                                                           self.clone(self.home + "/g2")))
 
     # NEG-3
     def test_text_that_only_mentions_git_proposes_nothing(self):
@@ -303,20 +344,56 @@ class Writer(Base):
             self.assert_refused("no-btime", self.bash("git clone %s %s" % (self.src, d), self.clone(d)))
 
     # NEG-17
+    # NEG-17
     def test_repo_config_runs_nothing_when_the_registry_reads_it(self):
-        marker = os.path.join(self.home, "fsmonitor-ran")
-        script = os.path.join(self.home, "fsmon.sh")
-        Path(script).write_text("#!/bin/sh\ntouch %s\nexit 1\n" % marker)
-        os.chmod(script, 0o755)
-        sh("git", "config", "core.fsmonitor", script, cwd=self.src)
-        subprocess.run(["git", "-C", self.src, "status", "--porcelain"], capture_output=True, env=ENV)
-        self.assertTrue(os.path.exists(marker), "positive control: plain git status runs the fsmonitor hook")
+        marker = os.path.join(self.home, "program-ran")
+        prog = os.path.join(self.home, "prog.sh")
+        Path(prog).write_text(textwrap.dedent("""\
+            #!/bin/sh
+            echo "$*" >> %s
+            case "$*" in
+              *--verify*) exit 1;;
+              *-bsau*) printf '%%s\\n' '-----BEGIN PGP SIGNATURE-----' x '-----END PGP SIGNATURE-----'
+                       printf '\\n[GNUPG:] SIG_CREATED D 1 8 00 0 0\\n' >&2; exit 0;;
+            esac
+            cat
+            """ % marker))
+        os.chmod(prog, 0o755)
+        inc = os.path.join(self.home, "included.cfg")            # include.path: a file outside the repo
+        Path(inc).write_text("[filter \"p\"]\n\tclean = %s\n\tsmudge = %s\n" % (prog, prog))
+        for k, v in (("include.path", inc), ("diff.p.textconv", prog), ("gpg.program", prog),
+                     ("log.showSignature", "true"), ("core.fsmonitor", prog)):
+            sh("git", "config", k, v, cwd=self.src)
+        Path(self.src, ".gitattributes").write_text("*.txt filter=p diff=p\n")
+        Path(self.src, "f.txt").write_text("signed\n")
+        sh("git", "add", ".gitattributes", "f.txt", cwd=self.src)
+        sh("git", "-c", "core.fsmonitor=false", "commit", "-q", "-S", "-m", "signed", cwd=self.src)
+        sh("git", "-c", "core.fsmonitor=false", "push", "-q", "origin", "main", cwd=self.src)
+        for control in (["status", "--porcelain"], ["log", "-1"], ["diff", "HEAD~1"]):
+            if os.path.exists(marker):
+                os.unlink(marker)
+            subprocess.run(["git", "-C", self.src, *control], capture_output=True, env=ENV)
+            self.assertTrue(os.path.exists(marker), "positive control: plain git %s runs a program" % control[0])
         os.unlink(marker)
-        R.stat_path(self.src)
-        R.verdict({"path": self.src, "kind": "clone", "host": "local", "dev": 0, "ino": 0, "btime_ns": 0},
-                  time.monotonic() + 10)
-        R._git(self.src, "status", "--porcelain")
-        self.assertFalse(os.path.exists(marker))
+        iso = os.path.join(self.src, ".claude", "worktrees", "agent-a9")
+        sh("git", "-c", "core.fsmonitor=false", "-C", self.src, "worktree", "add", "-q", "--detach", iso, "main")
+        os.unlink(marker) if os.path.exists(marker) else None     # the smudge filter ran in that checkout
+        self.sub_transcript("s1", "a9")
+        R.subagent_start({"session_id": "s1", "agent_id": "a9", "cwd": iso})
+        wt = os.path.join(self.home, "wt-p")
+        cmd = "git -C %s worktree add %s -b px" % (self.src, wt)
+        tid = self.tid()
+        self.record(tid, cmd)
+        R.pretool(self.payload(cmd, tid))
+        sh("git", "-c", "core.fsmonitor=false", "-c", "filter.p.smudge=cat", "-C", self.src, "worktree", "add", "-q",
+           wt, "-b", "px")
+        os.unlink(marker) if os.path.exists(marker) else None
+        R.posttool(self.payload(cmd, tid))
+        note = R.subagent_stop({"session_id": "s1", "agent_id": "a9"}).read_text()
+        self.assertFalse(os.path.exists(marker), "no hook surface may start a repo-configured program")
+        self.assertIn("keep: repo config runs programs", note)
+        with self.assertRaises(ValueError):
+            R._git(self.src, "status", "--porcelain")            # porcelain is refused inside the module
 
 
 REAL_BIRTH = R.birth_ns
@@ -347,6 +424,15 @@ class Ownership(Base):
             live = dict(live, dev=old["dev"], ino=old["ino"])
         self.assertNotEqual(live["btime_ns"], old["btime_ns"])
         self.assertIsNone(R.held(live), "the old row must not own the new checkout")
+        if sys.platform.startswith("linux"):
+            # H1: removed and recreated in-process inside one clock tick, so dev, ino and btime_ns are all equal
+            # (probe P8: 249 of 300). Only the inode generation tells them apart.
+            same_tick = dict(live, btime_ns=old["btime_ns"])
+            self.assertIsInstance(old["gen"], int)
+            self.assertNotEqual(same_tick["gen"], old["gen"])
+            self.assertIsNone(R.held(same_tick), "equal dev, ino and btime with a new generation is a new checkout")
+            self.assertIsNotNone(R.held(dict(same_tick, gen=old["gen"])), "positive control: the old identity")
+        self.assertIsNone(R.held(dict(live, gen=old["gen"])), "same dev, ino and generation, but another btime")
         shutil.rmtree(dest)
         new = self.assert_one(self.bash("git clone %s %s" % (self.src, dest), self.clone(dest), session="s2",
                                         agent="b2"))
@@ -362,6 +448,64 @@ class Ownership(Base):
         self.assertEqual(R.write_created(f, "clone", "s2", "b2", "toolu_x"), (None, "second-owner"))
         self.assertEqual(R.write_created(f, "clone", "s1", "a1", "toolu_y"), (None, "already-held"))
         self.assertEqual([(r["session"], r["agent"]) for r in self.held()], [("s1", "a1")])
+
+    def race(self, cmd_a, cmd_b, make, before_b=None):
+        """Pre of A, then Pre of B, then the real effect, then Post of B first and A second: the order in which a fast
+        failing call would win."""
+        for tid, cmd, s, a in (("toolu_A", cmd_a, "s1", "a1"), ("toolu_B", cmd_b, "s2", "b2")):
+            if tid == "toolu_B" and before_b:
+                before_b()
+            self.record(tid, cmd, s, a)
+            R.pretool(self.payload(cmd, tid, s, a))
+        make()
+        got = R.posttool(self.payload(cmd_b, "toolu_B", "s2", "b2")) + R.posttool(self.payload(cmd_a, "toolu_A",
+                                                                                                  "s1", "a1"))
+        return got
+
+    # NEG-9: one claim key for case, normalization and pinned-ancestor variants of one path
+    def test_variant_spellings_of_one_path_are_one_claim(self):
+        h = self.home
+        work = os.path.join(h, "Work")
+        os.makedirs(work)
+        self.assertEqual(R.claim_key(work + "/p"), R.claim_key(h + "/work/p"))
+        got = self.race("git clone %s %s/Work/p" % (self.src, h), "git clone %s %s/work/p || true" % (self.src, h),
+                        self.clone(os.path.join(work, "p")))
+        self.assertEqual(got, [])
+        self.assertIn("contested", self.codes("toolu_B"))
+
+    def test_two_calls_that_pinned_different_folders_share_one_claim(self):
+        h = self.home
+        deep = os.path.join(h, "P", "x", "y")
+        got = self.race("mkdir -p %s/P/x && git clone %s %s" % (h, self.src, deep),
+                        "git clone %s %s || true" % (self.src, deep), self.clone(deep),
+                        before_b=lambda: os.makedirs(os.path.join(h, "P", "x")))
+        self.assertEqual(got, [])
+        self.assertIn("contested", self.codes("toolu_B"))
+
+    def test_nfc_and_nfd_spellings_share_one_claim(self):
+        nfc, nfd = "café", "café"
+        self.assertEqual(R.claim_key(self.home + "/" + nfc), R.claim_key(self.home + "/" + nfd))
+        self.assertNotEqual(R.claim_key(self.home + "/a"), R.claim_key(self.home + "/b"), "positive control")
+        bad = self.home + "/\udcff-not-utf8"              # surrogateescape: a non-UTF-8 byte hashes, never raises
+        self.assertTrue(R._claim_file("claims", bad).name)
+
+    def test_busy_lock_and_unreadable_claim_write_no_row(self):
+        import fcntl
+        self.assert_one(self.bash("git clone %s %s/free" % (self.src, self.home), self.clone(self.home + "/free")))
+        fd = os.open(str(R.state_dir() / "registry.lock"), os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)                  # another holder (a separate open file description)
+            with mock.patch.object(R, "LOCK_WAIT", 0.2):
+                self.assert_refused("lock-timeout", self.bash("git clone %s %s/busy" % (self.src, self.home),
+                                                              self.clone(self.home + "/busy")))
+        finally:
+            os.close(fd)
+        target = self.home + "/locked-out"
+        claim = R._claim_file("claims", target)
+        claim.write_text("someone")
+        os.chmod(str(claim), 0o644)                         # exists but is not a private file: unreadable to us
+        self.assert_refused("contested", self.bash("git clone %s %s" % (self.src, target), self.clone(target)))
+        self.assertEqual(len(self.held()), 1)
 
     # NEG-9
     def test_two_calls_racing_for_one_path_write_no_row(self):
@@ -406,7 +550,8 @@ class Ownership(Base):
         f = R.stat_path(dest)
         key = R.ensure_key()
         base = {"v": 1, "event": "created", "kind": "clone", "host": "local", "path": dest, "dev": f["dev"],
-                "ino": f["ino"], "btime_ns": f["btime_ns"], "common_dir": f["common_dir"], "agent": None,
+                "ino": f["ino"], "btime_ns": f["btime_ns"], "gen": f["gen"], "common_dir": f["common_dir"],
+                "agent": None,
                 "task": None, "created_at": "x", "tool_use_id": None}
         with R._locked():
             R._append(dict(base, session="s1"), key)
@@ -511,6 +656,15 @@ class Ownership(Base):
         R.pretool(self.payload(cmd, tid, agent="zz"))
         self.clone(dest)()
         self.assert_refused("transcript-unbound", R.posttool(self.payload(cmd, tid, agent="zz")))
+        dest = os.path.join(self.home, "f10")                  # G1: an agent's call binds to its own file only
+        cmd = "git clone %s %s" % (self.src, dest)
+        tid = self.tid()
+        self.last_tid = tid
+        self.sub_transcript("s1", "a1")                         # the agent's transcript exists ...
+        self.record(tid, cmd, agent=None)                       # ... but this tool_use is only in main's
+        R.pretool(self.payload(cmd, tid))
+        self.clone(dest)()
+        self.assert_refused("transcript-unbound", R.posttool(self.payload(cmd, tid)))
         self.assertEqual(len(self.held()), 1)
 
     def test_subagent_transcript_path_form_is_accepted(self):
@@ -690,9 +844,57 @@ class Isolation(Base):
                 R.ISO_WINDOW_NS + 10 ** 9 if p.endswith("agent-a6.jsonl") else 0)):
             R.pretool(self.payload("ls", "t2", agent="a6", cwd=path, tool="Read"))
         self.assertIn("iso-window", self.codes())
+        with mock.patch.object(R, "birth_ns", side_effect=lambda p: real(p) - (
+                10 ** 9 if p.endswith("agent-a6.jsonl") else 0)):     # transcript older: worktree planted later
+            R.pretool(self.payload("ls", "t2b", agent="a6", cwd=path, tool="Read"))
+        self.assertEqual(self.codes().count("iso-window"), 2)
         self.assertEqual(self.held(), [])
         R.pretool(self.payload("ls", "t3", agent="a6", cwd=path, tool="Read"))
         self.assertEqual(len(self.held()), 1, "positive control: same worktree, real birth times")
+
+    def test_a_missing_transcript_is_rechecked_at_once(self):
+        """SubagentStart can fire before the subagent transcript exists; that must not block the row for a minute."""
+        path = os.path.join(self.src, ".claude", "worktrees", "agent-a8")
+        sh("git", "-C", self.src, "worktree", "add", "-q", path, "-b", "w-a8")
+        R.subagent_start({"session_id": "s1", "agent_id": "a8", "cwd": path})
+        self.assertIn("iso-no-transcript", self.codes())
+        self.sub_transcript("s1", "a8")
+        R.pretool(self.payload("ls", "t1", agent="a8", cwd=path, tool="Read"))
+        self.assertEqual([r["agent"] for r in self.held()], ["a8"])
+
+
+class Retire(Base):
+    # Rule 14
+    def test_retire_needs_absence_on_the_rows_own_filesystem(self):
+        d = os.path.join(self.home, "rt")
+        row = self.assert_one(self.bash("git clone %s %s" % (self.src, d), self.clone(d)))
+        key = R.read_key()
+        self.assertEqual(R.retire_absent(d, key), 0, "present: nothing is retired")
+        shutil.rmtree(d)
+        elsewhere = {"realpath": self.home, "dev": row["dev"] + 1, "ino": 1, "rest": "rt"}
+        with mock.patch.object(R, "_anchor", lambda p: elsewhere):
+            self.assertEqual(R.retire_absent(d, key), 0, "a parent on another st_dev (an unmounted volume) never "
+                                                         "retires a row")
+        self.assertIsNotNone(R.held(row))
+        out = io.StringIO()
+        with redirect_stdout(out):
+            R.main(["retire", "--path", d])
+        self.assertEqual(json.loads(out.getvalue())["retired"], 1)
+        self.assertIsNone(R.held(row))
+        self.assertEqual([r["route"] for r in R.rows()[0] if r["event"] == "removed"], ["observed-absent"])
+
+    # AC-3, Rule 13
+    def test_oversized_ledger_or_remote_state_folder_writes_nothing(self):
+        row = self.assert_one(self.bash("git clone %s %s/l1" % (self.src, self.home), self.clone(self.home + "/l1")))
+        self.assertTrue(R.state_is_local(), "positive control: the test state folder is on a local filesystem")
+        with mock.patch.object(R, "MAX_FILE", 10):
+            self.assertIsNone(R.held(row), "never judge ownership from part of the file")
+            self.assert_refused("ledger-too-large", self.bash("git clone %s %s/l2" % (self.src, self.home),
+                                                              self.clone(self.home + "/l2")))
+        with mock.patch.object(R, "state_is_local", lambda: False):
+            self.assert_refused("state-not-local", self.bash("git clone %s %s/l3" % (self.src, self.home),
+                                                             self.clone(self.home + "/l3")))
+        self.assertEqual(len(self.held()), 1)
 
 
 class Stop(Base):
@@ -714,13 +916,24 @@ class Stop(Base):
         calls = []
         fake = types.ModuleType("ah_worktree")
         fake.remove_owned = lambda *a, **k: calls.append(a) or shutil.rmtree(a[1]["path"])
+        Path(self.src, "package.json").write_text("{}\n")
+        sh("git", "add", "package.json", cwd=self.src)
+        sh("git", "commit", "-q", "-m", "pkg", cwd=self.src)
+        sh("git", "push", "-q", "origin", "main", cwd=self.src)
+        with open(os.path.join(self.src, ".git", "info", "exclude"), "a") as fh:
+            fh.write("node_modules/\n.venv/\n__pycache__/\n*.pyc\n.env.local\n")
         with mock.patch.dict(sys.modules, {"ah_worktree": fake}):
             iso = self.iso(branch="x`rm`OWNER-DECISION")
-            os.makedirs(os.path.join(iso, "build"))
-            Path(iso, "build", "out.o").write_text("o")
+            os.makedirs(os.path.join(iso, "node_modules", "left-pad"))           # regenerable ignored content only
+            Path(iso, "node_modules", "left-pad", "index.js").write_text("x")
+            os.makedirs(os.path.join(iso, ".venv", "bin"))
+            Path(iso, ".venv", "pyvenv.cfg").write_text("home = /usr\n")
+            os.makedirs(os.path.join(iso, "pkg", "__pycache__"))
+            Path(iso, "pkg", "__pycache__", "m.cpython-312.pyc").write_bytes(b"x")
+            Path(iso, "pkg", "m.pyc").write_bytes(b"x")
             text = R.subagent_stop({"session_id": "s1", "agent_id": "a1"}).read_text()
             self.assertIn("isolation `%s`: owner may remove" % iso, text, "positive control")
-            self.assertIn("ignored 1", text)
+            self.assertRegex(text, r"ignored [1-9]")        # the entry count varies by git version (--directory)
             self.assertIn("Informational data", text)
             self.assertNotIn("`rm`", text)
             self.assertIn("x?rm?OWNER-DECISION", text)
@@ -733,15 +946,19 @@ class Stop(Base):
             self.assertIn("keep: changes", text)
             self.assertIn("changed 1, untracked 0", text)
             sh("git", "-C", iso, "checkout", "-q", "--", "f.txt")
-            # The original path of a rename follows as its own NUL field; "ab c.txt" is shaped like an entry, so
-            # it would be counted as a second change if the parser did not skip it.
-            Path(iso, "ab c.txt").write_text("r\n")
-            sh("git", "-C", iso, "add", "ab c.txt")
-            sh("git", "-C", iso, "commit", "-q", "-m", "tracked")
-            sh("git", "-C", iso, "mv", "ab c.txt", "g.txt")
+            sh("git", "-C", iso, "mv", "f.txt", "g.txt")                       # staged: counted by path, so two
             text = R.subagent_stop({"session_id": "s1", "agent_id": "a1"}).read_text()
-            self.assertIn("changed 1, untracked 0", text, "a rename is one change, not two")
+            self.assertIn("keep: changes", text)
+            self.assertIn("changed 2, untracked 0", text)
             sh("git", "-C", iso, "reset", "-q", "--hard", "origin/main")
+
+            for name in (".env.local", os.path.join("build", "out.o")):         # ignored, and maybe the only copy
+                os.makedirs(os.path.dirname(os.path.join(iso, name)), exist_ok=True)
+                Path(iso, name).write_text("data\n")
+                text = R.subagent_stop({"session_id": "s1", "agent_id": "a1"}).read_text()
+                self.assertIn("keep: ignored files", text, name)
+                os.unlink(os.path.join(iso, name))
+            shutil.rmtree(os.path.join(iso, "build"))
 
             Path(iso, "new.txt").write_text("y\n")
             text = R.subagent_stop({"session_id": "s1", "agent_id": "a1"}).read_text()
@@ -767,6 +984,22 @@ class Stop(Base):
             self.assertEqual(calls, [])
             self.assertEqual(sh("git", "-C", iso, "status", "--porcelain", "--ignored"), before)
         self.assertEqual(os.stat(self.note()).st_mode & 0o777, 0o600)
+
+    # NEG-17: a global fsmonitor is trusted config, so the verdict's plumbing runs, and the hardening must stop it
+    def test_global_fsmonitor_never_starts_from_the_verdict(self):
+        marker = os.path.join(self.home, "fsmonitor-ran")
+        prog = os.path.join(self.home, "fsmon.sh")
+        Path(prog).write_text("#!/bin/sh\ntouch %s\nexit 1\n" % marker)
+        os.chmod(prog, 0o755)
+        iso = self.iso("a3")
+        Path(self.home, ".gitconfig").write_text("[core]\n\tfsmonitor = %s\n" % prog)
+        subprocess.run(["git", "-C", iso, "diff-files", "--name-only"], capture_output=True,
+                       env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")})
+        self.assertTrue(os.path.exists(marker), "positive control: unhardened plumbing starts the fsmonitor")
+        os.unlink(marker)
+        text = R.subagent_stop({"session_id": "s1", "agent_id": "a3"}).read_text()
+        self.assertIn("owner may remove", text, "the plumbing ran (global config is trusted)")
+        self.assertFalse(os.path.exists(marker))
 
     def test_clone_is_listed_but_never_a_removal_candidate(self):
         dest = os.path.join(self.home, "c")

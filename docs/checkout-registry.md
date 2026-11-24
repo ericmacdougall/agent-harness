@@ -1,9 +1,9 @@
 # Checkout registry
 
-`harness/hooks/checkout_registry.py` (goodqa#16947) records who created each git checkout an agent makes. Stream B's owner
-removal uses these rows to decide what an agent may delete as its own work, and the janitor reads them too. The rule is
-simple: a missing row is safe, but a wrong row deletes someone's work. So a row is written only when a hook watched the
-checkout being born during that agent's own tool call.
+`harness/hooks/checkout_registry.py` (goodqa#16947, spec v3.2) records who created each git checkout an agent makes.
+Stream B's owner removal uses these rows to decide what an agent may delete as its own work, and the janitor reads them
+too. The rule is simple: a missing row is safe, but a wrong row deletes someone's work. So a row is written only when a
+hook watched the checkout being born during that agent's own tool call.
 
 ## What gets a row
 
@@ -15,54 +15,80 @@ Each row goes in `~/.agent-harness/state/checkouts/local.jsonl`:
 
 ```
 {"v":1,"event":"created","kind":"clone","host":"local","path":"/Users/me/x","dev":16777234,"ino":123,
- "btime_ns":1795496019112242768,"common_dir":"/Users/me/x/.git","session":"<session id>","agent":"<agent id or null>",
- "task":null,"created_at":"2026-11-24T05:00:00Z","tool_use_id":"toolu_...","mac":"<hmac-sha256>"}
+ "btime_ns":1795496019112242768,"gen":null,"common_dir":"/Users/me/x/.git","session":"<session id>",
+ "agent":"<agent id or null>","task":null,"created_at":"2026-11-24T05:00:00Z","tool_use_id":"toolu_...",
+ "mac":"<hmac-sha256>"}
 ```
 
-- **Identity.** A checkout is identified by host, dev, ino and btime_ns. The path is not part of the identity, because ext4
-  reuses an inode number as soon as it is freed (40 of 40 times on t2-dev). The birth time tells a new checkout from an old
-  one. Where the birth time cannot be read, no row is written. On macOS it comes from `st_birthtime`; on Linux from
-  `/usr/bin/stat -c %.9W`.
+- **Identity.** A checkout is identified by host, dev, ino, btime_ns and gen. The path is not part of the identity.
+  - ext4 reuses a freed inode number at once (40 of 40 times on t2-dev). The birth time tells a new checkout from an old
+    one.
+  - A folder removed and recreated inside one clock tick has an equal birth time too (249 of 300 in-process rounds on
+    t2-dev). On Linux the inode generation (`FS_IOC_GETVERSION`, readable unprivileged) changes on reuse, so `gen`
+    separates them.
+  - APFS does not reuse inode numbers, so `gen` is null on macOS.
+  - With no birth time, or no generation on Linux, no row is written.
 - **`removed` rows.** These end ownership. Stream B's route writes one after it removes a checkout, through
-  `append_removed(identity, by, route)`. A hook that sees the path gone writes one with route `observed-absent`.
+  `append_removed(identity, by, route)`. A path seen gone is retired with route `observed-absent` (see Retirement).
 - **Signing.** `mac(row)` and `verify(row)` are the only signing functions. The key is
   `state/checkouts/registry.key`: 32 random bytes, mode 0600, created once.
-- **Ownership check.** `held(identity)` is the only one. It reads the host's own file and returns None when two created
-  rows name one identity.
+- **Ownership check.** `held(identity)` is the only one. It reads the host's own file. It returns None when two created
+  rows name one identity, and when the file is over 64 MB (ownership is never judged from part of the file).
 - **Kill switch.** Replacing the key voids every row.
 
 ## How a Bash row is proven
 
 The command text only proposes a path. The row needs all of the following, as observed state:
 
-1. PreToolUse sees the path absent (ENOENT). It pins the nearest existing folder above the path by realpath, dev and inode.
-   It takes a clock mark (the birth time of a fresh file) and claims the path under a lock.
-2. Any second claim on the same path marks it contested, and neither call gets a row.
+1. PreToolUse takes a clock mark (the birth time and st_dev of a fresh file in `state/checkouts/marks/`). It then sees
+   the path absent (ENOENT) and pins the nearest existing folder above it by realpath, dev and inode.
+2. It claims the path under the lock. The claim key is the expected path, NFC-normalized and casefolded, so case and
+   Unicode variants of one path, and calls that pinned different parent folders, share one claim. A second claim marks the
+   path contested, and neither call gets a row. A claim file that cannot be read counts as someone else's claim.
 3. PostToolUse or PostToolUseFailure carries the same tool_use_id, session, agent and command hash as the signed pending
-   record. The payload's transcript must be the session's own, and it must hold that Bash tool_use.
-4. The path is now a git checkout top. It is not a symlink and it is under the home folder. It sits at the pinned folder,
-   which still has the same dev and inode, and it was born at or after the clock mark. That rules out a checkout moved in
-   with `mv`.
-5. For a clone, `remote.origin.url` is the command's URL. For a worktree, it is linked and has the named repo's common dir.
+   record. The payload's transcript must be the session's own. For an agent, only its own file
+   `projects/<p>/<session>/subagents/agent-<id>.jsonl` is searched, never the main transcript. It must hold that Bash
+   tool_use.
+4. Post takes a second clock mark. The path is now a git checkout top. It is not a symlink, and it is under the home
+   folder. Its realpath equals the expected path byte for byte. The pinned folder still has the same dev and inode, and
+   the checkout is on the same st_dev as the marker.
+5. The checkout top, its `.git` and, for a worktree, its admin folder were all born between the two marks. That rules
+   out a checkout or a `.git` moved in with `mv`, and an object dated in the future.
+6. For a clone, `remote.origin.url` is the command's URL. For a worktree, it is linked and has the named repo's common
+   dir.
+
+The lock is `state/checkouts/registry.lock`. Waits stop after 2 s with `lock-timeout`, and a state folder that is not on
+a local filesystem gets no rows.
 
 ## How an isolation row is proven
 
 - The path is named after the payload's agent id.
 - It is a linked worktree listed by the repo that contains it.
-- The subagent transcript `~/.claude/projects/*/<session>/subagents/agent-<id>.jsonl` exists.
-- The worktree was born within 300 s of that transcript.
+- The subagent transcript `~/.claude/projects/*/<session>/subagents/agent-<id>.jsonl` exists. A missing transcript is
+  checked again on the next call; other failures are retried after a minute.
+- The transcript was born 0 to 120 s after the worktree (the worktree comes first).
 
 The row is written at SubagentStart, or at the agent's first tool call from inside the worktree.
 
+## Retirement
+
+A row is retired as `observed-absent` only when two lstat calls under the lock both give ENOENT for its exact path, and
+the nearest existing folder is on the row's own st_dev, so an unmounted volume never retires a row. Retirement happens
+when a later call proposes the same path, when SubagentStop finds the checkout gone, or through
+`checkout_registry.py retire --path P`.
+
+Retirement only ends ownership. A removed or retired row is never permission to delete anything.
+
 ## Why no row was written
 
-Every refusal appends one reason code to `state/checkouts/decisions.jsonl`. The codes are:
+Every refusal appends one reason code to `state/checkouts/decisions.jsonl` (rotated to `decisions.1.jsonl` at 4 MB).
+The codes are:
 
 | Stage | Codes |
 |---|---|
-| PreToolUse | `existed-at-pre`, `unreadable-at-pre`, `repo-unknown`, `contested`, `unsure` |
-| PostToolUse | `pending-missing`, `pending-bad-mac`, `pending-foreign`, `pending-expired`, `transcript-unbound`, `not-made`, `link`, `not-a-checkout`, `outside-home`, `realpath-moved`, `anchor-changed`, `no-btime`, `born-before-pre`, `not-linked`, `repo-mismatch`, `origin-mismatch`, `second-owner`, `already-held` |
-| Other | `background`, `permission-denied` |
+| PreToolUse | `existed-at-pre`, `unreadable-at-pre`, `repo-unknown`, `contested`, `lock-timeout`, `no-mark`, `unsure` |
+| PostToolUse | `pending-missing`, `pending-bad-mac`, `pending-foreign`, `pending-expired`, `transcript-unbound`, `no-mark`, `not-made`, `link`, `not-a-checkout`, `outside-home`, `realpath-moved`, `anchor-changed`, `other-fs`, `not-linked`, `repo-mismatch`, `no-btime`, `born-outside-call`, `origin-mismatch`, `state-not-local`, `no-generation`, `lock-timeout`, `ledger-too-large`, `second-owner`, `already-held`, `contested-identity` |
+| Other | `background`, `permission-denied`, `observed-absent`, `hook-error` |
 | Isolation | `iso-not-checkout`, `iso-not-listed`, `iso-no-transcript`, `iso-window` |
 
 A successful write is recorded as `written`.
@@ -70,15 +96,18 @@ A successful write is recorded as `written`.
 ```
 python3 ~/.claude/hooks/checkout_registry.py list                 # verified rows, failures, how many are held
 python3 ~/.claude/hooks/checkout_registry.py stat --path ~/x      # read-only facts about one path
+python3 ~/.claude/hooks/checkout_registry.py retire --path ~/x    # end ownership of a checkout that is gone
 tail -n 20 ~/.agent-harness/state/checkouts/decisions.jsonl       # why recent calls did or did not get a row
 ```
 
-No command writes a row by hand. The `hook` verbs read a hook payload, and a made-up payload fails the transcript binding.
+No command writes a created row by hand. The `hook` verbs read a hook payload, and a made-up payload fails the
+transcript binding.
 
 ## When an agent stops
 
 SubagentStop writes `~/.agent-harness/work/<session>/inbox/data-checkout-<agent>.md` for the parent session. owner_inbox
-injects it under a header that says it is data, not instructions. For each checkout the agent still holds, the note lists:
+injects it under a header that says it is data, not instructions. Data notes never block Stop or crowd out a decision
+note. For each checkout the agent still holds, the note lists:
 
 - the changed, untracked and ignored counts;
 - the branch and HEAD;
@@ -86,11 +115,35 @@ injects it under a header that says it is data, not instructions. For each check
 - the repo's stash count;
 - any checkouts nested under its path.
 
-It also gives a verdict. "owner may remove" is given only to the agent's own isolation worktree when it is clean, has
-nothing unpushed and has nothing nested. Everything else gets "keep: reasons".
+It also gives a verdict. "owner may remove" is given only to the agent's own isolation worktree when all of these hold:
 
-The hook removes nothing. A resumed agent keeps its worktree. git runs hardened (no fsmonitor, no hooks, no optional
-locks), within a 15 s budget.
+- nothing is changed, staged or untracked;
+- nothing is unpushed or stashed, and nothing is nested;
+- the repo configures no program;
+- its ignored content is all regenerable: `node_modules` beside a `package.json`, a virtualenv (a folder with
+  `pyvenv.cfg`), `__pycache__` and `*.pyc`.
+
+Everything else gets "keep: reasons". Ignored files such as `.env.local`, data or build output may be someone's only copy,
+so they always mean keep.
+
+The hook removes nothing, and a resumed agent keeps its worktree.
+
+## How the hooks run git
+
+No hook runs `git status`, `git log`, `git diff`, `git show` or `git stash list`, because those can start a program that
+the repo's config names (filter drivers, textconv, gpg.program). `_git` refuses them.
+
+The verdict uses plumbing that reads no file content through filters: `diff-files`, `diff-index --cached`, `ls-files`
+and `rev-list`. Every call is hardened:
+
+- no fsmonitor, no hooks and no optional locks;
+- `log.showSignature=false` and `protocol.allow=never`;
+- `GIT_NO_LAZY_FETCH=1`, no `GIT_*` from the caller, and `GIT_CONFIG_NOSYSTEM=1`;
+- bounded by the hook's whole deadline (8 s, 15 s for SubagentStart, 18 s for SubagentStop).
+
+If the repo's own config, or a file it includes, sets `filter.*`, `diff.*.textconv`, `diff.external`, `core.fsmonitor`,
+`core.hooksPath` or `gpg.*program`, the verdict is "keep: repo config runs programs" and no content-reading command runs.
+The user's global config is trusted.
 
 ## Not covered (disclosed)
 
@@ -111,5 +164,10 @@ locks), within a 15 s budget.
 - **macOS device numbers.** st_dev can change across a reboot. Rows then stop matching: safe, but stranded.
 - **Trust boundary.** It is the same as kill_guard's ledger: careless agents, not a hostile process with the same uid
   that reads the key.
+  - The writer is an importable module, so until command_guard refuses imports of it and writes under `state/checkouts/`,
+    such a process could append a signed row.
+  - macOS lets an owner set a birth time, so a hostile agent could forward-date a moved-in checkout.
+- **Same-URL race.** An unhooked creator that clones the same URL into the same path during the call is attributed to
+  the call.
 - **Forgery protection.** command_guard's `state_files` list should protect `state/checkouts/` against direct writes.
   That is stream B's file, and the rule was handed over.
