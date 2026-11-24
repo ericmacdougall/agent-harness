@@ -52,7 +52,9 @@ ALLOW = {
     'regex group alternation then a list operator inside': PRE + '[[ "$tok" =~ ^(a|b)$ || "$v" == x ]] && echo ok',
     'string comparisons with < and >': PRE + '[[ "$v" < b || "$v" > a ]] && echo ok',
     'negated test before a list operator': PRE + '! [[ -z "$v" || -z "$tok" ]] || echo empty',
-    'after then, inside a function and a loop': PRE + 'f() { while [[ -n "$v" || -n "$tok" ]]; do break; done; }; f',
+    'inside a function body': PRE + 'f() { [[ -n "$tok" || "$v" == x ]] && echo ok; }; f',
+    'in a loop condition': PRE + 'while [[ -n "$tok" || "$v" == x ]]; do break; done',
+    'after time': PRE + 'time [[ -n "$tok" || "$v" == x ]]',
     'case arms around it': PRE + 'case "$1" in a) [[ -n "$v" || -n "$tok" ]] && shift ;; *) exit 64 ;; esac',
     'closed bracket then a real list operator': PRE + '[[ -n "$v" || -n "$tok" ]] || { echo missing; exit 64; }',
 }
@@ -212,6 +214,15 @@ class ShellOracle(unittest.TestCase):
                 out, files = self.run_shell(shell, form)
                 self.assertNotIn('RAN', out, (shell, form))
                 self.assertEqual(files, [], (shell, form))
+
+    def test_a_bracket_out_of_command_position_is_not_the_keyword_in_bash(self):
+        # the parser keeps the split reading for these, because bash runs the word after `||`
+        for form in ('>/dev/null [[ a || marker ]]', 'command [[ a || marker ]]', 'X=1 [[ a || marker ]]',
+                     '"[[" a || marker ]]'):
+            self.assertIn('RAN', self.run_shell(shutil.which('bash'), form)[0], form)
+        # and these are the keyword: the word after `||` is an operand
+        for form in ('time [[ a || marker ]]', 'f() { [[ -n a || marker ]]; }; f', '! [[ a == b || marker ]]'):
+            self.assertNotIn('RAN', self.run_shell(shutil.which('bash'), form)[0], form)
 
     def test_substitutions_inside_run_and_list_operators_outside_run(self):
         for shell in self.shells():

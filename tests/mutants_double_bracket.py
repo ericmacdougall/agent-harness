@@ -25,8 +25,9 @@ MUTANTS = {
         'at_start = kind == \'w\' and not val.quoted and val.text in RESERVED'),
     'a closing parenthesis leads': ("at_start = val != ')' or (", "at_start = True or ("),
     'a function body does not lead': ("at_start = val != ')' or (len(out) >= 3", "at_start = val != ')' or (False"),
-    'a redirection keeps the position': ("                at_start = at_start and kind == 'w' and",
-                                         "                at_start = at_start and kind in ('w', 'redir') and"),
+    'a redirection keeps the position': (
+        "                at_start = at_start and kind == 'w' and not val.quoted and val.text in _LEAD_WORDS",
+        "                at_start = at_start and (kind == 'redir' or (not val.quoted and val.text in _LEAD_WORDS))"),
     'a quoted bracket is folded': ('    return not word.quoted and word.raw == text', '    return word.text == text'),
     'an unterminated bracket is folded': ('    return len(tokens), False',
                                           '    return (len(tokens) - 1, True) if len(tokens) > i else (len(tokens), False)'),
