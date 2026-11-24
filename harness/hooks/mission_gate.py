@@ -175,6 +175,34 @@ def chat_send_stamps(cmd: str) -> list:
     return out
 
 
+def chat_allow_stamps(cmd: str) -> list:
+    """[stamp parts] for each `ah chat allow --with ID --org ID --name N --source S` this Bash line runs at command position
+    (goodqa#16399): bound to the id, the org, the name and the SHA-256 of the exact source text. --list, a computed word and an unparsable line get none."""
+    import contextlib  # noqa: PLC0415
+    import io  # noqa: PLC0415
+    try:
+        import ah  # noqa: PLC0415
+        import ah_chat_send  # noqa: PLC0415
+    except ImportError:
+        return []
+    out = []
+    for words in simple_commands(cmd):
+        argv = mission_argv(words, "ah.py") or mission_argv(words, "ah")
+        if not argv or [str(w) for w in argv[:2]] != ["chat", "allow"] or any(getattr(w, "computed", False) for w in argv):
+            continue
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                args = ah.build_parser().parse_args([str(w) for w in argv])
+        except (SystemExit, Exception):  # noqa: BLE001 - a refusal or --help mints nothing
+            continue
+        if getattr(args, "list_only", True):
+            continue
+        parts = ah_chat_send.allow_parts(args.with_user, args.org, args.name, args.source)
+        if parts:
+            out.append(parts)
+    return out
+
+
 def stamps_for(cmd: str) -> list:
     """[(subcommand, argv key)] for each main-only mission_coverage.py command this Bash line runs. The key is
     mission_coverage.argv_key of the exact argument list, so the stamp covers that command and nothing else."""
@@ -221,6 +249,11 @@ def cmd_pretool(payload: dict) -> dict:
         import ah_chat_send  # noqa: PLC0415
         for parts in chat_send_stamps(cmd)[:3]:
             caller_identity.put_stamp(ah_chat_send.STAMP, parts, session=session, home=home_dir(),
+                                      tool_use_id=tool_use_id, transcript=str(payload.get("transcript_path") or ""))
+    if "chat" in cmd and "allow" in cmd:
+        import ah_chat_send  # noqa: PLC0415
+        for parts in chat_allow_stamps(cmd)[:1]:
+            caller_identity.put_stamp(ah_chat_send.ALLOW_STAMP, parts, session=session, home=home_dir(),
                                       tool_use_id=tool_use_id, transcript=str(payload.get("transcript_path") or ""))
     if "ahc" in cmd:
         try:

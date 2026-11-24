@@ -3563,11 +3563,18 @@ def build_parser():
     cs = chs.add_parser("send", help="send one short direct message as the user's bot (main agent only; never retried)")
     cs.add_argument("--base", help="API base; must be the pinned GoodQA base")
     cs.add_argument("--conversation", help="a one-to-one DM conversation id")
-    cs.add_argument("--with", dest="with_user", help="user id, or a member's exact name")
-    cs.add_argument("--org", help="organization id (default: org in browser-defaults.json)")
+    cs.add_argument("--with", dest="with_user", help="the person's user id (never a name)")
+    cs.add_argument("--org", help="organization id (required; the defaults file is not used for a send)")
     cs.add_argument("--text-file", dest="text_file", required=True, help="absolute path to the message text (at most 600 characters)")
     cs.add_argument("--approval-id", dest="approval_id", help="the approval id an earlier send printed, after the user approved it")
     cs.add_argument("--dry-run", action="store_true", help="print exactly what would be sent; reads no token, sends nothing")
+    ca = chs.add_parser("allow", help="add a person to the send allow-list on the user's own words (main agent only), or --list it")
+    ca.add_argument("--with", dest="with_user", help="the person's user id (never a name)")
+    ca.add_argument("--org", help="organization id (required): the entry holds for this org only")
+    ca.add_argument("--name", help="the one word the user's quoted words call this person, e.g. Tisha; the member name must contain it")
+    ca.add_argument("--source", help="user:/uuid:, queue: or answer: source whose verbatim excerpt names the person")
+    ca.add_argument("--list", dest="list_only", action="store_true", help="print the listed user ids; changes nothing")
+    ca.add_argument("--base", help="API base; must be the pinned GoodQA base")
     for name in ("probe", "conversations", "history", "files"):
         c = chs.add_parser(name)
         c.add_argument("--base", help="API base; must be listed in allowedBases of browser-defaults.json")
@@ -3815,6 +3822,9 @@ def run(args, home: Path) -> dict:
                 import ah_chat_send  # noqa: PLC0415
                 return ah_chat_send.send(home, args.conversation, args.with_user, args.org, args.text_file, args.dry_run,
                                          args.base, approval=args.approval_id)
+            if args.sub == "allow":
+                import ah_chat_send  # noqa: PLC0415
+                return ah_chat_send.allow(home, args.with_user, args.org, args.name, args.source, args.base, args.list_only)
             if args.sub == "probe":
                 return ah_chat.probe(args.base, args.token)
             if args.sub == "conversations":
