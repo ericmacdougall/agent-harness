@@ -47,7 +47,8 @@ MUTANTS = {
     "an unparseable line is silent": ("ask_evidence.py", "                        skipped.setdefault(reason, []).append(number)",
                                       "                        pass", "tests/test_ask_evidence.py"),
     "the size cap is not checked": ("ask_evidence.py", "    if info.st_size > limit:", "    if False:", "tests/test_ask_evidence.py"),
-    "an incomplete listing exits 0": ("ask_sweep.py", '    return 2 if result["unread"] else 0', "    return 0", "tests/test_ask_sweep.py"),
+    "an incomplete listing exits 0": ("ask_sweep.py", '    return 2 if result["unread"] or result["incomplete"] else 0',
+                                      '    return 2 if result["incomplete"] else 0', "tests/test_ask_sweep.py"),
     "apply ignores an incomplete listing": ("ask_sweep.py", '            elif result["unread"]:', "            elif False:",
                                             "tests/test_ask_sweep.py"),
     # round 2 F3: a printed close is one provenance accepts
@@ -119,7 +120,7 @@ MUTANTS = {
     "an answer elsewhere ranks as obsolete": ("ask_sweep.py", '        return 0 if evidence.get("human") else 2',
                                               "        return 2", "tests/test_ask_close_contract.py"),
     "answer rows need a user: source": (
-        "ask_sweep.py", "                  and not still_waiting(note, ident) and human(source)):",
+        "ask_sweep.py", '                  and not still_waiting(note, ident) and walk(source)["human"]):',
         '                  and not still_waiting(note, ident) and source.startswith("user:")):',
         "tests/test_ask_close_contract.py"),
     "queue: is not a user turn": ("provenance.py", '"answer": "user", "queue": "user", "pasted": "pasted"',
@@ -153,10 +154,80 @@ MUTANTS = {
                                             "    return None, False", "tests/test_ask_sweep_e2e.py"),
     # not listed: the `#<ask id>` pre-check in _outcome_problem is equivalent to the entry read after it (the same id is
     # refused with the same message, and an unreadable path is refused too), like the FIFO case above
+    #
+    # round 6 (R4 F1/F2, CRITICAL class): "could not tell" is never "no". One variant per cell class of the contract.
+    # provenance: where a walk stops
+    "a pointer that fails is not a stop": (
+        "provenance.py", "    return code not in END_CODES or kind is None or kind in POINTER_KINDS",
+        "    return code not in END_CODES or kind is None", "tests/test_ask_close_contract.py"),
+    "a source that names no kind is not a stop": (
+        "provenance.py", "    return code not in END_CODES or kind is None or kind in POINTER_KINDS",
+        "    return code not in END_CODES or kind in POINTER_KINDS", "tests/test_ask_close_contract.py"),
+    "every code of an origin ends the walk": (
+        "provenance.py", "    return code not in END_CODES or kind is None or kind in POINTER_KINDS",
+        "    return kind is None or kind in POINTER_KINDS", "tests/test_ask_close_contract.py"),
+    "a wal: hop drops the upstream stops": (
+        "provenance.py", '        result["stops"] = list(sub["stops"])  # and every place the walk upstream stopped (#170 round 6)',
+        "        pass", "tests/test_ask_close_contract.py"),
+    "an entry with no source is not a stop": ("provenance.py", '            result["stops"].append("wal-unsourced")',
+                                              "            pass", "tests/test_ask_close_contract.py"),
+    "an unparseable inferred input is not a stop": (
+        "provenance.py", "                if stops_walk(problem.code, item):  # a pointer or kindless input: what it cites is not known",
+        "                if False:", "tests/test_ask_close_contract.py"),
+    "a nested or mc: input is not a stop": (
+        "provenance.py", "                result[\"stops\"].append(code)  # never walked, so what it reaches is not known (#170 round 6)",
+        "                pass", "tests/test_ask_close_contract.py"),
+    "an internal error is not a stop": ("provenance.py", '        result["stops"].append("internal")', "        pass",
+                                        "tests/test_ask_close_contract.py"),
+    # ask_close: the three states and the verdict
+    "trace reads unknown as not human": (
+        "ask_close.py", '    state = "human" if kinds & HUMAN_KINDS else "unknown" if stops else "not-human"',
+        '    state = "human" if kinds & HUMAN_KINDS else "not-human"', "tests/test_ask_close_contract.py"),
+    "the verdict ignores a stopped walk": ("ask_close.py", '        if traced["stops"]:', "        if False:",
+                                           "tests/test_ask_close_contract.py"),
+    "the policy switch turns a stopped walk into a close": (
+        "ask_close.py", '        if traced["stops"]:',
+        '        if traced["stops"] and provenance.load_policy()["wal"].get("ask", "warn") != "off":',
+        "tests/test_ask_close_contract.py"),
+    "outcome evidence that does not resolve passes when the policy is off": (
+        "ask_close.py", '        if mode == "outcome" and not result.get("ok"):', "        if False:",
+        "tests/test_ask_close_contract.py"),
+    "an mc: decision in the tree backs an outcome": (
+        "ask_close.py", '        if mode == "outcome" and traced["kinds"] & BIND_KINDS:', "        if False:",
+        "tests/test_ask_close_contract.py"),
+    "precheck skips wal_note's argument checks": (
+        "ask_close.py", "        problem = wal_note.argument_problem(note, source, reason)", "        problem = None",
+        "tests/test_ask_close_contract.py"),
+    "precheck skips the open-ask check": ("ask_close.py", "        if not wal_note.open_ask_exists(wal, ref):",
+                                          "        if False:", "tests/test_ask_sweep_incomplete.py"),
+    # ask_sweep: ranking, listing and exit
+    "unknown ranks as not human": ("ask_sweep.py", '            traced[source] = {"human": t["maybe_human"],',
+                                   '            traced[source] = {"human": t["state"] == "human",',
+                                   "tests/test_ask_close_contract.py"),
+    "an untraced answer does not come first in its rank": (
+        "ask_sweep.py", '        found.sort(key=lambda e: (rank(e), not e.get("unknown"), not ask_close.is_card(e["source"]),',
+        '        found.sort(key=lambda e: (rank(e), not ask_close.is_card(e["source"]),', "tests/test_ask_close_contract.py"),
+    "an untraced best evidence gets the refusal reason only": ("ask_sweep.py", '    if best.get("unknown"):', "    if False:",
+                                                               "tests/test_ask_close_contract.py"),
+    "incomplete walks are not listed": (
+        "ask_sweep.py", '                            for i in result["evidence"] for e in i["evidence"] if e.get("unknown")]',
+        '                            for i in result["evidence"] for e in i["evidence"] if False]',
+        "tests/test_ask_close_contract.py"),
+    "an incomplete walk exits 0": ("ask_sweep.py", '    return 2 if result["unread"] or result["incomplete"] else 0',
+                                   '    return 2 if result["unread"] else 0', "tests/test_ask_sweep_incomplete.py"),
+    "an answer card skips the precheck": ("ask_sweep.py", '        if verdict["problem"]:\n            result["answered"].remove(item)',
+                                          '        if False:\n            result["answered"].remove(item)',
+                                          "tests/test_ask_close_contract.py"),
+    "a credential answer is printed": ("ask_sweep.py", "            item[\"answer\"] = CREDENTIAL", "            pass",
+                                       "tests/test_ask_close_contract.py"),
+    # not listed: the "tree-too-large" stop in provenance._walk_tree cannot be reached (MAX_RESOLVES caps a tree at
+    # far fewer nodes than its bound), and trace's except branch runs only when provenance cannot be imported or
+    # resolve() raises, which it never does; both fail closed by construction
 }
 REAL_TESTS = ["tests/test_ask_sweep.py", "tests/test_ask_evidence.py", "tests/test_ask_sweep_quoting.py",
               "tests/test_ask_close_outcome.py", "tests/test_ask_sweep_e2e.py", "tests/test_ask_reminders.py",
-              "tests/test_ask_sweep_whole_turn.py", "tests/test_ask_close_contract.py", "tests/test_ops_watch_resolved_asks.py"]
+              "tests/test_ask_sweep_whole_turn.py", "tests/test_ask_close_contract.py", "tests/test_ops_watch_resolved_asks.py",
+              "tests/test_ask_sweep_incomplete.py"]
 
 
 def one(job):
