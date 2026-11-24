@@ -105,6 +105,68 @@ These instructions apply to my local Claude Code sessions. Follow repository ins
 - For user interfaces, test keyboard access, focus behavior, semantic labels, text contrast, and error messages against applicable WCAG guidance. Single-character global shortcuts need a way to turn them off or remap them.
 - Every owner proposes applicable documentation changes with evidence: README, architecture/how it works, contributing and standards, ERD, service or deployment maps, API/OpenAPI/MCP docs, and developer or customer docs. Main agent coordinates updates at merge and verifies all factual claims. Update only documents affected by the change; avoid empty boilerplate.
 
+## Agent self-serve
+
+Mechanics live in `docs/operations.md`, "Agent self-serve"; this is the rule set.
+
+- One user-run command (`ah_enable_self_serve.py --apply`, dry run by default, TTY and typed nonce required) installs a signed policy; nothing an agent can run creates, widens or re-enables it. The signing key is a new purpose-bound key, separate from the central-decisions key, and every signed payload carries a `purpose`.
+- The capability list is closed: `same_harness_fallback_review`, `merge_reviewed_pr`, `harness_repair`, `pool_cleanup`, `install_files_manifest`, `central_decisions_agent_steps`. Unknown keys fail closed, a repo file may only narrow a grant, helper subagents never receive one, and only proven main (Claude) or a Codex Desktop root does. Hard rules 1 to 4, accounts, passwords, payments, CAPTCHA and the gated-tier approval have no capability.
+- The policy library fails to no grant on any error. The hooks fail open on a crash, so the library must never turn a crash into a grant.
+- Same-harness fallback review applies only to a settled exact-HEAD PASS with a QUOTA or AUTH receipt for the other harness bound to the same repo, PR, head and packet, a reviewer one rung up in a fresh worktree, no findings, green checks and no denylisted path. The merge carries `SAME_HARNESS_FALLBACK` and the receipt id, and a cross-harness re-review ticket is filed in the same run.
+- Parity: the enabler refuses, and `ah ops doctor` reports, any installed hook that differs from the blob on the tip of canonical main, on the Mac and t2-dev, any fail-closed guard not registered as the installer writes it, and (for the enabler) any Codex hook Codex will skip. A comparison that compared nothing and an unreachable host are never clean for the enabler (unknown, no local fallback). The enabler compares the tip of main or the one SHA the user typed on its own command line (an ancestor of main); the doctor's `--ref` is doctor-only and `verify-parity` has no `--ref`. The doctor never writes `trusted_hash`: the `/hooks` click stays the user's. An importable file in neither the manifest nor the repo is only a named WARN. CLEAN is bytes and user-level registrations, not proof that a session runs every guard.
+- `ah ops doctor --probe` runs one allow-listed recipe in dry run after checking for the exact allow rule and for deny or ask rules that shadow it; PASS means "rule present and recipe runs" and the fresh-session no-prompt check is the click-test's. A denial is reported as a limitation plus a P0 ticket and is never retried by another route.
+- Rollback: `ah_enable_self_serve.py --undo`, or the kill-switch file `~/.agent-harness/policy/disabled`, which refuses every capability at once.
+
+### Supervisor power
+
+Source: the user, relayed by main on 2026-11-24 (goodqa#16944): "make a way for an agent to request supervisor power from me, record i granted it, and then its able to do these things", and "a supervisor agent must be sol,opus,fable or astra". Code: `harness/hooks/supervisor_grant.py`.
+
+- **Two powers only.** `merge` and `delete` are the only powers there are.
+  - A merge ok means only that the user need not be asked each time. merge_gate still requires the review of record.
+  - `delete` covers worktrees, clones and branches the session or its agents created, build output and scratch. Uncommitted and unpushed work in those worktrees can be lost.
+- **Request.** Main asks with one plain foreground command:
+
+  `ah supervisor request --project owner/repo:host[,host] --power merge|delete --reason TEXT [--include-subagents] [--user-source SRC]`
+
+  - Main's hook stamps that exact command. A sub-agent's call gets no stamp, so it cannot request.
+  - The session and the model come from the transcript record of that one call. That record's command must be exactly
+    one plain `ah supervisor request ...` simple command (no list, pipe, wrapper or computed word).
+  - The request file is only a pointer to that call. At grant time every field the user sees and signs (projects,
+    powers, sub-agents, reason, user source, model) is computed again from the recorded command; any edited field is
+    refused. The evidence and reason checks run again, the age comes from the record's own time, and one call can be
+    granted once.
+  - Projects are named one by one; a wildcard is refused. Each project must appear in the session's own WAL or brief.
+  - A request grants nothing.
+- **Grant.** The user runs `ah_enable_self_serve.py --grant-supervisor <rid>` in his own terminal.
+  - It runs the enabler's human checks.
+  - He can only remove what was requested.
+  - The expiry is 8 hours by default. "until revoked" applies only when he types those words.
+  - He then reads the summary and types the dialog code.
+  - The grant is signed with the self-serve key under its own domain.
+- **Check at every use.** Consuming guards call `supervisor_grant.check(payload, power, project, host=, target=)` with their own hook payload. It re-verifies:
+  - the signature, the session, the sub-agent rule, the project, the host and the power;
+  - the expiry, revocation and the kill switch;
+  - the model of the call being checked, read from its own transcript record. The whole transcript is searched, so
+    padding cannot push the record out of view. Only Sol, Opus, Fable and Astra qualify. An unknown model, or a
+    duplicated record, is refused.
+  - Only the client writes transcripts: the command guard's `transcript-forgery` rule refuses shell writes, and
+    `transcript_guard.py` (PreToolUse on Write, Edit, MultiEdit and NotebookEdit) refuses file-tool writes under
+    `~/.claude/projects` and `~/.claude/transcripts`, except notes under `projects/<dir>/memory/`. A script that
+    computes the path at run time is outside both guards, the same-user limit self_serve states.
+
+  Delete targets are never covered when they reach a log, WAL, transcript, session, state, policy or guard location.
+  The list is the delete guard's own (`command_guard.load_policy()`: its Tier A roots, guard files and WAL rules) plus
+  `~/.agent-harness/logs`, `policy`, `private`, `state`, `bin`, `~/.claude/hooks`, the settings files and `~/.codex`.
+  Inside a harness tree only the guard's scratch subtrees and `~/.agent-harness/work/<session>/<task>/...` can be
+  deleted, and an existing local folder is read first and refused when it holds any of those. The default, release
+  and tag refs, and yates, apex_app_pos and OptinRouter, are never covered either.
+- **Revoke and status.** `ah supervisor revoke <gid>|all` works for anyone. It appends a row to
+  `~/.agent-harness/policy/supervisor/revocations.jsonl`, which nothing rewrites. `revoke all` revokes every grant
+  issued up to that moment, so a later grant works. If that log exists but cannot be read safely (not a private
+  regular file, oversized, a malformed or torn row), every grant counts as revoked, and `ah supervisor status` says
+  why. `ah supervisor status` shows every grant, and the session-start line says when a grant is live.
+- **What it never touches.** Rules 1 to 4, permission prompts and modes, guard installs, and the separate Fable and Astra per-task approval are unaffected.
+
 ## Completion
 
 For fast-path fixes, finish after the direct edit, focused verification, diff self-review, and WAL result. Report the changed file and check. For substantive work, do not tell me it is done until the owner reports, peer review is signed off or explicitly unavailable, relevant tests and click testing pass or limitations are disclosed, the main agent has checked the diff against scope, WAL and docs are current, and verified work is integrated into the original checkout or a concrete local blocker is reported. A draft PR awaiting authorized remote merge is `PR_READY`, not delivered. Report what changed, exact verification, original-checkout HEAD, feature push/PR status, how to run and watch it, and remaining risks. A remote publication failure does not stop local verification or guarded local-only delivery.

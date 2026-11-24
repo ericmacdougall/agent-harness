@@ -17,7 +17,7 @@ try:
 except ModuleNotFoundError:  # Codex installer requires Python 3.11+.
     tomllib = None
 
-from install import (DirectoryPins, local_profile_status, migrate_local_profiles, netwatch_status, atomic_write, git_hook_status, markdown_marker_lines, read_regular,
+from install import (DirectoryPins, install_enabler_bin, local_profile_status, migrate_local_profiles, netwatch_status, atomic_write, git_hook_status, markdown_marker_lines, read_regular,
                      safe_unlink)
 
 
@@ -48,6 +48,7 @@ DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report
                     'shell_words.py',  # the shell reader merge_gate and copy_hygiene share (goodqa#16811)
                     # Dropped-owner gate on Codex Stop and its reads (goodqa#14791 P18)
                     'dropped_gate.py', 'ah.py', 'ah_worktree.py', 'ah_install.py', 'guard_selftest.py', 'liveness.py',
+                    'self_serve.py', 'ah_ops.py', 'ah_parity.py',  # self-serve policy, recipes and parity (goodqa#16757)
                     # ah export and ah status: status_report imports goals_view (goodqa#15788)
                     'ah_export.py', 'goals_view.py',
                     # goals_view imports mission_coverage at load; spec_flow and others import these lazily
@@ -452,6 +453,7 @@ def main() -> None:
     for path in changes:
         print(f'  {path}')
     print(f'  {install_git_backstop(args.home, args.apply)}')
+    print(f'  {install_enabler_bin(args.home, args.apply)}')
     if args.hooks_only:
         print('  AGENTS.md, hooks.json and config.toml: not touched (--hooks-only)')
         return

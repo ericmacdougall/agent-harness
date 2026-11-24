@@ -1,0 +1,8 @@
+{
+  "schema": "supervisor-policy/1",
+  "source": "user rule relayed by main, 2026-11-24: \"a supervisor agent must be sol,opus,fable or astra.. sonnet terra and luna haiku etc are not qualified to be granted supervisor power\"",
+  "qualified": {"claude": ["opus", "fable"], "openai": ["sol", "astra"]},
+  "hosts": {"mac": {"darwin": true, "names": []}, "ah-mac-mini": {"darwin": true, "names": ["ah-mac-mini"]},
+            "t2-dev": {"darwin": false, "names": ["t2-dev"]}},
+  "never_covered_names": ["yates", "apex_app_pos", "optinrouter"]
+}
