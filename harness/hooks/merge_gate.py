@@ -82,6 +82,7 @@ STAMP_TTL_SECONDS = 120
 WAIVER_FILE = "merge-gate-waivers.jsonl"
 WAIVER_HEAD_FILE = "merge-gate-waivers.head"
 AUDIT_FILE = "merge-gate-audit.jsonl"
+REVIEW_NOTES_FILE = "merge-gate-review-notes.jsonl"  # advisory only: never read as authority (goodqa#17129)
 APPROVALS_DIR = "merge-gate-approvals"
 LOCK_FILE = "merge-gate.lock"
 ZERO = "0" * 64
@@ -109,7 +110,7 @@ WRAPPER_WORDS = {"env", "command", "sudo", "time", "nohup", "nice", "exec", "bui
 MERGE_HINT = re.compile(r"\bgh\b|merge|pulls|graphql|api\.github", re.I)
 DYNAMIC_WORD = re.compile(r"^(?:\$|\$\w+|\$\{[^}]*\}\w*)$")  # a command word that is only a variable or substitution
 GH_HINT = re.compile(r"\bgh\b|merge|curl|wget|\bhttps?\b|python|node|perl|ruby|ssh|eval|graphql|pulls|api\.github", re.I)
-STATE_NAMES = re.compile(r"merge-gate[-/](?:waivers|audit|approvals)|main-stamps", re.I)
+STATE_NAMES = re.compile(r"merge-gate[-/](?:waivers|audit|approvals|review-notes)|main-stamps", re.I)
 # #134 red-team P2: the peer_review run that mints a merge authorization (pr stage with a GitHub binding)
 # any option order (B2): `peer_review.py --github-repo o/r --pr 5 pr ...` binds as well
 PEER_REVIEW_AUTH = re.compile(r"peer_review(?:\.py)?\b[^\n;&|]*\s--(?:github-repo|pr)\b")
@@ -1525,6 +1526,9 @@ def evaluate_merge(merge, client, state_dir, now, command_hash):
             # needs positive evidence instead: an exact-head waiver, or the one a bound PR review authorization writes
             soft.append("GitHub CI is switched off for this repository, so no check ran on this head; the merge needs "
                         "an exact-head waiver or a PR review authorization (peer_review.py pr --github-repo --pr)")
+            note = review_refusal_note(state_dir, info["repo"], info["pr"], info["head"])
+            if note:
+                soft.append("the latest PR review of this head did not authorize the merge: " + note)
         if merge.kind != "check":
             if merge.head_unknown or not merge.head_vals:
                 hard.append(f"the merge must carry the verified head: add {merge.binding.replace('<full head sha>', details['head'])}")
@@ -1671,7 +1675,7 @@ def add_waiver(state_dir, repo, pr, head, ticket, reason, approved_by, source="a
     return record
 
 
-def pr_pass_evidence(evidence, *, with_base=False):
+def pr_pass_evidence(evidence, *, with_base=False, same_harness=True):
     """The (repo, pr, head, report_sha256) binding of settled, independent, pure PR PASS evidence, or ValueError.
     With with_base=True it is (repo, pr, head, report_sha256, snapshot_base), where snapshot_base is the reviewer's
     validated snapshot base B_r (goodqa#16049 spec ahc-m1-v2g, main's ruling). A receipt without snapshot_base is
@@ -1691,6 +1695,13 @@ def pr_pass_evidence(evidence, *, with_base=False):
         raise ValueError('merge authorization needs typed PR review FINAL evidence')
     usage_guard.validate_review_metadata(review, result=evidence.get('result'))
     usage = evidence.get('usage') if isinstance(evidence.get('usage'), dict) else {}
+    # goodqa#17129: one decision with peer_review's own check (model_tiers.review_independence); the ahc daemon
+    # passes same_harness=False and stays cross-vendor only.
+    import model_tiers
+    not_independent = model_tiers.review_independence(review, usage.get('review_routing'), evidence.get('run_id'),
+                                                      allow_same_harness=same_harness)
+    if not_independent:
+        raise ValueError('PASS not merge-eligible: ' + not_independent)
     reviewer = review.get('reviewer', '')
     reviewer_harness = review.get('reviewer_harness')
     expected_prefix = {'openai': 'Codex ', 'claude': 'Claude '}.get(reviewer_harness)
@@ -1706,7 +1717,6 @@ def pr_pass_evidence(evidence, *, with_base=False):
             or subject.get('head') != review['head']
             or review.get('author_harness') not in {'claude', 'openai'}
             or reviewer_harness not in {'claude', 'openai'}
-            or reviewer_harness == review['author_harness']
             or not expected_prefix or not isinstance(reviewer, str) or not reviewer.startswith(expected_prefix)
             or type(usage.get('provider_launches')) is not int or usage['provider_launches'] < 1):
         raise ValueError('FINAL is not settled independent pure PR PASS evidence')
@@ -1747,7 +1757,7 @@ def ahc_bound_pass(evidence, binding):
     default branch, outside the PR's diff); and the author-harness derivation that excludes ahc's own update-branch
     commits (parked with the held W21 work). Pure: it reads its arguments and writes nothing.
     """
-    repo, pr, reviewed, report, snapshot_base = pr_pass_evidence(evidence, with_base=True)
+    repo, pr, reviewed, report, snapshot_base = pr_pass_evidence(evidence, with_base=True, same_harness=False)
     if not isinstance(binding, dict):
         raise ValueError('ahc binding needs the item record and its readbacks')
     head, base = binding.get('head'), binding.get('base')
@@ -1818,6 +1828,41 @@ def add_review_waiver(state_dir, reference, *, store=None, now=None):
     finally:
         _unlock(lock)
     return record
+
+
+def note_review_refusal(state_dir, repo, pr, head, reason):
+    """Advisory only (goodqa#17129): why the latest PASS of this exact head did not authorize a merge. It is shown in
+    the gate's refusal and never counts as evidence of anything; a failed write loses only the hint."""
+    state_dir = Path(state_dir)
+    state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    line = json.dumps({"repo": str(repo).lower(), "pr": pr, "head": head, "reason": clean(str(reason), 200),
+                       "ts": time.time()}, sort_keys=True).encode("utf-8") + b"\n"
+    path = state_dir / REVIEW_NOTES_FILE
+    if path.exists() and path.stat().st_size > 256 * 1024:
+        os.replace(str(path), str(state_dir / (REVIEW_NOTES_FILE + ".1")))
+    fd = os.open(str(path), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        os.write(fd, line)
+    finally:
+        os.close(fd)
+
+
+def review_refusal_note(state_dir, repo, pr, head):
+    """The newest advisory reason for this repo, PR and exact head, or None. Never raises."""
+    try:
+        data = safe_input.read_bounded(str(Path(state_dir) / REVIEW_NOTES_FILE), 512 * 1024)
+    except (safe_input.InputRejected, OSError):
+        return None
+    found = None
+    for raw in data.splitlines():
+        try:
+            row = json.loads(raw.decode("utf-8"))
+        except ValueError:
+            continue
+        if (isinstance(row, dict) and row.get("head") == head and row.get("pr") == pr
+                and repo_key(row.get("repo")) == repo_key(repo) and isinstance(row.get("reason"), str)):
+            found = clean(row["reason"], 200)
+    return ("PASS not merge-eligible: " + found) if found else None
 
 
 def consume_waiver(state_dir, repo, pr, head, command_hash, now=None, review_ok=True):

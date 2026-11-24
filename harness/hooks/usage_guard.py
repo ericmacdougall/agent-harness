@@ -1250,7 +1250,8 @@ class UsageStore:
 
 TICKETED_CATEGORIES = {'correctness', 'reliability', 'performance', 'maintainability', 'testing', 'documentation', 'ux'}
 REVIEW_METADATA_KEYS = {'stage', 'verdict', 'findings', 'report_sha256', 'head', 'repo', 'pr', 'ticketed',
-                        'reviewer', 'reviewer_harness', 'author_harness', 'snapshot_base'}
+                        'reviewer', 'reviewer_harness', 'author_harness', 'snapshot_base',
+                        'author_rung', 'reviewer_rung', 'primary_unavailable'}
 REVIEWER_IDENTITY_KEYS = {'reviewer', 'reviewer_harness', 'author_harness'}
 TICKETED_RECORD_KEYS = {'state', 'finding', 'category', 'ticket', 'head', 'report_sha256'}
 
@@ -1294,6 +1295,21 @@ def validate_review_metadata(review, *, result):
                 or review.get('author_harness') not in {'claude', 'openai', 'unknown'}):
             raise GuardError('INVALID_OUTPUT', 'Review author and actual reviewer identity are malformed')
         safe_text(review['reviewer'], maximum=160)
+    for key in ('author_rung', 'reviewer_rung'):
+        if key in review and (review['stage'] != 'PR' or not isinstance(review[key], str)
+                              or not re.fullmatch(r'R[0-9]{1,2}', review[key])):
+            raise GuardError('INVALID_OUTPUT', 'Review rung binding is malformed')
+    if 'primary_unavailable' in review:
+        # goodqa#17129: the run's own record that its cross-harness primary was down; checked by
+        # model_tiers.review_independence, which also binds run_id to the FINAL it rides in.
+        record = review['primary_unavailable']
+        if (review['stage'] != 'PR' or not isinstance(record, dict)
+                or set(record) != {'run_id', 'provider', 'reason', 'basis'}
+                or not isinstance(record['run_id'], str) or not re.fullmatch(r'[0-9a-f]{32}', record['run_id'])
+                or record['provider'] not in {'codex', 'claude', 'kimi'}
+                or record['reason'] not in {'QUOTA', 'AUTH', 'TRANSIENT_INFRA'}
+                or record['basis'] not in {'structured', 'prose'}):
+            raise GuardError('INVALID_OUTPUT', 'Review primary-outage record is malformed')
     ticketed = review.get('ticketed', [])
     if not isinstance(ticketed, list) or len(ticketed) > 128:
         raise GuardError('INVALID_OUTPUT', 'Ticketed review records are malformed')

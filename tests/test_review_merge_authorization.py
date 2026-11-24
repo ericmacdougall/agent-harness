@@ -722,7 +722,10 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Reviewer: Claude", output.read_text())
         self.assertNotIn("Merge authorization:", result.stdout)
-        self.assertFalse((self.root / ".agent-harness" / "state").exists())
+        state = self.root / ".agent-harness" / "state"
+        # goodqa#17129: no authorization is minted (only the advisory reason note may exist), and the reason is shown
+        self.assertFalse((state / mg.WAIVER_FILE).exists())
+        self.assertIn("PASS not merge-eligible: no main-agent stamp", result.stderr)
 
 
     def run_review(self, *extra):
