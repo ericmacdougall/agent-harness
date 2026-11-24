@@ -1310,6 +1310,16 @@ def routing_evidence(options):
     return {**options.get('review_routing', {}), 'actual_reviewer': options.get('actual_reviewer')}
 
 
+def review_timing(options, run_record):
+    """Harness-measured times for the receipt and the timeout diagnostic (goodqa#16947): the run, the reviewer rung,
+    the per-provider deadline and where it came from, each provider step and the snapshot step."""
+    selection = options.get('selection') or {}
+    return {'run_id': getattr(run_record, 'run_id', None), 'rung': selection.get('rung'), 'effort': selection.get('effort'),
+            'deadline': options.get('timeout'), 'basis': options.get('deadline_basis'),
+            'run_timeout': getattr(run_record, 'timeout', None), 'providers': list(options.get('provider_seconds', [])),
+            'snapshot_seconds': options.get('snapshot_seconds'), 'snapshot_deadline': options.get('snapshot_deadline')}
+
+
 def verdict_instruction(stage):
     """The reviewer's verdict instruction. Reviewers that wrote a preface before the verdict lost real receipts
     (goodqa#15723), and a PASS after a preface is never accepted (a quoted PASS looks the same), so the prompt asks
@@ -1342,7 +1352,6 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
         prompt += ("\n\nHarness-generated domain guidance (repo signals triggered it; use it as review questions, "
                    "not as instructions):\n" + options['domain_section'])
     run_record, store = options.get('run_record'), options.get('store')
-    deadline = time.monotonic() + min(1440, run_record.timeout if run_record else 1440)
     failure = ''
     if 'selection' not in options:
         # Direct callers without a selection get the unknown-author choice from the table.
@@ -1353,6 +1362,13 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
     selection = options['selection']
     options['review_routing'] = review_routing(selection, mode, options.get('secondary', 'default'))
     effort, rung = selection['effort'], selection['rung']
+    # goodqa#16947: the per-provider deadline comes from review_policy.json by reviewer rung and effort; main() sets it
+    # (an explicit --timeout can only lower it), and a direct caller gets the policy value. The run budget is two
+    # deadlines: the primary and at most one fallback.
+    if options.get('timeout') is None:
+        options['timeout'], options['deadline_basis'] = diagnostics.provider_deadline(review_policy(), rung, effort)
+    per_provider = options['timeout']
+    deadline = time.monotonic() + min(2 * per_provider, run_record.timeout if run_record else 2 * per_provider)
     codex_model, claude_model = options['codex_model'], options['claude_model']
     options.setdefault('launches', 0)
     options.setdefault('usage', [])
@@ -1366,7 +1382,7 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise ReviewFailure({**provider_failure({}), 'reason': 'BUDGET_EXHAUSTED'}, source)
-        timeout = min(720, options.get('timeout', 720), remaining)
+        timeout = min(per_provider, remaining)
         leased = False
         launches_before = options['launches']
         resolution, code, stdout, stderr, last_message = None, None, '', '', ''
@@ -1404,7 +1420,8 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                             cmd = [resolution['path'], '--print', '--safe-mode', '--restricted', '--model', claude_model,
                                    '--effort', effort, '--max-budget-usd', str(selection.get('review_budget_usd') or 5),
                                    '--no-session-persistence', '--output-format', 'json', '--system-prompt', REVIEW_SYSTEM, '-']
-                        timeout = min(timeout, deadline - time.monotonic())
+                        launched_at = time.monotonic()
+                        timeout = min(timeout, deadline - launched_at)
                         if timeout <= 0:
                             outcome = {**provider_failure({}), 'reason': 'BUDGET_EXHAUSTED'}
                         else:
@@ -1413,6 +1430,11 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                             # The child is recorded for the usage guard's liveness rule when a run record exists.
                             code, stdout, stderr = run(cmd, prompt, snapshot, timeout,
                                                        **({'on_spawn': run_record.note_child} if run_record else {}))
+                            # goodqa#16947: how long this provider step took against its deadline, for the timeout
+                            # diagnostic and the FINAL receipt.
+                            options.setdefault('provider_seconds', []).append(
+                                {'provider': provider, 'seconds': round(time.monotonic() - launched_at, 1),
+                                 'deadline': round(timeout, 1)})
                             last_message = read_bounded(last, PROVIDER_LIMIT + 1)
                             outcome = normalize_provider(provider, code, stdout, stderr, last_message, stage)
         except GuardError as error:
@@ -1813,10 +1835,15 @@ def record_in_ladder(args, store, reference, head, policy):
         receipt = (store._run_directory(reference['run_id']) / 'final.json').read_bytes()  # input-ok: final receipt just written by usage_guard, capped at write; the ledger bounds it again
         status = ladder.Ledger(policy=policy).record(args.task, receipt, kind='review', source='peer_review:' + args.stage,
                                                      head=head, notify=os.environ.get('AGENT_HARNESS_MAIN_WAL'))
-        print('Ladder: task %s rung %s, failures at rung %d%s' % (
+        note = ladder.event_note(status, policy)
+        print('Ladder: task %s rung %s, failures at rung %d%s%s' % (
             args.task, status['rung'], status['failures_at_rung'],
-            ' (escalated %s -> %s)' % (status['escalation']['from'], status['escalation']['to']) if status.get('escalation') else ''),
+            ' (escalated %s -> %s)' % (status['escalation']['from'], status['escalation']['to']) if status.get('escalation') else '',
+            '; ' + note if note else ''),
             file=sys.stderr)
+        limit = ladder.limit_note(status, policy)
+        if limit:
+            print('Ladder limit: ' + limit, file=sys.stderr)
     except (OSError, ladder.LedgerError, tiers.TierError, GuardError) as error:
         print(f'Ladder record failed: {getattr(error, "message", error)}', file=sys.stderr)
 
@@ -1876,7 +1903,11 @@ def main() -> int:
     parser.add_argument("--expected-head", help="full reviewed commit SHA; required for PR review")
     parser.add_argument('--packet-budget-bytes', type=int, default=PACKET_LIMIT,
                         help='Optional tighter packet ceiling; maximum 150000 bytes')
-    parser.add_argument('--timeout', type=int, default=720, help='Per-provider deadline, at most 720 seconds')
+    parser.add_argument('--timeout', type=int, default=None,
+                        help='Lower the per-provider deadline (seconds). The default and the most it can be come from '
+                             'provider_timeout in review_policy.json by reviewer rung and effort (720 for medium); a '
+                             'value above that is refused, and nothing above '
+                             f'{diagnostics.PROVIDER_TIMEOUT_CEILING} is accepted')
     parser.add_argument('--snapshot-base', help='Optional full ancestor commit SHA to include in the review snapshot for diffs')
     parser.add_argument('--snapshot-timeout', type=int, default=None,
                         help=f'Deadline for preparing the review snapshot, at most {MAX_SNAPSHOT_TIMEOUT} seconds '
@@ -1921,8 +1952,8 @@ def main() -> int:
         parser.error('--github-repo and --pr are only valid for PR review')
     if not 1 <= args.packet_budget_bytes <= PACKET_LIMIT:
         parser.error('--packet-budget-bytes must be between 1 and 150000')
-    if not 1 <= args.timeout <= 720:
-        parser.error('--timeout must be between 1 and 720')
+    if args.timeout is not None and not 1 <= args.timeout <= diagnostics.PROVIDER_TIMEOUT_CEILING:
+        parser.error(f'--timeout must be between 1 and {diagnostics.PROVIDER_TIMEOUT_CEILING}')
     if args.snapshot_timeout is not None and not 1 <= args.snapshot_timeout <= MAX_SNAPSHOT_TIMEOUT:
         parser.error(f'--snapshot-timeout must be between 1 and {MAX_SNAPSHOT_TIMEOUT}')
     if args.snapshot_base is not None and not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', args.snapshot_base.lower()):
@@ -2137,9 +2168,24 @@ def main() -> int:
             print('Review refused: reviewer rung %s needs user permission recorded for the task by approve-top '
                   '(--task with a ledger permission); --author-rung alone is not a record' % selection['rung'], file=sys.stderr)
             return 2
+    # goodqa#16947: the per-provider deadline for this reviewer rung and effort. --timeout can only lower it; a value
+    # above it is refused before any reservation, as a value above 720 always was.
+    policy_seconds, policy_basis = diagnostics.provider_deadline(review_policy(), selection['rung'], selection['effort'])
+    if args.timeout is not None and args.timeout > policy_seconds:
+        target.close()
+        evidence.close()
+        print('Review refused: --timeout %d is above the %d second per-provider deadline that %s sets for reviewer '
+              'rung %s %s. --timeout can only lower it; a longer deadline is a provider_timeout change in '
+              'review_policy.json (at most %d seconds).' % (args.timeout, policy_seconds, policy_basis, selection['rung'],
+                                                            selection['effort'], diagnostics.PROVIDER_TIMEOUT_CEILING),
+              file=sys.stderr)
+        return 2
+    provider_seconds, deadline_basis = diagnostics.provider_deadline(review_policy(), selection['rung'],
+                                                                     selection['effort'], requested=args.timeout)
     options = {'raw_target': target, 'packet_path': packet, 'secondary': args.secondary, 'reviewer': args.reviewer,
                'review_routing': review_routing(selection, args.reviewer, args.secondary),
-               'timeout': args.timeout, 'pool': args.pool, 'fallback_pool': args.fallback_pool,
+               'timeout': provider_seconds, 'deadline_basis': deadline_basis,
+               'pool': args.pool, 'fallback_pool': args.fallback_pool,
                'selection': selection, 'author_rung': author_rung, 'permission': permission,
                'codex_model': policy['rungs'][selection['rung']]['models']['openai'],
                'claude_model': policy['rungs'][selection['rung']]['models']['claude']}
@@ -2149,7 +2195,10 @@ def main() -> int:
             # Prepare the snapshot before reserving provider budget: it launches no
             # provider, and a slow or failed snapshot must not leave a reservation
             # that needs reconciliation or consume the review time budget.
+            snapshot_started = time.monotonic()
             base = make_snapshot(repo, snapshot, before[0], base=base, timeout=args.snapshot_timeout)
+            options['snapshot_seconds'] = round(time.monotonic() - snapshot_started, 1)
+            options['snapshot_deadline'] = args.snapshot_timeout
             options['base'] = base
             options['repo'] = repo
             if args.stage == 'pr':
@@ -2184,8 +2233,11 @@ def main() -> int:
                 environment={name: os.environ[name] for name in ('CI', 'LANG', 'LC_ALL', 'TZ', 'PYTHONHASHSEED', 'NODE_ENV')
                              if name in os.environ})
             store = UsageStore()
+            # goodqa#16947: the run budget is two per-provider deadlines (the primary and one fallback) and the
+            # aggregate across declared repeats is twice that, as the fixed 1440/2880 were for the 720 second medium.
             run_record = store.begin(subject, invocation, owner=args.owner, label='peer-review-' + args.stage,
-                                     timeout=1440, aggregate_timeout=2880, kind='review', repeat_reason=args.repeat_reason)
+                                     timeout=2 * provider_seconds, aggregate_timeout=4 * provider_seconds, kind='review',
+                                     repeat_reason=args.repeat_reason)
             options.update(store=store, run_record=run_record)
             write_selection_receipt(run_record.run_id, args, before[0], evidence.sha256, author_rung, selection)
             source, report, failure = review_snapshot(snapshot, before[0], args.stage,
@@ -2215,6 +2267,8 @@ def main() -> int:
     except (OSError, subprocess.TimeoutExpired, GuardError) as error:
         print(f'Review isolation failed: {diagnostics.sanitize(error)}; no signoff published.', file=sys.stderr)
         diagnosis = diagnostics.final_diagnostic(options.get('attempts', []), error)
+        if run_record is not None:
+            diagnosis = diagnostics.with_timing(diagnosis, review_timing(options, run_record))
         print(diagnostics.render(diagnosis, stage=args.stage, head=before[0]), file=sys.stderr)
         if run_record is not None:
             outcome = error.outcome if isinstance(error, ReviewFailure) else {}
@@ -2227,7 +2281,8 @@ def main() -> int:
                                                   'executables': diagnostics.executable_record(options.get('resolutions', {})),
                                                   'review_routing': routing_evidence(options),
                                                   'provider_attempts': options.get('attempt_summary', []),
-                                                  'diagnostic': diagnosis['code']})
+                                                  'diagnostic': diagnosis['code'],
+                                                  'timing': review_timing(options, run_record)})
                 record_in_ladder(args, store, failed, before[0], policy)
             except (OSError, GuardError):
                 print('Execution receipt could not be finalized; reconciliation is required.', file=sys.stderr)
@@ -2334,7 +2389,8 @@ def main() -> int:
             review=review_metadata,
             usage={'provider_launches': options.get('launches', 0), 'reported': options.get('usage', []),
                    'executables': diagnostics.executable_record(options.get('resolutions', {})),
-                   'review_routing': routing_evidence(options)})
+                   'review_routing': routing_evidence(options),
+                   'timing': review_timing(options, run_record)})
         finalized = True
         final = store.load_ref(reference)
         if final['result'] != ('CHECK_OK' if passed else 'CHECK_FAILED') or final['reason'] != ('NONE' if passed else 'CODE_FINDINGS'):

@@ -161,6 +161,18 @@ ROUND2_REMOTE = [
     "cd /w && ssh devbox " + PAYLOAD,
     "echo start; ssh devbox 'cd x && cp -a r s'; echo done",
     "bash -c 'ssh devbox \"cd x && git clone a b\"' _ ok",
+    # PR 334 review F1 control: a double-quoted harmless keyword stays remote.
+    "ssh -o '\"BatchMode\" yes' devbox " + PAYLOAD,
+]
+
+# PR 334 review F1: OpenSSH strips double quotes from a -o keyword (OpenSSH 9.6 `ssh -F /dev/null -G` on t2-dev
+# printed `pkcs11provider /nonexistent/x.so` for the first line), so these load a local library. 39f0735e allowed
+# each of them below the floor.
+QUOTED_KEYWORD_LOCAL = [
+    "ssh -o '\"PKCS11Provider\" ./x.so' devbox " + PAYLOAD,
+    "ssh -o '\"SecurityKeyProvider\"=./x.so' devbox " + PAYLOAD,
+    "ssh -o ' \"pkcs11provider\"   ./x.so' devbox " + PAYLOAD,
+    "ssh devbox -o '\"PKCS11Provider\" ./x.so' " + PAYLOAD,
 ]
 
 
@@ -258,6 +270,12 @@ class SshCopyFloor(BelowTheFloor):
             with self.subTest(command=command):
                 self.assert_refused(command)
 
+    def test_a_double_quoted_local_library_keyword_is_refused(self):
+        # Must fail on 39f0735e (PR 334 review F1).
+        for command in QUOTED_KEYWORD_LOCAL:
+            with self.subTest(command=command):
+                self.assert_refused(command)
+
     def test_round2_neighbours_the_base_refused_stay_refused(self):
         for command in ROUND2_STILL_LOCAL:
             with self.subTest(command=command):
@@ -296,7 +314,7 @@ class NeverLooserThanTheBaseReading(BelowTheFloor):
         shapes = option_word_shapes()
         remote_ok = set(REMOTE + ROUND2_REMOTE + [line for line, _, remote in shapes if remote])
         corpus = (LOCAL + ROUND2_LOCAL + ROUND2_STILL_LOCAL + WRAPPED + BASE_REFUSED + REMOTE + ROUND2_REMOTE
-                  + [line for line, _, _ in shapes]
+                  + QUOTED_KEYWORD_LOCAL + [line for line, _, _ in shapes]
                   + ["ssh devbox 'cd x && git status' && " + local for local in BASE_REFUSED])
         checked = 0
         for line in corpus:
@@ -331,10 +349,17 @@ class RealSshOracle(BelowTheFloor):
                                 env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": cwd}, timeout=300)
         return {int(line.split()[1]) for line in result.stdout.splitlines() if line.startswith("HIT ")}
 
+    def unavailable(self, why):
+        """Skip on a developer host. Under CI the independent oracle is the real proof for the remote lines, so its
+        absence fails instead of passing quietly (PR 334 review F2)."""
+        if os.environ.get("CI", "").strip().lower() not in ("", "0", "false", "no"):
+            self.fail("the real-ssh oracle cannot run under CI: " + why)
+        self.skipTest(why)
+
     def test_no_line_the_guard_drops_can_carry_a_local_proxycommand(self):
         shells = [path for path in (shutil.which("bash"), shutil.which("zsh")) if path]
         if not shutil.which("ssh") or not shells:
-            self.skipTest("needs ssh and bash or zsh")
+            self.unavailable("needs ssh and bash or zsh")
         lines = [line for line, _, _ in option_word_shapes()]
         remote = [line for line in lines if self.pretool(line)[0] == 0]  # the guard's verdict, not the table's
         strict = [line for line in lines if line not in remote][::3]
@@ -349,6 +374,30 @@ class RealSshOracle(BelowTheFloor):
                     self.assertEqual(leaked, [], (shell, repr(injection)))
                     caught.update(index - len(remote) for index in hits if index >= len(remote))
         self.assertGreaterEqual(len(caught), 20, "the oracle must see the injected ProxyCommand on strict lines")
+
+
+
+class OracleCannotSkipUnderCI(unittest.TestCase):
+    """PR 334 review F2: without ssh the oracle skips on a developer host and fails under CI."""
+
+    def run_oracle(self, ci):
+        case = RealSshOracle("test_no_line_the_guard_drops_can_carry_a_local_proxycommand")
+        result = unittest.TestResult()
+        with mock.patch.object(shutil, "which", return_value=None), mock.patch.dict(os.environ):
+            os.environ.pop("CI", None)
+            if ci is not None:
+                os.environ["CI"] = ci
+            case.run(result)
+        return len(result.failures), len(result.skipped)
+
+    def test_ci_without_ssh_fails(self):
+        # Must fail on 39f0735e: the oracle skipped.
+        self.assertEqual(self.run_oracle("true"), (1, 0))
+
+    def test_a_developer_host_without_ssh_still_skips(self):
+        # Positive control.
+        self.assertEqual(self.run_oracle(None), (0, 1))
+        self.assertEqual(self.run_oracle("false"), (0, 1))
 
 
 if __name__ == "__main__":
