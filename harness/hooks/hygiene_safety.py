@@ -681,39 +681,53 @@ def recoverable(repo: str, deadline: "float | None" = None) -> "tuple[bool, str]
 # review head. This function is the proposed common rule; adopting it in the guard needs its own security review and a
 # ruling (docs/workspace-janitor.md, "Proposal: one published rule").
 PUBLISHED_REF_PREFIXES = ("refs/heads/", "refs/tags/")
-MAX_ANCESTRY_CHECKS = 200
+# agent-harness and timbar each advertise over 200 branches (2026-11-23), so the cap is well above that, and the
+# preferred refs (the worktree's own branch, the default branch) are tried first.
+MAX_ANCESTRY_CHECKS = 1000
+_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
-def head_published(head: str, live: dict, allowed_hosts, is_ancestor) -> "tuple[bool, str]":
+def head_published(head: str, live: dict, allowed_hosts, is_ancestor, prefer=()) -> "tuple[bool, str]":
     """(True, "") when HEAD is on a live branch or tag of an allowlisted host, else (False, why). Pure: no git here.
 
     head          the exact 40- or 64-hex commit id HEAD resolves to.
-    live          {remote host: {ref name: id}} as a FRESH ls-remote reports it (the caller reads it; stale tracking refs
-                  never count). Hosts not in `allowed_hosts` are ignored.
+    live          {remote name: (host, {ref name: id})} as a FRESH ls-remote of each remote reports it (the caller reads
+                  it; stale tracking refs never count). Keyed by remote, so two remotes on one host (origin and a fork)
+                  are both read. Remotes whose host is not in `allowed_hosts` are ignored.
     is_ancestor   callable(a, b) -> True / False / None; True only when commit a is an ancestor of commit b using LOCAL
                   objects (no fetch); None for an error, a timeout or a missing object, which never counts as proof.
+    prefer        ref names tried first, in order (the worktree's own upstream branch, the default branch).
     Only refs/heads/* and refs/tags/* count (a peeled `^{}` entry stands for its tag); refs/pull/*, refs/changes/*,
     notes and every other namespace are NOT publication: anyone who can open a pull request can create refs/pull/*,
-    and the host may drop them. At most MAX_ANCESTRY_CHECKS ancestry calls; past that the answer is "not proven".
+    and the host may drop them. An exact match needs no ancestry call; at most MAX_ANCESTRY_CHECKS ancestry calls,
+    past that the answer is "not proven".
     """
-    if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
+    if not isinstance(head, str) or not _SHA.fullmatch(head):
         return False, "HEAD is not an exact commit id"
     allowed = set(allowed_hosts or ())
-    tips = set()
-    for host, refs in sorted((live or {}).items()):
+    by_ref = {}
+    for _remote, entry in sorted((live or {}).items()):
+        if not isinstance(entry, tuple) or len(entry) != 2:
+            continue
+        host, refs = entry
         if host not in allowed or not isinstance(refs, dict):
             continue
         for name, sha in refs.items():
-            if not isinstance(name, str) or not isinstance(sha, str) or not name.startswith(PUBLISHED_REF_PREFIXES):
-                continue
-            if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha):
-                tips.add(sha)  # an annotated tag's own id never equals HEAD; its peeled `^{}` row carries the commit
-    if not tips:
+            if isinstance(name, str) and isinstance(sha, str) and name.startswith(PUBLISHED_REF_PREFIXES) \
+                    and _SHA.fullmatch(sha):
+                by_ref.setdefault(name, set()).add(sha)  # an annotated tag's own id never equals HEAD; `^{}` carries it
+    if not by_ref:
         return False, "no live branch or tag on an allowlisted host"
-    if head in tips:
+    if any(head in ids for ids in by_ref.values()):
         return True, ""
+    order, seen = [], set()
+    for name in list(prefer or ()) + sorted(by_ref):
+        for tip in sorted(by_ref.get(name, ())) if isinstance(name, str) else ():
+            if tip not in seen:
+                seen.add(tip)
+                order.append(tip)
     errors = 0
-    for n, tip in enumerate(sorted(tips)):
+    for n, tip in enumerate(order):
         if n >= MAX_ANCESTRY_CHECKS:
             return False, "too many live refs to check (not proven)"
         verdict = is_ancestor(head, tip)

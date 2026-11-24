@@ -529,48 +529,58 @@ class HeadPublished(unittest.TestCase):
     H, T1, T2 = "a" * 40, "b" * 40, "c" * 40
     GH = ("github.com",)
 
-    def pub(self, live, anc=lambda a, b: False, hosts=GH):
-        return S.head_published(self.H, live, hosts, anc)
+    def pub(self, refs, anc=lambda a, b: False, hosts=GH, host="github.com", prefer=()):
+        return S.head_published(self.H, {"origin": (host, refs)}, hosts, anc, prefer)
 
     def test_exact_tip_of_a_live_branch_or_peeled_tag(self):
-        self.assertEqual(self.pub({"github.com": {"refs/heads/x": self.H}}), (True, ""))
-        self.assertEqual(self.pub({"github.com": {"refs/tags/v1^{}": self.H}}), (True, ""))
+        self.assertEqual(self.pub({"refs/heads/x": self.H}, anc=lambda a, b: None), (True, ""))
+        self.assertEqual(self.pub({"refs/tags/v1^{}": self.H}, anc=lambda a, b: None), (True, ""))
 
     def test_head_behind_its_live_branch_is_published(self):
         # timbar-legacy-preflight: HEAD 24 commits behind its own live branch, refused by the exact-tip rule
-        self.assertTrue(self.pub({"github.com": {"refs/heads/x": self.T1}}, anc=lambda a, b: b == self.T1)[0])
+        self.assertTrue(self.pub({"refs/heads/x": self.T1}, anc=lambda a, b: b == self.T1)[0])
 
     def test_pull_request_and_other_namespaces_never_publish(self):
         for ref in ("refs/pull/7/head", "refs/pull/7/merge", "refs/changes/1/1", "refs/notes/x", "refs/remotes/o/x",
                     "HEAD", "refs/headsx/y"):
-            ok, why = self.pub({"github.com": {ref: self.H}}, anc=lambda a, b: True)
+            ok, why = self.pub({ref: self.H}, anc=lambda a, b: True)
             self.assertFalse(ok, ref)
             self.assertIn("no live branch or tag", why)
 
     def test_a_host_off_the_allowlist_never_publishes(self):
-        self.assertFalse(self.pub({"evil.example": {"refs/heads/x": self.H}}, anc=lambda a, b: True)[0])
-        self.assertFalse(self.pub({"github.com": {"refs/heads/x": self.H}}, hosts=())[0])
+        self.assertFalse(self.pub({"refs/heads/x": self.H}, anc=lambda a, b: True, host="evil.example")[0])
+        self.assertFalse(self.pub({"refs/heads/x": self.H}, anc=lambda a, b: True, hosts=())[0])
+
+    def test_two_remotes_on_one_host_are_both_read(self):
+        live = {"fork": ("github.com", {"refs/heads/y": self.T2}), "origin": ("github.com", {"refs/heads/x": self.H})}
+        self.assertTrue(S.head_published(self.H, live, self.GH, lambda a, b: False)[0])
+        live = {"fork": ("github.com", {"refs/heads/x": self.T2}), "origin": ("github.com", {"refs/heads/x": self.T1})}
+        self.assertTrue(S.head_published(self.H, live, self.GH, lambda a, b: b == self.T2)[0])
 
     def test_failed_ancestry_is_not_proof(self):
-        ok, why = self.pub({"github.com": {"refs/heads/x": self.T1}}, anc=lambda a, b: None)
+        ok, why = self.pub({"refs/heads/x": self.T1}, anc=lambda a, b: None)
         self.assertEqual((ok, why), (False, "an ancestry check failed (not proven)"))
-        self.assertTrue(self.pub({"github.com": {"refs/heads/x": self.T1, "refs/heads/y": self.T2}},
+        self.assertTrue(self.pub({"refs/heads/x": self.T1, "refs/heads/y": self.T2},
                                  anc=lambda a, b: None if b == self.T1 else True)[0])
 
     def test_bad_input_is_refused(self):
         for head in ("", "HEAD", "a" * 39, "A" * 40, None):
-            self.assertFalse(S.head_published(head, {"github.com": {"refs/heads/x": "a" * 40}}, self.GH,
+            self.assertFalse(S.head_published(head, {"origin": ("github.com", {"refs/heads/x": "a" * 40})}, self.GH,
                                               lambda a, b: True)[0])
-        self.assertFalse(self.pub({"github.com": {"refs/heads/x": "not-a-sha"}}, anc=lambda a, b: True)[0])
-        self.assertFalse(self.pub({"github.com": ["refs/heads/x"]}, anc=lambda a, b: True)[0])
-        self.assertFalse(self.pub({}, anc=lambda a, b: True)[0])
+        self.assertFalse(self.pub({"refs/heads/x": "not-a-sha"}, anc=lambda a, b: True)[0])
+        self.assertFalse(S.head_published(self.H, {"origin": {"refs/heads/x": self.H}}, self.GH, lambda a, b: True)[0])
+        self.assertFalse(S.head_published(self.H, {}, self.GH, lambda a, b: True)[0])
 
-    def test_ancestry_calls_are_capped(self):
+    def test_preferred_refs_go_first_and_ancestry_calls_are_capped(self):
+        refs = {"refs/heads/b%04d" % i: "%040x" % (i + 1) for i in range(S.MAX_ANCESTRY_CHECKS + 50)}
+        mine = "refs/heads/b%04d" % (S.MAX_ANCESTRY_CHECKS + 49)         # sorts last: past the cap without prefer
         calls = []
-        live = {"github.com": {"refs/heads/b%d" % i: "%040x" % (i + 1) for i in range(S.MAX_ANCESTRY_CHECKS + 50)}}
-        ok, why = self.pub(live, anc=lambda a, b: calls.append(b) or False)
+        ok, why = self.pub(refs, anc=lambda a, b: calls.append(b) or False)
         self.assertEqual((ok, why), (False, "too many live refs to check (not proven)"))
         self.assertEqual(len(calls), S.MAX_ANCESTRY_CHECKS)
+        calls.clear()
+        self.assertTrue(self.pub(refs, anc=lambda a, b: calls.append(b) or b == refs[mine], prefer=[mine])[0])
+        self.assertEqual(calls, [refs[mine]])
 
 
 if __name__ == "__main__":

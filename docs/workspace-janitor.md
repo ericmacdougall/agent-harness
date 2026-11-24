@@ -97,16 +97,24 @@ session folder itself stay. Same deletion switch; report-only lists them under `
 
 `python3 harness/hooks/workspace_janitor.py report` is read-only: one row per session folder with its state
 (`retired`/`kept`), reasons, bytes, rebuildable bytes, checkout count, whether it is over `session_budget_gb` (raw key in
-`copy-hygiene.json`, default 15) and the command that would release it; plus `total_gb` and `retired_gb`.
+`copy-hygiene.json`, default 15), the command that releases it (retired rows only: `release` refuses the others) and, for
+a kept row, `next`: what would let it be released; plus `total_gb` and `retired_gb`. It writes nothing (no audit, alert
+or dedupe row).
+
+On t2-dev (2026-11-23) almost every session folder belongs to a Mac session whose records are on the Mac, so the janitor
+there keeps them (`no_local_record`): of 176.6 GB, 2.0 GB was retired. Releasing the rest needs a cross-host verdict, which
+is not built yet (goodqa#16947).
 
 ## Proposal: one "published" rule (`hygiene_safety.head_published`, not wired yet)
 
 Today `recoverable` accepts a HEAD that is an ancestor of anything the remote advertises (pull-request refs included),
 while the `remove-worktree` verifier behind `ah worktree-remove` accepts only the exact tip of a live branch or tag, or an
 ancestor of the live default branch. The verifier therefore refuses a worktree whose HEAD is behind its own live branch
-and every detached review head, and those are never removed. `head_published(head, live, allowed_hosts, is_ancestor)` is
-the proposed common rule: HEAD equals, or is an ancestor (local objects only, no fetch) of, a live `refs/heads/*` or
-`refs/tags/*` id on an allowlisted host, as a fresh `ls-remote` reports it.
+and every detached review head, and those are never removed. `head_published(head, live, allowed_hosts, is_ancestor,
+prefer)` is the proposed common rule: HEAD equals, or is an ancestor (local objects only, no fetch) of, a live
+`refs/heads/*` or `refs/tags/*` id on an allowlisted host, as a fresh `ls-remote` of each remote reports it. `live` is
+keyed by remote, so origin and a fork on the same host are both read; `prefer` (the worktree's own branch, the default
+branch) is tried first.
 
 Security review, to be done before either caller adopts it:
 
@@ -115,8 +123,8 @@ Security review, to be done before either caller adopts it:
 | Newly allowed | a worktree whose HEAD is an ancestor of a live non-default branch or tag (refused today) |
 | Worst case | that branch is deleted or force-pushed after the removal and the host garbage-collects the commit. The exact-tip rule has the same exposure (a branch deleted after a squash merge), so this is no new class; the verifier's stale-tracking-ref and private-ref checks stay |
 | Narrower than `recoverable` | `refs/pull/*`, `refs/changes/*`, notes and other namespaces never count: anyone who can open a pull request can create `refs/pull/*`, and hosts may drop them. Adopting it in `recoverable` would keep review copies whose PR branch is gone |
-| Fails closed | a non-hex HEAD, a host off the allowlist, a failed or timed-out ancestry check, or more than `MAX_ANCESTRY_CHECKS` (200) refs is "not proven" |
-| Must-fail tests | `tests/test_hygiene_safety.py` `HeadPublished`: pull-request refs, off-allowlist hosts, failed ancestry, bad input and the call cap each refuse |
+| Fails closed | a non-hex HEAD, a host off the allowlist, a failed or timed-out ancestry check, or more than `MAX_ANCESTRY_CHECKS` (1000; agent-harness and timbar each advertise over 200 branches) ancestry calls is "not proven" |
+| Must-fail tests | `tests/test_hygiene_safety.py` `HeadPublished`: pull-request refs, off-allowlist hosts, failed ancestry, bad input and the call cap each refuse; preferred refs are tried first |
 
 The installed `ah worktree-remove` keeps the exact-tip rule until this review passes and the owner rules.
 

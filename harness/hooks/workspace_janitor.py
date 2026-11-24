@@ -382,7 +382,8 @@ def _open_task_sessions() -> "set | None":
     try:
         from pathlib import Path
         import ah  # sibling module in the hooks folder
-        path = ah.store_dir(Path(S.home())) / "ledger.jsonl"
+        # the path ah.store_dir names, built here because store_dir creates the folders (report must write nothing)
+        path = Path(S.home()) / ".agent-harness" / "state" / "ah" / "store" / "ledger.jsonl"
         if not path.exists():
             _TASKS = {"sessions": set()}
         else:
@@ -734,6 +735,26 @@ def _session_budget_gb() -> float:
         return SESSION_BUDGET_GB
 
 
+NEXT_STEPS = (
+    ("no_process_list", "the process list could not be read on this host; rerun when ps or /proc works"),
+    ("session_live", "a running process carries this session id; nothing to do until it exits"),
+    ("open_work", "the session has open asks, open ah tasks or live bg jobs; its owner resolves or hands them off"),
+    ("no_local_record", "no WAL or transcript of this session on this host; its owner releases it from the host that "
+                        "holds its records, or a ruling names it"),
+    ("recent_activity", "active within max_age_hours; it is reconsidered after the quiet window"),
+)
+
+
+def _next_step(why: list) -> "str | None":
+    """What would let a kept folder be released (the first matching reason wins); None for a retired one."""
+    if not why:
+        return None
+    for reason, text in NEXT_STEPS:
+        if reason in why:
+            return text
+    return "a session record could not be read or is ambiguous (%s); inspect it by hand" % ",".join(why)
+
+
 def report(cfg=None, now=None) -> dict:
     """Read only. One row per session folder of each work root: the ownership verdict and its reasons, total bytes,
     regenerable bytes (what release would rebuild-free once the session is retired), checkouts, and whether the folder
@@ -757,7 +778,9 @@ def report(cfg=None, now=None) -> dict:
             rows.append({"session": e, "path": p, "state": "retired" if not why else "kept", "reasons": why,
                          "bytes": size, "regenerable_bytes": sum(S.du(d) for d in regen), "checkouts": len(repos),
                          "over_budget": size > budget * GB,
-                         "command": "python3 -I %s release --path %s" % (os.path.abspath(__file__), p)})
+                         # only a retired row gets a command: release refuses every other one
+                         "command": None if why else "python3 -I %s release --path %s" % (os.path.abspath(__file__), p),
+                         "next": _next_step(why)})
     rows.sort(key=lambda r: -r["bytes"])
     return {"budget_gb": budget, "sessions": rows, "total_gb": round(sum(r["bytes"] for r in rows) / GB, 2),
             "retired_gb": round(sum(r["bytes"] for r in rows if r["state"] == "retired") / GB, 2)}

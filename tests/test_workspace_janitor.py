@@ -1342,8 +1342,22 @@ class Report(Base):
         os.makedirs(wal)
         Path(wal, "main.jsonl").write_text("{}\n")
         self.write_config(reaper_delete_enabled=True, session_budget_gb=0.0001)
+
+        def snapshot():
+            out = {}
+            for dp, dn, fn in os.walk(self.home):
+                for f in dn + fn:
+                    st = os.lstat(os.path.join(dp, f))
+                    out[os.path.join(dp, f)] = (st.st_size, st.st_mtime_ns)
+            return out
+        before = snapshot()
         r = wj.report()
+        self.assertEqual(snapshot(), before)          # read only: no audit, alert or dedupe row, nothing removed
         rows = {x["session"]: x for x in r["sessions"]}
+        self.assertIn("release --path", rows[SID]["command"])
+        self.assertIsNone(rows[SID]["next"])
+        self.assertIsNone(rows[live]["command"])     # release would refuse it, so no command is offered
+        self.assertIn("quiet window", rows[live]["next"])
         self.assertEqual(rows[SID]["state"], "retired")
         self.assertGreater(rows[SID]["regenerable_bytes"], 100000)
         self.assertTrue(rows[SID]["over_budget"])
