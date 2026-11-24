@@ -84,7 +84,19 @@ class Base(unittest.TestCase):
         gh = self.stub / 'gh'
         gh.write_text('#!/bin/sh\necho "gh stub: tests must never reach GitHub" >&2\nexit 1\n')
         gh.chmod(0o755)
+        # a deterministic gitleaks stand-in: `gitleaks stdin ... --report-path -` flags every line holding GLFAKE-
+        # (rule fake-leak); it never echoes a value, like the real one under --redact=100
+        gl = self.stub / 'gitleaks'
+        gl.write_text(
+            '#!%s\nimport json, sys\n'
+            'assert sys.argv[1] == "stdin" and "--redact=100" in sys.argv\n'
+            'data = sys.stdin.buffer.read()\n'
+            'out = [{"RuleID": "fake-leak", "StartLine": n, "Secret": "REDACTED"}\n'
+            '       for n, ln in enumerate(data.split(b"\\n"), 1) if b"GLFAKE-" in ln]\n'
+            'sys.stdout.write(json.dumps(out))\n' % sys.executable)
+        gl.chmod(0o755)
         self.env = {
+            'TRANSCRIPTS_GITLEAKS': str(gl),
             'HOME': str(self.fakehome), 'TRANSCRIPTS_HOME': str(self.home),
             'TRANSCRIPTS_SOURCES': json.dumps({k: str(v) for k, v in self.roots.items()}),
             'TRANSCRIPTS_REMOTE_BASE': str(self.remote), 'TRANSCRIPTS_ALLOW_LOCAL_REMOTE': '1',

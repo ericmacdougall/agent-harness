@@ -646,7 +646,15 @@ def publish_tree(cfg, repo, files, message, journal=None, deadline=None, overwri
     """Add files {path: bytes} to repo main. Returns (commit or None if nothing to do, collisions [paths]).
 
     Chunk paths are never overwritten: an existing path with a different blob is a collision (NEG-17).
-    Catalog files (overwrite=True) are replaced. Never --force; a non-fast-forward refetches (5 tries)."""
+    Catalog files (overwrite=True) are replaced. Never --force; a non-fast-forward refetches (5 tries).
+
+    The egress gate runs first, over the repo name, the ref, the message, every path and every blob; any hit
+    refuses the whole commit before a tree is built (C11). This is the only function that runs commit-tree or
+    push (a guard test lists every plumbing call site)."""
+    failures = egress_check(cfg, repo, 'refs/heads/main', files, message)
+    if failures:
+        alert(cfg, 'egress-refused', '%d item(s) refused at the egress gate for %s' % (len(failures), sha12(repo)))
+        raise egress_refusal(failures)
     collisions = []
     for attempt in range(5):
         tr = TmpRepo(cfg, repo)
@@ -1010,6 +1018,155 @@ def decompress(zdata):
     return r.stdout
 
 
+# ----------------------------------------------------------------------------------------------------------
+# Egress gate (click-test F1 / failure class C11): the one choke point every byte that leaves the host passes.
+#
+# publish_tree() is the only caller of commit-tree and push, and it calls egress_check() first over the repo name,
+# the ref, the commit message, every tree path and every blob. A blob given as bytes is scanned line by line with
+# pass 2 (transcript_redact.verify_bytes) and with gitleaks, the independent third gate. A blob given as an outbox
+# path (a zstd chunk) must have been registered by Run.reverify(), which scanned its decompressed bytes and its
+# sidecar with both scanners, and its sha256 must still match. Any hit refuses the whole commit (the last line);
+# producers filter first (egress_filter) so one dirty catalog entry does not stall the catalog.
+# Findings carry only rule names and counts, never a value.
+# ----------------------------------------------------------------------------------------------------------
+
+GITLEAKS_VERSION = '8.30.1'  # the pinned, checksum-verified scanner version (goodqa#17119)
+
+
+def gitleaks_bin(cfg):
+    """The gitleaks binary, or None when the local test remote turned it off. Missing in real use refuses."""
+    want = os.environ.get('TRANSCRIPTS_GITLEAKS')
+    if want == 'off':
+        if cfg.local:
+            return None
+        raise Refused('TRANSCRIPTS_GITLEAKS=off is honoured only against a local test remote')
+    cands = [want] if want and want != 'off' else [shutil.which('gitleaks'), os.path.expanduser('~/.local/bin/gitleaks'),
+                                                   '/opt/homebrew/bin/gitleaks']
+    for c in cands:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    raise Refused('secret scanner gitleaks %s is not installed; refusing to push' % GITLEAKS_VERSION)
+
+
+def gitleaks_scan(cfg, data):
+    """gitleaks over bytes -> [(rule_id, 1-based line)]. Values are redacted by gitleaks and dropped here."""
+    g = gitleaks_bin(cfg)
+    if g is None or not data:
+        return []
+    r = run_child([g, 'stdin', '--no-banner', '--redact=100', '--report-format', 'json', '--report-path', '-',
+                   '--exit-code', '0', '--log-level', 'error'], input=data, capture_output=True,
+                  timeout=bounded(600))
+    if r.returncode != 0:
+        raise Refused('gitleaks failed (exit %d)' % r.returncode)
+    try:
+        found = json.loads(r.stdout or b'[]')
+    except ValueError:
+        raise Refused('gitleaks output unreadable')
+    out = []
+    for f in found or []:
+        rule = _SAFE.sub('_', str(f.get('RuleID') or 'unknown'))[:60]
+        out.append(('gitleaks:' + rule, int(f.get('StartLine') or 0)))
+    return out
+
+
+def scan_bytes(cfg, data):
+    """Both scanners over one byte string -> [(kind, 1-based line)], kinds only."""
+    tr = redact_mod()
+    return list(tr.verify_bytes(data)) + gitleaks_scan(cfg, data)
+
+
+class EgressRefused(Refused):
+    pass
+
+
+def _egress_items(repo, ref, files, message):
+    yield 'repo', repo.encode('utf-8', 'surrogateescape')
+    yield 'ref', ref.encode('utf-8', 'surrogateescape')
+    yield 'message', message.encode('utf-8', 'surrogateescape')
+    for path in files:
+        yield 'path', path.encode('utf-8', 'surrogateescape')
+
+
+def egress_check(cfg, repo, ref, files, message):
+    """Scan everything a commit would publish. Returns [(where, kinds)] for each failing item; [] means clean.
+
+    `where` is 'repo', 'ref', 'message', 'path:<sha12>' or 'blob:<sha12 of path>'. Bytes blobs and the names are
+    scanned in one batch per scanner, so a catalog of thousands of small files costs one gitleaks process."""
+    lines, owner = [], []  # one scanned line each; owner[i] = where it came from
+    for where, b in _egress_items(repo, ref, files, message):
+        b = b.replace(b'\n', b' ')
+        lines.append(b)
+        owner.append(where if where != 'path' else 'path:' + sha12(b.decode('utf-8', 'surrogateescape')))
+    bad = {}
+    registered = getattr(cfg, 'egress_registered', {})
+    for path, data in files.items():
+        where = 'blob:' + sha12(path)
+        if isinstance(data, bytes):
+            parts = data.split(b'\n')
+            if parts and parts[-1] == b'':
+                parts.pop()
+            lines.extend(parts)
+            owner.extend([where] * len(parts))
+            continue
+        # an outbox file: only a chunk reverify() scanned, unchanged since, may leave
+        want = registered.get(os.path.abspath(data))
+        try:
+            with open(data, 'rb') as fh:
+                got = hashlib.sha256(fh.read()).hexdigest()
+        except OSError:
+            got = None
+        if want is None or got != want:
+            bad.setdefault(where, set()).add('unverified-blob')
+    batch = b'\n'.join(lines) + b'\n'
+    for kind, line in scan_bytes(cfg, batch):
+        if 1 <= line <= len(owner):
+            bad.setdefault(owner[line - 1], set()).add(kind)
+        else:
+            bad.setdefault('batch', set()).add(kind)
+    return sorted((w, sorted(k)) for w, k in bad.items())
+
+
+def egress_refusal(failures):
+    kinds = {}
+    for _, ks in failures:
+        for k in ks:
+            kinds[k] = kinds.get(k, 0) + 1
+    return EgressRefused('egress gate refused %d item(s): %s' % (
+        len(failures), ','.join('%s=%d' % kv for kv in sorted(kinds.items()))))
+
+
+def egress_filter(cfg, repo, files, message):
+    """Drop what cannot leave before the commit is built, so one dirty entry does not stall a catalog.
+
+    A JSONL blob loses only its failing lines; any other failing blob or path is dropped whole. Returns
+    (clean files, dropped [(where, kinds)]). A failing repo, ref or message refuses: nothing can be dropped."""
+    failures = egress_check(cfg, repo, 'refs/heads/main', files, message)
+    if not failures:
+        return files, []
+    fatal = [f for f in failures if f[0] in ('repo', 'ref', 'message', 'batch')]
+    if fatal:
+        raise egress_refusal(fatal)
+    by_sha = {sha12(p): p for p in files}
+    out = dict(files)
+    dropped = []
+    for where, kinds in failures:
+        p = by_sha.get(where.split(':', 1)[1])
+        if p is None or p not in out:
+            continue
+        data = out[p]
+        if where.startswith('blob:') and p.endswith('.jsonl') and isinstance(data, bytes):
+            parts = data.split(b'\n')
+            if parts and parts[-1] == b'':
+                parts.pop()
+            dirty = {line for _, line in scan_bytes(cfg, b''.join(x + b'\n' for x in parts))}
+            out[p] = b''.join(x + b'\n' for n, x in enumerate(parts, 1) if n not in dirty)
+            dropped.append((where + ':lines', kinds))
+        else:
+            out.pop(p)
+            dropped.append((where, kinds))
+    return out, dropped
+
+
 def gate_metadata(sidecar):
     """Sidecars are pushed too: drop optional fields that trip the verifier; refuse if still dirty."""
     tr = redact_mod()
@@ -1160,6 +1317,10 @@ class Run:
         self.refused = None
         self.last_save = time.monotonic()
         self.disk_low = None
+        self.egress_held = 0  # files held because a chunk path or sidecar failed the egress gate
+        self.scanner_held = 0  # files held because the pre-push rescan of a staged chunk still found a hit
+        self.catalog_withheld = 0  # catalog entries (manifests, index lines) withheld at the egress gate
+        cfg.egress_registered = {}  # outbox chunk abspath -> sha256, set only by reverify()
 
     # -- persistence
     def save(self, force=False):
@@ -1667,12 +1828,28 @@ class Run:
                     why = 'sha256'
                 elif meta.get('ruleset_version') != tr.RULESET_VERSION:
                     why = 'ruleset'
-                elif tr.verify_bytes(data) or tr.verify_bytes(meta_b):
-                    why = 'verifier'
+                else:
+                    # the pre-push rescan: pass 2 and gitleaks over the decompressed chunk and its sidecar
+                    hits = scan_bytes(self.cfg, data + b'\n' + meta_b)
+                    if hits:
+                        why = 'scanner'
         except (OSError, ValueError):
             why = 'unreadable'
         if why is None:
+            self.cfg.egress_registered[os.path.abspath(zp)] = c['zsha256']
             return zp, meta_b  # pushed from the outbox file: one chunk in memory at a time
+        if why == 'scanner':
+            # a hit that survived redaction: the whole file is held back and listed, never pushed (goodqa#17119)
+            first = sorted(hits, key=lambda h: h[1])[0]
+            rules = sorted({k for k, _ in hits})
+            line = c.get('line_start', 1) + first[1] - 1 if first[1] <= c.get('records', 0) else None  # source line
+            self.rollback(e, g, i, why)
+            hold(self.cfg, e, 'scanner:' + ','.join(rules)[:80], line)
+            alert(self.cfg, 'scanner-hit', 'file %s held: %d pre-push scanner hit(s) (%s)' % (
+                sha12(key), len(hits), ','.join(rules)[:200]))
+            self.scanner_held += 1
+            self.mark_manifest(key)
+            return None
         alert(self.cfg, 'reverify-failed', 'chunk %s held back (%s); re-chunking from source' % (sha12(c['path']), why))
         e['reverify_failures'] = e.get('reverify_failures', 0) + 1
         self.rollback(e, g, i, why)
@@ -1736,8 +1913,9 @@ class Run:
             self.refused = 'catalog incident open kind=%s; pushes stop on every host' % ','.join(kinds)
             alert(cfg, 'incident-open', self.refused)
             return
+        ready = self.rescan_staged(todo)
         for repo in repos:
-            pending = [it for it in todo if it[3]['shard'] == repo]
+            pending = [it for it in todo if it[3]['shard'] == repo and id(it[3]) in ready]
             while pending:
                 group, size = [], 0
                 while pending and (not group or size + pending[0][3]['zbytes'] <= cfg.push_max):
@@ -1748,15 +1926,42 @@ class Run:
                     key, e, g, c = pending.pop(0)
                     if c['status'] != 'staged' or c not in g['chunks']:
                         continue  # rolled back with an earlier chunk of the same file
-                    ok = self.reverify(key, e, g, g['chunks'].index(c), c)
-                    if ok is None:
-                        continue
-                    group.append((key, e, g, c, ok))
+                    group.append((key, e, g, c, ready[id(c)]))
                     size += c['zbytes']
                 if group:
                     self.push_group(repo, group)
         if (need_catalog or self.st.get('catalog_dirty')) and time.monotonic() < self.deadline:
             self.push_catalog()
+
+    def rescan_staged(self, todo):
+        """File-atomic pre-push rescan. Every staged chunk of a file is rescanned before any chunk of that file is
+        pushed. A scanner hit holds the whole file and none of its staged chunks leave; a file the budget cut off
+        part way waits whole. Returns {id(chunk): (zpath, sidecar bytes)} for the chunks that may be pushed."""
+        ready, failed, cut = {}, set(), set()
+        for key, e, g, c in todo:
+            if key in failed or key in cut or c['status'] != 'staged' or c not in g['chunks']:
+                continue
+            if time.monotonic() > self.deadline:
+                cut.add(key)
+                continue
+            ok = self.reverify(key, e, g, g['chunks'].index(c), c)
+            if ok is None:
+                failed.add(key)
+                if e.get('held'):
+                    # held: the chunks of this file already rescanned clean are withdrawn too
+                    for x in g['chunks']:
+                        ready.pop(id(x), None)
+                    staged = [i for i, x in enumerate(g['chunks']) if x['status'] == 'staged']
+                    if staged:
+                        self.rollback(e, g, staged[0], 'held')
+                continue
+            ready[id(c)] = ok
+        for key, e, g, c in todo:
+            if key in cut:
+                ready.pop(id(c), None)
+        if cut:
+            self.notes.append('budget reached during the pre-push rescan; %d file(s) wait whole' % len(cut))
+        return ready
 
     def all_chunks(self):
         for key, e in self.st['files'].items():
@@ -1769,8 +1974,33 @@ class Run:
         for key, e, g, c, (zdata, meta_b) in group:
             files[c['path']] = zdata
             files[c['path'] + '.meta.json'] = meta_b
-        commit, collisions, _ = publish_tree(self.cfg, repo, files, 'archive %d chunk(s) from %s' % (
-            len(group), self.cfg.host), journal=self.journal, deadline=self.deadline)
+        message = 'archive %d chunk(s) from %s' % (len(group), self.cfg.host)
+        files, dropped = egress_filter(self.cfg, repo, files, message)
+        if dropped:
+            # a chunk whose path or sidecar cannot leave: hold its file locally, push the rest of the group
+            gone = {w.split(':')[1] for w, _ in dropped}
+            bad = {}  # key -> (e, g, first index in this group)
+            for key, e, g, c, _ in group:
+                if sha12(c['path']) in gone or sha12(c['path'] + '.meta.json') in gone:
+                    if key not in bad or g['chunks'].index(c) < bad[key][2]:
+                        bad[key] = (e, g, g['chunks'].index(c))
+            for key, (e, g, idx) in bad.items():
+                # the whole file is held back: every chunk of it in this group stays local
+                first = min([idx] + [g['chunks'].index(c) for k, _, gg, c, _ in group if k == key and gg is g])
+                self.rollback(e, g, first, 'egress')
+                hold(self.cfg, e, 'refused:egress')
+                alert(self.cfg, 'egress-held', 'file %s held: a chunk path or sidecar failed the egress gate'
+                      % sha12(key))
+                self.mark_manifest(key)
+                self.egress_held += 1
+            group = [it for it in group if it[0] not in bad]
+            files = {p: d for p, d in files.items()
+                     if any(p in (it[3]['path'], it[3]['path'] + '.meta.json') for it in group)}
+            if not group:
+                self.save(force=True)
+                return
+        commit, collisions, _ = publish_tree(self.cfg, repo, files, message, journal=self.journal,
+                                             deadline=self.deadline)
         bad = set()
         for p in collisions:
             bad.add(p[:-len('.meta.json')] if p.endswith('.meta.json') else p)
@@ -1812,8 +2042,14 @@ class Run:
             + [p[len('repo-checks/'):-5] for p in snap if p.startswith('repo-checks/')]))
         if self.st.get('catalog_commit') is None:
             self.guard_lost_state(files)
-        commit, _, _ = publish_tree(cfg, CATALOG, files, 'catalog update from %s' % cfg.host,
-                                    deadline=self.deadline, overwrite=True)
+        message = 'catalog update from %s' % cfg.host
+        files, dropped = egress_filter(cfg, CATALOG, files, message)
+        if dropped:
+            # the entry stays local; its file is listed by path sha12 only, and nothing secret-shaped leaves
+            self.catalog_withheld += len(dropped)
+            alert(cfg, 'catalog-withheld', '%d catalog item(s) withheld at the egress gate' % len(dropped))
+            self.notes.append('catalog items withheld at the egress gate: %d' % len(dropped))
+        commit, _, _ = publish_tree(cfg, CATALOG, files, message, deadline=self.deadline, overwrite=True)
         crash_point(cfg, 'after_catalog_push')
         self.st['catalog_dirty'] = False
         self.st['manifest_dirty'] = []
@@ -1866,6 +2102,8 @@ def catalog_files(cfg, st, _unused=None):
         mpath = 'manifests/%s/%s/%s.json' % (cfg.host, safe_comp(label), '/'.join(safe_comp(p) for p in rel.split('/')))
         if e is None:
             continue
+        if e.get('held') and not any(c['status'] == 'pushed' for g in e['gens'] for c in g['chunks']):
+            continue  # C11: a held file with nothing archived gets no manifest; its hold shows locally only
         files[mpath] = jdump(manifest_of(cfg, key, e)) + b'\n'
     for key in st['manifest_dirty']:
         e = st['files'].get(key)
@@ -2014,6 +2252,10 @@ def write_receipt(cfg, run=None, status=None, error=None, checkpoint=None):
                     'records_processed': run.records if run else 0},
         'incidents': incidents_of(st),
         'collisions': run.collisions if run else 0,
+        'egress': {'egress_held_files': run.egress_held if run else 0,
+                   'scanner_held_files': run.scanner_held if run else 0,
+                   'catalog_withheld': run.catalog_withheld if run else 0,
+                   'scanner': 'gitleaks %s + pass 2' % GITLEAKS_VERSION},
         'last_progress_at': st.get('last_progress_at') or st.get('created_at'),
         'killswitch': os.path.exists(cfg.p('killswitch.json')), 'notes': run.notes if run else [],
         'error': error or (run.refused if run else None) or ((run.disk_low or '; '.join(run.errors)) if run else None)
@@ -2082,6 +2324,11 @@ def check(cfg, max_age_min=60):
 # Commands
 # ----------------------------------------------------------------------------------------------------------
 
+def max_load(cfg):
+    """Backfill defers above this 1-minute load: --max-load, else the core count."""
+    return getattr(cfg, 'max_load', None) or float(os.cpu_count() or 1)
+
+
 def do_sync(cfg, checkpoint, budget, dry_run=False, backfill=False):
     ensure_home(cfg)
     if dry_run:
@@ -2096,7 +2343,7 @@ def do_sync(cfg, checkpoint, budget, dry_run=False, backfill=False):
         take_requests(cfg, reap_only=True)
         if backfill and not cfg.ignore_load:
             load = os.getloadavg()[0]
-            if load > (os.cpu_count() or 1):
+            if load > max_load(cfg):
                 write_receipt(cfg, None, status='deferred', error='deferred: load %.1f' % load, checkpoint='backfill')
                 print('deferred: load')
                 return 0
@@ -2163,6 +2410,8 @@ def sync_body(run, backfill):
         run.status = 'failed'
     for e in run.st['files'].values():
         e.pop('retry_of', None)  # a retry that ended without a new hold released the file
+    if run.catalog_withheld and run.status == 'ok':
+        run.status = 'held'
     held = held_summary(run.st)
     if held['count'] and run.status == 'ok':
         # gate F1: a held file is never reported ok. The run still archived every other file; the receipt is
@@ -2183,7 +2432,9 @@ def process_queue(run, backfill):
                 e['missing'] = True
                 run.mark_manifest(key)
         todo = [x for x in found if run.needs_visit(run.st['files'].get(x[0]), x[4])]
-        todo.sort(key=lambda x: -x[4].st_mtime_ns)  # newest first
+        # a checkpoint sync takes the newest first; backfill takes the oldest first, so the transcripts closest to
+        # Claude Code's retention cleanup (30 days after last activity) are archived first (goodqa#17119)
+        todo.sort(key=(lambda x: x[4].st_mtime_ns) if backfill else (lambda x: -x[4].st_mtime_ns))
         rescan = False
         for n, (key, label, rel, path, st) in enumerate(todo):
             rest = [x for x in todo[n:] if x[0] not in run.st['files']]
@@ -2204,7 +2455,7 @@ def process_queue(run, backfill):
                 break
             if backfill and not cfg.ignore_load:
                 load = os.getloadavg()[0]
-                if load > (os.cpu_count() or 1) * 0.8:
+                if load > max_load(cfg) * 0.8:
                     time.sleep(min(2.0, max(0.0, run.work_deadline - time.monotonic())))
         if not rescan:
             run.st['unvisited'] = {'files': 0, 'bytes': 0}
@@ -2847,6 +3098,8 @@ def build_parser():
     s.add_argument('--dry-run', action='store_true')
     b = sub.add_parser('backfill', help='resumable full-history archive (scheduler)')
     b.add_argument('--budget-seconds', type=int, default=1800)
+    b.add_argument('--max-load', type=float, default=None,
+                   help='defer while the 1-minute load is over this (default: the core count)')
     c = sub.add_parser('check', help='exit 0 ok, 1 stale, 2 failed/cap/held/disk-low/killswitch, 3 never-ok')
     c.add_argument('--max-age-min', type=int, default=60)
     c.add_argument('--json', action='store_true')
@@ -2913,6 +3166,10 @@ def main(argv=None):
                     os.nice(10)
                 except OSError:
                     pass
+            if a.max_load is not None:
+                if a.max_load <= 0:
+                    raise Refused('--max-load must be positive')
+                cfg.max_load = a.max_load
             return do_sync(cfg, 'backfill', a.budget_seconds, backfill=True)
         ensure_home(cfg)
         return {'status': cmd_status, 'find': cmd_find, 'cat': cmd_cat, 'recover': cmd_recover,
