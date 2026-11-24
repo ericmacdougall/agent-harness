@@ -14,6 +14,16 @@ from install import (END, START, ROOT, durable_tmp_choice, install, merged_instr
 
 
 class InstallerTests(unittest.TestCase):
+    def test_task_recovery_survives_reinstall(self):
+        for _ in range(2):
+            install(self.home, apply=True)
+            helper = self.claude / "hooks/task_recovery.py"
+            self.assertEqual(helper.read_bytes(), (ROOT / "harness/hooks/task_recovery.py").read_bytes())
+            result = subprocess.run([sys.executable, str(helper), "--help"], cwd=self.home,
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("enroll", result.stdout)
+
     def setUp(self):
         # Sessions started after install export CLAUDE_CODE_TMPDIR; tests must not depend on the host.
         isolate = patch.dict(os.environ)
@@ -139,7 +149,7 @@ class InstallerTests(unittest.TestCase):
         first = json.loads((self.claude / "settings.json").read_text())
         self.assertEqual(first["model"], "sonnet")
         self.assertEqual(first["permissions"]["deny"], ["Read(**/.env)"])
-        self.assertEqual(len(first["hooks"]["PreToolUse"]), 12)  # user + command guard + kill guard + WAL + ladder + commit policy + heavy-job guard + agent gate + spec gate + ask gate + dropped-gate pretool + prod-delete guard
+        self.assertEqual(len(first["hooks"]["PreToolUse"]), 14)  # user + command guard + kill guard + WAL + ladder + commit policy + heavy-job guard + copy hygiene + agent gate + spec gate + ask gate + dropped-gate pretool + mission-gate pretool + prod-delete guard
         self.assertNotIn("skipDangerousModePermissionPrompt", first)
         self.assertIn("My existing instructions.", (self.claude / "CLAUDE.md").read_text())
         self.assertEqual((self.claude / "CLAUDE.md").read_text().count(START), 1)
@@ -236,7 +246,8 @@ class InstallerTests(unittest.TestCase):
         foreign = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "other-stop"}]}]}}
         (self.claude / "settings.json").write_text(json.dumps(foreign))
         install(self.home, apply=True)
-        expected = [("PreToolUse", "AskUserQuestion", "ask-gate"), ("Stop", None, "stop-lint"),
+        expected = [("PostToolUse", "AskUserQuestion", "answer"), ("PreToolUse", "AskUserQuestion", "ask-gate"),
+                    ("Stop", None, "stop-lint"),
                     ("UserPromptSubmit", None, "prompt")]
         self.assertEqual(self.provenance_entries(), expected)
         install(self.home, apply=True)
@@ -253,7 +264,10 @@ class InstallerTests(unittest.TestCase):
         install(self.home, apply=True)
         self.assertEqual([e for e in self.provenance_entries() if e[0] == "Stop"], [("Stop", None, "stop-lint")])
         stop = json.loads((self.claude / "settings.json").read_text())["hooks"]["Stop"]
-        self.assertEqual([h["timeout"] for g in stop for h in g["hooks"]], [10, 15, 30, 20])  # managed stop-lint replaced the manual one; dropped-owner gate, WAL cadence, worktree hygiene follow
+        self.assertEqual([h["timeout"] for g in stop for h in g["hooks"]], [10, 15, 15, 15, 10, 30, 20, 5, 5])  # managed stop-lint replaced the manual one; dropped-owner gate, mission gate, idle guard (goodqa#15943), status truth, WAL cadence, worktree hygiene, Mission Control inbox follow
+        self.assertEqual([h["args"] for g in stop for h in g["hooks"]
+                          if h.get("args", [None])[0] == str(self.claude / "hooks" / "owner_inbox.py")],
+                         [[str(self.claude / "hooks" / "owner_inbox.py"), "hook"]])
 
     def test_foreign_hook_sharing_a_group_and_users_empty_event_list_survive(self):
         script = str(self.claude / "hooks" / "provenance_hooks.py")
@@ -263,13 +277,30 @@ class InstallerTests(unittest.TestCase):
         (self.claude / "settings.json").write_text(json.dumps(mixed))
         install(self.home, apply=True, provenance=False)
         hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
-        self.assertEqual([h["command"] for g in hooks["Stop"] for h in g["hooks"]], ["other-stop", "python3", "python3", "python3"])  # foreign kept; gate, WAL cadence, worktree hygiene are not provenance hooks
+        self.assertEqual([h["command"] for g in hooks["Stop"] for h in g["hooks"]], ["other-stop", "python3", "python3", "python3", "python3", "python3", "python3", "python3", "python3"])  # foreign kept; dropped gate, mission gate, idle guard (goodqa#15943), status truth (goodqa#15754), WAL cadence, worktree hygiene, Mission Control inbox are not provenance hooks
         self.assertTrue(any("dropped_gate.py" in str(h.get("args")) for g in hooks["Stop"] for h in g["hooks"]))
+        self.assertEqual([h["args"] for g in hooks["Stop"] for h in g["hooks"]
+                          if h.get("args", [None])[0] == str(self.claude / "hooks" / "owner_inbox.py")],
+                         [[str(self.claude / "hooks" / "owner_inbox.py"), "hook"]])
         self.assertEqual(hooks["Notification"], [])  # untouched, not ours
+
+    def test_idle_guard_registrations_survive_reinstall_once_each(self):  # goodqa#15943 (receipt r6 F2)
+        def idle_entries():
+            hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
+            return sorted((event, h["args"][1], h["timeout"]) for event, groups in hooks.items() for g in groups
+                          for h in g["hooks"] if "idle_guard.py" in str(h.get("args")))
+        expected = [("PermissionDenied", "reject", 5), ("PostToolUseFailure", "reject", 5), ("Stop", "stop", 15),
+                    ("UserPromptSubmit", "reject", 5)]
+        install(self.home, apply=True)
+        self.assertEqual(idle_entries(), expected)
+        install(self.home, apply=True)
+        install(self.home, apply=True, provenance=False)
+        self.assertEqual(idle_entries(), expected)  # neither dropped nor duplicated
+        self.assertTrue((self.claude / "hooks" / "idle_guard.py").is_file())
 
     def test_no_provenance_hooks_flag_unregisters_and_default_restores(self):
         install(self.home, apply=True)
-        self.assertEqual(len(self.provenance_entries()), 3)
+        self.assertEqual(len(self.provenance_entries()), 4)  # ask-gate, answer (goodqa#16651), stop-lint, prompt
         install(self.home, apply=True, provenance=False)
         self.assertEqual(self.provenance_entries(), [])
         hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
@@ -277,7 +308,7 @@ class InstallerTests(unittest.TestCase):
         self.assertTrue(any("wal.py" in str(h.get("args")) for g in hooks["UserPromptSubmit"] for h in g["hooks"]))
         self.assertTrue((self.claude / "hooks" / "provenance_hooks.py").is_file())  # files stay installed
         install(self.home, apply=True)
-        self.assertEqual(len(self.provenance_entries()), 3)
+        self.assertEqual(len(self.provenance_entries()), 4)
 
     def test_tolerates_user_hook_with_empty_args(self):
         (self.claude / "settings.json").write_text(json.dumps(
@@ -285,7 +316,7 @@ class InstallerTests(unittest.TestCase):
         ))
         install(self.home, apply=True)
         settings = json.loads((self.claude / "settings.json").read_text())
-        self.assertEqual(len(settings["hooks"]["PreToolUse"]), 12)  # + command guard + kill guard + ladder + heavy-job guard + agent gate + spec gate + ask gate + dropped-gate pretool + prod-delete guard
+        self.assertEqual(len(settings["hooks"]["PreToolUse"]), 14)  # + command guard + kill guard + ladder + heavy-job guard + copy hygiene + agent gate + spec gate + ask gate + dropped-gate pretool + mission-gate pretool + prod-delete guard
         self.assertEqual(settings["hooks"]["PreToolUse"][0]["hooks"][0]["args"], [])
 
     def test_backups_are_private(self):
@@ -342,7 +373,7 @@ class InstallerTests(unittest.TestCase):
         install(self.home, apply=True)
         groups = json.loads((self.claude / "settings.json").read_text())["hooks"]["PreToolUse"]
         self.assertEqual(groups[0], {**group, "hooks": [foreign]})
-        self.assertEqual(len(groups), 12)  # foreign + command guard + kill guard + WAL + ladder + commit policy + heavy-job guard + agent gate + spec gate + ask gate + dropped-gate pretool + prod-delete guard
+        self.assertEqual(len(groups), 14)  # foreign + command guard + kill guard + WAL + ladder + commit policy + heavy-job guard + copy hygiene + agent gate + spec gate + ask gate + dropped-gate pretool + mission-gate pretool + prod-delete guard
 
     def test_refuses_symlinked_parent_directories_before_writing(self):
         for name in ("agents", "hooks", "tools", "agent-harness-backups", ".claude"):

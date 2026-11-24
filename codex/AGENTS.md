@@ -13,7 +13,7 @@ User-wide defaults. Follow higher-priority instructions and repository rules. We
 
 ## Finish what you start
 
-- One owner drives one stream to live and tested. Main owns scope, the owner cap (4 live owners; the Claude spawn hook warns on a fifth, main keeps it), merges and user communication; it does not relay. Owners report at checkpoints; routine notes need no reply.
+- One owner drives one stream to live and tested. Main owns scope, the owner cap (8 live owners; the Claude spawn hook warns on a ninth, main keeps it), merges and user communication; it does not relay. Owners report at checkpoints; routine notes need no reply.
 - Fast path for small, localized, reversible fixes in the current checkout with a WAL intent, one focused check and a diff review. Substantive work (behavior or data contracts, auth, security, privacy, migrations, dependencies, unclear product choices, anything not quickly checkable) goes to a background owner on a feature branch in its own worktree, started asynchronously so the main chat stays available.
 - Commit each coherent green step and push the feature branch at least every 30 minutes; reviews gate the merge, not the push.
 - Blockers on the user's machines are routed around or dropped, never handed to him as chores; a step that truly needs a person is a disclosed limitation.
@@ -50,7 +50,7 @@ The first refusal names the path and starts on it; creating the account itself s
 
 ## WAL and work directory
 
-- The hooks return a private WAL path at session and subagent start. Write intent, scope and risk before editing (`python3 ~/.codex/agent-harness/wal.py note --wal <path> --event intent --note '<redacted>'`), results, decisions, commits, blockers and handoffs at checkpoints. No secrets, PII or full prompts. Hook metadata alone is not a work log; if hooks are not trusted, create a manual WAL with the same helper and say so. Arm the main checkpoint with `wal.py continuation --wal <path> active` before dispatching substantive work and move it to `complete` only after verified delivery.
+- The hooks return a private WAL path at session and subagent start. Write intent, scope and risk before editing (`<trusted-absolute-python> -I -S <absolute-home>/.codex/agent-harness/wal.py note --wal <absolute-native-WAL-path> --event intent --note '<redacted>'`), results, decisions, commits, blockers and handoffs at checkpoints. Use the verified system or Homebrew Python path; the literal note form requires separate `-I -S` flags and an existing private native WAL (see `docs/operations.md`). No secrets, PII or full prompts. Hook metadata alone is not a work log; if hooks are not trusted, create a manual WAL with the same helper and say so. Arm the main checkpoint with `wal.py continuation --wal <path> active` before dispatching substantive work and move it to `complete` only after verified delivery.
 - Durable state (scripts, run kits, packets, job state) lives in `~/.agent-harness/work/<task-or-thread>/` (0700), never in `/tmp`.
 - Browser denials: a `Local browser use is disabled` error is a workspace setting, not a site rule; record it, continue independent work, never bypass through another surface.
 - If `~/.agent-harness/bin/netwatch` is installed, check `netwatch orphans --json` before a handoff; signal only your own processes started after your task began.

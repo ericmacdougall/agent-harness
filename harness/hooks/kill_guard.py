@@ -38,11 +38,195 @@ import json
 import os
 import re
 import signal
+import stat
 import subprocess
 import sys
 import time
 import unicodedata
 from pathlib import Path
+
+# Reviewed native append-only implementation; changing it requires updating the binding and tests.
+CODEX_WAL_NOTE_SHA256 = 'eebaeda8cc22ca056632041a2e3f1a5128ac6cbf24d814b909be7c3002e56f3c'
+CODEX_WAL_EVENTS = frozenset(('intent', 'scope', 'decision', 'risk', 'check', 'commit', 'blocker',
+                              'status', 'handoff', 'result'))
+
+
+def _owned_path(path, root, private=False, digest=None):
+    """Observe a canonical owned file without following links. Not atomic execution binding.
+
+    A same-account writer can change an installed script after this observation; this is an
+    installed-account trust boundary, not isolation from a hostile process with the same uid.
+    """
+    try:
+        path, root = Path(path), Path(root)
+        if not path.is_absolute() or path != Path(os.path.normpath(path)) or root.resolve() != root:
+            return False
+        relative = path.relative_to(root)
+        if not relative.parts:
+            return False
+        current = root
+        for part in (None,) + relative.parts:
+            if part is not None:
+                current = current / part
+            info = current.lstat()
+            last = current == path
+            if info.st_uid != os.getuid() or stat.S_ISLNK(info.st_mode):
+                return False
+            if last:
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    return False
+            elif not stat.S_ISDIR(info.st_mode):
+                return False
+            # The root home need not itself be private; the WAL subtree must be.
+            forbidden = 0o077 if private and current != root else 0o022
+            if info.st_mode & forbidden:
+                return False
+        if digest:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                opened = os.fstat(fd)
+                if (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns) != (
+                        info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns) or opened.st_size > 200000:
+                    return False
+                with os.fdopen(fd, 'rb', closefd=False) as stream:
+                    data = stream.read(200001)
+                after = os.fstat(fd)
+                identity = lambda value: (value.st_dev, value.st_ino, value.st_size,
+                                          value.st_mtime_ns, value.st_ctime_ns, value.st_mode, value.st_uid)
+                if identity(after) != identity(opened) or hashlib.sha256(data).hexdigest() != digest:
+                    return False
+            finally:
+                os.close(fd)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _trusted_cellar_directory(path, info):
+    """One observed Homebrew admin-managed directory, never an arbitrary writable ancestor."""
+    if (sys.platform != 'darwin' or str(path) != '/opt/homebrew/Cellar'
+            or not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, os.getuid())
+            or info.st_gid != 80 or info.st_mode & 0o002):
+        return False
+    try:
+        import grp  # only available on Unix; the exception is Darwin-only
+        if grp.getgrgid(80).gr_name != 'admin':
+            return False
+        # Darwin exposes extended ACL presence as '+' in the ls mode field. Unknown or
+        # extended ACLs are refused rather than inferring their effective permissions.
+        result = subprocess.run(['/bin/ls', '-lde', '/opt/homebrew/Cellar'], capture_output=True,
+                                text=True, timeout=2, env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
+        mode = result.stdout.split()[0] if result.stdout.split() else ''
+        return result.returncode == 0 and bool(re.fullmatch(r'd[rwxstST-]{9}', mode))
+    except (KeyError, OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _trusted_python_chain(path):
+    """Inspect original aliases and each intermediate target, not just the resolved leaf."""
+    pending, current, links = list(Path(path).parts[1:]), Path('/'), 0
+    root = current.lstat()
+    if root.st_uid not in (0, os.getuid()) or not stat.S_ISDIR(root.st_mode) or root.st_mode & 0o022:
+        return None
+    while pending:
+        part = pending.pop(0)
+        if part in ('', '.'):
+            continue
+        if part == '..':
+            current = current.parent
+            continue
+        candidate = current / part
+        info = candidate.lstat()
+        if info.st_uid not in (0, os.getuid()):
+            return None
+        if stat.S_ISLNK(info.st_mode):
+            # Symlink modes are conventionally 0777; replacement is controlled by the
+            # already-inspected parent. The link owner and every target ancestor matter.
+            links += 1
+            if links > 40:
+                return None
+            target = os.readlink(candidate)
+            if target.startswith('/'):
+                current = Path('/')
+            pending = list(Path(target).parts[1:] if target.startswith('/') else Path(target).parts) + pending
+            continue
+        if info.st_mode & 0o022 and not _trusted_cellar_directory(candidate, info):
+            return None
+        if pending:
+            if not stat.S_ISDIR(info.st_mode):
+                return None
+        elif not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not info.st_mode & 0o111:
+            return None
+        current = candidate
+    return current
+
+
+def _trusted_note_python(word):
+    """Literal trusted system/Homebrew installation; no arbitrary basename or relocated alias."""
+    text = word.text
+    if word.raw != text or not re.fullmatch(
+            r'(?:/usr/bin/python3(?:\.[0-9]+)?|/opt/homebrew/(?:bin/python3(?:\.[0-9]+)?|'
+            r'opt/python@3\.[0-9]+/bin/python3\.[0-9]+|Cellar/python@3\.[0-9]+/[0-9][0-9A-Za-z_.-]*/'
+            r'(?:Frameworks/Python\.framework/Versions/3\.[0-9]+/bin/|bin/)python3(?:\.[0-9]+)?))', text):
+        return False
+    try:
+        resolved = _trusted_python_chain(text)
+        if '/Cellar/' in text and resolved != Path(text):
+            return False  # the canonical versioned entry must itself be physical, not a second alias
+        if resolved is None or not (str(resolved).startswith('/usr/bin/') or re.fullmatch(
+                r'/opt/homebrew/Cellar/python@3\.[0-9]+/[^/]+/(?:Frameworks/Python\.framework/Versions/'
+                r'3\.[0-9]+/bin/)?(?:bin/)?python3(?:\.[0-9]+)?', str(resolved))):
+            return False
+        return True
+    except OSError:
+        return False
+
+
+def _literal_wrapper_tail(name, args):
+    """Return the proven inner argv boundary for a deliberately finite wrapper grammar."""
+    if any(a.dynamic or a.subs or a.vars or a.glob for a in args):
+        return None
+    texts = [a.text for a in args]
+    if name == 'env':
+        if texts[:1] != ['-i']:
+            return None
+        i, seen = 1, set()
+        while i < len(texts) and '=' in texts[i]:
+            key, _, value = texts[i].partition('=')
+            if key in seen or key not in ('PATH', 'LC_ALL'):
+                return None
+            if key == 'PATH' and value != '/usr/bin:/bin' or key == 'LC_ALL' and value != 'C':
+                return None
+            seen.add(key)
+            i += 1
+        return i if seen == {'PATH', 'LC_ALL'} and i < len(texts) and not texts[i].startswith('-') else None
+    if name == 'sudo':
+        return 1 if len(texts) > 1 and texts[0] == '-n' and not texts[1].startswith('-') else None
+    if name != 'timeout':
+        return None
+    def duration(value):
+        match = re.fullmatch(r'([0-9]+(?:\.[0-9]+)?)([smhd]?)', value)
+        return bool(match and 0 < float(match[1]) * {'': 1, 's': 1, 'm': 60, 'h': 3600, 'd': 86400}[match[2]] <= 86400)
+    i, seen = 0, set()
+    while i < len(texts) and texts[i].startswith('-'):
+        key, equal, value = texts[i].partition('=')
+        if key not in ('--signal', '--kill-after', '-s', '-k'):
+            return None
+        key = {'-s': '--signal', '-k': '--kill-after'}.get(key, key)
+        if key in seen:
+            return None
+        if not equal:
+            i += 1
+            if i >= len(texts):
+                return None
+            value = texts[i]
+        if key == '--signal' and value not in ('TERM', 'KILL', 'INT', 'HUP', '15', '9', '2', '1'):
+            return None
+        if key == '--kill-after' and not duration(value):
+            return None
+        seen.add(key)
+        i += 1
+    return i + 1 if i + 1 < len(texts) and duration(texts[i]) and not texts[i + 1].startswith('-') else None
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -53,6 +237,11 @@ MAX_PID = 4194304
 GUARDED_TOOLS = {'bash', 'powershell', 'shell', 'local_shell', 'exec_command', 'unified_exec', 'write_stdin',
                  'container.exec'}
 COMMAND_KEYS = ('command', 'cmd', 'script', 'chars', 'input')
+# File-edit tools write text and run nothing; the shell tool that later runs the file is judged then (GoodQA #15565).
+# Codex apply_patch carries the patch body in tool_input.command. Same set as merge_gate.WRITE_TOOLS and the tools
+# commit_policy.shell_like excludes; kept local so the launcher imports nothing extra. Exact casefolded match only:
+# write_stdin types into a running shell and stays guarded.
+EDIT_TOOLS = frozenset({'apply_patch', 'write', 'edit', 'multiedit', 'notebookedit'})
 PROTECTED_COMM = {'claude', 'codex', 'sshd', 'launchd', 'systemd', 'init', 'tmux', 'screen', 'netwatch', 'login',
                   'terminal', 'iterm2', 'alacritty', 'kitty', 'wezterm', 'gnome-terminal', 'sudo'}
 SHELL_COMM = {'zsh', 'bash', 'sh', 'fish', 'dash', 'ksh', 'tcsh', 'csh'}  # protected when interactive
@@ -117,6 +306,129 @@ QUOTED_VARIABLE = re.compile(r'"\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-
 FUNCTION_KW = re.compile(r'\bfunction\s+([A-Za-z_][\w.:-]*)\s*(?:\(\s*\))?\s*\{')
 COPROC_KW = re.compile(r'\bcoproc\s+(?:[A-Za-z_]\w*\s*)?\{')
 INTERPRETER_NAME = re.compile(r'(?:python|pypy)[0-9.]*|node(?:js)?[0-9]*|ruby[0-9.]*|perl[0-9.]*|php[0-9.]*|deno|bun|lua[0-9.]*')
+# goodqa#16124: an operand that is only a file name (test/qac-kill-switch-ceiling.test.ts) is not signalling.
+PATH_OPERAND_EXTS = ('.ts', '.tsx', '.js', '.mjs', '.py', '.go', '.rs')
+PATH_OPERAND_CHARS = re.compile(r'[A-Za-z0-9_.@+/-]+')
+
+
+def path_operand(word, kill_re):
+    """True when `word` is a plain path-shaped operand whose kill word, if any, is only part of a file name: a literal
+    word (unquoted, no expansion, glob or substitution) of path characters, not an option, whose last component ends
+    in a listed test or source extension, or which has a '/' and whose last component holds no kill word. So
+    `test/qac-kill-switch.test.ts` and `kill-notes/README` pass; `pkill`, `/usr/bin/pkill`, `bin/kill`,
+    `scripts/kill-all.sh`, `'kill 4242'` and `--script=x/kill.py` do not. Where the word sits is decided by the
+    caller (test_runner_exemptions); this only judges its shape."""
+    text = word.text
+    if word.dynamic or word.subs or word.glob or word.quoted or word.raw != text:
+        return False
+    if not text or text.startswith('-') or not PATH_OPERAND_CHARS.fullmatch(text):
+        return False
+    base = text.rsplit('/', 1)[-1]
+    if not base:
+        return False
+    if base.lower().endswith(PATH_OPERAND_EXTS):
+        return True
+    return '/' in text and not kill_re.search(base)
+
+
+# PR 265 rescue (receipts v1 and v2): the exemption is an allowlist. A test path is exempt only when the WHOLE
+# interpreter command is one of the exact test-runner lines below; any other word, option, wrapper, runner or
+# subcommand anywhere in the command means no exemption, and the full script-kill scan applies. There is no generic
+# wrapper or runner parsing: unknown means scan.
+PYTHON_TEST_FLAGS = frozenset(('-I', '-u', '-B'))  # python3 -I lanes/pgpool.py ...: flags that take no value
+PGPOOL_SCRIPT = re.compile(r'(?:.*/)?lanes/pgpool\.py')
+PGPOOL_RUN_OPTS = frozenset(('--job', '--lane', '--ttl', '--mode', '--template', '--database'))  # each takes a value
+DBTEST_SCRIPT = re.compile(r'dbtest-any\.sh|(?:/|~/)[A-Za-z0-9_.@+/-]*/dbtest-any\.sh')
+TEST_DIRS = frozenset(('test', 'tests', '__tests__'))
+
+
+def plain_word(word):
+    """A literal word: no expansion, substitution, glob or brace alternatives, so the shell passes exactly this one
+    word and the grammar's slot count is the real argv count."""
+    return (not (word.dynamic or word.subs or word.glob) and bool(word.text) and len(word.alts) == 1
+            and word.overflow is None)
+
+
+def is_test_path(word, kill_re):
+    """A test-file operand: a path_operand that is a relative path written only with plain names (no leading `/`,
+    no empty, `.` or `..` component; path_operand already refuses `~`, quotes and expansions), that has a test/,
+    tests/ or __tests__/ directory component, and whose file name is test-shaped (`.test.`, `.spec.`, `test_` or
+    `test-`). PR 265 review v3: `tests/../tools/kill-all.js` names a file outside the test directory, so it is not
+    a test path. `tools/kill-all.ts`, `tools/kill-all.test.ts` and `tests/kill-all.py` are not test paths either,
+    so a runner given them keeps the full scan. A symlink inside a test directory cannot be seen statically."""
+    if not path_operand(word, kill_re):
+        return False
+    text = word.text
+    if text.startswith('/'):
+        return False
+    parts = text.split('/')
+    if any(p in ('', '.', '..') for p in parts):
+        return False
+    base = parts[-1].lower()
+    return (any(p in TEST_DIRS for p in parts[:-1])
+            and ('.test.' in base or '.spec.' in base or base.startswith(('test_', 'test-'))))
+
+
+def _test_paths(args, i, kill_re):
+    """Indexes of args[i:] when every one of them (at least one) is a test path, else None."""
+    if i >= len(args) or not all(is_test_path(a, kill_re) for a in args[i:]):
+        return None
+    return set(range(i, len(args)))
+
+
+def _pgpool_inner(args, i, kill_re):
+    """The command after pgpool's `--`, which must be exactly one of:
+    `[~/|/...]dbtest-any.sh WT LOG TEST [-t NAME]`, `npx [-y] vitest run TEST...` or
+    `pnpm --filter PKG exec vitest run TEST...`. Only TEST words are exempt; WT, LOG, PKG and NAME stay scanned."""
+    texts = [a.text for a in args]
+    rest = texts[i:]
+    if rest and DBTEST_SCRIPT.fullmatch(rest[0]):
+        if len(rest) not in (4, 6) or rest[1].startswith('-') or rest[2].startswith('-'):
+            return None
+        if len(rest) == 6 and rest[4] != '-t':
+            return None
+        test = i + 3
+        return {test} if is_test_path(args[test], kill_re) else None
+    if rest[:2] == ['npx', 'vitest'] and rest[2:3] == ['run']:
+        return _test_paths(args, i + 3, kill_re)
+    if rest[:3] == ['npx', '-y', 'vitest'] and rest[3:4] == ['run']:
+        return _test_paths(args, i + 4, kill_re)
+    if len(rest) > 6 and rest[0] == 'pnpm' and rest[1] == '--filter' and not rest[2].startswith('-') \
+            and rest[3:6] == ['exec', 'vitest', 'run']:
+        return _test_paths(args, i + 6, kill_re)
+    return None
+
+
+def test_runner_exemptions(name, args, kill_re):
+    """goodqa#16124: the indexes of `args` (the words after interpreter `name`) that are test paths of one of these
+    exact lines, and so are file names rather than signalling code:
+      G1 python3 [-I|-u|-B]... lanes/pgpool.py run [--job|--lane|--ttl|--mode|--template|--database V]... -- INNER
+         (INNER as _pgpool_inner says)
+      G2 python3 [-I|-u|-B]... -m pytest TEST...
+      G3 node --test TEST...
+    Every word must be literal (plain_word). Anything else returns the empty set, which keeps the full scan."""
+    if kill_re is None or not args or not all(plain_word(a) for a in args):
+        return set()
+    texts = [a.text for a in args]
+    if name.startswith('python'):
+        i = 0
+        while i < len(texts) and texts[i] in PYTHON_TEST_FLAGS:
+            i += 1
+        if texts[i:i + 2] == ['-m', 'pytest']:
+            return _test_paths(args, i + 2, kill_re) or set()  # G2
+        if i + 1 < len(texts) and PGPOOL_SCRIPT.fullmatch(texts[i]) and texts[i + 1] == 'run':  # G1
+            i, seen = i + 2, set()
+            while i < len(texts) and texts[i] in PGPOOL_RUN_OPTS and texts[i] not in seen:
+                if i + 1 >= len(texts) or texts[i + 1].startswith('-'):
+                    return set()
+                seen.add(texts[i])
+                i += 2
+            if i < len(texts) and texts[i] == '--':
+                return _pgpool_inner(args, i + 1, kill_re) or set()
+        return set()
+    if name == 'node' and texts[:1] == ['--test']:
+        return _test_paths(args, 1, kill_re) or set()  # G3
+    return set()
 RUN_OPTS = {'-c', '-s', '-i', '-e', '-lc', '-ic', '--command', '-l', '-S'}  # options that take a command to run
 LAUNCHERS = {'tmux', 'screen', 'at', 'batch', 'watch'}
 CLASSIC_VERBS = {'pkill', 'killall', 'killall5', 'skill', 'slay', 'taskkill', 'stop-process', 'spps'}
@@ -228,10 +540,12 @@ def pure_data_python(code):
     return True
 
 
-def hook_script_ok(raw, names):
-    """The raw word names ~/.claude/hooks/<name>.py or the same path under the caller's real HOME, nothing else."""
+def hook_script_ok(raw, names, codex=False):
+    """The raw word names ~/.claude/hooks/<name>.py or the same path under the caller's real HOME, nothing else.
+    With codex=True the Codex install copy ~/.codex/agent-harness/<name>.py counts as well (goodqa#15565)."""
     home = re.escape(str(Path.home()))
-    return bool(re.fullmatch(r'(?:~|%s)/\.claude/hooks/(?:%s)\.py' % (home, '|'.join(names)), raw or ''))
+    root = r'\.claude/hooks' if not codex else r'(?:\.claude/hooks|\.codex/agent-harness)'
+    return bool(re.fullmatch(r'(?:~|%s)/%s/(?:%s)\.py' % (home, root, '|'.join(names)), raw or ''))
 
 
 # --------------------------------------------------------------------------- policy and small helpers
@@ -1331,12 +1645,13 @@ def make_analyzer_class(cg):
                 if rest:
                     self.inner_words(args[args.index(rest[0]):], depth, pl, idx)
             elif name in cg.INTERPRETERS or INTERPRETER_NAME.fullmatch(name):
-                if not self.is_ah_kill(name, args, cmd, depth) and not self.is_harness_cli(name, args, cmd, depth):
+                if not self.is_codex_note(words, cmd, depth, pl) and not self.is_ah_kill(name, args, cmd, depth) \
+                        and not self.is_harness_cli(name, args, cmd, depth):
                     self.check_interpreter(name, texts, cmd, args)
             self.check_spawn(name, args, texts, depth, pl, idx)
-            self.check_text_runners(name, args, texts, cmd, depth)
+            self.check_text_runners(name, args, texts, cmd, depth, pl, idx)
 
-        def check_text_runners(self, name, args, texts, cmd, depth):
+        def check_text_runners(self, name, args, texts, cmd, depth, pl, idx):
             """Commands that run a text argument or here-string as shell code, which the base does not follow."""
             runs_stdin = name in cg.SHELLS or name in ('at', 'batch') or (
                 (name in WRAPPER_NAMES or name in REMOTE_WRAPPERS or name in REMOTE_EXEC) and any(
@@ -1357,7 +1672,20 @@ def make_analyzer_class(cg):
                 finally:
                     self.remote -= 1 if remote else 0
             if (name in WRAPPER_NAMES) and any(INTERPRETER_NAME.fullmatch(cg.norm_name(a.text)) for a in args):
-                self.check_interpreter(name, texts, cmd)  # uv run python - <<EOF
+                # Rebuilt inner argv does not carry the original input redirections or pipeline.
+                # Keep the old full scan in those contexts rather than losing stdin code.
+                head = (getattr(cmd, 'words', None) or [None])[0]
+                trusted_wrapper = head is not None and head.raw == '/usr/bin/' + name
+                boundary = (None if not trusted_wrapper or getattr(cmd, 'redirs', [])
+                            or (pl is not None and len(pl.cmds) != 1)
+                            else _literal_wrapper_tail(name, args))
+                if boundary is None:
+                    self.check_interpreter(name, texts, cmd)  # uncertain wrapper: retain conservative scan
+                else:
+                    # Prove the actual inner boundary by analyzing that argv, not by exempting a whole
+                    # wrapper. Base wrapper recursion and scan_tail still run independently. Original
+                    # redirections above remain checked; inner Python/shell code is never omitted.
+                    self.inner_words(args[boundary:], depth, pl, idx)
             if name in ('at', 'batch'):
                 for i, t in enumerate(texts):
                     if t == '-f' and i + 1 < len(args):
@@ -1424,7 +1752,8 @@ def make_analyzer_class(cg):
             i = 0
             while i < len(args) and args[i].text in ('-I', '-B', '-u'):
                 i += 1
-            if i >= len(args) or not hook_script_ok(args[i].raw, ('ah', 'wal_note', 'provenance')) or self.home_moved():
+            if i >= len(args) or not hook_script_ok(args[i].raw, ('ah', 'wal_note', 'provenance'), codex=True) \
+                    or self.home_moved():
                 return False
             if args[i].text.endswith('/ah.py'):
                 # only a known non-kill subcommand (optionally after the top-level --text) makes the rest data
@@ -1434,6 +1763,59 @@ def make_analyzer_class(cg):
                 if not rest or rest[0] not in AH_SUBCOMMANDS:
                     return False
             return True
+
+        def is_codex_note(self, words, cmd, depth, pl):
+            """Only reviewed installed append data, isolated from Python startup and shell expansion."""
+            if self.remote or depth or self.ctx.ps or self.home_moved() or getattr(cmd, 'redirs', []):
+                return False
+            if pl is not None and len(pl.cmds) != 1:
+                return False
+            if not words or any(w.dynamic or w.subs or w.vars or w.glob for w in words):
+                return False
+            original = getattr(cmd, 'words', None) or []
+            if not original or original[0].raw != words[0].raw:
+                return False  # assignment prefixes may have been removed from the execution words
+            if not _trusted_note_python(words[0]):
+                return False
+            args = words[1:]
+            texts = [a.text for a in args]
+            if texts[:2] != ['-I', '-S']:
+                return False
+            i = 2
+            seen_flags = set()
+            while i < len(texts) and texts[i] in ('-B', '-u'):
+                if texts[i] in seen_flags:
+                    return False
+                seen_flags.add(texts[i])
+                i += 1
+            home = Path.home()
+            script = home / '.codex/agent-harness/wal.py'
+            if i >= len(texts) or texts[i] != str(script) or args[i].raw != str(script):
+                return False
+            if not _owned_path(script, home, digest=CODEX_WAL_NOTE_SHA256):
+                return False
+            rest = texts[i + 1:]
+            if len(rest) != 7 or rest[0] != 'note':
+                return False
+            values = {}
+            for j in (1, 3, 5):
+                key, value = rest[j:j + 2]
+                if key not in ('--wal', '--event', '--note') or key in values:
+                    return False
+                values[key] = value
+            if values.get('--event') not in CODEX_WAL_EVENTS or not 1 <= len(values['--note'].strip()) <= 4000:
+                return False
+            wal = Path(values['--wal'])
+            root = home / '.agent-harness/codex-wals'
+            try:
+                parts = wal.relative_to(root).parts
+            except ValueError:
+                return False
+            if len(parts) != 2 or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', parts[0]):
+                return False
+            if parts[1] != 'main.jsonl' and not re.fullmatch(r'agent-[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\.jsonl', parts[1]):
+                return False
+            return _owned_path(wal, home, private=True)
 
         def is_ah_kill(self, name, args, cmd, depth):
             """True only for the literal form `python3 [-I|-B|-u] ~/.claude/hooks/ah.py kill --pid N[,N] --reason R
@@ -1511,6 +1893,11 @@ def make_analyzer_class(cg):
             return '--pid' in seen and '--reason' in seen
 
         def check_interpreter(self, name, texts, cmd, args=None):
+            if args is not None and len(args) == len(texts) and all(a.text == t for a, t in zip(args, texts)):
+                skip = test_runner_exemptions(name, args, self.script_kill)
+                if skip:
+                    keep = [k for k in range(len(args)) if k not in skip]
+                    texts, args = [texts[k] for k in keep], [args[k] for k in keep]
             texts = self.drop_script_arguments(texts, args)
             body = ' '.join(texts)
             for redir in getattr(cmd, 'redirs', []):
@@ -1813,6 +2200,11 @@ def decide(command, cwd=None, ps=False, ownership=None, policy=None, compiled=No
 
 # --------------------------------------------------------------------------- hook entry points
 
+def is_edit_tool(payload):
+    """True for a file-edit tool (EDIT_TOOLS, exact name after casefold); a missing name is not one."""
+    return str(payload.get('tool_name') or payload.get('toolName') or '').casefold() in EDIT_TOOLS
+
+
 def guarded_text(raw):
     """(is_shell_tool, command text) for a PreToolUse payload; unparsable input counts as guarded."""
     try:
@@ -1821,6 +2213,8 @@ def guarded_text(raw):
         return True, raw
     if not isinstance(payload, dict):
         return True, raw
+    if is_edit_tool(payload):  # file text is not a command, even under a `command` key
+        return False, ''
     tool = str(payload.get('tool_name') or payload.get('toolName') or '').casefold()
     tool_input = payload.get('tool_input') or payload.get('toolInput') or {}
     has_command = isinstance(tool_input, dict) and any(k in tool_input for k in COMMAND_KEYS[:3])
@@ -1868,6 +2262,8 @@ def analyze_main(data=None):
             if fallback_blocks(raw):
                 return emit('block', block_message('unparsable-payload', 'the hook payload is not valid JSON and '
                                                    'mentions a kill verb or indirection'))
+            return 0
+        if isinstance(payload, dict) and is_edit_tool(payload):  # writing a file runs nothing (GoodQA #15565)
             return 0
         cg = _import_base()
         command, ps = cg.extract_command(payload)

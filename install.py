@@ -21,22 +21,37 @@ ROOT = Path(__file__).resolve().parent
 START = "<!-- agent-harness:start -->"
 END = "<!-- agent-harness:end -->"
 AGENTS = ("task-owner.md", "click-tester.md", "fixer.md", "red-team.md")
-HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", "usage_guard.py", "wal.py", "wal_note.py", "peer_review.py", "rescue.py", "publish_feature.py", "integrate_local.py", "deliver.py",
+HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", "usage_guard.py", "wal.py", "wal_note.py", "peer_review.py", "rescue.py", "publish_feature.py", "integrate_local.py", "node_check_reporter.mjs", "deliver.py",
          "ticket_adapters.py", "commit_policy.py", "commit_policy.json", "workdir.py",
          "spec_flow.py", "spec_policy.json", "spec_template.md", "provenance.py", "provenance_policy.json", "provenance_hooks.py", "safe_input.py", "caller_identity.py", "review_map.py",
+         "native_context.py", "native_user_source.py", "native_admission.py", "native_main.py", "t2scan_consent.py",
          "review_diagnostics.py", "review_policy.json", "merge_gate.py",
          "heavy_job_guard.py", "dropbox_budget.conf", "run_capped.py", "run_probe.py", "resource_budget.py", "agent_gate.py", "ops_watch.py", "resource_limits.json",
          "domain_gates.py", "domain_checklists.json",
          "command_guard.py", "command_guard_hook.py", "redact.py", "kill_guard.py", "kill_guard_policy.json",
-         "doctor.py", "hooks_manifest.json", "rules.json", "ah.py", "ah_kill.py", "ah_ticket.py", "liveness.py",
+         "doctor.py", "hooks_manifest.json", "rules.json", "ah.py", "ah_kill.py", "ah_worktree.py", "ah_install.py", "guard_selftest.py", "ah_ticket.py", "ah_chat.py", "liveness.py",
+         "ah_export.py",  # ah export: redacted local HTML of a session (goodqa#15788)
          "remote_delete.py", "remote_delete_agent.py",
-         "model_tiers.py", "model_tiers.json", "escalation.py", "tier_gate.py",
+         "model_tiers.py", "model_tiers.json", "escalation.py", "central_decisions.py", "tier_gate.py",
          "ahd.py", "ahd_peek.py", "ahd_policy.json",
-         "commit_policy.local.json.example", "spec_policy.local.json.example", "ledger_reminder.py", "log_backup.py", "bg_job.py", "bg_lint.py",
-         "dropped_gate.py", "ask_reminders.py", "ask_sweep.py",  # dropped-owner gate and ask reminders (goodqa#14791)
+         "commit_policy.local.json.example", "spec_policy.local.json.example", "ledger_reminder.py", "log_backup.py", "bg_job.py", "task_recovery.py", "bg_lint.py",
+         "successor.py",  # successor kit and `ah task succeed` (goodqa#15565)
+         "dropped_gate.py", "ask_reminders.py", "ask_sweep.py",  # dropped-owner gate, ask reminders and ask sweep (goodqa#14791, #15565)
          "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py",  # Hawkeye ports (goodqa#14908)
+         "copy_hygiene.py", "lifecycle_cleanup.py",  # reusable copies and scoped completed-task cleanup
          "backup_watch.py", "kimi_review.py", "installer_scan.py",
-         "trivy_gate.py")  # pinned Trivy scan for deliver prepare --scan (goodqa#15295)
+         "trivy_gate.py",  # pinned Trivy scan for deliver prepare --scan (goodqa#15295)
+         "mc_chat.py", "mc_inbox.py",  # Mission Control chat store and inbox CLI/hook (goodqa#15585)
+         "owner_inbox.py",  # stall-watcher answer inbox: OWNER-DECISION-*.md and inbox/ notes
+         "mission_coverage.py", "mission_gate.py",  # mission goals: owner, disposition or done evidence (goodqa#15565)
+         "goals_view.py", "status_truth.py", "stop_blocks.py",  # `ah goals`, status lint and injection (goodqa#15754)
+         "gq_browser.py",  # GoodQA worker browser CLI and stdio MCP server; main registers the MCP (goodqa#15745)
+         "idle_guard.py",  # main-idle detector, Stop block and rejected-question reminder (goodqa#15943)
+         "shellwords.py",  # quote-aware command splitting shared by mission_gate and dropped_gate (goodqa#15684)
+         "ahc_core.py", "ahc_fs.py", "ahc_packet.py", "ahc_clone.py", "ahc_runner.py", "ahc_install.py",  # ahc daemon (goodqa#16034)
+         "ahc_contracts.py", "ahc_crash.py", "ahc_migrate.py", "ahc_clock.py", "ahc_scan.py", "ahc_shadow.py", "ahc_guard.py",
+         "ahc_observe.py", "ahc_w21.py", "ahc_review.py",
+         "ahc_release.json")  # imported or read by ahc_runner (goodqa#16049; ahc_release.json: AC-11 preflight)
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
@@ -86,7 +101,8 @@ def managed_scripts(claude: Path) -> set[str]:
     return {str(claude / "hooks" / name)
             for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py",
                          "command_guard_hook.py", "kill_guard.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py", "log_backup.py", "bg_lint.py",
-                         "dropped_gate.py", "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py")}
+                         "dropped_gate.py", "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py",
+                         "mc_inbox.py", "owner_inbox.py", "mission_gate.py", "status_truth.py", "idle_guard.py", "copy_hygiene.py")}
 
 
 # Every agent type: a narrower matcher left general-purpose, claude and Explore owners without any
@@ -108,6 +124,8 @@ def provenance_hook_groups(claude: Path) -> dict[str, list[dict]]:
 
     return {
         "PreToolUse": [{"matcher": "AskUserQuestion", "hooks": [hook("ask-gate")]}],
+        # goodqa#16651: a withdrawing question answer revokes the session's published central decisions.
+        "PostToolUse": [{"matcher": "AskUserQuestion", "hooks": [hook("answer")]}],
         "Stop": [{"hooks": [hook("stop-lint")]}],
         "UserPromptSubmit": [{"hooks": [hook("prompt")]}],
     }
@@ -200,6 +218,13 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
             "matcher": "Bash",
             "hooks": [heavy_guard],
         }, {
+            # Copy hygiene: below the free-space floor, denies commands that create another copy (clone, worktree
+            # add, cp -r, rsync -a, ditto); always denies writing scratch into /dev/shm (RAM). Silent otherwise; fails
+            # open, so no onFailure.
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": "python3",
+                       "args": [str(claude / "hooks" / "copy_hygiene.py"), "pretool"], "timeout": 5}],
+        }, {
             "matcher": PROD_DELETE_MATCHER,
             "hooks": [prod_delete],
         }, {
@@ -210,9 +235,17 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
             "hooks": [spec_gate],
         }],
     }
+    # Dispatch records (goodqa#15794): PostToolUse closes the spawn's dispatch with the models the harness reported, and a
+    # SendMessage to an indexed agent reopens it (a resume). Silent and fail-open; it cannot block, so no onFailure.
+    managed.setdefault("PostToolUse", []).append({"matcher": "Agent|Task|SendMessage", "hooks": [ladder("dispatch")]})
     if command_guard:
         managed["PreToolUse"].insert(0, command_guard_group(claude))
         managed["PreToolUse"].insert(1, kill_guard_group(claude))
+    # Copy hygiene report (t2-dev disk full 2026-11-21): one line when idle test copies pile up, and a detached
+    # report-only reap at most every 6 h. Never deletes; fails open.
+    managed["SessionStart"].append({"hooks": [{
+        "type": "command", "command": "python3", "args": [str(claude / "hooks" / "copy_hygiene.py"), "session-start"],
+        "timeout": 5}]})
     if log_backup:
         # Visible alert when the scheduled log backup has not succeeded for an hour; fails open. Only registered
         # where the backup is opted in (--log-backup, or already installed), so a host without it gets no alert.
@@ -229,6 +262,24 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
     managed.setdefault("SubagentStop", []).append({"matcher": SUBAGENT_MATCHER, "hooks": [{
         "type": "command", "command": "python3", "args": [str(claude / "hooks" / "dropped_gate.py"), "subagent-stop"],
         "timeout": 15}]})
+    # Mission gate (goodqa#15565): blocks main's turn end while an active mission goal has no live owner, no live
+    # disposition and no done evidence. Main only, bounded per signature, silent where no goals file exists.
+    managed.setdefault("Stop", []).append({"hooks": [{"type": "command", "command": "python3",
+                                                       "args": [str(claude / "hooks" / "mission_gate.py")], "timeout": 15}]})
+    # Idle guard (goodqa#15943): blocks main's turn end while the session is idle with a non-user next step, and adds
+    # one reminder line after a user rejection. Main only, bounded per signature, fails open.
+    idle = str(claude / "hooks" / "idle_guard.py")
+    managed.setdefault("Stop", []).append({"hooks": [{"type": "command", "command": "python3", "args": [idle, "stop"],
+                                                       "timeout": 15}]})
+    for event in ("PostToolUseFailure", "PermissionDenied", "UserPromptSubmit"):
+        managed.setdefault(event, []).append({"hooks": [{"type": "command", "command": "python3",
+                                                         "args": [idle, "reject"], "timeout": 5}]})
+    # Status truth (goodqa#15754): a status question gets the goal ledger, a compaction re-injects it, and main's Stop
+    # lint catches a goal-status answer that contradicts it. Mission session only; fails open; mode status_lint.
+    truth = str(claude / "hooks" / "status_truth.py")
+    for event, arg in (("UserPromptSubmit", "prompt"), ("SessionStart", "session-start"), ("Stop", "stop")):
+        managed.setdefault(event, []).append({"hooks": [{"type": "command", "command": "python3", "args": [truth, arg],
+                                                         "timeout": 10}]})
     # WAL cadence (rule W04, goodqa#14908): one bounded nudge when a big uncommitted diff has no recent WAL note.
     # Fails open on its own errors, so no onFailure.
     cadence = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "wal_cadence.py")], "timeout": 30}
@@ -244,10 +295,31 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
     managed.setdefault("PreToolUse", []).append({"matcher": "Bash", "hooks": [{
         "type": "command", "command": "python3", "args": [str(claude / "hooks" / "dropped_gate.py"), "pretool"],
         "timeout": 5}]})
+    # Main-only mission commands (goodqa#15565 red-team M1): main's own hook stamps them; never denies anything.
+    managed.setdefault("PreToolUse", []).append({"matcher": "Bash", "hooks": [{
+        "type": "command", "command": "python3", "args": [str(claude / "hooks" / "mission_gate.py"), "pretool"],
+        "timeout": 5}]})
+    # ... and deletes that stamp when the call ends, fails or is denied (goodqa#15754 red-team F1): a stamp of a call
+    # that never ran must not be honoured by a later process. Never denies anything; fails open.
+    for event in ("PostToolUse", "PostToolUseFailure", "PermissionDenied"):
+        managed.setdefault(event, []).append({"matcher": "Bash", "hooks": [{
+            "type": "command", "command": "python3", "args": [str(claude / "hooks" / "mission_gate.py"), "posttool"],
+            "timeout": 5}]})
     # Local-ledger reminder (docs/ledger.md): rate limited and dismissible; fails open, so no onFailure.
     reminder = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "ledger_reminder.py")], "timeout": 3}
     for event in ("SessionStart", "UserPromptSubmit"):
         managed.setdefault(event, []).append({"hooks": [reminder]})
+    # Mission Control chat (goodqa#15585, docs/mission-control.md): acts only for the session registered with
+    # `mc_inbox.py wait`; its output is a fixed pointer, never dashboard text; fails open, so no onFailure.
+    inbox = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "mc_inbox.py"), "hook"], "timeout": 5}
+    for event in ("Stop", "UserPromptSubmit"):
+        managed.setdefault(event, []).append({"hooks": [dict(inbox)]})
+    # Stall-watcher / owner decision inbox: inject unread OWNER-DECISION-*.md and inbox/ notes
+    # as additionalContext (or a one-time Stop block), then mark them read. Fails open, so no onFailure.
+    owner_inbox = {"type": "command", "command": "python3",
+                   "args": [str(claude / "hooks" / "owner_inbox.py"), "hook"], "timeout": 5}
+    for event in ("UserPromptSubmit", "SessionStart", "Stop", "PostToolUse"):
+        managed.setdefault(event, []).append({"hooks": [dict(owner_inbox)]})
     return managed
 
 
@@ -962,6 +1034,15 @@ def netwatch_status(home: Path, apply: bool, flag) -> str:
         return f"netwatch: skipped ({error.__class__.__name__}: {error})"
 
 
+def mission_control_status(home: Path, apply: bool, flag) -> str:
+    """Optional dashboard; never fails the harness install (mission_control_install.status never raises)."""
+    try:
+        import mission_control_install
+        return mission_control_install.status(home, apply, flag)
+    except Exception as error:  # noqa: BLE001
+        return f"mission control: skipped ({error.__class__.__name__}: {error})"
+
+
 def migrate_local_profiles(claude: Path, policy_dir: Path | None = None) -> list[str]:
     """Before the shipped policies are overwritten, copy their personal values into new untracked 0600 profiles.
     Never overwrites an existing profile. Without this an upgrade would silently turn ticket enforcement off."""
@@ -1087,6 +1168,13 @@ def main() -> None:
                           help="do not install or upgrade the netwatch monitor (remembered)")
     netwatch.add_argument("--netwatch", dest="netwatch", action="store_true",
                           help="install or upgrade the pinned netwatch monitor (the default; remembered)")
+    mission = parser.add_mutually_exclusive_group()
+    mission.add_argument("--mission-control", dest="mission_control", action="store_true", default=None,
+                         help="install Mission Control (the local fleet dashboard) and, on macOS, its LaunchAgent "
+                              "(the default; remembered)")
+    mission.add_argument("--no-mission-control", dest="mission_control", action="store_false",
+                         help="do not install Mission Control; where installed, stop its LaunchAgent (files and chat "
+                              "data stay; remembered)")
     parser.add_argument("--no-provenance-hooks", dest="provenance", action="store_false",
                         help="do not register the provenance hooks (ask-gate, stop-lint, prompt) and remove any "
                              "registered by an earlier install; the files stay installed; not remembered")
@@ -1133,6 +1221,7 @@ def main() -> None:
     print(f"  {local_profile_status(args.home)}")
     print(f"  {command_guard_status(args.command_guard)}")
     print(f"  {log_backup_status(args.home, args.apply, args.log_backup)}")
+    print(f"  {mission_control_status(args.home, args.apply, args.mission_control)}")
     if not args.apply:
         print("Run with --apply to install. Existing files will be backed up.")
 

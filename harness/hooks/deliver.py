@@ -9,6 +9,8 @@ command merges a remote PR or executes text from the run kit.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
@@ -25,7 +27,7 @@ import time
 from urllib.parse import quote
 
 from github_identity import github_repository, repository_name
-from git_safety import git_environment, require_safe_source
+from git_safety import git_environment, require_safe_source, unsupported_git_environment
 from integrate_local import (ALLOWED_GIT_ENV, CheckInterpreterError, CheckLog, ExternalApplyError,
                              OriginalScope, acquire_scope_lock, approved_check, approved_prepare, redact_output,
                              require_check_interpreters,
@@ -70,13 +72,14 @@ def report(status, message, **facts):
     print(json.dumps({"status": status, "message": message, **facts}, sort_keys=True))
 
 
-def bounded(command, *, cwd=None, env=None, timeout=30, limit=MAX_OUTPUT):
+def bounded(command, *, cwd=None, env=None, timeout=30, limit=MAX_OUTPUT, pass_fds=()):
     """Bound a child process group and output without echoing its private output."""
-    code, output, _ = bounded_with_stderr(command, cwd=cwd, env=env, timeout=timeout, limit=limit)
+    code, output, _ = bounded_with_stderr(command, cwd=cwd, env=env, timeout=timeout, limit=limit,
+                                        pass_fds=pass_fds)
     return code, output
 
 
-def bounded_with_stderr(command, *, cwd=None, env=None, timeout=30, limit=MAX_OUTPUT, stderr_limit=0):
+def bounded_with_stderr(command, *, cwd=None, env=None, timeout=30, limit=MAX_OUTPUT, stderr_limit=0, pass_fds=()):
     """Like bounded, optionally keeping the first stderr_limit bytes.
 
     stderr is drained through a pipe and the excess discarded, so a child that
@@ -85,7 +88,7 @@ def bounded_with_stderr(command, *, cwd=None, env=None, timeout=30, limit=MAX_OU
     process = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                                stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE if stderr_limit else subprocess.DEVNULL,
-                               start_new_session=True)
+                               start_new_session=True, pass_fds=pass_fds)
     data, errors, deadline = bytearray(), bytearray(), time.monotonic() + timeout
     try:
         with selectors.DefaultSelector() as poller:
@@ -153,7 +156,7 @@ def require_arguments(args, *names):
         raise DeliveryError("BLOCKED_POLICY", "Required delivery arguments are missing", code=2)
 
 
-def snapshot(repo, branch, *, require_clean=True):
+def snapshot(repo, branch, *, require_clean=True, expected_layout=None):
     if (repo.is_symlink() or not repo.is_dir()
             or Path(git_value(repo, "rev-parse", "--show-toplevel")).resolve() != repo.resolve()):
         raise DeliveryError("BLOCKED_POLICY", "Checkout must be a Git worktree root", code=2)
@@ -161,9 +164,11 @@ def snapshot(repo, branch, *, require_clean=True):
     if code or git_value(repo, "symbolic-ref", "--quiet", "--short", "HEAD") != branch:
         raise DeliveryError("BLOCKED_LOCAL", "Checkout branch changed or is invalid")
     try:
-        require_safe_source(repo, git_environment(), timeout=15)
+        layout = require_safe_source(repo, git_environment(), timeout=15)
     except OSError:
         raise DeliveryError("BLOCKED_LOCAL", "Checkout Git metadata is unsafe or unverifiable") from None
+    if expected_layout is not None and layout != expected_layout:
+        raise DeliveryError("RECHECK_REQUIRED", "Prepared checkout layout changed")
     if require_clean:
         code, status = git(repo, "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
                            "status", "--porcelain=v1", "-z", "--untracked-files=all")
@@ -476,6 +481,9 @@ class Workflow:
         private_directory(self.directory)
         self.state = private_json(self.directory / "journal.json")
         self.validate_state(self.state)
+        replacing = getattr(self.args, "new_generation", False) and self.state["phase"] in SETTLED
+        if not replacing:
+            self.snapshot()
         return self.state
 
     def validate_state(self, value):
@@ -484,7 +492,13 @@ class Workflow:
                   "phase", "pr_number", "target", "merge_head", "guard_key", "local_key", "checks_digest", "apply_base"}
         strings = ("kind", "task", "scope", "generation", "original", "branch", "source", "source_branch",
                    "source_head", "baseline", "kit_digest", "repository", "phase")
-        if (set(value) != fields or type(value.get("schema")) is not int or value["schema"] != 1
+        if value.get("schema") == 2:
+            fields |= {"source_layout", "original_layout"}
+            for name in ("source_layout", "original_layout"):
+                item = value.get(name)
+                if not isinstance(item, str) or (item != "ordinary" and not HEX64.fullmatch(item)):
+                    raise DeliveryError("RECOVERY_REQUIRED", "Required checkout layout proof is invalid")
+        if (set(value) != fields or type(value.get("schema")) is not int or value["schema"] not in (1, 2)
                 or any(not valid_identity_text(value.get(name)) for name in strings)
                 or value["kind"] != "delivery_workflow" or value["task"] != self.task
                 or value["scope"] != self.scope or value["generation"] != self.generation
@@ -519,7 +533,13 @@ class Workflow:
         self.generation = secrets.token_hex(16)
         private_directory(self.root / "generations")
         private_directory(self.directory)
-        self.state = {"schema": 1, "kind": "delivery_workflow", "task": self.task, "scope": self.scope,
+        try:
+            source_layout = require_safe_source(source, git_environment(), timeout=15)
+            original_layout = require_safe_source(self.original, git_environment(), timeout=15)
+        except OSError:
+            raise DeliveryError("BLOCKED_LOCAL", "Checkout layout could not be verified") from None
+        self.state = {"schema": 2, "kind": "delivery_workflow", "task": self.task, "scope": self.scope,
+                      "source_layout": source_layout, "original_layout": original_layout,
                       "generation": self.generation, "original": str(self.original),
                       "original_dev": self.identity[0], "original_ino": self.identity[1], "branch": self.branch,
                       "source": str(source), "source_branch": source_branch, "source_head": source_head,
@@ -540,6 +560,10 @@ class Workflow:
         self.validate_state(value)
         write_journal(self.directory, value)
         self.state = value
+
+    def snapshot(self):
+        return snapshot(self.original, self.branch,
+                        expected_layout=self.state.get("original_layout", "ordinary"))
 
     def assert_state(self):
         self.assert_context()
@@ -633,7 +657,7 @@ class Workflow:
                 or type(value.get("pr_number")) is not type(self.state["pr_number"])
                 or not isinstance(value.get("checks_digest"), str) or not HEX64.fullmatch(value["checks_digest"])):
             raise DeliveryError("RECOVERY_REQUIRED", "Completed workflow receipt is invalid")
-        current = snapshot(self.original, self.branch)
+        current = self.snapshot()
         if not ancestry(self.original, value["head"], current):
             raise DeliveryError("RECHECK_REQUIRED", "Historical delivery is absent from current checkout", head=current)
         return {**value, "current_head": current}
@@ -908,7 +932,8 @@ def source_inputs(args):
 def verify_source(flow):
     state = flow.state
     source = Path(state["source"])
-    if snapshot(source, state["source_branch"]) != state["source_head"]:
+    if snapshot(source, state["source_branch"],
+                expected_layout=state.get("source_layout", "ordinary")) != state["source_head"]:
         raise DeliveryError("BLOCKED_POLICY", "Prepared source changed; review a new generation", code=2)
     return source
 
@@ -1184,6 +1209,58 @@ def scan_gate(args, source, head):
                             reason="SCAN_UNAVAILABLE", scan=lines[-1])
 
 
+@contextmanager
+def publication_attempt(flow, resume, url):
+    """Contain known publishers; legacy absence never proves an old write failed."""
+    flow.assert_state()
+    path = flow.directory / "publication.lock"
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        def verify_lease():
+            info = os.fstat(fd)
+            named = path.stat(follow_symlinks=False)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1
+                    or info.st_mode & 0o077 or (info.st_dev, info.st_ino) != (named.st_dev, named.st_ino)):
+                raise DeliveryError("RECOVERY_REQUIRED", "Publication lease identity is unsafe")
+        verify_lease()
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise DeliveryError("BUSY", "A known publisher still holds this generation's lease") from None
+        verify_lease()
+        flow.assert_state()
+        if resume:
+            verify_source(flow)
+            if flow.snapshot() != flow.state["baseline"]:
+                raise DeliveryError("BLOCKED_LOCAL", "Original checkout changed before publication resume")
+            matching_origins(Path(flow.state["source"]), flow.original, flow.state["repository"])
+            # Query before any retry. A legacy publisher may still be alive;
+            # explicit authority covers only its identical nonforce write.
+            observed = published_ref(flow.original, url, flow.state, flow.args.timeout)
+            if observed is not None:
+                verify_lease()
+                flow.save(phase="PR_LOOKUP")
+                yield False, fd
+                return
+            verify_source(flow)
+            if flow.snapshot() != flow.state["baseline"]:
+                raise DeliveryError("BLOCKED_LOCAL", "Original checkout changed during publication resume preflight")
+            matching_origins(Path(flow.state["source"]), flow.original, flow.state["repository"])
+            verify_lease()
+            record = {"schema": 1, "kind": "publication_resume", "attempt": secrets.token_hex(16),
+                      "reason": flow.args.resume_reason, "prior_outcome": "UNKNOWN",
+                      "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                      "generation": flow.generation, "scope": dict(flow.state)}
+            _write_private_json(flow.directory / ("publication-resume-" + record["attempt"] + ".json"), record)
+            fsync_directory(flow.directory)
+        # The descriptor is inherited by the native publisher below. It remains
+        # locked if the coordinator dies, until that publisher itself exits.
+        yield True, fd
+        verify_lease()
+    finally:
+        os.close(fd)
+
+
 def prepare(args):
     if getattr(args, "reconcile_only", False):
         return reconcile(args)
@@ -1220,12 +1297,19 @@ def prepare(args):
             origin_error = error
     with Workflow(args) as flow:
         state = flow.load()
+        resuming_publication = getattr(args, "resume_publication", False)
+        if resuming_publication and (state is None or state["phase"] != "PUBLISHING"):
+            raise DeliveryError("BLOCKED_POLICY", "Publication resume requires this generation in PUBLISHING", code=2)
         if state is not None and not getattr(args, "new_generation", False):
             if (state["source"] != str(source) or state["source_branch"] != branch
                     or state["source_head"] != head or state["baseline"] != baseline
                     or state["kit_digest"] != kit or (state["phase"] == "LOCAL_READY") != local_only
                     or state["repository"] != repository):
                 raise DeliveryError("BLOCKED_POLICY", "Prepared scope differs; explicitly request a new generation", code=2)
+            # Prepare consumes source state, including its layout. A merged
+            # remote recovery instead uses pinned remote/guard proof and may
+            # legitimately finish after the source worktree has been retired.
+            verify_source(flow)
         else:
             policy_record = commit_policy_gate(source, args.original_branch, branch, head, baseline,
                                                title, body, local_only)
@@ -1254,48 +1338,56 @@ def prepare(args):
             return record_pr(flow, found)
         if state["phase"] not in {"INITIAL", "PUBLISHING", "PR_LOOKUP", "PR_CREATING", "REMOTE_UNCERTAIN"}:
             raise DeliveryError("RECOVERY_REQUIRED", "Generation has pending checkout recovery", **flow.facts())
-        if state["phase"] == "INITIAL":
-            require_remote_base(flow, url)
-            flow.save(phase="PUBLISHING")
-            try:
-                code, output = bounded([sys.executable, str(Path(__file__).with_name("publish_feature.py")),
-                                        "--repo", str(source), "--branch", branch,
-                                        "--original-branch", flow.branch, "--expected-head", head,
-                                        "--expected-repository", repository, "--timeout", str(args.timeout)],
-                                       # At most 24 sequential bounded Git waits,
-                                       # including source guards and the one-deadline LFS scan.
-                                       timeout=24 * args.timeout + 30)
-                published = json.loads(output)
-                if not isinstance(published, dict):
-                    raise ValueError
-            except (OSError, DeliveryError, ValueError):
-                pass  # Durable PUBLISHING intent requires exact reconciliation.
-            else:
-                if (code == 0 and published.get("status") == "PUSHED"
-                        and published.get("repository") == repository):
-                    flow.save(phase="PR_LOOKUP")
-                elif published.get("status") == "BLOCKED_POLICY":
-                    flow.save(phase="POLICY_BLOCKED")
-                    raise DeliveryError("BLOCKED_POLICY", "Publisher refused the pinned repository or source policy", code=2)
-                elif code == 4 and published.get("push_rejected") is True:
-                    flow.save(phase="POLICY_BLOCKED")
+        if state["phase"] == "INITIAL" or resuming_publication:
+            with publication_attempt(flow, resuming_publication, url) as (launch, lease_fd):
+                if state["phase"] == "INITIAL":
+                    require_remote_base(flow, url)
+                    flow.save(phase="PUBLISHING")
+                if launch:
                     try:
-                        published_ref(flow.original, url, flow.state, args.timeout)
-                    except DeliveryError as error:
-                        if error.status == "BLOCKED_POLICY":
-                            raise
-                    raise DeliveryError("BLOCKED_POLICY", "Remote refused the push; review a new branch generation",
-                                        code=2, **flow.facts())
-                elif code == 4 and published.get("push_attempted") is False:
-                    flow.save(phase="REMOTE_BLOCKED")
-                    raise DeliveryError("REMOTE_BLOCKED", "Publisher preflight failed before any push attempt",
-                                        code=4, **flow.facts())
-                else:
-                    pass  # A failed push can still have reached the remote.
+                        code, output = bounded([sys.executable, str(Path(__file__).with_name("publish_feature.py")),
+                                                "--repo", str(source), "--branch", branch,
+                                                "--original-branch", flow.branch, "--expected-head", head,
+                                                "--expected-repository", repository, "--timeout", str(args.timeout)],
+                                               # At most 24 sequential bounded Git waits,
+                                               # including source guards and the one-deadline LFS scan.
+                                               timeout=24 * args.timeout + 30, pass_fds=(lease_fd,))
+                        published = json.loads(output)
+                        if not isinstance(published, dict):
+                            raise ValueError
+                    except (OSError, DeliveryError, ValueError):
+                        pass  # Durable PUBLISHING intent requires exact reconciliation.
+                    else:
+                        if resuming_publication:
+                            if published.get("status") == "BLOCKED_POLICY":
+                                raise DeliveryError("BLOCKED_POLICY", "Retry publisher refused the pinned source policy; prior publication remains unknown", code=2)
+                        elif (code == 0 and published.get("status") == "PUSHED"
+                                and published.get("repository") == repository):
+                            flow.save(phase="PR_LOOKUP")
+                        elif published.get("status") == "BLOCKED_POLICY":
+                            flow.save(phase="POLICY_BLOCKED")
+                            raise DeliveryError("BLOCKED_POLICY", "Publisher refused the pinned repository or source policy", code=2)
+                        elif code == 4 and published.get("push_rejected") is True:
+                            flow.save(phase="POLICY_BLOCKED")
+                            try:
+                                published_ref(flow.original, url, flow.state, args.timeout)
+                            except DeliveryError as error:
+                                if error.status == "BLOCKED_POLICY":
+                                    raise
+                            raise DeliveryError("BLOCKED_POLICY", "Remote refused the push; review a new branch generation",
+                                                code=2, **flow.facts())
+                        elif code == 4 and published.get("push_attempted") is False:
+                            flow.save(phase="REMOTE_BLOCKED")
+                            raise DeliveryError("REMOTE_BLOCKED", "Publisher preflight failed before any push attempt",
+                                                code=4, **flow.facts())
+                        else:
+                            pass  # A failed push can still have reached the remote.
         if flow.state["phase"] == "PUBLISHING":
             try:
                 published = published_ref(flow.original, url, flow.state, args.timeout)
             except DeliveryError as error:
+                if resuming_publication and error.status == "BLOCKED_POLICY":
+                    raise
                 raise DeliveryError("REMOTE_UNCERTAIN", "Publisher completion is not yet positively verified",
                                     code=4, **{**flow.facts(), **error.facts}) from None
             if published is None:
@@ -1303,7 +1395,7 @@ def prepare(args):
                                     code=4, **flow.facts())
             # Exact publication reconciled; any previous create is queried before another is attempted.
             flow.save(phase="PR_LOOKUP")
-        if snapshot(source, branch) != head or snapshot(flow.original, flow.branch) != baseline:
+        if snapshot(source, branch, expected_layout=flow.state.get("source_layout", "ordinary")) != head or flow.snapshot() != baseline:
             raise DeliveryError("RECHECK_REQUIRED", "Checkout moved during publication; inspect its remote outcome", **flow.facts())
         matching_origins(source, flow.original, repository)
         return prepare_pr(flow, title, body)
@@ -1564,7 +1656,7 @@ def remote_finish(flow, preparations, checks):
     digest, guard = checks_digest(preparations, checks), None
     with OriginalScope(flow.original, flow.branch, args.timeout) as scope:
         try:
-            current = snapshot(flow.original, flow.branch)
+            current = flow.snapshot()
             if not ancestry(flow.original, state["baseline"], current) or not ancestry(flow.original, current, target):
                 raise DeliveryError("BLOCKED_LOCAL", "Original checkout diverges from the verified target", head=current)
             if flow.state["phase"] == "REMOTE_APPLYING" and flow.state["guard_key"] is not None:
@@ -1580,17 +1672,17 @@ def remote_finish(flow, preparations, checks):
                           apply_base=current, checks_digest=digest)
                 guard = scope.reserve_external(base=current, target=target, task_digest=task_generation_digest(flow))
                 flow.save(guard_key=guard.key)
-                if snapshot(flow.original, flow.branch) != current:
+                if flow.snapshot() != current:
                     raise DeliveryError("RECHECK_REQUIRED", "Original changed before fast-forward")
                 if current != target:
                     code, _ = git(flow.original, "merge", "--ff-only", "--no-overwrite-ignore",
                                   "--no-autostash", target, timeout=args.timeout)
                     if code:
                         raise DeliveryError("BLOCKED_LOCAL", "Protected fast-forward was refused")
-            if snapshot(flow.original, flow.branch) != target:
+            if flow.snapshot() != target:
                 raise DeliveryError("DELIVERED_CHECK_FAILED", "Original changed during sync")
             run_checks(flow.original, preparations, checks, args.check_timeout, flow.directory / "checks")
-            if snapshot(flow.original, flow.branch) != target:
+            if flow.snapshot() != target:
                 raise DeliveryError("DELIVERED_CHECK_FAILED", "Checks changed the delivered checkout")
             if origin_destination(flow.original)[0] != state["repository"]:
                 raise DeliveryError("BLOCKED_POLICY", "Original repository changed after sync", code=2)
@@ -1647,13 +1739,13 @@ def local_completion(flow, preparations, checks):
             flow.save(phase="RESOLVED_BASELINE")
             raise DeliveryError("RESOLVED_BASELINE", "Local recovery baseline accepted; prepare a new reviewed generation",
                                 head=observed_head(flow.original), **flow.facts())
-        current = snapshot(flow.original, flow.branch)
+        current = flow.snapshot()
         if (completed is None and not ancestry(flow.original, flow.state["source_head"], flow.state["baseline"])):
             return False
         if not ancestry(flow.original, flow.state["source_head"], current):
             raise recovery_error(flow, "Local delivery is absent from current checkout", flow.state["baseline"])
         run_checks(flow.original, preparations, checks, flow.args.check_timeout, flow.directory / "checks")
-        if snapshot(flow.original, flow.branch) != current:
+        if flow.snapshot() != current:
             raise recovery_error(flow, "Local checks changed the delivered checkout", flow.state["baseline"])
         flow.complete("local", current, checks_digest(preparations, checks))
         tickets = ticket_updates(flow, "delivered-local", current)
@@ -1677,7 +1769,7 @@ def local_finish(flow, preparations, checks):
     verify_source(flow)
     if git_common_directory(source, 30)[0] != flow.common:
         raise DeliveryError("BLOCKED_POLICY", "Local delivery requires worktrees of the same repository", code=2)
-    current = snapshot(flow.original, flow.branch)
+    current = flow.snapshot()
     if current != state["baseline"]:
         raise recovery_error(flow, "Original changed before local delivery; inspect its prior attempt", state["baseline"])
     flow.save(phase="LOCAL_APPLYING", local_key=key, apply_base=current,
@@ -1717,7 +1809,7 @@ def finish(args):
     try:
         # Before any checkout effect: a bare python3 that resolves to an
         # unsupported interpreter would only fail after the fast-forward.
-        require_check_interpreters(checks)
+        require_check_interpreters(checks, args.original)
     except CheckInterpreterError as error:
         raise DeliveryError("BLOCKED_POLICY", str(error), code=2) from None
     with Workflow(args) as flow:
@@ -1761,14 +1853,14 @@ def resolve_baseline(flow, preparations, checks):
         if blocked is not None:
             raise recovery_error(flow, "Resolve actual shared recovery journals before accepting this workflow baseline",
                                  flow.state["baseline"], journal=blocked / "journal.json")
-        if snapshot(flow.original, flow.branch) != confirmed:
+        if flow.snapshot() != confirmed:
             raise DeliveryError("RECOVERY_REQUIRED", "Confirmed baseline HEAD changed")
         try:
             run_checks(flow.original, preparations, checks, flow.args.check_timeout, flow.directory / "checks")
         except DeliveryError as error:
             raise DeliveryError("RECOVERY_REQUIRED", "Baseline checks did not validate the confirmed checkout",
                                 **check_facts(error)) from None
-        if snapshot(flow.original, flow.branch) != confirmed:
+        if flow.snapshot() != confirmed:
             raise DeliveryError("RECOVERY_REQUIRED", "Baseline checks changed the confirmed checkout")
         # save rereads both the exact generation pointer and loaded state.
         flow.save(phase="RESOLVED_BASELINE")
@@ -1867,6 +1959,9 @@ def parse_args():
     prep.add_argument("--pr-body-file", type=Path,
                       help="mode-0600 PR body, e.g. ~/.agent-harness/work/<session-id>/<task>/pr-body.md")
     prep.add_argument("--reconcile-only", action="store_true", help="Query a pending remote outcome without publishing or changing checkout")
+    prep.add_argument("--resume-publication", action="store_true",
+                      help="Explicitly reauthorize only the identical pinned nonforce write of a PUBLISHING generation")
+    prep.add_argument("--resume-reason", help="Private explanation for reauthorizing an uncertain publication")
     prep.add_argument("--local-only", action="store_true", help="Explicitly choose guarded local delivery")
     prep.add_argument("--target-policy", choices=("refuse", "warn"), default=None,
                       help="Original-checkout sanity preflight: refuse (default) or warn and continue; "
@@ -1897,6 +1992,16 @@ def parse_args():
         parser.error("--timeout must be between 1 and 3600 seconds")
     if args.phase == "finish" and not 1 <= args.check_timeout <= MAX_CHECK_TIMEOUT:
         parser.error(f"--check-timeout must be between 1 and {MAX_CHECK_TIMEOUT} seconds")
+    if args.phase == "prepare":
+        if args.resume_publication:
+            if (not args.generation or args.kit_file is None or not args.expected_source_head
+                    or not args.expected_original_head or args.reconcile_only or args.local_only or args.new_generation):
+                parser.error("--resume-publication requires the exact --generation, --kit-file and expected HEADs; it cannot change modes or generations")
+            if (not valid_identity_text(args.resume_reason) or not 1 <= len(args.resume_reason.strip()) <= 512
+                    or any(ord(char) < 32 for char in args.resume_reason)):
+                parser.error("--resume-publication requires a nonempty --resume-reason of at most 512 characters without controls")
+        elif args.resume_reason is not None:
+            parser.error("--resume-reason requires --resume-publication")
     if args.phase == "finish":
         if args.resume and (args.mode != "remote" or not args.generation or args.kit_file is None):
             parser.error("--resume requires --mode remote, --generation and --kit-file")
@@ -1912,7 +2017,7 @@ def parse_args():
 def main():
     args = parse_args()
     try:
-        if any(name.startswith("GIT_") and name not in ALLOWED_GIT_ENV for name in os.environ):
+        if unsupported_git_environment(os.environ, ALLOWED_GIT_ENV):
             raise DeliveryError("BLOCKED_POLICY", "Unsupported Git routing environment", code=2)
         return prepare(args) if args.phase == "prepare" else finish(args)
     except DeliveryError as error:

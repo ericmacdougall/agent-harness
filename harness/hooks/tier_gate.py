@@ -48,6 +48,35 @@ def hook_result(decision, reason=None, updated=None, context=None):
     return {'hookSpecificOutput': out}
 
 
+def central_permission(task, family, facts):
+    """A verified signed central decision (central_decisions.py, GoodQA goodqa#16651) stands in for the task's own
+    recorded permission, exactly where the local permission is read and nowhere else (the rung ceiling is unchanged).
+    Nothing is written into the escalation state; any failure, timeout or missing config means no permission."""
+    if not isinstance(task, str) or not esc.SAFE_KEY.fullmatch(task) or family not in ('fable', 'astra'):
+        return None
+    try:
+        import central_decisions as cd  # noqa: PLC0415
+        store = cd.Store()
+        if not store.config.exists():
+            return None
+        # One budget per hook run, shared by every consult of that run (a Bash line can reach two sites).
+        import time as _time  # noqa: PLC0415
+        end = facts.setdefault('central_budget_end', _time.monotonic() + cd.HOOK_DEADLINE)
+        remaining = end - _time.monotonic()
+        if remaining < 0.5:
+            raise cd.Denied('ledger_timeout', 'the central decision budget of this hook run is spent')
+        found = cd.verify(task, family, store=store, deadline_seconds=remaining)
+    except Exception as error:  # noqa: BLE001  fail closed: no permission
+        facts['central'] = str(getattr(error, 'code', type(error).__name__))[:40]
+        return None
+    facts['central'] = found['decision_id']
+    return {'central': True, 'decision_id': found['decision_id'], 'task': task, 'expires_at': found['expires_at']}
+
+
+def family_of_model(model):
+    return 'astra' if 'astra' in str(model or '').lower() else 'fable'
+
+
 def requested_spec(tool_input, policy):
     """What the caller asked for, classified, or None when no model was named (inherit)."""
     model = tool_input.get('model')
@@ -116,10 +145,17 @@ def decide_spawn(data, policy, ledger, *, session_id=None):
     facts['requested'] = requested
     blocked = status['blocked_by'] if status else []
 
+    central = {}
+
     def permitted(rung):
-        """Only the task's own recorded permission. Review F1 and main's rule: there is no session-wide grant, so
-        an untagged spawn never inherits a permission the user gave for another task."""
-        return bool((status or {}).get('permission'))
+        """Only the task's own recorded permission, or a verified central decision for this exact task (family
+        fable: a Claude spawn). Review F1 and main's rule: there is no session-wide grant, so an untagged spawn never
+        inherits a permission the user gave for another task."""
+        if (status or {}).get('permission'):
+            return True
+        if 'value' not in central:
+            central['value'] = central_permission(task if not generated else None, 'fable', facts)
+        return bool(central['value'])
 
     def permission_denied(rung):
         return ('rung %s needs the user permission for task %s. Fix: %s (then add [task:%s] to the Agent description)'
@@ -436,6 +472,7 @@ def _decide_launch(command, policy, ledger, env_model=None, session_id=None):
                     permission = ledger.status(task).get('permission')
                 except (esc.LedgerError, tiers.TierError) as error:
                     facts['ladder_error'] = getattr(error, 'code', 'error')
+            # Central decisions do not apply to reviewers: peer_review.py itself honours only the local permission.
             if not permission:
                 return 'deny', 'review at %s needs recorded user permission for task %s' % (selection['rung'], task or '(none)'), None, facts
     if model is None:
@@ -451,7 +488,10 @@ def _decide_launch(command, policy, ledger, env_model=None, session_id=None):
         except (esc.LedgerError, tiers.TierError) as error:
             facts['ladder_error'] = getattr(error, 'code', 'error')
     # Permission and review-only checks come first: no task means no recorded permission (no session grant).
-    if entry['needs_user_permission'] and not (status or {}).get('permission'):
+    granted = bool((status or {}).get('permission'))
+    if not granted and task is not None and (entry['needs_user_permission'] or (status or {}).get('needs_user_permission')):
+        granted = bool(central_permission(task, family_of_model(model), facts))
+    if entry['needs_user_permission'] and not granted:
         return 'deny', 'launch at %s needs the user permission for task %s. Fix: %s' % (
             requested['rung'], task or '(none)', esc.approve_fix(task)), None, facts
     if not entry['writable'] and 'rescue.py' in basenames:
@@ -466,7 +506,7 @@ def _decide_launch(command, policy, ledger, env_model=None, session_id=None):
         return 'allow', 'launch without --task: lowest rung applies', None, facts
     if status is None:
         return 'allow', 'ladder state unreadable (%s): lowest rung applies' % facts.get('ladder_error', 'error'), None, facts
-    if status.get('needs_user_permission') and not status.get('permission') and 'rescue.py' not in basenames:
+    if status.get('needs_user_permission') and not granted and 'rescue.py' not in basenames:
         # The task has climbed to a permission rung: like the spawn path, nothing launches for it below
         # that rung either until approve-top records the user's answer.
         return 'deny', 'task %s is computed at %s, which needs the user permission before any launch. Fix: %s' % (
@@ -587,14 +627,31 @@ def _owners_with_deadline(home, session_id, seconds):
 
 
 def _slot_freed(row):
-    """F4: a silent owner frees its slot only for an ending disposition (closed, superseded, wontdo, or reassigned) that
-    `ah` does not still mark decision_required. `live: true` alone never frees it: a resumed owner inside its grace and a
-    waiting owner are still owners."""
+    """A silent owner frees its slot when main disposed of it the way the liveness alerts already accept
+    (liveness.row_disposed, goodqa#15322): the work was reassigned, closed, superseded or written off, or a named wait is
+    still live (a reassignment or wait counts only while its holder is live, never-drop 16.1). A `resumed` owner is working, so it keeps its slot, and `ah` still marking
+    decision_required keeps it too. GoodQA #15565: a0680533 (live wait) was SILENT-HIGH and disposed, yet held one of
+    the four slots. With never-drop 16.1, a reassignment frees a slot only while its successor is live (af265a5's
+    had returned, so that owner is ownerless and decision_required, not disposed)."""
     disp = row.get('disposition')
     if not isinstance(disp, dict) or row.get('decision_required') is True:
         return False
     kind = disp.get('kind')
-    return kind in ('closed', 'superseded', 'wontdo') or (kind == 'reassigned' and disp.get('live') is True)
+    if kind in ('closed', 'superseded', 'wontdo', 'legacy'):
+        return True
+    # a reassignment or a wait frees the slot only while its holder is live (`live` is ah's own verdict); this is checked
+    # here, not left to liveness.row_disposed, which accepted any reassignment until never-drop 16.1 lands (red-team ad4294 B1)
+    return kind in ('reassigned', 'waiting') and disp.get('live') is True
+
+
+IDLE_OWNER_MAX_S = liveness.SILENT_S  # an owner-type agent `ah` calls idle-helper holds its slot while it is merely quiet
+
+
+def _counts_while_idle(row):
+    """`ah owners` flags only task-owner agents as owners, so a quiet general-purpose owner is classified idle-helper.
+    It is still running (never stopped), so it holds a slot while its idle time is known and under IDLE_OWNER_MAX_S (a longer-idle one is stale, not working)."""
+    idle = row.get('idle_s')
+    return str(row.get('state') or '') == 'idle-helper' and isinstance(idle, (int, float)) and idle < IDLE_OWNER_MAX_S
 
 
 def live_owner_ids(session_id, policy):
@@ -605,10 +662,11 @@ def live_owner_ids(session_id, policy):
                                      OWNER_COUNT_DEADLINE_S)
         return sorted(r['agent_id'] for r in data.get('owners') or []
                       if counts_as_owner(r.get('type'), policy, r.get('owner'))
-                      and str(r.get('state') or '').startswith(RUNNING_STATES)
+                      and (str(r.get('state') or '').startswith(RUNNING_STATES) or _counts_while_idle(r))
                       # a silent owner that main disposed of (reassigned, closed, ...) frees its slot; an owner that is
                       # live, working or quiet always counts, whatever its disposition (red-team C3)
-                      and (str(r.get('state') or '').startswith(('live', 'working', 'quiet')) or not _slot_freed(r)))
+                      and (str(r.get('state') or '').startswith(('live', 'working', 'quiet')) or _counts_while_idle(r)
+                           or not _slot_freed(r)))
     except (Exception, _Deadline):  # noqa: BLE001,B036 - no main WAL yet, a partial install or a scan past its deadline: the live map decides
         pass
     try:
@@ -636,9 +694,173 @@ def owner_cap_decision(session_id, tool_input, policy):
                                                       Path(__file__).resolve().parent / 'ah.py')), owners
 
 
+ACTIONS = ('hook', 'start', 'stop', 'dispatch')
+BASH_DISPATCH = re.compile(r'(^|[\s;&|(/`\'"=\\])(claude|codex|rescue\.py)(\s|$|[\'"`)])', re.IGNORECASE)
+
+
+def _gate_log(record):
+    try:
+        log = esc.state_root() / 'gate.jsonl'
+        esc.rotate_log(log)
+        with open(log, 'a', encoding='utf-8') as handle:
+            handle.write(json.dumps(record, sort_keys=True, default=str) + '\n')
+        os.chmod(log, 0o600)
+    except Exception:  # noqa: BLE001  inspection F9: a symlinked state dir (LedgerError) must not escape either
+        pass
+
+
+def _spec_from(value):
+    if not isinstance(value, dict):
+        return None
+    return {'model': value.get('model'), 'effort': value.get('effort'), 'rung': value.get('rung')}
+
+
+def _selected_from(updated, requested, policy, mode):
+    """What will actually run: updatedInput applies only in enforce mode (warn mode never rewrites)."""
+    if mode == 'enforce' and isinstance(updated, dict):
+        found = tiers.classify(updated.get('model') or 'sonnet', updated.get('effort'), policy)
+        if found:
+            return {'model': updated.get('model'), 'effort': found['effort'], 'rung': found['rung']}
+    return requested
+
+
+def _is_review_segment(segment):
+    """True when the segment's program is peer_review.py itself (directly or as `python3 peer_review.py`); a
+    launch that merely mentions it in a prompt is still a launch. Unparsable segments are launches."""
+    try:
+        words = shlex.split(segment)
+    except ValueError:
+        return False
+    program = command_program(words)
+    if program == 'peer_review.py':
+        return True
+    if not re.fullmatch(r'python[0-9.]*', program or ''):
+        return False
+    bases = [w.rsplit('/', 1)[-1].lower() for w in words]
+    if program not in bases:
+        return False
+    rest = [b for w, b in zip(words[bases.index(program) + 1:], bases[bases.index(program) + 1:]) if not w.startswith('-')]
+    return bool(rest) and rest[0] == 'peer_review.py'
+
+
+def open_spawn_dispatch(data, tool, command, decision, updated, facts, policy, mode, ledger, session_id):
+    """goodqa#15794: record an open dispatch for a spawn or launch that will run. Never changes the decision."""
+    if decision != 'allow' and not (decision == 'deny' and mode == 'warn'):
+        return  # an enforced deny never runs
+    tool_input = data.get('tool_input') if isinstance(data.get('tool_input'), dict) else {}
+    tool_use_id = data.get('tool_use_id')
+    if not esc.clean_str(tool_use_id, 64):
+        return  # nothing could ever close it; the harness always sends one on a real PreToolUse
+    if tool in SPAWN_TOOLS:
+        prompt, description = str(tool_input.get('prompt') or ''), str(tool_input.get('description') or '')
+        task = facts.get('task')
+        if not task:  # the owner-cap and live-cap paths skip decide_spawn: same key rule, no ledger.status
+            task = esc.task_key_from(prompt, description) or esc.generated_key(session_id or '', description or prompt[:200])
+        subagent_type = str(tool_input.get('subagent_type') or '')
+        requested = _spec_from(facts.get('requested')) if 'requested' in facts else _spec_from(requested_spec(tool_input, policy))
+        kind = 'workflow' if tool == 'Workflow' else 'agent'
+        fields = {'tool_use_id': tool_use_id, 'kind': kind, 'subagent_type': subagent_type,
+                  'owner': kind == 'agent' and counts_as_owner(subagent_type, policy),
+                  'reviewer': subagent_type in REVIEWER_TYPES,  # the type alone: a [review:] mark never hides a writer
+                  'requested': requested, 'selected': _selected_from(updated, requested, policy, mode)}
+    elif tool == 'Bash':
+        # Inspection F6: every launch segment counts; only a segment that is itself a peer_review.py run is skipped,
+        # and the task key may sit in any segment of the line.
+        launches = [s for s in split_segments(command) if BASH_DISPATCH.search(s) and not _is_review_segment(s)]
+        first = next((s for s in split_segments(command) if LAUNCH.search(s)), '')
+        own = facts.get('task') if not _is_review_segment(first) else None  # m2: a review segment's --task is not the launch's
+        task = esc.task_key_from(*launches) or own or esc.task_key_from(command)
+        if not task or not launches:
+            return
+        single = len(launches) == 1 and 'peer_review.py' not in command  # facts describe this launch only then
+        model, effort = (facts.get('model'), facts.get('effort')) if single else (None, None)
+        found = tiers.classify(model, effort, policy) if model else None
+        requested = {'model': model, 'effort': effort, 'rung': (found or {}).get('rung')}
+        fields = {'tool_use_id': tool_use_id, 'kind': 'bash', 'subagent_type': None, 'owner': False,
+                  'reviewer': False, 'requested': requested, 'selected': requested}
+    else:
+        return
+    ledger.open_dispatch(task, fields)
+
+
+def reopen_resumed(agent_id, ledger):
+    """Inspection F5: a resumed agent (SubagentStart, or a SendMessage to its agent id) runs again. Only an agent
+    this ledger indexed is reopened; a new spawn is not yet indexed, and a name never resolves to a path."""
+    task = esc.lookup_agent(ledger.root, agent_id)
+    if task:
+        ledger.reopen_dispatch(task, agent_id)
+        return task
+    return None
+
+
+def record_dispatch(data):
+    """PostToolUse for Agent/Task (close the open dispatch with the harness-reported models) and SendMessage
+    (reopen a resumed agent). Silent and fail-open: every path returns without output; nothing here can block."""
+    record = {'at': esc.now(), 'tool': data.get('tool_name'), 'decision': 'dispatch'}
+    try:
+        tool = data.get('tool_name')
+        response = data.get('tool_response')
+        if tool == 'SendMessage':
+            # r7 M1: the harness's own response names the resumed agent (resumedAgentId) even when `to` is a name;
+            # it wins over `to`. Only the response's key names are logged, never its values.
+            response = response if isinstance(response, dict) else {}
+            target = (data.get('tool_input') or {}).get('to') if isinstance(data.get('tool_input'), dict) else None
+            ledger = esc.Ledger(policy=tiers.load_policy())
+            task = None
+            for candidate in (response.get('resumedAgentId'), response.get('agentId'), target):
+                task = reopen_resumed(esc.clean_str(candidate, 64), ledger)
+                if task:
+                    break
+            record.update(task=task, result='reopened' if task else 'ignored',
+                          response_keys=sorted(esc.clean_str(k, 32) or '?' for k in list(response)[:12]))
+            return
+        if tool not in ('Agent', 'Task') or not isinstance(response, dict):
+            record['result'] = 'ignored'
+            return
+        tool_input = data.get('tool_input') if isinstance(data.get('tool_input'), dict) else {}
+        prompt, description = str(tool_input.get('prompt') or ''), str(tool_input.get('description') or '')
+        task = esc.task_key_from(prompt, description) or esc.generated_key(str(data.get('session_id') or ''),
+                                                                           description or prompt[:200])
+        policy = tiers.load_policy()
+        ledger = esc.Ledger(policy=policy)
+        subagent_type = str(tool_input.get('subagent_type') or '')
+        dispatch = ledger.close_dispatch(
+            task, data.get('tool_use_id'), status=response.get('status'), agent_id=response.get('agentId'),
+            resolved_model=response.get('resolvedModel'), models_used=response.get('modelsUsed'),
+            subagent_type=subagent_type, owner=counts_as_owner(subagent_type, policy),
+            reviewer=subagent_type in REVIEWER_TYPES)
+        record.update(task=task, tool_use_id=dispatch.get('tool_use_id'), agent_id=dispatch.get('agent_id'),
+                      resolved_model=dispatch.get('resolved_model'), candidates=dispatch.get('candidates'))
+        if dispatch.get('agent_id'):
+            pending = esc.index_agent(ledger.root, dispatch['agent_id'], task)
+            if isinstance(pending, dict):  # a foreground stop that arrived before this close
+                ledger.end_dispatch(task, dispatch['agent_id'], pending.get('effort'))
+                record['pending_stop'] = True
+        record['result'] = 'closed'
+    except BaseException as error:  # noqa: BLE001  fail-open by design
+        record['result'] = 'error'
+        record['error'] = '%s: %s' % (type(error).__name__, str(error)[:120])
+    finally:
+        _gate_log(record)
+
+
+def end_from_stop(data, ledger):
+    """SubagentStop: end the indexed dispatch and record the observed effort; remember a stop that beat its close."""
+    agent_id = data.get('agent_id')
+    effort = data.get('effort')
+    level = effort.get('level') if isinstance(effort, dict) else None
+    task = esc.lookup_agent(ledger.root, agent_id)
+    if task:
+        ledger.end_dispatch(task, agent_id, level)
+    else:
+        esc.note_pending_stop(ledger.root, agent_id, level)
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     action = argv[0] if argv else 'hook'
+    if action not in ACTIONS:
+        return 0  # an unknown action (install skew) is a no-op
     unreadable = None
     try:
         data = json.loads(safe_input.read_stdin_bounded().decode('utf-8', errors='replace'))
@@ -648,6 +870,13 @@ def main(argv=None):
         data, unreadable = {}, 'hook input is not JSON'
     if not isinstance(data, dict):
         data, unreadable = {}, unreadable or 'hook input is not an object'
+    if action == 'dispatch':
+        # Before the policy load, the owner scan and decide_spawn: PostToolUse only records, silently.
+        if unreadable:
+            _gate_log({'at': esc.now(), 'decision': 'dispatch', 'result': 'unreadable', 'error': unreadable})
+        else:
+            record_dispatch(data)
+        return 0
     if unreadable and action == 'hook':
         # Input the hook cannot read (an over-bound stdin from a huge command, or malformed JSON) is never a
         # silent allow: the tool call is refused in enforce and flagged in warn, the same as an oversize line.
@@ -689,6 +918,14 @@ def _main(action, data, tool, command, applies):
         return 0
     if action in ('start', 'stop'):
         count = live_update(session_id, data.get('agent_id'), start=(action == 'start'), agent_type=data.get('agent_type'))
+        try:
+            if action == 'stop':
+                end_from_stop(data, ledger)
+            else:
+                reopen_resumed(data.get('agent_id'), ledger)
+        except BaseException as error:  # noqa: BLE001  fail-open: start/stop never fail on dispatch bookkeeping
+            _gate_log({'at': esc.now(), 'decision': 'dispatch_%s_failed' % action,
+                       'error': '%s: %s' % (type(error).__name__, str(error)[:120])})
         cap = int(policy.get('caps', {}).get('session_live_agents', LIVE_CAP_DEFAULT))
         if action == 'start' and count > cap:
             print(json.dumps({'hookSpecificOutput': {'hookEventName': 'SubagentStart',
@@ -709,14 +946,12 @@ def _main(action, data, tool, command, applies):
     else:
         return 0
     record = {'at': esc.now(), 'tool': tool, 'decision': decision, 'reason': reason, 'mode': mode, 'facts': facts}
+    _gate_log(record)
     try:
-        log = esc.state_root() / 'gate.jsonl'
-        esc.rotate_log(log)
-        with open(log, 'a', encoding='utf-8') as handle:
-            handle.write(json.dumps(record, sort_keys=True, default=str) + '\n')
-        os.chmod(log, 0o600)
-    except OSError:
-        pass
+        open_spawn_dispatch(data, tool, command, decision, updated, facts, policy, mode, ledger, session_id)
+    except BaseException as error:  # noqa: BLE001  the decision and output never depend on the dispatch record
+        _gate_log({'at': esc.now(), 'tool': tool, 'decision': 'dispatch_open_failed',
+                   'error': '%s: %s' % (type(error).__name__, str(error)[:120])})
     if decision == 'allow' and updated is None:
         return 0  # nothing to change; the decision and its reason are in gate.jsonl
     if mode == 'warn':

@@ -91,18 +91,24 @@ def defaults(host: str) -> dict:
                       "no_heavy_jobs": darwin},
         "delivery": [],
         "drift": {"repo": None, "ref": "origin/main", "claude_dir": "~/.claude"},
+        # goodqa#15565: merged-not-deployed per registered service, and PENDING_REAL_TEST left open
+        "deploys": {"enabled": True, "services": [], "merged_after_h": 2, "pending_after_h": 6, "lookback_h": 72,
+                    "wal_root": "~/.claude/wals"},
         "codex_dir": "~/.codex",
         # thresholds shared with ahd's liveness.py (DESIGN.md section 5): SILENT 30 min warning, 60 min high
         "liveness": {"enabled": True, "wal_root": "~/.claude/wals", "silent_min": 30, "silent_high_min": 60,
                      "lookback_h": 24, "lookback_active_h": 168, "retire_h": 6, "ticket_quiet_h": 3, "max_ticket_lookups": 10,
                      "ticket_budget_s": 90, "gq": "~/.claude/goodqa-p0p1/gq.py",
                      "projects": {"goodqa": "1ae27b6b-f8f2-4e61-ab2d-c9c43fd162c3"}},
+        "idle_guard": {"enabled": True, "idle_min": 30, "wal_root": "~/.claude/wals", "lookback_h": 12},
         "peers": [],
         # goodqa#15234: point events (a refused copy, a foreign process stop) describe something that happened, not a
         # condition that can stop being true, so nothing ever cleared them. They expire after ttl_h without a repeat.
-        "point_events": {"prefixes": ["heavy:", "ah-" + "kill:"], "ttl_h": 6},
+        "point_events": {"prefixes": ["heavy:", "ah-" + "kill:", "bgwait:"], "ttl_h": 6},  # bgwait: a waiter gave up (goodqa#15565)
         # goodqa#15070: timer jobs on other hosts, read over ssh: [{"host", "unit", "user": bool, "max_age_h"}]
         "remote_units": [],
+        # goodqa#15771: read-only capacity watch of a Proxmox pool: [{"host", "storage", "mount", "watch_vms": [ids]}]
+        "proxmox_pools": [],
         "sinks": {"comment": {"mode": "none"}, "deadman": [], "comment_min_interval_s": 1800},
     }
 
@@ -142,11 +148,89 @@ def now_iso(ts: float | None = None) -> str:
     return datetime.fromtimestamp(time.time() if ts is None else ts, timezone.utc).isoformat()
 
 
-def run(argv, timeout, stdin=None, env=None, cwd=None):
-    """Default runner: (returncode, stdout). Raises subprocess.TimeoutExpired; stderr is discarded."""
-    p = subprocess.run(argv, input=stdin, capture_output=True, text=True, timeout=timeout,
-                       env=env, cwd=cwd)
-    return p.returncode, p.stdout
+RUN_MAX_BYTES = 64 * 1024 * 1024  # default per-stream bound for every runner call
+RUN_OVERFLOW_RC = -1000  # sentinel return code: output passed max_bytes; the child was killed and reaped
+
+
+def _read_capped(sel, data, deadline, max_bytes, argv, timeout, read=None, write=None):
+    """Drive the selector until every stream is at EOF: (stdout bytes, overflow). Overflow is irreversible: the
+    moment either stream passes max_bytes it returns (out, True) without handling the rest of the batch, so a
+    later small chunk on the other stream cannot hide it. Raises TimeoutExpired at the deadline. read/write are
+    injectable so the event order can be tested without real streams."""
+    read, write = read or os.read, write or os.write
+    out, err, offset = bytearray(), 0, 0
+    while sel.get_map():
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise subprocess.TimeoutExpired(argv, timeout)
+        for key, _ in sel.select(left):
+            if key.data == "in":
+                try:
+                    offset += write(key.fd, data[offset:offset + 512])
+                except BrokenPipeError:
+                    offset = len(data)
+                if offset >= len(data):
+                    sel.unregister(key.fileobj)
+                    key.fileobj.close()
+                continue
+            chunk = read(key.fd, 65536)
+            if not chunk:
+                sel.unregister(key.fileobj)
+                continue
+            if key.data == "out":
+                out += chunk
+                if len(out) > max_bytes:
+                    return out, True
+            else:
+                err += len(chunk)  # discarded, but counted against the same cap
+                if err > max_bytes:
+                    return out, True
+    return out, False
+
+
+def run(argv, timeout, stdin=None, env=None, cwd=None, max_bytes=RUN_MAX_BYTES):
+    """Default runner: (returncode, stdout). Raises subprocess.TimeoutExpired; stderr is discarded.
+
+    stdout and stderr are read incrementally and each is capped at max_bytes while reading, so a runaway producer
+    cannot grow this process: on overflow the child is killed and reaped and (RUN_OVERFLOW_RC, "") is returned.
+    On timeout the child is killed and reaped before TimeoutExpired is raised."""
+    import locale
+    import selectors
+    enc = locale.getpreferredencoding(False)
+    data = stdin.encode(enc) if stdin is not None else None
+    p = subprocess.Popen(argv, stdin=subprocess.PIPE if data is not None else None, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, env=env, cwd=cwd)
+    deadline = time.monotonic() + timeout
+    sel = selectors.DefaultSelector()
+    try:
+        sel.register(p.stdout, selectors.EVENT_READ, "out")
+        sel.register(p.stderr, selectors.EVENT_READ, "err")
+        if data is not None:
+            if data:
+                sel.register(p.stdin, selectors.EVENT_WRITE, "in")
+            else:
+                p.stdin.close()
+        out, overflow = _read_capped(sel, data, deadline, max_bytes, argv, timeout)
+        if overflow:
+            p.kill()
+            p.wait()
+            return RUN_OVERFLOW_RC, ""
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise subprocess.TimeoutExpired(argv, timeout)
+        rc = p.wait(timeout=left)
+    except BaseException:
+        if p.poll() is None:
+            p.kill()
+        p.wait()
+        raise
+    finally:
+        sel.close()
+        for f in (p.stdin, p.stdout, p.stderr):
+            if f is not None and not f.closed:
+                f.close()
+    text = out.decode(enc, errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+    return rc, text
 
 
 def alert(check, key, severity, message, detail=None) -> dict:
@@ -220,8 +304,9 @@ def _parse_slots(data: bytes) -> list:
             obj = json.loads(data[i:i + SLOT_BYTES].decode("utf-8", "replace").strip())
         except ValueError:
             continue
-        if isinstance(obj, dict) and isinstance(obj.get("seq"), int):
-            out.append(obj)
+        if (isinstance(obj, dict) and isinstance(obj.get("seq"), int)
+                and all(isinstance(obj.get(k), (str, type(None))) for k in ("host", "source", "key"))):
+            out.append(obj)  # a row whose host, source or key is not a string would crash every reader
     return sorted(out, key=lambda e: e["seq"])
 
 
@@ -240,6 +325,8 @@ def emit(event: dict, path: Path | None = None, home: Path | None = None) -> int
     missing = [k for k in REQUIRED if not event.get(k)]
     if missing:
         raise ValueError(f"alert event missing {missing}")
+    if not all(isinstance(event.get(k), str) for k in ("host", "source", "key")):
+        raise ValueError("alert event host, source and key must be strings")
     if event["severity"] not in SEVERITIES or event["event"] not in ("raise", "clear"):
         raise ValueError("bad severity or event")
     event = dict(event, message=redact(event["message"]), detail=redact_obj(event.get("detail") or {}))
@@ -1212,6 +1299,53 @@ def check_codex_trust(cfg):
                   {"untrusted": untrusted, "changed": changed, "hooks_json": str(hooks)})]
 
 
+def check_stale_runtimes(cfg):
+    """Runtime sessions (Claude, Codex, Kimi) still running a binary that a self-update replaced. The origin probe
+    cannot identify them, so they are denied main authority and commit attribution until restarted (fail-closed by
+    decision, goodqa#15646). Listed so restarts are scheduled instead of discovered through a refused commit."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        import native_context  # noqa: PLC0415 - absent on hosts without the native probe
+        rows = native_context.stale_runtime_processes()
+    except Exception:  # noqa: BLE001 - a detector must never crash the watch
+        return []
+    if not rows:
+        return []
+    shown = ", ".join("%s pid %d" % (r["name"], r["pid"]) for r in rows[:5])
+    more = " and %d more" % (len(rows) - 5) if len(rows) > 5 else ""
+    return [alert("runtime", "runtime:stale", "warning",
+                  "%d runtime session(s) run a binary replaced by an update (%s%s); restart them (resume the same "
+                  "session) or they are denied main authority and commits" % (len(rows), shown, more),
+                  {"processes": rows[:10]})]
+
+
+# ---------------------------------------------------------------- Mission Control "Needs you" sweeper
+
+MC_SWEEP_STALE_S = 15 * 60  # three missed sweeps (the sweeper runs every 5 minutes inside the dashboard server)
+
+
+def check_mc_sweeper(cfg, now):
+    """A dead Needs-you sweeper is an alert (GoodQA #15585). It runs inside the Mission Control server and writes
+    <home>/.agent-harness/mission-control/needs/heartbeat.json after every sweep. No heartbeat file means the
+    sweeper was never installed here: silent. An unreadable or old heartbeat raises."""
+    path = home_of(cfg) / ".agent-harness" / "mission-control" / "needs" / "heartbeat.json"
+    try:
+        if not path.is_file() or path.is_symlink():
+            return []
+        raw = read_text_capped(path, 4096)
+        at = json.loads(raw).get("at")
+        age = now - float(at)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return [alert("mission-control", "mc:needs-sweeper", "high",
+                      "Mission Control Needs-you sweeper heartbeat is unreadable; the list may be stale", {"path": str(path)})]
+    if age <= MC_SWEEP_STALE_S:
+        return []
+    return [alert("mission-control", "mc:needs-sweeper", "high",
+                  f"Mission Control Needs-you sweeper has not run for {int(age // 60)} min (expected every 5): "
+                  f"settled and stale asks are not being cleared; check `server.py status` and the launchd job",
+                  {"path": str(path), "age_s": int(age)})]
+
+
 # ---------------------------------------------------------------- peers
 
 def active_json_path(home: Path) -> Path:
@@ -1340,6 +1474,288 @@ def _read_unit(out, rec, key, host, unit, svc, tmr, now, max_age):
         out.append(alert("remote_units", key + ":stale", "high",
                          f"{unit} on {host}: {what} {hours:.0f} h ago (limit {max_age / 3600:.0f} h)",
                          {"host": host, "unit": unit, "age_h": round(hours, 1)}))
+
+
+# ---------------------------------------------------------------- 7c. Proxmox storage pool (goodqa#15771)
+# Read-only capacity watch of a dir-type Proxmox pool whose thin guest disks can fill it. One bounded ssh call
+# runs a fixed script (pvesm status, pvesm list, a name-only find of the image dirs, du -sk of the watched VMs'
+# image dirs). The only caller input is a validated host, storage name, mount path and integer VM ids. A failed
+# or unusable read is UNKNOWN, never OK, and nothing the remote side prints is copied into an alert.
+
+POOL_STORAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}")
+POOL_MOUNT = re.compile(r"/[A-Za-z0-9._/-]{1,100}")
+POOL_LOCAL_FILE = re.compile(r"/[A-Za-z0-9._/-]{1,200}")  # ssh_config / known_hosts on the watching host
+POOL_VOLS_HEADER = ["Volid", "Format", "Type", "Size", "VMID"]
+POOL_GUEST_TYPES = ("images", "rootdir")  # VM disks (incl. unusedN), container volumes; iso/backup/... never count
+POOL_WARN_PCT, POOL_HIGH_PCT, POOL_CRIT_PCT, POOL_FLOOR_GIB = 85.0, 92.0, 97.0, 20.0
+POOL_GROWTH_GIB_DAY, POOL_GROWTH_MIN_S, POOL_GROWTH_MAX_S = 10.0, 6 * 3600, 48 * 3600
+POOL_SAMPLE_GAP_S, POOL_SAMPLE_KEEP_S, POOL_SAMPLE_MAX = 1800, 48 * 3600, 120
+POOL_UNKNOWN_HIGH_S = 1800
+POOL_MAX_BYTES = 1048576  # the probe prints a few KB; anything near this is not a pvesm answer
+
+
+def pool_script(storage: str, mount: str, watch=()) -> str:
+    """Every command is bounded by remote `timeout`. `pvesm list` gives the size of every volume on the storage
+    (VM disks, detached unusedN disks and container volumes alike); `find` lists the image files by name only
+    (readdir, no reads), because pvesm skips a file whose size it cannot read with nothing but a stderr warning.
+    Only the watched VMs' image directories are measured with du, one call each."""
+    du = "".join(f"timeout 5 du -sk {mount}/images/{int(v)}; echo \"##RC DU {int(v)} $?\"; " for v in watch)
+    # every command is followed by its own ##RC line: the script's final echo would otherwise make a failed or
+    # timed out command look complete, and du can print a plausible subtotal and still fail
+    return (f"echo '##PVESM'; timeout 8 pvesm status --storage {storage}; echo \"##RC PVESM $?\"; "
+            f"echo '##VOLS'; timeout 8 pvesm list {storage}; echo \"##RC VOLS $?\"; "
+            f"echo '##FILES'; timeout 3 find {mount}/images -mindepth 2 -maxdepth 2; echo \"##RC FILES $?\"; "
+            f"echo '##DU'; {du}echo '##END'")
+
+
+def _pool_num(text):
+    try:
+        v = float(text)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) and v >= 0 else None
+
+
+def parse_pool_status(text: str, storage: str):
+    """(total, used, avail) in bytes from `pvesm status` output, or None for anything unusable."""
+    lines = [l.split() for l in (text or "").splitlines() if l.strip()]
+    if not lines:
+        return None
+    # pve 8 prints "Total (KiB)  Used (KiB) Available (KiB)"; older output has no unit. Either all three size columns say
+    # (KiB) or none does; any other unit is refused rather than misread.
+    head = lines[0]
+    units = [t for t in head if t.startswith("(")]
+    if units not in ([], ["(KiB)"] * 3) or (units and head[3:9] != ["Total", "(KiB)", "Used", "(KiB)", "Available",
+                                                                     "(KiB)"]):
+        return None
+    if [t for t in head if not t.startswith("(")][:6] != ["Name", "Type", "Status", "Total", "Used", "Available"]:
+        return None
+    rows = [l for l in lines[1:] if l[0] == storage]
+    if len(rows) != 1 or len(rows[0]) != 7 or rows[0][2] != "active":
+        return None
+    total, used, avail = (_pool_num(x) for x in rows[0][3:6])
+    if None in (total, used, avail) or total <= 0 or used > total or avail > total:
+        return None
+    return total * KIB, used * KIB, avail * KIB
+
+
+def parse_pool_volumes(vols, files, storage: str, mount: str):
+    """({vmid: {gib, unsized}}, list_ok, files_ok) from `pvesm list` rows (Size in bytes) and the image file names.
+
+    list_ok is False when the listing cannot be trusted as a whole (bad header, or a row that cannot be tied to
+    one VM). A guest volume with an unreadable or zero size (a size-less subvol) flags its VM unsized. files_ok is
+    False when the file names are unusable; an image file that pvesm did not list flags its VM unsized, since pvesm
+    silently skips a file it cannot size. The caller treats every subtotal as unknown unless both are True."""
+    lines = [l for l in vols if l.strip()]
+    list_ok = bool(lines) and lines[0].split() == POOL_VOLS_HEADER
+    vms, listed = {}, set()
+    for line in lines[1:]:
+        cols = line.split()
+        if len(cols) < 4:
+            list_ok = False
+            continue
+        if cols[2] not in POOL_GUEST_TYPES:
+            continue
+        name = cols[0].split(":", 1)[1].split("/") if cols[0].startswith(storage + ":") else []
+        if len(cols) != 5 or not re.fullmatch(r"\d{1,10}", cols[4]) or len(name) < 2 or name[-2] != cols[4]:
+            list_ok = False  # a guest volume this parser cannot tie to one VM
+            continue
+        vm = vms.setdefault(int(cols[4]), {"gib": 0.0, "unsized": False})
+        listed.add((int(cols[4]), name[-1]))
+        if re.fullmatch(r"\d{1,20}", cols[3]) and int(cols[3]) > 0:
+            vm["gib"] += int(cols[3]) / GIB
+        else:
+            vm["unsized"] = True  # never a zero
+    files_ok = True
+    for line in files:
+        m = re.fullmatch(re.escape(mount) + r"/images/(\d{1,10})/([^/\s]+)", line.strip())
+        if not m:
+            if line.strip():
+                files_ok = False
+            continue
+        if (int(m.group(1)), m.group(2)) not in listed:
+            vms.setdefault(int(m.group(1)), {"gib": 0.0, "unsized": False})["unsized"] = True
+    for vm in vms.values():  # a VM whose only volumes are unsized has no known allocation at all
+        if vm["unsized"] and not vm["gib"]:
+            vm["gib"] = None
+    return vms, list_ok, files_ok
+
+
+def parse_pool_probe(text: str, storage: str, mount: str = "/var/lib/vz"):
+    """{status, vms: {id: {gib, unsized}}, du: {id: bytes}, list_ok, files_ok} or None when the output is unusable
+    or truncated."""
+    sections, cur = {}, None
+    for line in (text or "").splitlines():
+        m = re.fullmatch(r"##(PVESM|VOLS|FILES|DU|END)", line)
+        if m:
+            cur = m.group(1)
+            sections.setdefault(cur, [])
+            continue
+        m = re.fullmatch(r"##RC (PVESM|VOLS|FILES|DU \d{1,10}) (\d{1,3})", line)
+        if m:
+            sections.setdefault("RC", {})[m.group(1)] = int(m.group(2))
+            continue
+        if cur in ("PVESM", "VOLS", "FILES", "DU"):
+            sections[cur].append(line)
+    if "END" not in sections:
+        return None
+    rcs = sections.get("RC", {})
+    status = parse_pool_status("\n".join(sections.get("PVESM", [])), storage) if rcs.get("PVESM") == 0 else None
+    if status is None:
+        return None
+    vms, list_ok, files_ok = parse_pool_volumes(sections.get("VOLS", []), sections.get("FILES", []), storage, mount)
+    list_ok = list_ok and rcs.get("VOLS") == 0 and "VOLS" in sections  # failed, timed out or cut: partial at best
+    files_ok = files_ok and rcs.get("FILES") == 0 and "FILES" in sections
+    if not (list_ok and files_ok):  # every subtotal is untrusted, including a prefix printed before a failure
+        for vm in vms.values():
+            vm["gib"] = None
+    du_lines = {}
+    for line in sections.get("DU", []):
+        m = re.fullmatch(r"(\d+)\s+" + re.escape(mount) + r"/images/(\d{1,10})", line.strip())
+        if m:
+            du_lines.setdefault(int(m.group(2)), []).append(int(m.group(1)) * KIB)
+    # a subtotal counts only with its own du status 0 and exactly one line: a failed, timed out or status-less du
+    # is unknown usage however plausible its number
+    du = {vm: vals[0] for vm, vals in du_lines.items() if len(vals) == 1 and rcs.get(f"DU {vm}") == 0}
+    return {"status": status, "vms": vms, "du": du, "list_ok": list_ok, "files_ok": files_ok}
+
+
+def pool_baseline(samples: list, now: float):
+    """The stored sample 6 h to 48 h old that is closest to 24 h, else None."""
+    ok = [s for s in samples if POOL_GROWTH_MIN_S <= now - s[0] <= POOL_GROWTH_MAX_S]
+    return min(ok, key=lambda s: abs(now - s[0] - 24 * 3600)) if ok else None
+
+
+def _pool_sample_ok(s) -> bool:
+    """A stored sample is [time, used_bytes, {vm id: bytes}] as _pool_alerts writes it."""
+    num = (int, float)
+    return (isinstance(s, (list, tuple)) and len(s) == 3 and type(s[0]) in num and type(s[1]) in num
+            and isinstance(s[2], dict) and all(type(v) in num for v in s[2].values()))
+
+
+def check_proxmox_pool(cfg, state, runner, now):
+    out = []
+    seen = state.setdefault("proxmox_pools", {})
+    for entry in cfg.get("proxmox_pools") or []:
+        entry = entry if isinstance(entry, dict) else {}
+        host = str(entry.get("host", ""))
+        storage = str(entry.get("storage", "local"))
+        mount = str(entry.get("mount", "/var/lib/vz")).rstrip("/") or "/"
+        watch = entry.get("watch_vms", [])
+        jump, ssh_config, known_hosts = (str(entry.get(k, "")) for k in ("jump", "ssh_config", "known_hosts"))
+        shown = host.rsplit("@", 1)[-1]  # alerts name the host, never the login user
+        base = f"{shown[:64]}:{mount[:100]}"
+        if (not REMOTE_HOST.fullmatch(host) or not POOL_STORAGE.fullmatch(storage) or not POOL_MOUNT.fullmatch(mount)
+                or ".." in mount or not isinstance(watch, list)
+                or any(type(v) is not int or not 0 < v < 10 ** 10 for v in watch)
+                or (jump and not REMOTE_HOST.fullmatch(jump))
+                or any(p and (not POOL_LOCAL_FILE.fullmatch(p) or ".." in p) for p in (ssh_config, known_hosts))):
+            out.append(alert("proxmox_pool", f"disk:config:{base}", "warning",
+                             "proxmox pool entry has an unsafe host, storage, mount, VM id or ssh option",
+                             {"host": shown[:64]}))
+            continue
+        rec = seen.get(base)
+        if not isinstance(rec, dict) or not isinstance(rec.get("first_try"), (int, float)):
+            rec = seen[base] = {"first_try": now, "samples": []}  # a corrupt saved record restarts, never crashes
+        mark = len(out)
+        try:
+            # optional ssh config, jump host and pinned known_hosts file; host-key checking is strict either way
+            opts = (["-F", ssh_config] if ssh_config else []) + (["-J", jump] if jump else []) + (
+                ["-o", f"UserKnownHostsFile={known_hosts}", "-o", "StrictHostKeyChecking=yes"] if known_hosts else [])
+            try:
+                rc, text = runner(["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                                   "-o", "StrictHostKeyChecking=yes", "-o", "ControlMaster=no", "-o", "ControlPath=none",
+                                   *opts, "--", host, pool_script(storage, mount, watch)], 25, max_bytes=POOL_MAX_BYTES)
+            except (subprocess.TimeoutExpired, OSError):
+                rc, text, why = 255, "", "unreachable or timed out"
+            else:
+                why = ("output over the size limit" if rc == RUN_OVERFLOW_RC or len(text or "") > POOL_MAX_BYTES
+                       else "unreachable or ssh failed" if rc != 0 else "unusable output")
+            parsed = parse_pool_probe(text, storage, mount) if rc == 0 and len(text or "") <= POOL_MAX_BYTES else None
+            if parsed is not None:
+                total, used, avail = parsed["status"]
+                _pool_alerts(out, rec, base, shown, storage, mount, watch, parsed, total, used, avail, now)
+                rec["ok_at"] = now
+                rec["alerts"] = out[mark:]
+                continue
+        except Exception:  # undecodable output, a corrupt sample, anything else: UNKNOWN, never a generic check error
+            del out[mark:]
+            why = "probe or parse error"
+            if not isinstance(rec.get("samples"), list) or not all(_pool_sample_ok(s) for s in rec["samples"]):
+                rec["samples"] = []
+        prior = rec.get("alerts") if isinstance(rec.get("alerts"), list) else []
+        out.extend(a for a in prior if isinstance(a, dict) and a.get("check") == "proxmox_pool")
+        ok_at = rec.get("ok_at") if isinstance(rec.get("ok_at"), (int, float)) else rec["first_try"]
+        stale = now - ok_at > POOL_UNKNOWN_HIGH_S
+        out.append(alert("proxmox_pool", f"disk:unknown:{base}", "high" if stale else "warning",
+                         f"UNKNOWN: cannot read {shown} {storage} pool ({why}); capacity is not being watched",
+                         {"host": shown[:64], "reason": why}))
+    return out
+
+
+def _pool_alerts(out, rec, base, host, storage, mount, watch, parsed, total, used, avail, now):
+    pct = 100.0 * used / total
+    free_gib = avail / GIB
+    samples = rec.setdefault("samples", [])
+    samples[:] = [s for s in samples if 0 <= now - s[0] <= POOL_SAMPLE_KEEP_S]  # also drops clock-skewed future rows
+    vm_used = {str(v): parsed["du"].get(v) for v in watch}
+    last = max((s[0] for s in samples), default=None)
+    base_sample = pool_baseline(samples, now)
+    if last is None or now - last >= POOL_SAMPLE_GAP_S:
+        samples.append([now, int(used), {k: v for k, v in vm_used.items() if v is not None}])
+        del samples[:-POOL_SAMPLE_MAX]
+    days = (now - base_sample[0]) / 86400 if base_sample else None
+
+    def per_day(delta):
+        return round(max(delta, 0) / GIB / days, 2) if days else None
+
+    complete = parsed["list_ok"] and parsed["files_ok"] and all(v["gib"] is not None and not v["unsized"]
+                                                                 for v in parsed["vms"].values())
+    provisioned = [v["gib"] for v in parsed["vms"].values()]
+    unsized = sorted(str(k) for k, v in parsed["vms"].items() if v["gib"] is None or v.get("unsized"))
+    prov_gib = round(sum(g for g in provisioned if g), 2)
+    vms = {}
+    for v in watch:
+        gib = (parsed["vms"].get(v) or {}).get("gib")
+        actual = parsed["du"].get(v)
+        old = (base_sample[2].get(str(v)) if base_sample else None)
+        vms[str(v)] = {"allocated_gib": None if gib is None else round(gib, 2),
+                       "actual_gib": None if actual is None else round(actual / GIB, 2),
+                       "growth_gib_day": per_day(actual - old) if actual is not None and old is not None else None}
+    detail = {"host": host[:64], "storage": storage, "used_pct": round(pct, 1), "free_bytes": int(avail),
+              "total_bytes": int(total), "total_gib": round(total / GIB, 2), "provisioned_gib": prov_gib if complete else None,
+              "overcommit_ratio": round(prov_gib / (total / GIB), 2) if complete else None,
+              "allocation_complete": complete, "vms": vms, "unsized_vms": unsized}
+    sev = None
+    if pct >= POOL_CRIT_PCT or free_gib < POOL_FLOOR_GIB:
+        sev = "critical"
+    elif pct >= POOL_HIGH_PCT:
+        sev = "high"
+    elif pct >= POOL_WARN_PCT:
+        sev = "warning"
+    if sev:
+        out.append(alert("proxmox_pool", f"disk:volume:{base}", sev,
+                         f"{host} {storage} pool {pct:.1f}% used, {free_gib:.0f} GiB free, "
+                         f"{detail['overcommit_ratio'] if complete else 'unknown'}x overcommitted", detail))
+    if not complete:  # never a low overcommit figure from a partial inventory
+        out.append(alert("proxmox_pool", f"disk:allocunknown:{base}", "warning",
+                         f"UNKNOWN: VM allocation on the {host} {storage} pool is incomplete; overcommit not computed",
+                         {"host": host[:64], "vms_unreadable": unsized, "list_ok": parsed["list_ok"],
+                          "files_ok": parsed["files_ok"]}))
+    for v in watch:  # a watched VM that cannot be read must be visible even when the pool is below every threshold
+        vm = parsed["vms"].get(v) or {}
+        if vm.get("gib") is None or vm.get("unsized") or parsed["du"].get(v) is None:
+            out.append(alert("proxmox_pool", f"disk:vmunknown:{base}:{v}", "warning",
+                             f"UNKNOWN: VM {v} volume sizes or disk usage missing from the {host} {storage} probe; "
+                             "its growth is not being watched", {"host": host[:64], "vm": v}))
+    if base_sample:
+        rate = per_day(used - base_sample[1])
+        if rate is not None and rate > POOL_GROWTH_GIB_DAY:
+            to_full = free_gib / rate
+            out.append(alert("proxmox_pool", f"disk:growth:{base}", "high" if to_full <= 3 else "warning",
+                             f"{host} {storage} pool growing {rate:.0f} GiB/day, full in about {to_full:.1f} days",
+                             {"host": host[:64], "growth_gib_day": rate, "free_gib": round(free_gib, 1),
+                              "days_to_full": round(to_full, 1), "threshold_gib_day": POOL_GROWTH_GIB_DAY}))
 
 
 # ---------------------------------------------------------------- 8. owner liveness
@@ -1596,7 +2012,210 @@ def check_liveness(cfg, state, runner, now):
     return out
 
 
+def check_idle_guard(cfg, state, runner, now):
+    """goodqa#15943: one high alert idle-guard:<session8> per recent session whose main and owners made no progress for
+    idle_min minutes while a stream holds a non-user next step (idle_guard.assess). The alert ends when progress
+    resumes or nothing actionable is left. A session that cannot be assessed raises nothing (the Stop hook fails open
+    too)."""
+    ic = cfg["idle_guard"]
+    home = Path(home_of(cfg))
+    root = Path(expand(home, ic["wal_root"]))
+    if root != home / ".claude" / "wals":
+        return []  # the owner view reads the real session root only
+    out = []
+    try:
+        sessions = [e for e in os.scandir(root) if e.is_dir(follow_symlinks=False)]
+    except OSError:
+        return []  # no session WALs on this host (a Codex-only install): nothing to assess, nothing to import
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        import idle_guard  # noqa: PLC0415 - installed beside this file
+    except ImportError as error:  # a partial install: say so, never a check-error (receipt r3 F1)
+        return [alert("idle_guard", "idle-guard:unavailable", "warning",
+                      f"idle_guard.py is not installed beside ops_watch.py ({type(error).__name__}); main-idle detection is off",
+                      {"fix": "reinstall the harness"})]
+    for sess in sorted(sessions, key=lambda e: e.name):
+        try:
+            if os.stat(os.path.join(sess.path, "main.jsonl")).st_mtime < now - ic["lookback_h"] * 3600:
+                continue
+            a = idle_guard.assess(home, sess.name, now, float(ic["idle_min"]))
+        except Exception:  # noqa: BLE001 - one unreadable session never hides the others
+            continue
+        if a["idle"]:
+            names = ", ".join(s["agent"] for s in a["streams"][:6])
+            out.append(alert("idle_guard", f"idle-guard:{sess.name[:8]}", "high",
+                             f"main idle {round(a['idle_s'] / 60)}m with {len(a['streams'])} stream(s) holding a non-user next step: {names}",
+                             {"session": sess.name[:8], "idle_min": round(a["idle_s"] / 60),
+                              "streams": [{"agent": s["agent"], "next": s["next"]} for s in a["streams"][:12]]}))
+    return out
+
+
+def check_mission(cfg, state, runner, now):
+    """Mission coverage (goodqa#15565): mission:<goal>:uncovered (high, stop_block) and mission:<goal>:stalled
+    (warning) from mission_coverage.assess for the mission session (goals.json mission_session);
+    mission:goals:unreadable when the goals file cannot be trusted. Silent on a host without a goals file or a mission
+    session. Each full owner scan here is signed as the owner snapshot the Stop gate reads (ops-watch is its only
+    writer). When the scan is unavailable (overran mission.timeout_s, or ah failed) the last mission alerts are kept
+    and mission:scan:unavailable is raised: an unavailable scan never clears anything. When the set of uncovered goals
+    gains a goal it wakes main (mission_coverage.notify_main); when it empties it clears that notice."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import mission_coverage as mc  # noqa: PLC0415 - installed beside this file
+    home = Path(home_of(cfg))
+    if not os.path.lexists(mc.goals_path(home)) and not mc.audit_segments(home):
+        return []
+    session = mc.mission_session_of(home)
+    if not session:
+        return []
+    timeout = float((cfg.get("mission") or {}).get("timeout_s", 120))
+    assessment = mc.assess(home, session, now, with_commits=True, deadline_s=timeout, save_snapshot=True)
+    if assessment.get("state") == "owners-unavailable":
+        kept = [{"check": "mission", "key": key, "severity": a.get("severity", "warning"),
+                 "message": a.get("message", ""), "detail": a.get("detail") or {}}
+                for key, a in (state.get("active") or {}).items()
+                if key.startswith("mission:") and key != "mission:scan:unavailable" and a.get("check") == "mission"]
+        return kept + [{"check": "mission", "key": "mission:scan:unavailable", "severity": "warning",
+                        "message": f"mission coverage could not list owners ({mc.clean(assessment.get('error'), 160)}); "
+                                   "the last mission alerts are kept", "detail": {"stop_block": False}}]
+    uncovered = sorted(r["id"] for r in assessment.get("results") or [] if r["state"] == "UNCOVERED")
+    notified = [g for g in state.get("mission_notified") or [] if isinstance(g, str)]
+    if set(uncovered) - set(notified):
+        mc.notify_main(uncovered, home=home, session=session)
+    elif notified and not uncovered:
+        mc.notify_main([], home=home, session=session)
+    state["mission_notified"] = uncovered
+    return mc.mission_alerts(assessment)
+
+
 # ---------------------------------------------------------------- run
+
+PENDING_NOTE_RE = re.compile(r"^\s*PENDING_REAL_TEST\s+([A-Za-z0-9][A-Za-z0-9._-]{0,40})\s*:")
+TESTED_NOTE_RE = re.compile(r"^\s*REALLY_TESTED\s+([A-Za-z0-9][A-Za-z0-9._-]{0,40})\s*:")
+MAX_DEPLOY_WAL_BYTES = 32 << 20
+
+
+def check_deploys(cfg, state, runner, now):
+    """GoodQA #15565 (never-drop slice 3): a fix that merged but never deployed, and a PENDING_REAL_TEST that never closed.
+
+    services: each {name, repo, ref (default origin/main), deployed_file}. deployed_file is JSON {"sha": ...} written by
+    the deploy tool. Ancestry is settled first: when the deployed sha is an ancestor of the ref and the OLDEST undeployed
+    commit is older than merged_after_h, one warning per service lists how many commits wait; a deploy ahead of the ref is
+    quiet; diverged histories are reported at any age. A service with no readable deploy record, a deployed sha the repo
+    does not know, or a failing git call is reported too (the drift cannot be judged). Pending: every PENDING_REAL_TEST
+    older than pending_after_h with no REALLY_TESTED of the same id in the same session is listed, one alert per session."""
+    d = cfg.get("deploys") or {}
+    home = home_of(cfg)
+    out = []
+    env = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
+    merged_after = float(d.get("merged_after_h", 2)) * 3600
+    for svc in d.get("services") or []:
+        name = str(svc.get("name") or "")
+        repo = expand(home, svc.get("repo") or "")
+        if not name or not repo or not os.path.isdir(repo):
+            continue
+        ref = str(svc.get("ref") or "origin/main")
+        key = f"deploy-drift:{name}"
+        try:
+            deployed = json.loads(Path(expand(home, svc.get("deployed_file") or "")).read_text(encoding="utf-8")).get("sha")
+        except (OSError, ValueError, AttributeError):
+            deployed = None
+        if not isinstance(deployed, str) or not re.fullmatch(r"[0-9a-f]{7,40}", deployed):
+            out.append(alert("deploys", key, "warning", f"{name}: no readable deploy record, so merged-not-deployed cannot be judged",
+                             {"service": name}))
+            continue
+        rc, head = runner(["git", "-C", repo, "rev-parse", "--verify", "--end-of-options", ref], 30, env=env)
+        if rc != 0:
+            out.append(alert("deploys", key, "warning", f"{name}: cannot resolve {ref} in the repo, so drift cannot be judged",
+                             {"service": name}))
+            continue
+        head = head.strip()
+        # Codex final gate F1: establish ancestry BEFORE any age threshold. deployed..head of a diverged pair holds commits
+        # only reachable from head, so judging its ages alone hid a young divergence and called an old one merely behind.
+        rc, full = runner(["git", "-C", repo, "rev-parse", "--verify", "--quiet", "--end-of-options", f"{deployed}^{{commit}}"],
+                          30, env=env)
+        if rc != 0 or not full.strip():
+            out.append(alert("deploys", key, "warning", f"{name}: deployed {deployed[:12]} is not in the repo (or git failed), "
+                             f"so drift against {ref} {head[:8]} cannot be judged", {"service": name}))
+            continue
+        deployed = full.strip()
+        if deployed == head:
+            continue
+        # --is-ancestor exits 0 (yes) or 1 (no); anything else is a git failure, never read as "no alert"
+        behind, _ = runner(["git", "-C", repo, "merge-base", "--is-ancestor", deployed, head], 30, env=env)
+        ahead = runner(["git", "-C", repo, "merge-base", "--is-ancestor", head, deployed], 30, env=env)[0] if behind == 1 else 1
+        if behind not in (0, 1) or ahead not in (0, 1):
+            out.append(alert("deploys", key, "warning", f"{name}: git merge-base failed for deployed {deployed[:8]} and {ref} "
+                             f"{head[:8]}, so drift cannot be judged", {"service": name}))
+            continue
+        if behind == 1 and ahead == 0:
+            continue  # the deployed build is ahead of the ref (a hotfix or an unmerged deploy): not merged-not-deployed
+        if behind == 1:
+            out.append(alert("deploys", key, "warning", f"{name}: deployed {deployed[:8]} and {ref} {head[:8]} have diverged",
+                             {"service": name, "deployed": deployed, "head": head}))
+            continue
+        rc, times = runner(["git", "-C", repo, "log", "--format=%ct", f"{deployed}..{head}"], 30, env=env)
+        stamps = sorted(int(x) for x in times.split() if x.isdigit()) if rc == 0 else []
+        if rc != 0 or not stamps:
+            out.append(alert("deploys", key, "warning", f"{name}: git log of {deployed[:8]}..{head[:8]} failed or was empty, so "
+                             f"drift cannot be judged", {"service": name}))
+        elif now - stamps[0] >= merged_after:
+            out.append(alert("deploys", key, "warning",
+                             f"{name}: {len(stamps)} merged commit(s) not deployed, oldest {int((now - stamps[0]) // 3600)}h old "
+                             f"(deployed {deployed[:8]}, {ref} {head[:8]})", {"service": name, "commits": len(stamps)}))
+    pending_after = float(d.get("pending_after_h", 6)) * 3600
+    look = float(d.get("lookback_h", 72)) * 3600
+    root = Path(expand(home, d.get("wal_root") or "~/.claude/wals"))
+    try:
+        sessions = [p for p in root.iterdir() if p.is_dir()]
+    except OSError:
+        sessions = []
+    for session in sessions:
+        events, unscanned = {}, []  # id -> [(time, "P" pending | "T" tested)]
+        for path in session.glob("*.jsonl"):
+            try:
+                if now - path.lstat().st_mtime > look:
+                    continue
+                # regular files only, never a symlink, a FIFO or a device; over the cap RAISES instead of being cut, and the
+                # file is reported as not scanned (red-team a5: a silent skip would clear a real alert)
+                text = read_text_capped(path, MAX_DEPLOY_WAL_BYTES)
+            except OSError:
+                unscanned.append(path.name)
+                continue
+            for raw in text.splitlines():
+                if "REAL" not in raw:
+                    continue
+                try:
+                    row = json.loads(raw)
+                except ValueError:
+                    continue
+                note = str(row.get("note") or "") if isinstance(row, dict) else ""
+                at = parse_ts(row.get("at")) if isinstance(row, dict) else None
+                m = TESTED_NOTE_RE.match(note)
+                if m and at is not None:
+                    events.setdefault(m.group(1), []).append((at, "T"))
+                m = PENDING_NOTE_RE.match(note)
+                if m and at is not None:
+                    events.setdefault(m.group(1), []).append((at, "P"))
+        # An id is open from its FIRST pending after its LAST test: a behavior change that re-opens it invalidates the earlier
+        # live test (red-team ad4294 A1), and restating a PENDING in a recap must not restart its clock (N1).
+        old = []
+        for ident, rows in events.items():
+            since = None
+            for at, kind in sorted(rows):
+                since = None if kind == "T" else (at if since is None else since)
+            if since is not None and now - since >= pending_after:
+                old.append(ident)
+        old.sort()
+        if unscanned:
+            out.append(alert("deploys", f"pending-unscanned:{session.name[:8]}", "warning",
+                             f"{len(unscanned)} log file(s) of session {session.name[:8]} could not be scanned for open "
+                             f"PENDING_REAL_TEST (over {MAX_DEPLOY_WAL_BYTES >> 20} MiB, not a regular file or unreadable)",
+                             {"session": session.name[:8], "files": unscanned[:5]}))
+        if old:
+            out.append(alert("deploys", f"pending-open:{session.name[:8]}", "warning",
+                             f"{len(old)} PENDING_REAL_TEST open for {int(pending_after // 3600)}h or more with no REALLY_TESTED "
+                             f"(session {session.name[:8]}): {', '.join(old[:6])}", {"session": session.name[:8], "ids": old[:20]}))
+    return out
+
 
 DEFAULT_CHECKS = {
     "disk": check_disk,
@@ -1607,9 +2226,15 @@ DEFAULT_CHECKS = {
     "delivery": lambda c, s, r, n: check_delivery(c, r),
     "drift": lambda c, s, r, n: check_drift(c, r),
     "codex": lambda c, s, r, n: check_codex_trust(c),
+    "mission-control": lambda c, s, r, n: check_mc_sweeper(c, n),
+    "runtime": lambda c, s, r, n: check_stale_runtimes(c) if (c.get("stale_runtime") or {}).get("enabled", True) else [],
     "liveness": lambda c, s, r, n: check_liveness(c, s, r, n) if c["liveness"].get("enabled") else [],
     "peers": check_peers,
     "remote_units": check_remote_units,
+    "proxmox_pool": check_proxmox_pool,
+    "deploys": lambda c, s, r, n: check_deploys(c, s, r, n) if (c.get("deploys") or {}).get("enabled", True) else [],
+    "idle_guard": lambda c, s, r, n: check_idle_guard(c, s, r, n) if (c.get("idle_guard") or {}).get("enabled", True) else [],
+    "mission": lambda c, s, r, n: check_mission(c, s, r, n) if (c.get("mission") or {}).get("enabled", True) else [],
 }
 RUN_CHECK = "_run"    # internal errors; cleared by any completed run
 SINK_CHECK = "_sink"  # delivery failures; cleared when that sink recovers
@@ -1797,6 +2422,113 @@ def compact(e: dict) -> dict:
     return {k: e.get(k) for k in ("host", "event", "severity", "key", "message", "detail", "seq", "at")}
 
 
+def queue_events(cfg: dict, state: dict, news: list, now: float) -> None:
+    """Queue alert transitions for the digest and, for critical raises, the deadman mail (at most one mail per key per 6 h,
+    so a flapping threshold does not flood; no deadman configured: nothing to queue)."""
+    state["pending_comment"] = ((state.get("pending_comment") or []) + [compact(e) for e in news])[-500:]
+    sent = state.setdefault("deadman_sent", {})
+    for e in news:
+        if (cfg["sinks"].get("deadman") and e["event"] == "raise" and e["severity"] == "critical"
+                and now - sent.get(e["key"], 0) > 6 * 3600):
+            state.setdefault("pending_deadman", []).append(compact(e))
+            sent[e["key"]] = now
+
+
+DELIVERED_MAX = 500  # deadman delivery receipts kept (oldest evicted)
+
+
+def record_delivered(state: dict, key, now: float) -> None:
+    """The deadman delivery receipt (goodqa#16034 D19): written only after send_deadman returned success, so it is the
+    one piece of state that means "handed to the mail command". deadman_sent stays the queue and rate-limit marker
+    and is set before any send, so it is never evidence of delivery."""
+    if not key:
+        return
+    got = state.setdefault("deadman_delivered", {})
+    got.pop(key, None)
+    got[key] = now
+    while len(got) > DELIVERED_MAX:
+        got.pop(min(got, key=got.get))
+
+
+def delivered_at(home: Path, key: str):
+    """Read-only query for other tools (ahc): the key's delivery time, or None. Unreadable or malformed state is
+    None, never a receipt."""
+    got = load_state(home).get("deadman_delivered")
+    if not isinstance(got, dict):
+        return None
+    value = got.get(key)
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+FWD_KEYS_MAX = 200  # keys remembered as forwarded-raised (a bounded state slot)
+
+
+def forward_foreign(cfg: dict, home: Path, state: dict, ring: Path, now: float) -> list:
+    """goodqa#15827: critical raise and clear events that a foreign source wrote to this host's ring (fabd-health, any script
+    using `ops_watch.py emit`) never reached the digest or the deadman queue, because only run_once's own transitions are
+    queued. Returns the ring rows to queue now and advances state["fwd_seq"] (persisted with the queues in one state write, so
+    a crash re-forwards rather than loses). Rules: source other than ops-watch, this host, severity critical for a raise, a
+    clear only for a key that was forwarded as raised, text refreshes (updated, reasserted) skipped. The first run (or a ring
+    whose sequence restarted below the stored one) forwards only what is standing, never the history."""
+    host = cfg["host"]
+    rows = sorted(read_ring(ring), key=lambda e: e.get("seq") or 0)
+    try:
+        info = os.stat(ring)
+    except FileNotFoundError:
+        state.setdefault("fwd_seq", 0)  # no ring yet: everything that appears later is new
+        return []
+    except OSError:
+        return []  # the ring cannot be examined: unknown, never a reset; position and keys stay as they are
+    ring_id = f"{info.st_dev}:{info.st_ino}"
+    top = max([e.get("seq") or 0 for e in rows] or [0])
+    seen = state.get("fwd_seq")
+    if isinstance(seen, int) and not rows:
+        return []  # an unreadable or empty read after a forward is "unknown": keep fwd_seq, never replay on the next good read
+    active = state.setdefault("fwd_active", {})  # key -> seq of the raise that was forwarded
+    stored_id = state.get("fwd_ring")
+    low = isinstance(seen, int) and top < seen
+    state["fwd_low"] = (state.get("fwd_low") or 0) + 1 if low else 0
+    # a real reset needs a positive signal: the ring file itself was replaced, or the sequence stayed below the stored
+    # position on three consecutive runs; one low read (a torn newest slot) is not one
+    recreated = isinstance(seen, int) and ((bool(stored_id) and stored_id != ring_id) or state["fwd_low"] >= 3)
+    if low and not recreated:
+        return []
+    out = []
+    if not isinstance(seen, int) or recreated:  # first run or a recreated ring
+        before = dict(active)
+        active.clear()
+        state["fwd_low"] = 0
+        for (h, src, key), e in latest_by_key(rows).items():
+            if h != host or src == SOURCE:
+                continue
+            if e.get("event") == "raise" and e.get("severity") == "critical":
+                out.append(e)
+                active[f"{src}/{key}"] = e.get("seq") or 0
+            elif e.get("event") == "clear" and f"{src}/{key}" in before:
+                out.append(e)  # a clear the old sequence never delivered: the digest must not keep it standing
+    else:
+        for e in rows:
+            if (e.get("seq") or 0) <= seen or ring_host(e) != host or e.get("source") == SOURCE:
+                continue
+            detail = e.get("detail") if isinstance(e.get("detail"), dict) else {}  # emit() lets any JSON through as detail
+            if not isinstance(e.get("key"), str) or not isinstance(e.get("source"), str):
+                continue  # one malformed foreign row must never stop the alert path
+            ident = f"{e.get('source')}/{e.get('key')}"
+            if e.get("event") == "raise" and e.get("severity") == "critical":
+                if detail.get("updated") or detail.get("reasserted"):
+                    continue  # a text refresh is not a new alert
+                active[ident] = e.get("seq") or 0
+                out.append(e)
+            elif e.get("event") == "clear" and ident in active:  # an expiry clear carries updated=true and still closes the raise
+                del active[ident]
+                out.append(e)
+    state["fwd_seq"] = top
+    state["fwd_ring"] = ring_id
+    while len(active) > FWD_KEYS_MAX:
+        active.pop(min(active, key=active.get))
+    return out
+
+
 def _transition(host, kind, key, a, extra=None) -> dict:
     return {"host": host, "source": SOURCE, "event": kind, "severity": a.get("severity", "info"), "key": key,
             "message": a.get("message", ""), "detail": {**(a.get("detail") or {}), **(extra or {})},
@@ -1915,14 +2647,7 @@ def run_once(cfg: dict, home: Path, runner=run, checks: dict | None = None, now:
                 rc = 2
                 print(f"ops-watch: alert ring write failed ({type(exc).__name__}): {e['key']}", file=sys.stderr)
                 active.get(e["key"], {}).pop("written", None)  # not written: next run reads what the ring really says
-        news = [e for e in evs if not (e.get("detail") or {}).get("updated")]  # a text refresh alerts nobody
-        state["pending_comment"] = ((state.get("pending_comment") or []) + [compact(e) for e in news])[-500:]
-        sent = state.setdefault("deadman_sent", {})
-        for e in news:  # critical raises, at most one deadman mail per key per 6 h (flapping thresholds)
-            if (cfg["sinks"].get("deadman") and e["event"] == "raise" and e["severity"] == "critical"
-                    and now - sent.get(e["key"], 0) > 6 * 3600):  # no deadman configured: nothing to queue
-                state.setdefault("pending_deadman", []).append(compact(e))
-                sent[e["key"]] = now
+        queue_events(cfg, state, [e for e in evs if not (e.get("detail") or {}).get("updated")], now)  # a text refresh alerts nobody
         try:
             save_state(home, state)
         except (OSError, ValueError) as exc:
@@ -1931,6 +2656,14 @@ def run_once(cfg: dict, home: Path, runner=run, checks: dict | None = None, now:
 
     events += expire_point_events(cfg, latest_by_key(read_ring(ring)), active, now, ring)
     persist(events)  # durable before any slow sink: a crash or timeout below cannot re-raise these
+    foreign = forward_foreign(cfg, home, state, ring, now)
+    if foreign:
+        queue_events(cfg, state, [dict(e, detail=e["detail"] if isinstance(e.get("detail"), dict) else {}) for e in foreign], now)
+        try:
+            save_state(home, state)  # queues and the forwarded seq in one write: idempotent across a restart
+        except (OSError, ValueError) as exc:
+            rc = 2
+            print(f"ops-watch: state write failed ({type(exc).__name__})", file=sys.stderr)
     latest = latest_by_key(read_ring(ring))
     reassert = [_transition(host, "raise", k, a, {"reasserted": True}) for k, a in sorted(active.items())
                 if latest.get((host, SOURCE, k), {}).get("event") != "raise"]
@@ -1952,6 +2685,7 @@ def run_once(cfg: dict, home: Path, runner=run, checks: dict | None = None, now:
         if tries < 3 and time.monotonic() < deadline:
             tries += 1
             if send_deadman(cfg, runner, e):
+                record_delivered(state, e.get("key"), now)  # saved with this run's state, after the send succeeded
                 continue
         still.append(e)
     state["pending_deadman"] = still
@@ -1999,7 +2733,7 @@ def run_once(cfg: dict, home: Path, runner=run, checks: dict | None = None, now:
 SAFE_TEXT = re.compile(r"[^A-Za-z0-9 ._:/%+()\[\],=@#~-]")
 
 
-def injection_text(home: Path | None = None, max_chars: int = 700) -> str:
+def injection_text(home: Path | None = None, max_chars: int = 700, session: str = "") -> str:
     """Context line for wal.py. Never raises; "" when nothing is active. Alert text can carry dir, unit, branch
     or process names, so it is reduced to a safe character set and labelled as data."""
     try:
@@ -2027,9 +2761,13 @@ def injection_text(home: Path | None = None, max_chars: int = 700) -> str:
         for h, group in live.items():
             group.sort(key=lambda x: -SEVERITIES.get(x[0], 0))
             top = max(SEVERITIES.get(g[0], 0) for g in group)
-            names = ", ".join(str(g[1]).split("/", 1)[-1] for g in group[:4])
+            # goodqa#15754: one owner can hold several alert rows (a critical and a high under one key); count owners
+            seen = list(dict.fromkeys(str(g[1]) for g in group))
+            names = ", ".join(k.split("/", 1)[-1] for k in seen[:4])
+            mine = sum(1 for k in seen if session and k.split(":", 1)[-1].startswith(session[:8] + "/"))
+            share = f" ({mine} in this session)" if session else ""
             rest.append(([k for k, v in SEVERITIES.items() if v == top][0], h, "liveness",
-                         f"{len(group)} owner(s) silent or dropped: {names}{', ...' if len(group) > 4 else ''}"))
+                         f"{len(seen)} owner(s) silent or dropped{share}: {names}{', ...' if len(seen) > 4 else ''}"))
         items = sorted(rest, key=lambda x: -SEVERITIES.get(x[0], 0))
 
         def clean(v, n):
@@ -2159,6 +2897,18 @@ def lower_priority() -> None:
         subprocess.run(["ionice", "-c3", "-p", str(os.getpid())], capture_output=True, timeout=10)
 
 
+def capabilities() -> list:
+    """What this installed ops_watch.py can do, one name per line, for installers that must not depend on a missing feature
+    (goodqa#15827: the fabd installer refuses to install without forward-foreign-critical). A name is listed only when the code
+    behind it is present."""
+    caps = ["emit"]
+    if callable(globals().get("forward_foreign")) and callable(globals().get("queue_events")):
+        caps.append("forward-foreign-critical")  # critical raise and clear rows of a foreign ring source reach the digest and the deadman queue
+    if callable(globals().get("record_delivered")) and callable(globals().get("delivered_at")):
+        caps.append("deadman-delivered")  # a durable delivery receipt and the read-only `delivered --key K --json` query
+    return caps
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd")
@@ -2173,11 +2923,21 @@ def main(argv=None) -> int:
     u = sub.add_parser("uninstall")
     u.add_argument("--apply", action="store_true")
     sub.add_parser("config")
+    sub.add_parser("capabilities", help="print one capability per line (an installer can grep -qx for one)")
     sub.add_parser("relay-comment", help="post stdin as one comment on the ops-watch alerts ticket (peer relay)")
+    d = sub.add_parser("delivered", help="read-only: when a deadman alert key was handed to the mail command, or null")
+    d.add_argument("--key", required=True)
+    d.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
-    home = Path.home()
     cmd = args.cmd or "run"
+    if cmd == "capabilities":  # no home, no config, no state, no ring: a pure probe (works with HOME unset)
+        print("\n".join(capabilities()))
+        return 0
+    home = Path.home()
     try:
+        if cmd == "delivered":  # read-only; never writes state
+            print(json.dumps({"key": args.key, "delivered_at": delivered_at(home, args.key)}))
+            return 0
         if cmd == "emit":
             print(emit(json.loads(args.json), home=home))
             return 0

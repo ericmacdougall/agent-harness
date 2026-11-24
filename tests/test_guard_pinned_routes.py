@@ -29,6 +29,12 @@ PY_REL = 'unit-mig/cf-dns/cf_dns_prod_move.py'
 BASE = '.agent-harness/work/dev-decom/'
 SH_TEXT = b'#!/bin/bash\nconf=~/.config/rclone/rclone.conf\n'
 PY_TEXT = b'#!/usr/bin/env python3\nSECRET = "GOODQA_CLOUDFLARE_API_TOKEN"\n'
+FAB_REL = ('.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/agent-ad1ff08b576984a4d/do-auth/'
+           'doctl-auth-fabric.sh')
+FAB_TEXT = (b'#!/bin/sh\nexec ssh t2-dev "gcloud secrets versions access latest '
+            b'--secret=DIGITALOCEAN_API_TOKEN | awk x"\n')
+DNS_REL = '.agent-harness/work/3410ce93-bee1-4ffb-b94b-1e852bc94483/cf_dns.py'
+DNS_FIXTURE = ROOT / 'tests' / 'fixtures' / 'pinned_routes' / 'cf_dns_timbar_staging.py'
 PY_ARGS = ['list', 'set-ttl --name connect.example.test --ttl 60 --expect-ttl 300',
            'set-content --name example.test --content 192.0.2.1 --expect-content 192.0.2.2']
 
@@ -46,14 +52,14 @@ class Base(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
         # A fixed clock, so these do not start failing on the expiry date before the table is removed.
-        clock = mock.patch.object(cg.time, 'time', return_value=cg.PINNED_ROUTE_EXPIRES - 86400)
+        clock = mock.patch.object(cg.time, 'time', return_value=cg.DEV_DECOM_EXPIRES - 86400)
         clock.start()
         self.addCleanup(clock.stop)
         self.sh = self.write(BASE + SH_REL, SH_TEXT)
         self.py = self.write(BASE + PY_REL, PY_TEXT)
         table = mock.patch.object(cg, 'PINNED_ROUTES', (
-            (SH_REL, sha(SH_TEXT), cg.PINNED_ROUTES[0][2] if hasattr(cg, 'PINNED_ROUTES') else ''),
-            (PY_REL, sha(PY_TEXT), cg.PINNED_ROUTES[1][2] if hasattr(cg, 'PINNED_ROUTES') else ''),
+            (BASE + SH_REL, sha(SH_TEXT), cg.PINNED_ROUTES[0][2], cg.DEV_DECOM_EXPIRES),
+            (BASE + PY_REL, sha(PY_TEXT), cg.PINNED_ROUTES[1][2], cg.DEV_DECOM_EXPIRES),
         ), create=True)
         table.start()
         self.addCleanup(table.stop)
@@ -155,9 +161,9 @@ class PinnedRouteTests(Base):
 
     def test_routes_end_at_expiry(self):
         command = '/bin/bash -p %s' % self.sh
-        self.assertTrue(cg.pinned_route(command, now=cg.PINNED_ROUTE_EXPIRES - 1))
-        self.assertFalse(cg.pinned_route(command, now=cg.PINNED_ROUTE_EXPIRES))
-        with mock.patch.object(cg.time, 'time', return_value=cg.PINNED_ROUTE_EXPIRES):
+        self.assertTrue(cg.pinned_route(command, now=cg.DEV_DECOM_EXPIRES - 1))
+        self.assertFalse(cg.pinned_route(command, now=cg.DEV_DECOM_EXPIRES))
+        with mock.patch.object(cg.time, 'time', return_value=cg.DEV_DECOM_EXPIRES):
             self.assertRefused(command)
 
     def test_read_failure_gives_no_route(self):
@@ -192,7 +198,7 @@ class PinnedRouteTests(Base):
         text = b'#!/bin/bash\ncat ~/.config/rclone/rclone.conf\n'
         # Under the routes' own base with its true hash, so only the table can be what refuses it.
         rogue = self.write(BASE + 'rogue.sh', text)
-        row = ['rogue.sh', sha(text), '/bin/bash -p {path}']
+        row = [BASE + 'rogue.sh', sha(text), '/bin/bash -p {path}', cg.DEV_DECOM_EXPIRES]
         policy.write_text(json.dumps({'PINNED_ROUTES': [row], 'pinned_routes': [row]}))
         compiled = cg.Compiled(cg.load_policy(path=str(policy)), cwd=str(self.home))
         self.assertEqual(cg.decide('/bin/bash -p %s' % rogue, compiled, cwd=str(self.home))[0], 'block')
@@ -205,7 +211,7 @@ class PinnedRouteTests(Base):
     def test_a_file_past_the_read_limit_gets_no_route(self):
         big = b'#' * (cg.CREDENTIAL_SCRIPT_READ + 1)
         self.sh.write_bytes(big)
-        table = ((SH_REL, sha(big), cg.PINNED_ROUTES[0][2]), cg.PINNED_ROUTES[1])
+        table = ((BASE + SH_REL, sha(big), cg.PINNED_ROUTES[0][2], cg.DEV_DECOM_EXPIRES), cg.PINNED_ROUTES[1])
         with mock.patch.object(cg, 'PINNED_ROUTES', table):
             self.assertFalse(cg.pinned_route('/bin/bash -p %s' % self.sh))
 
@@ -628,16 +634,245 @@ class CredentialScriptTests(Base):
         self.assertAllowed('python3 %s' % far)
 
 
+class FabricDoAuthRouteTests(unittest.TestCase):
+    """The goodqa#15976 route: one no-argument script, its own expiry, independent of the expired dev-decom pins."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name).resolve()
+        env = mock.patch.dict(os.environ, {'HOME': str(self.home)})
+        env.start()
+        self.addCleanup(env.stop)
+        clock = mock.patch.object(cg.time, 'time', return_value=cg.FABRIC_DO_AUTH_EXPIRES - 86400)
+        clock.start()
+        self.addCleanup(clock.stop)
+        self.fab = self.home / FAB_REL
+        self.fab.parent.mkdir(parents=True)
+        self.fab.write_bytes(FAB_TEXT)
+        real = [r for r in cg.PINNED_ROUTES if r[0] == FAB_REL]
+        self.assertEqual(len(real), 1)
+        table = mock.patch.object(cg, 'PINNED_ROUTES', tuple(
+            (r[0], sha(FAB_TEXT), r[2], r[3]) if r[0] == FAB_REL else r for r in cg.PINNED_ROUTES))
+        table.start()
+        self.addCleanup(table.stop)
+
+    def verdict(self, command):
+        return cg.decide(command, cwd=str(self.home))[0]
+
+    def test_exact_invocation_is_allowed(self):
+        self.assertTrue(cg.pinned_route('/bin/bash -p %s' % self.fab))
+        self.assertEqual(self.verdict('/bin/bash -p %s' % self.fab), 'allow')
+
+    def test_changed_invocations_are_refused(self):
+        fab = self.fab
+        for command in ('/bin/bash -p %s extra' % fab, '/bin/bash -p %s --context x' % fab,
+                        '/bin/bash -p %s; true' % fab, '/bin/bash -p %s | cat' % fab,
+                        '/bin/bash -p %s > %s/out' % (fab, self.home), '/bin/bash %s' % fab,
+                        '/bin/sh -p %s' % fab, 'bash -p %s' % fab, 'sh %s' % fab, str(fab),
+                        'BASH_ENV=%s/e /bin/bash -p %s' % (self.home, fab), '/bin/bash -p -x %s' % fab):
+            with self.subTest(command=command):
+                self.assertFalse(cg.pinned_route(command))
+                self.assertEqual(self.verdict(command), 'block')
+
+    def test_modified_script_is_refused(self):
+        self.fab.write_bytes(FAB_TEXT + b'echo leak\n')
+        self.assertFalse(cg.pinned_route('/bin/bash -p %s' % self.fab))
+        self.assertEqual(self.verdict('/bin/bash -p %s' % self.fab), 'block')
+
+    def test_copy_elsewhere_and_symlink_are_refused(self):
+        copy = self.home / 'elsewhere/doctl-auth-fabric.sh'
+        copy.parent.mkdir(parents=True)
+        copy.write_bytes(FAB_TEXT)
+        self.assertFalse(cg.pinned_route('/bin/bash -p %s' % copy))
+        self.fab.unlink()
+        self.fab.symlink_to(copy)
+        self.assertFalse(cg.pinned_route('/bin/bash -p %s' % self.fab))
+
+    def test_route_ends_at_its_own_expiry(self):
+        command = '/bin/bash -p %s' % self.fab
+        self.assertTrue(cg.pinned_route(command, now=cg.FABRIC_DO_AUTH_EXPIRES - 1))
+        self.assertFalse(cg.pinned_route(command, now=cg.FABRIC_DO_AUTH_EXPIRES))
+        with mock.patch.object(cg.time, 'time', return_value=cg.FABRIC_DO_AUTH_EXPIRES):
+            self.assertEqual(self.verdict(command), 'block')
+
+    def test_other_scripts_naming_the_do_token_are_refused(self):
+        rows = (('a.sh', b'#!/bin/sh\ngcloud secrets versions access latest --secret=DIGITALOCEAN_API_TOKEN\n'),
+                ('b.py', b'#!/usr/bin/env python3\nNAME = "DIGITALOCEAN_API_TOKEN"\n'))
+        for name, text in rows:
+            path = self.home / 'other' / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(text)
+            runner = '/bin/bash -p' if name.endswith('.sh') else 'python3'
+            with self.subTest(name=name):
+                self.assertEqual(self.verdict('%s %s' % (runner, path)), 'block')
+
+    def test_a_lookalike_name_is_not_refused(self):
+        path = self.home / 'other/c.sh'
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b'#!/bin/sh\necho MY_DIGITALOCEAN_API_TOKEN_NOTE\n')
+        self.assertEqual(self.verdict('/bin/bash -p %s' % path), 'allow')
+
+    def test_dev_decom_pins_stay_expired(self):
+        sh = self.home / BASE / SH_REL
+        sh.parent.mkdir(parents=True)
+        sh.write_bytes(SH_TEXT)
+        table = tuple((r[0], sha(SH_TEXT), r[2], r[3]) if r[0] == BASE + SH_REL else r for r in cg.PINNED_ROUTES)
+        with mock.patch.object(cg, 'PINNED_ROUTES', table):
+            self.assertFalse(cg.pinned_route('/bin/bash -p %s' % sh))
+            self.assertTrue(cg.pinned_route('/bin/bash -p %s' % sh, now=cg.DEV_DECOM_EXPIRES - 1))
+
+
+class TimbarStagingDnsRouteTests(unittest.TestCase):
+    """The goodqa#16393 route: one no-argument Python script. The table row is the real one, unpatched, and the file under
+    the temporary HOME holds the reviewed fixture bytes, so these fail if the row, its digest or its shape changes."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name).resolve()
+        env = mock.patch.dict(os.environ, {'HOME': str(self.home)})
+        env.start()
+        self.addCleanup(env.stop)
+        clock = mock.patch.object(cg.time, 'time', return_value=cg.TIMBAR_STAGING_DNS_EXPIRES - 3600)
+        clock.start()
+        self.addCleanup(clock.stop)
+        self.text = DNS_FIXTURE.read_bytes()
+        self.dns = self.home / DNS_REL
+        self.dns.parent.mkdir(parents=True)
+        self.dns.write_bytes(self.text)
+        self.command = '/usr/bin/python3 -I %s' % self.dns
+
+    def verdict(self, command):
+        return cg.decide(command, cwd=str(self.home))[0]
+
+    def test_exact_invocation_is_allowed(self):
+        self.assertTrue(cg.pinned_route(self.command))
+        self.assertEqual(self.verdict(self.command), 'allow')
+
+    def test_without_the_row_the_same_command_is_refused(self):
+        # The negative control: the row is what allows it, not a gap in the credential-script check.
+        table = tuple(r for r in cg.PINNED_ROUTES if r[0] != DNS_REL)
+        self.assertEqual(len(table), len(cg.PINNED_ROUTES) - 1)
+        with mock.patch.object(cg, 'PINNED_ROUTES', table):
+            self.assertFalse(cg.pinned_route(self.command))
+            self.assertEqual(self.verdict(self.command), 'block')
+
+    def test_any_argument_or_other_spelling_is_refused(self):
+        dns, home = self.dns, self.home
+        for command in (
+                self.command + ' auto', self.command + ' auto transition2.ai timbar-staging.transition2.ai 159.203.13.118',
+                self.command + ' find transition2.ai', self.command + ' --help', self.command + ' ',
+                self.command + '\n', ' ' + self.command, self.command + '; true', self.command + ' && true',
+                self.command + ' | cat', self.command + ' > %s/out' % home, self.command + ' 2>&1',
+                self.command + ' &', 'true; ' + self.command, '(%s)' % self.command, 'time ' + self.command,
+                '/usr/bin/python3 %s' % dns, '/usr/bin/python3 -I  %s' % dns, '/usr/bin/python3 -I -u %s' % dns,
+                '/usr/bin/python3 -i -I %s' % dns, '/usr/bin/python3 -I -- %s' % dns, 'python3 -I %s' % dns,
+                '/opt/homebrew/bin/python3 -I %s' % dns, '/usr/bin/python3.9 -I %s' % dns, '/usr/bin/env python3 -I %s' % dns,
+                'env -i /usr/bin/python3 -I %s' % dns, 'PYTHONPATH=%s /usr/bin/python3 -I %s' % (home, dns),
+                'https_proxy=http://192.0.2.1:9 /usr/bin/python3 -I %s' % dns, str(dns), '/bin/bash -p %s' % dns,
+                '/usr/bin/python3 -I %s/' % dns, '/usr/bin/python3 -I %s/../%s/cf_dns.py' % (dns.parent, dns.parent.name),
+                '/usr/bin/python3 -I "%s"' % dns, '/usr/bin/python3 -I ~/%s' % DNS_REL,
+                '/usr/bin/python3 -I $HOME/%s' % DNS_REL):
+            with self.subTest(command=command):
+                self.assertFalse(cg.pinned_route(command))
+                self.assertEqual(self.verdict(command), 'block')
+
+    def test_spellings_the_credential_check_does_not_read_are_still_not_routes(self):
+        # The credential-script check does not follow a script fed on stdin or read by -c, with or without this row
+        # (a limit that predates it; follow-up GoodQA goodqa#16394). The row must not be what decides them.
+        for command in ('/usr/bin/python3 -I < %s' % self.dns,
+                        '/usr/bin/python3 -I -c "exec(open(\'%s\').read())"' % self.dns):
+            with self.subTest(command=command):
+                self.assertFalse(cg.pinned_route(command))
+                with mock.patch.object(cg, 'PINNED_ROUTES', tuple(r for r in cg.PINNED_ROUTES if r[0] != DNS_REL)):
+                    without = self.verdict(command)
+                self.assertEqual(self.verdict(command), without)
+
+    def test_a_changed_byte_is_refused(self):
+        for label, data in (('appended', self.text + b'\n'), ('one byte', self.text.replace(b'159.203.13.118', b'159.203.13.119')),
+                            ('other secret', self.text.replace(b'GOODQA_CLOUDFLARE_API_TOKEN', b'MIRRORED_CLOUDFLARE_DNS_TOKEN')),
+                            ('truncated', self.text[:-1]), ('empty', b'')):
+            with self.subTest(label):
+                self.assertNotEqual(data, self.text)
+                self.dns.write_bytes(data)
+                self.assertFalse(cg.pinned_route(self.command))
+                # A file that no longer names a credential is an ordinary script; one that does is refused.
+                if b'GOODQA_CLOUDFLARE_API_TOKEN' in data:
+                    self.assertEqual(self.verdict(self.command), 'block')
+
+    def test_a_copy_elsewhere_a_symlink_and_a_non_file_are_refused(self):
+        copy = self.home / 'elsewhere/cf_dns.py'
+        copy.parent.mkdir(parents=True)
+        copy.write_bytes(self.text)
+        other = '/usr/bin/python3 -I %s' % copy
+        self.assertFalse(cg.pinned_route(other))
+        self.assertEqual(self.verdict(other), 'block')
+        self.dns.unlink()
+        self.dns.symlink_to(copy)  # same bytes behind the pinned path, but the path itself is a link
+        self.assertFalse(cg.pinned_route(self.command))
+        self.assertEqual(self.verdict(self.command), 'block')
+        self.dns.unlink()
+        self.dns.mkdir()
+        self.assertFalse(cg.pinned_route(self.command))
+        self.dns.rmdir()
+        self.assertFalse(cg.pinned_route(self.command))
+
+    def test_route_ends_at_its_own_expiry(self):
+        self.assertTrue(cg.pinned_route(self.command, now=cg.TIMBAR_STAGING_DNS_EXPIRES - 1))
+        self.assertFalse(cg.pinned_route(self.command, now=cg.TIMBAR_STAGING_DNS_EXPIRES))
+        self.assertFalse(cg.pinned_route(self.command, now=cg.TIMBAR_STAGING_DNS_EXPIRES + 86400 * 365))
+        with mock.patch.object(cg.time, 'time', return_value=cg.TIMBAR_STAGING_DNS_EXPIRES):
+            self.assertEqual(self.verdict(self.command), 'block')
+
+    def test_expiry_is_within_seven_days_of_the_approval(self):
+        approved = 1794972969  # 2026-11-18T03:36:09Z, "fix the command guard"
+        self.assertEqual(time_string(approved), '2026-11-18T03:36:09Z')
+        self.assertTrue(approved < cg.TIMBAR_STAGING_DNS_EXPIRES <= approved + 7 * 86400)
+
+    def test_another_home_gets_no_route(self):
+        with mock.patch.dict(os.environ, {'HOME': str(self.home / 'elsewhere')}):
+            self.assertFalse(cg.pinned_route(self.command))
+
+    def test_other_scripts_naming_the_token_are_still_refused(self):
+        path = self.home / '.agent-harness/work/3410ce93-bee1-4ffb-b94b-1e852bc94483/cf_dns2.py'
+        path.write_bytes(self.text)
+        self.assertEqual(self.verdict('/usr/bin/python3 -I %s' % path), 'block')
+        draft = self.home / 'other/find.py'
+        draft.parent.mkdir(parents=True)
+        draft.write_bytes(b'#!/usr/bin/env python3\nNAMES = ["GOODQA_CLOUDFLARE_API_TOKEN", "MIRRORED_CLOUDFLARE_DNS_TOKEN"]\n')
+        self.assertEqual(self.verdict('python3 %s auto transition2.ai' % draft), 'block')
+
+    def test_the_other_pins_are_unchanged_by_this_one(self):
+        self.assertEqual([r[0] for r in cg.PINNED_ROUTES][:3], [BASE + SH_REL, BASE + PY_REL, FAB_REL])
+        self.assertEqual(len(cg.PINNED_ROUTES), 4)
+
+
 class TableTests(unittest.TestCase):
-    def test_the_table_is_exactly_these_two_pins(self):
-        self.assertEqual([(r[0], r[1]) for r in cg.PINNED_ROUTES], [
-            (SH_REL, '92438a47d6b8083266e42922a2d151d0d0d65475fcc20744ea54359f2af501f3'),
-            (PY_REL, '30c688923554c09f93128a7d9b89831557acd06d1f04949c235b09ea05cf89a6'),
+    def test_the_table_is_exactly_these_pins(self):
+        self.assertEqual([(r[0], r[1], r[2], r[3]) for r in cg.PINNED_ROUTES], [
+            (BASE + SH_REL, '92438a47d6b8083266e42922a2d151d0d0d65475fcc20744ea54359f2af501f3', '/bin/bash -p {path}',
+             cg.DEV_DECOM_EXPIRES),
+            (BASE + PY_REL, '30c688923554c09f93128a7d9b89831557acd06d1f04949c235b09ea05cf89a6', cg.PINNED_ROUTES[1][2],
+             cg.DEV_DECOM_EXPIRES),
+            (FAB_REL, '419863b6538f16b6d66c03faf06ecc42f76d8aa765069a447d28f36959f7985f', '/bin/bash -p {path}',
+             cg.FABRIC_DO_AUTH_EXPIRES),
+            (DNS_REL, '3fc503e96c61aa8ffb4705a858f8ded2515ae0ecd563142ce25d6c7c30f26420', '/usr/bin/python3 -I {path}', cg.TIMBAR_STAGING_DNS_EXPIRES),
         ])
 
-    def test_expiry_is_fixed(self):
-        self.assertEqual(time_string(cg.PINNED_ROUTE_EXPIRES), '2026-11-09T00:00:00Z')
+    def test_the_fabric_pin_is_the_reviewed_script(self):
+        # The pinned digest must be the bytes in tests/fixtures, which tests/test_fabric_do_auth_script.py exercises.
+        fixture = ROOT / 'tests' / 'fixtures' / 'pinned_routes' / 'doctl-auth-fabric.sh'
+        self.assertEqual([r[1] for r in cg.PINNED_ROUTES if r[0] == FAB_REL], [sha(fixture.read_bytes())])
 
+    def test_the_timbar_staging_dns_pin_is_the_reviewed_script(self):
+        # The pinned digest must be the bytes in tests/fixtures, which tests/test_timbar_staging_dns_script.py exercises.
+        self.assertEqual([r[1] for r in cg.PINNED_ROUTES if r[0] == DNS_REL], [sha(DNS_FIXTURE.read_bytes())])
+
+    def test_expiries_are_fixed(self):
+        self.assertEqual(time_string(cg.DEV_DECOM_EXPIRES), '2026-11-09T00:00:00Z')
+        self.assertEqual(time_string(cg.FABRIC_DO_AUTH_EXPIRES), '2026-11-21T00:00:00Z')
+        self.assertEqual(time_string(cg.TIMBAR_STAGING_DNS_EXPIRES), '2026-11-22T00:00:00Z')
 
 
 def time_string(epoch):

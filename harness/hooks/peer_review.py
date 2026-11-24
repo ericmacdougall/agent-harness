@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Independent read-only Codex review, with a blind Opus CLI fallback."""
+"""Independent read-only review with tiered automatic or explicit Codex-only routing."""
 
 # Hooks run under the host python3, which is 3.9 on macOS; keep annotations lazy.
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import math
@@ -27,17 +28,37 @@ if sys.version_info < (3, 9):
              'native evidence only, not a helper receipt.')
 
 import review_diagnostics as diagnostics
-from process import run as run_process, signal_group
+from process import CleanupIncomplete, OutputLimitExceeded, run as run_process, signal_group
 from git_safety import git_environment as safe_git_environment, require_safe_source
 from report_file import ReportTarget
 import escalation as ladder
 import model_tiers as tiers
-from usage_guard import GuardError, UsageStore, capture_subject, invocation_identity
+from usage_guard import GuardError, PoolUnavailable, UsageStore, capture_subject, invocation_identity
 
 
 PACKET_LIMIT = 150_000
 PACKET_WARNING = 32 * 1024
+# Verdict-bearing provider output (stderr, the last-message file and every stdout record, except the exempt Codex
+# command_execution output below) is bounded at 1 MB, as before goodqa#16170.
 PROVIDER_LIMIT = 1_000_000
+# goodqa#16170: Codex `exec --json` repeats each probe's full aggregated_output on stdout, so a valid review that runs
+# probes measured 1.08-2.68 MB on real receipts. That output never carries a verdict and is exempt from the bound
+# above; the raw ceiling bounds it instead. 16 MiB is about 6x the largest review observed, so a stream past it is a
+# runaway (OUTPUT_TOO_LARGE, fails closed). Capture stops there.
+PROVIDER_RAW_LIMIT = 16 * 2 ** 20
+# Raw bytes alone do not bound parse memory: millions of tiny records or objects fit under 16 MiB (review
+# harness-pr266-v1 F3). Each line is checked before it is decoded: record count, record size, and the cumulative JSON
+# node count (containers and separators outside string literals, counted by a constant-memory scanner). Real reviews
+# measured at most 60 records, about 600 nodes and a 1.2 MB longest line, so the caps leave more than 100x headroom
+# on count and about 7x on record size. Measured with tracemalloc (goodqa#16170 PR packet): normalize_provider peaks
+# at 24 MiB on a full 16 MiB stream, 20 MiB (2.1 s) on 16 MiB of escapes, 1.9 MiB on 1 MB of escapes and 15-16 MiB on
+# rejected shapes, on top of the input; bounded capture adds its 16 MiB buffer and the decoded copy, so a provider
+# call stays under about 60 MiB.
+PROVIDER_RECORDS = 10_000
+PROVIDER_JSON_NODES = 100_000
+PROVIDER_RECORD_LIMIT = 8 * 2 ** 20
+# One token per match, no repetition inside the pattern: an escape pair, a quote, or a structural character.
+JSON_TOKEN = re.compile(r'\\.|["{\[,]', re.DOTALL)
 _POLICY = []
 
 
@@ -79,7 +100,9 @@ def provider_failure(record, *, trusted=True):
     reset = reset if type(reset) in (int, float) and math.isfinite(reset) and reset > 0 else None
     return {'result': 'NO_RESULT', 'reason': reason, 'report': '',
             'account_cooldown': bool(trusted and (quota or auth)), 'reset_at': reset,
-            'fallback_allowed': bool(quota or auth or unavailable), 'usage': None}
+            'fallback_allowed': bool(quota or auth or unavailable), 'usage': None,
+            # The provider answered with a terminal refusal before doing any review work (goodqa#16725).
+            'provider_refused': bool(quota or auth or unavailable)}
 
 
 # Codex CLI retries a lost connection with `error` records like
@@ -128,38 +151,327 @@ def provider_usage(record):
 
 
 def verdict_match(stage, report):
+    """The verdict is the first non-blank line, and that line must be EXACTLY the stage's marker at column 0: only
+    trailing spaces, tabs or a CR are ignored. Anything after the marker on its line (prose, punctuation, a reason)
+    or before it (whitespace, a quote mark, decoration) is not a verdict (receipt r1 F1 on PR 211, goodqa#15723)."""
     prefix = {'pr': r'VERDICT: (PASS|BLOCK)', 'plan': r'PLAN_RESULT: (ACCEPT|BLOCK)',
               'code-inspection': r'CODE_INSPECTION_RESULT: (ACCEPT|BLOCK)'}
     if stage is None:
-        return re.match(r'^(?:VERDICT: (PASS|BLOCK)|(?:PLAN|CODE_INSPECTION)_RESULT: (ACCEPT|BLOCK))(?=\s|$)',
-                        report.strip())
-    return re.match('^' + prefix[stage] + r'(?=\s|$)', report.strip()) if stage in prefix else None
+        pattern = r'VERDICT: (PASS|BLOCK)|(?:PLAN|CODE_INSPECTION)_RESULT: (ACCEPT|BLOCK)'
+    elif stage in prefix:
+        pattern = prefix[stage]
+    else:
+        return None
+    first = next((line for line in report.split('\n') if line.strip()), '')
+    return re.fullmatch(pattern, first.rstrip(' \t\r'))
+
+
+ANY_MARKER = re.compile(r'(?:VERDICT|[A-Z_]*_RESULT)\s*:\s*(?:PASS|ACCEPT|BLOCK)')
+VERDICT_LINE = {'pr': r'VERDICT: (PASS|BLOCK)', 'plan': r'PLAN_RESULT: (ACCEPT|BLOCK)',
+                'code-inspection': r'CODE_INSPECTION_RESULT: (ACCEPT|BLOCK)'}
+HOIST_MAX_LINES = 12
+HOIST_MAX_CHARS = 2000
+
+
+def opens_quoted_text(line):
+    """True when a preamble line could start text the reviewer is quoting rather than writing: a fence, a blockquote,
+    an indented code block (4+ columns of leading space or a tab) or an HTML block. Any of these before the marker
+    makes the hoist refuse, so the marker can never sit inside a container that the parser would have to track."""
+    stripped = line.strip()
+    if not stripped:
+        return False
+    indent = line[:len(line) - len(line.lstrip(' \t'))]
+    return (stripped.startswith(('```', '~~~', '>', '<')) or '\t' in indent or len(indent) >= 4)
+
+
+def hoist_verdict(stage, text):
+    """A reviewer that writes a short preamble before its verdict (goodqa#15723) still gave a verdict, but only a BLOCK
+    is ever hoisted: plain prose can quote a marker ("The packet ends with:\n\nVERDICT: PASS", receipt r3 F1), and a
+    quoted BLOCK can only fail the review, which is safe. A PASS or ACCEPT counts only as the bare first non-blank line
+    (verdict_match); after a preamble it stays INVALID_OUTPUT and the raw answer is saved. A BLOCK is hoisted only
+    under these rules; anything else is returned unchanged (INVALID_OUTPUT):
+    - exactly one verdict-looking marker anywhere in the text, and its line is EXACTLY the stage's verdict at column 0
+      (no leading whitespace, quote mark, bold, heading or any other decoration; only trailing spaces are ignored);
+    - the marker is its own paragraph: the line before it is blank and the line after it is blank or the end;
+    - every preamble line before it is plain prose: no fence, no `>` line, no line indented 4+ columns or by a tab,
+      no HTML block line (opens_quoted_text);
+    - the preamble is at most HOIST_MAX_LINES lines and HOIST_MAX_CHARS characters.
+    Lines AFTER the marker may hold fences, quotes and code: reviewers put code in findings, and nothing after the
+    marker can contain it. A marker repeated after it still counts as a second marker, so it is never hoisted.
+    The text is returned verdict first, the preamble moved below with a note, so the pass marker, the ticket parser
+    and stage_report still see a first-line verdict."""
+    if not isinstance(text, str) or verdict_match(stage, text):
+        return text
+    pattern = VERDICT_LINE.get(stage) if stage is not None else '|'.join(VERDICT_LINE.values())
+    if pattern is None or len(ANY_MARKER.findall(text)) != 1:
+        return text
+    lines = [line.rstrip('\r') for line in text.split('\n')]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    for index, line in enumerate(lines[:HOIST_MAX_LINES + 1]):
+        if not re.fullmatch(pattern, line.rstrip(' \t')):
+            if opens_quoted_text(line):
+                return text
+            continue
+        if not line.rstrip(' \t').endswith(': BLOCK'):
+            return text  # receipt r3 F1: a PASS or ACCEPT after a preamble may be quoted; only the first line counts
+        preamble = lines[:index]
+        if (not index or lines[index - 1].strip() or (index + 1 < len(lines) and lines[index + 1].strip())
+                or len('\n'.join(preamble)) > HOIST_MAX_CHARS):
+            return text
+        verdict = line.rstrip(' \t')
+        after = lines[index + 1:]
+        while after and not after[0].strip():
+            after.pop(0)
+        rest = '\n'.join(after)  # leading indentation of a finding is kept
+        note = ('[harness: the reviewer wrote %d line(s) before its verdict; the verdict line was moved to the top '
+                'and the preamble is kept below]' % index)
+        return verdict + '\n' + (rest + '\n\n' if rest else '\n') + note + '\n' + '\n'.join(preamble).strip()
+    return text
+
+
+RAW_KEEP = 4 * 1024 * 1024
+
+
+def persist_raw_output(target, provider, code, stdout, stderr, last_message):
+    """Keep the reviewer's raw answer in a private mode-600 file when it could not be parsed, so its findings are never
+    lost (goodqa#15723). It is written through the report target's directory handle, after the directory is confirmed
+    to be the one that was validated (outside the worktree, not swapped), exactly like the report. Returns the path or
+    None; never raises."""
+    if target is None or getattr(target, 'fd', None) is None:
+        return None
+    try:
+        if not target.directory_is_current():
+            return None
+        body = ('provider: %s\nexit code: %s\n--- stdout ---\n%s\n--- last message ---\n%s\n--- stderr ---\n%s\n'
+                % (provider, code, stdout or '', last_message or '', stderr or ''))
+        data = body.encode('utf-8', errors='replace')[:RAW_KEEP]
+        for counter in range(100):
+            name = '%s.raw-%s-%d.txt' % (target.path.name, provider, counter)
+            try:
+                fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=target.fd)
+            except FileExistsError:
+                continue
+            try:
+                os.fchmod(fd, 0o600)
+                view = memoryview(data)
+                while view:  # a single write may be partial
+                    view = view[os.write(fd, view):]
+            finally:
+                os.close(fd)
+            return str(target.parent / name)
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def read_bounded(path, limit):
+    """The provider's last-message file, read to at most `limit` bytes (a longer one then fails the size bound)."""
+    try:
+        with open(path, 'rb') as handle:
+            return handle.read(limit).decode('utf-8', errors='replace')
+    except FileNotFoundError:
+        return ''
+
+
+def utf8_size(value):
+    return len(value.encode('utf-8', errors='replace'))
+
+
+def codex_bounded_size(record):
+    """Bytes of one Codex record that count against PROVIDER_LIMIT. Only a string `aggregated_output` of a
+    `command_execution` item in an `item.*` record is exempt: it is tool output, never read for a verdict (the verdict
+    comes only from the final agent_message, which must equal the last-message file). Every other field counts."""
+    item = record.get('item')
+    kind = record.get('type')
+    if (isinstance(kind, str) and kind.startswith('item.') and isinstance(item, dict)
+            and item.get('type') == 'command_execution' and isinstance(item.get('aggregated_output'), str)):
+        record = {**record, 'item': {key: value for key, value in item.items() if key != 'aggregated_output'}}
+    return utf8_size(json.dumps(record, ensure_ascii=False))
+
+
+def json_node_count(text, budget):
+    """Containers and separators outside JSON string literals, plus one: proportional to the objects json.loads
+    would allocate, counted without allocating them (review harness-pr266-v1 F3). A single-token scanner with string
+    and escape state uses constant auxiliary memory (review harness-pr266-v2 F1: a substitution regex with a repeated
+    group used ~79 MB on 1 MB of escapes). Stops counting once `budget` is passed."""
+    nodes, in_string = 1, False
+    for match in JSON_TOKEN.finditer(text):
+        token = match.group()
+        if token == '"':
+            in_string = not in_string
+        elif not in_string and len(token) == 1:
+            nodes += 1
+            if nodes > budget:
+                break
+    return nodes
+
+
+def provider_lines(text):
+    """Non-blank lines one at a time, so a stream is never split into a list of millions of strings."""
+    start = 0
+    while start <= len(text):
+        end = text.find('\n', start)
+        end = len(text) if end < 0 else end
+        line = text[start:end]
+        if line.strip():
+            yield line
+        start = end + 1
+
+
+def record_too_large(text):
+    return len(text) > PROVIDER_RECORD_LIMIT or utf8_size(text) > PROVIDER_RECORD_LIMIT
+
+
+def checked_record(provider, record, bounded):
+    """(new verdict-bearing total, failure or None) for one decoded record."""
+    if not isinstance(record, dict):
+        return bounded, 'INVALID'
+    if provider == 'codex':
+        try:
+            bounded += codex_bounded_size(record)
+        except (ValueError, TypeError, RecursionError):
+            return bounded, 'INVALID'
+        if bounded > PROVIDER_LIMIT:
+            return bounded, 'TOO_LARGE'
+    return bounded, None
+
+
+def parse_provider_records(provider, stripped, side):
+    """Decode a structured provider stream one line at a time under every bound, each checked before the line is
+    decoded: record count, record size and cumulative JSON node count; after decoding, for Codex, the cumulative
+    verdict-bearing size. Parsing stops at the first bound passed. A stream whose first line is not a JSON value on
+    its own is tried once as a single document (for example pretty-printed), under the same size and node bounds.
+    Returns the records, 'INVALID' or 'TOO_LARGE'."""
+    records, bounded, nodes = [], side, 0
+    for line in provider_lines(stripped):
+        if len(records) >= PROVIDER_RECORDS or record_too_large(line):
+            return 'TOO_LARGE'
+        nodes += json_node_count(line, PROVIDER_JSON_NODES - nodes)
+        if nodes > PROVIDER_JSON_NODES:
+            return 'TOO_LARGE'
+        try:
+            record = json.loads(line)
+        except (ValueError, TypeError, RecursionError):
+            if records or '\n' not in stripped:
+                return 'INVALID'
+            if record_too_large(stripped) or json_node_count(stripped, PROVIDER_JSON_NODES) > PROVIDER_JSON_NODES:
+                return 'TOO_LARGE'
+            try:
+                record = json.loads(stripped)
+            except (ValueError, TypeError, RecursionError):
+                return 'INVALID'
+            _, failure = checked_record(provider, record, side)
+            return failure or [record]
+        bounded, failure = checked_record(provider, record, bounded)
+        if failure:
+            return failure
+        records.append(record)
+    return records or 'INVALID'
+
+
+PROVIDER_MARKER = re.compile(r'(?:ERROR|Error): (ACCOUNT_QUOTA_EXCEEDED|AUTHENTICATION_REQUIRED|MODEL_UNAVAILABLE)\s*')
+CODEX_PRE_WORK_RECORDS = frozenset({'thread.started', 'turn.started', 'error', 'turn.failed'})
+CLAUDE_PRE_WORK_RECORDS = frozenset({'system', 'error', 'result'})
 
 
 def normalize_provider(provider, code, stdout, stderr='', last_message='', requested_stage=None):
-    """Validate supported terminal envelopes before extracting model verdict text."""
+    """Validate supported terminal envelopes before extracting model verdict text.
+
+    This is the one place that decides `provider_refused`: an error code alone never proves the provider did no
+    work, so the refusal stands only when the transcript itself shows no work (goodqa#16725, PR 318 review F1).
+    """
+    outcome = classify_provider(provider, code, stdout, stderr, last_message, requested_stage)
+    if outcome.get('provider_refused') is True and not (
+            not work_signal(outcome.get('usage')) and refusal_before_work(provider, stdout, last_message)):
+        outcome = {**outcome, 'provider_refused': False}
+    return outcome
+
+
+WORK_SIGNAL_KEYS = ('usage', 'total_cost_usd', 'modelUsage', 'costUSD', 'duration_api_ms', 'server_tool_use')
+
+
+def work_signal(value, depth=0):
+    """True when a value could show spent work: any positive number, any text, any unknown leaf, or too deep to
+    read. Only absent values, empty containers, booleans and zeros read as no work."""
+    if value is None or type(value) is bool:
+        return False
+    if type(value) in (int, float):
+        return not (math.isfinite(value) and value == 0)
+    if isinstance(value, dict):
+        return depth > 4 or any(work_signal(item, depth + 1) for item in value.values())
+    if isinstance(value, list):
+        return depth > 4 or any(work_signal(item, depth + 1) for item in value)
+    return True
+
+
+def refusal_before_work(provider, stdout, last_message=''):
+    """True only when the provider's whole transcript is a refusal: no work records, no usage, cost or API time.
+
+    Only Codex and Claude transcripts are read. Kimi's wrapper discards its transcript before this point, so a
+    Kimi refusal is never taken as proof of no work. Unknown shapes are treated as work, so a doubtful run keeps
+    counting against the repeat budget.
+    """
+    if provider not in ('codex', 'claude') or (last_message or '').strip():
+        return False
+    stripped = stdout.strip()
+    if not stripped:
+        return True
+    if not stripped.startswith(('{', '[')):
+        return bool(PROVIDER_MARKER.fullmatch(stripped))
+    records = parse_provider_records(provider, stripped, 0)
+    if not isinstance(records, list) or not records:
+        return False
+    allowed = CODEX_PRE_WORK_RECORDS if provider == 'codex' else CLAUDE_PRE_WORK_RECORDS
+    for record in records:
+        if not isinstance(record, dict):
+            return False
+        kind = record.get('type')
+        warning = (provider == 'codex' and kind == 'item.completed' and isinstance(record.get('item'), dict)
+                   and record['item'].get('type') == 'error' and set(record['item']) <= {'id', 'type', 'message'})
+        if kind not in allowed and not warning:
+            return False
+        if any(work_signal(record.get(key)) for key in WORK_SIGNAL_KEYS):
+            return False
+        turns = record.get('num_turns')
+        if turns is not None and (type(turns) is not int or turns > 1):
+            return False
+    return True
+
+
+def with_reported_usage(failure, record):
+    """Keep the usage an error record reports, so a paid failure is never mistaken for a free refusal."""
+    usage = provider_usage(record)
+    return {**failure, 'usage': usage} if usage is not None else failure
+
+
+def classify_provider(provider, code, stdout, stderr='', last_message='', requested_stage=None):
     invalid = provider_failure({})
+    too_large = {**invalid, 'reason': 'OUTPUT_TOO_LARGE'}
     if code == 124 and stderr == 'HARNESS_PROVIDER_TIMEOUT':
         return {**invalid, 'reason': 'TIMEOUT'}
     if code == 127 and stderr == 'HARNESS_PROVIDER_UNAVAILABLE':
         return {**invalid, 'reason': 'TRANSIENT_INFRA', 'fallback_allowed': True}
     if code == 125 and stderr == 'HARNESS_PROVIDER_IO_UNKNOWN':
         return {**invalid, 'reason': 'UNKNOWN'}
-    if sum(len(value.encode('utf-8', errors='replace')) for value in (stdout, stderr, last_message)) > PROVIDER_LIMIT:
-        return invalid
+    if code == 126 and stderr == 'HARNESS_PROVIDER_OUTPUT_TOO_LARGE':
+        return too_large
+    # Raw ceiling first, before anything is parsed; then the verdict-bearing bound (goodqa#16170).
+    side = utf8_size(stderr) + utf8_size(last_message)
+    if len(stdout) > PROVIDER_RAW_LIMIT or utf8_size(stdout) > PROVIDER_RAW_LIMIT or side > PROVIDER_LIMIT:
+        return too_large
+    exempt = provider == 'codex' and stdout.lstrip().startswith(('{', '['))
+    if not exempt and side + utf8_size(stdout) > PROVIDER_LIMIT:
+        return too_large
     text, usage = '', None
     stripped = stdout.strip()
     structured = stripped.startswith(('{', '['))
     if structured:
-        try:
-            records = [json.loads(stripped)]
-        except (ValueError, TypeError, RecursionError):
-            try:
-                records = [json.loads(line) for line in stripped.splitlines() if line.strip()]
-            except (ValueError, TypeError, RecursionError):
-                return invalid
-        if not records or any(not isinstance(record, dict) for record in records):
-            return invalid
+        records = parse_provider_records(provider, stripped, side)
+        if records in ('INVALID', 'TOO_LARGE'):
+            return too_large if records == 'TOO_LARGE' else invalid
         if provider == 'codex':
             completed = []
             messages = []
@@ -178,7 +490,8 @@ def normalize_provider(provider, code, stdout, stderr='', last_message='', reque
                     # final `turn.failed`; classify the pair by that final record.
                     continue
                 if kind in {'error', 'turn.failed'} or record.get('is_error') is True or record.get('error') is not None:
-                    return codex_failure(record, terminal=record is records[-1] and not completed and not messages)
+                    return with_reported_usage(
+                        codex_failure(record, terminal=record is records[-1] and not completed and not messages), record)
                 if kind == 'turn.completed':
                     if (record.get('status') not in (None, 'success', 'completed')
                             or record.get('subtype') not in (None, 'success', 'completed')):
@@ -205,7 +518,7 @@ def normalize_provider(provider, code, stdout, stderr='', last_message='', reque
                     failure = provider_failure(record)
                     if failure['reason'] == 'INVALID_OUTPUT' and record.get('is_error') is True:
                         failure = prose_quota_failure(record.get('result')) or failure
-                    return failure
+                    return with_reported_usage(failure, record)
             terminal = [record for record in records if record.get('type') == 'result']
             if len(terminal) != 1 or records[-1] is not terminal[0]:
                 return invalid
@@ -214,7 +527,7 @@ def normalize_provider(provider, code, stdout, stderr='', last_message='', reque
                 failure = provider_failure(record)
                 if failure['reason'] == 'INVALID_OUTPUT' and record.get('is_error') is True:
                     failure = prose_quota_failure(record.get('result')) or failure
-                return failure
+                return with_reported_usage(failure, record)
             if (record.get('stop_reason') is not None and not isinstance(record['stop_reason'], str)
                     or record.get('terminal_reason') is not None and not isinstance(record['terminal_reason'], str)
                     or record.get('stop_reason') not in (None, 'end_turn', 'stop_sequence', 'completed', 'success', 'complete', 'normal', 'done')
@@ -229,8 +542,7 @@ def normalize_provider(provider, code, stdout, stderr='', last_message='', reque
         # terminal error, never an arbitrary progress transcript containing PASS.
         text = last_message if not stripped and last_message else stdout
         if code != 0:
-            marker = re.fullmatch(r'(?:ERROR|Error): (ACCOUNT_QUOTA_EXCEEDED|AUTHENTICATION_REQUIRED|MODEL_UNAVAILABLE)\s*',
-                                  stderr.strip() or stripped)
+            marker = PROVIDER_MARKER.fullmatch(stderr.strip() or stripped)
             if marker:
                 return provider_failure({'code': marker[1].lower()})
             # Free-text stderr counts only for codex with no stdout, and only its last line (the CLI's own
@@ -243,6 +555,7 @@ def normalize_provider(provider, code, stdout, stderr='', last_message='', reque
         text.encode('utf-8')
     except UnicodeError:
         return invalid
+    text = hoist_verdict(requested_stage, text)
     verdict = verdict_match(requested_stage, text)
     if not verdict:
         return invalid
@@ -385,6 +698,22 @@ def git(repo: Path, *args: str, timeout: float = 120, snapshot: bool = False) ->
     return result.stdout
 
 
+def require_complete_repository(repo: Path) -> None:
+    """Refuse a partial clone (promisor remote) with its own message.
+
+    Runs before the source state inspection too: in a partial clone that inspection can need
+    missing objects, which isolated Git may not fetch, and would fail with an unrelated message
+    (goodqa#16271). Any answer other than "no such key" is a refusal.
+    """
+    partial = run_process(['git', '-C', str(repo), 'config', '--local', '--get-regexp',
+                          r'^(extensions\.partialclone|remote\..*\.promisor)$'],
+                         env=git_environment(), timeout=30)
+    if partial.returncode == 0:
+        raise OSError('partial repositories are unsupported for review')
+    if partial.returncode != 1:
+        raise OSError('isolated Git operation failed (config)')
+
+
 def make_snapshot(repo: Path, snapshot: Path, head: str, *, base: str | None = None,
                   timeout: float = DEFAULT_SNAPSHOT_TIMEOUT) -> str | None:
     """Copy only the reviewed commit and one base commit into a fresh repository.
@@ -419,11 +748,7 @@ def make_snapshot(repo: Path, snapshot: Path, head: str, *, base: str | None = N
             path = repo / path
         if path.exists():
             raise OSError('grafts and alternate object stores are unsupported for review')
-    partial = run_process(['git', '-C', str(repo), 'config', '--local', '--get-regexp',
-                          r'^(extensions\.partialclone|remote\..*\.promisor)$'],
-                         env=git_environment(), timeout=30)
-    if partial.returncode != 1:
-        raise OSError('partial repositories are unsupported for review')
+    require_complete_repository(repo)
     fmt = git(repo, 'rev-parse', '--show-object-format').strip()
     if fmt not in ('sha1', 'sha256'):
         raise OSError('unsupported Git object format')
@@ -454,6 +779,10 @@ def make_snapshot(repo: Path, snapshot: Path, head: str, *, base: str | None = N
             raise OSError('--snapshot-base must be an ancestor of the reviewed commit')
     snapshot.mkdir(mode=0o700)
     git(snapshot, 'init', '--quiet', '--template=', f'--object-format={fmt}')
+    # Persist the inert symlink representation in the snapshot itself: a reviewer's Git that
+    # runs without this helper's environment (checkout, reset, stash) must not materialize a
+    # committed symlink as a real one (goodqa#16271).
+    git(snapshot, 'config', '--local', 'core.symlinks', 'false')
     slow_git(snapshot, '-c', 'protocol.file.allow=always', 'fetch', '--quiet', '--no-tags',
              '--no-write-fetch-head', '--no-recurse-submodules', '--depth=1', str(repo), *commits)
     for name in ('info/grafts', 'objects/info/alternates'):
@@ -504,10 +833,27 @@ def run(cmd: list[str], prompt: str, cwd: Path, timeout=720, on_spawn=None) -> t
     environment['PATH'] = diagnostics.child_path(
         environment.get('PATH', ''), [*_CHILD_PATH_ROOTS, *diagnostics.untrusted_roots(snapshot=cwd)])
     try:
-        extra = {'on_spawn': on_spawn} if on_spawn is not None else {}
-        result = run_process(cmd, input=prompt, text=True, cwd=cwd, env=environment,
-                             timeout=timeout, **extra)
-        return result.returncode, result.stdout, result.stderr
+        try:
+            extra = {'on_spawn': on_spawn} if on_spawn is not None else {}
+            result = run_process(cmd, input=prompt, text=True, cwd=cwd, env=environment,
+                                 timeout=timeout, output_limit=PROVIDER_RAW_LIMIT, **extra)
+            return result.returncode, result.stdout, result.stderr
+        except Exception as error:
+            # Checked before any classification (review harness-pr266-v3): an error marked cleanup_incomplete (a
+            # failed child record of any type whose group could not be proven gone, or CleanupIncomplete itself)
+            # means ownership is unknown, never a missing CLI or another known end. UNKNOWN keeps the pool reserved
+            # and allows no fallback; a failed child record keeps its launch-unconfirmed diagnostic. Unmarked errors
+            # are re-raised to the classification below.
+            if not getattr(error, 'cleanup_incomplete', False):
+                raise
+            if isinstance(error, CleanupIncomplete):
+                return 125, '', 'HARNESS_PROVIDER_IO_UNKNOWN'
+            detail = error.message if isinstance(error, GuardError) else type(error).__name__
+            raise GuardError('UNKNOWN', 'The child record failed and the child could not be proven stopped: '
+                             + str(detail)) from error
+    except OutputLimitExceeded as error:
+        # The group is stopped and reaped; keep a bounded prefix so the raw answer can still be saved for diagnosis.
+        return 126, error.stdout[:RAW_KEEP], 'HARNESS_PROVIDER_OUTPUT_TOO_LARGE'
     except subprocess.TimeoutExpired:
         return 124, '', 'HARNESS_PROVIDER_TIMEOUT'
     except FileNotFoundError:
@@ -587,6 +933,113 @@ def read_packet(path: Path) -> PacketEvidence:
         raise ValueError('packet invalid or changed while being read') from None
 
 
+AHC_RELEASE = 'harness/hooks/ahc_release.json'
+AHC_RELEASE_FILE = re.compile(r'ahc_[a-z0-9_]{1,60}\.py')
+AHC_RELEASE_HELPER = re.compile(r'[a-z][a-z0-9_]{0,40}')  # a helper name in ahc_guard.HELPER_SCRIPTS
+AHC_RELEASE_SHA = re.compile(r'[0-9a-f]{64}')
+AHC_RELEASE_FIX = ('run `python3 scripts/ahc_release_hashes.py --write` and commit harness/hooks/ahc_release.json in '
+                   'the same change')
+
+
+def _hook_tree(snapshot: Path, rev: str) -> dict[str, str]:
+    """{basename: git mode} for the entries directly under harness/hooks/ at rev, read from the snapshot's objects."""
+    tree = {}
+    for entry in git(snapshot, 'ls-tree', '-z', rev, '--', 'harness/hooks/', snapshot=True).split('\0'):
+        meta, tab, path = entry.partition('\t')
+        if tab:
+            tree[path.rsplit('/', 1)[-1]] = meta.split(' ', 1)[0]
+    return tree
+
+
+def _release_parts(text: str, where: str) -> tuple[dict, dict]:
+    try:
+        data = json.loads(text)
+    except ValueError:
+        raise ValueError(f'{AHC_RELEASE} at {where} is not JSON') from None
+    parts = []
+    for part, names in (('files', AHC_RELEASE_FILE), ('helpers', AHC_RELEASE_HELPER)):
+        value = data.get(part) if isinstance(data, dict) else None
+        if not isinstance(value, dict) or not all(
+                isinstance(k, str) and names.fullmatch(k) and isinstance(v, str) and AHC_RELEASE_SHA.fullmatch(v)
+                for k, v in value.items()):
+            raise ValueError(f'{AHC_RELEASE} at {where} has a malformed "{part}" map')
+        parts.append(value)
+    return parts[0], parts[1]
+
+
+def _declared(snapshot: Path, rel: str, name: str, kind: type):
+    """The literal value HEAD assigns to `name` at module level in `rel`: parsed with ast.literal_eval, never run."""
+    import ast  # noqa: PLC0415
+    path = snapshot / rel
+    try:
+        tree = ast.parse(path.read_bytes(), filename=rel)
+    except (OSError, SyntaxError, ValueError):
+        raise ValueError(f'{rel} cannot be parsed at HEAD') from None
+    values = [node.value for node in tree.body if isinstance(node, ast.Assign)
+              and any(isinstance(target, ast.Name) and target.id == name for target in node.targets)]
+    if len(values) != 1:
+        raise ValueError(f'{rel} {name} must be assigned exactly once at module level')
+    try:
+        value = ast.literal_eval(values[0])
+    except ValueError:
+        raise ValueError(f'{rel} {name} is not a literal') from None
+    if not isinstance(value, kind):
+        raise ValueError(f'{rel} {name} is not a {kind.__name__}')
+    return value
+
+
+def ahc_release_problem(snapshot: Path, head: str, base: str | None) -> tuple[str | None, str | None]:
+    """The PR-stage gate for the ahc release list (goodqa#16049, PR 247 F4): (problem, manifest sha256).
+
+    agent-harness runs no GitHub CI, so a merge needs this review's authorization or an audited waiver; checking
+    here is what makes a stale list block a merge. It applies the predicate of scripts/ahc_release_hashes.py --check
+    without running any of the reviewed commit's code: the expected names are HEAD's own declarations, read as
+    literals (install.py HOOKS: its ahc_*.py modules; harness/hooks/ahc_guard.py HELPER_SCRIPTS: helper name to
+    script). The list's "files" and "helpers" must name exactly those, each a regular file at HEAD (no symlink or
+    submodule) whose sha256 matches. A repository with no list at HEAD or at the base is not checked (other
+    repositories use this review too); deleting the base's list is a problem.
+    """
+    head_tree = _hook_tree(snapshot, head)
+    base_tree = _hook_tree(snapshot, base) if base else {}
+    if 'ahc_release.json' not in head_tree:
+        if 'ahc_release.json' in base_tree:
+            return f'{AHC_RELEASE} exists at the base but not at HEAD; the ahc daemon refuses every entry point', None
+        return None, None
+    stale = []
+    try:
+        if head_tree['ahc_release.json'] not in {'100644', '100755'}:
+            raise ValueError(f'{AHC_RELEASE} is not a regular file at HEAD')
+        raw = (snapshot / AHC_RELEASE).read_bytes()
+        files, helpers = _release_parts(raw.decode('utf-8'), 'HEAD')
+        shipped = _declared(snapshot, 'install.py', 'HOOKS', tuple)
+        declared = _declared(snapshot, 'harness/hooks/ahc_guard.py', 'HELPER_SCRIPTS', dict)
+        if not all(isinstance(n, str) for n in shipped) or not all(
+                isinstance(k, str) and AHC_RELEASE_HELPER.fullmatch(k) and isinstance(v, str)
+                and re.fullmatch(r'[a-z][a-z0-9_]{0,60}\.py', v) for k, v in declared.items()):
+            raise ValueError('install.py HOOKS or ahc_guard.HELPER_SCRIPTS holds a name that is not a plain file name')
+        modules = {n for n in shipped if AHC_RELEASE_FILE.fullmatch(n)}
+        stale += [f'files {n} (shipped by install.py, not listed)' for n in sorted(modules - set(files))]
+        stale += [f'files {n} (listed, but install.py does not ship it)' for n in sorted(set(files) - modules)]
+        stale += [f'helpers {n} (declared by ahc_guard.HELPER_SCRIPTS, not listed)'
+                  for n in sorted(set(declared) - set(helpers))]
+        stale += [f'helpers {n} (listed, but ahc_guard.HELPER_SCRIPTS does not declare it)'
+                  for n in sorted(set(helpers) - set(declared))]
+        for part, entries, script in (('files', files, lambda n: n), ('helpers', helpers, declared.get)):
+            for name, digest in sorted(entries.items()):
+                if script(name) is None:
+                    continue
+                if head_tree.get(script(name)) not in {'100644', '100755'}:
+                    stale.append(f'{part} {name} (no regular file at HEAD)')
+                elif hashlib.sha256((snapshot / 'harness' / 'hooks' / script(name)).read_bytes()).hexdigest() != digest:
+                    stale.append(f'{part} {name} (sha256 differs)')
+    except (ValueError, UnicodeDecodeError) as error:
+        return f'{AHC_RELEASE} cannot be checked: {error}; {AHC_RELEASE_FIX}', None
+    if stale:
+        return (f'{AHC_RELEASE} is stale at HEAD: ' + '; '.join(stale[:12]) + '. The ahc daemon refuses these until '
+                f'the list matches: {AHC_RELEASE_FIX}'), None
+    return None, hashlib.sha256(raw).hexdigest()
+
+
 def repo_state(repo: Path, *, snapshot: bool = False) -> tuple[str, str]:
     """Capture a clean reviewed commit without reading untracked content.
 
@@ -605,8 +1058,8 @@ def repo_state(repo: Path, *, snapshot: bool = False) -> tuple[str, str]:
         raise OSError('Git status inspection failed')
     if status.stdout:
         return head.stdout.strip(), status.stdout
-    require_unflagged_index(repo)
-    require_no_special_entries(repo, allow_symlinks=not snapshot)
+    tracked = require_unflagged_index(repo)
+    require_no_special_entries(repo, allow_symlinks=not snapshot, tracked=tracked)
     diff = run_process(['git', '-C', str(repo), 'diff', '--no-ext-diff', '--no-textconv',
                         '--binary', 'HEAD', '--'], env=env, timeout=30)
     if diff.returncode or diff.stdout:
@@ -614,23 +1067,57 @@ def repo_state(repo: Path, *, snapshot: bool = False) -> tuple[str, str]:
     return head.stdout.strip(), status.stdout
 
 
-def require_no_special_entries(repo: Path, *, allow_symlinks: bool = True) -> None:
-    """Git status omits FIFOs and sockets; reject them with bounded metadata reads."""
+class ScanLimitExceeded(OSError):
+    """A bounded metadata scan or listing ran out of its time, size or entry budget.
+
+    This is never evidence of a special file, and is reported with its own message and code.
+    """
+
+
+class SpecialEntry(OSError):
+    """Internal marker: the scan met a FIFO, socket, device or a refused symlink."""
+
+
+# The metadata scan is bounded by a floor plus a per-tracked-entry allowance. A fixed 5 s bound
+# refused a clean 62k-entry checkout under ordinary concurrent load (goodqa#16271): measured about
+# 27 us per entry idle and 80 us at 12 concurrent scans on the Mac, so 500 us leaves about 6x
+# headroom. The entry cap keeps the worst case bounded: 5 + 250000 * 0.0005 = 130 seconds.
+SCAN_BASE_SECONDS = 5.0
+SCAN_SECONDS_PER_ENTRY = 0.0005
+SCAN_MAX_ENTRIES = 250_000
+SCAN_MAX_DEPTH = 64
+
+
+def scan_budget(tracked: int) -> float:
+    """Wall-clock budget for one worktree metadata scan of a tree with `tracked` index entries."""
+    return SCAN_BASE_SECONDS + SCAN_SECONDS_PER_ENTRY * min(max(int(tracked), 0), SCAN_MAX_ENTRIES)
+
+
+def require_no_special_entries(repo: Path, *, allow_symlinks: bool = True, tracked: int = 0) -> None:
+    """Git status omits FIFOs and sockets; reject them with bounded metadata reads.
+
+    The three refusals carry distinct messages and never filenames: a budget overrun
+    ("exceeded limits"), a special file, and an entry that changed or could not be read.
+    """
     inspected = [0]
-    deadline = time.monotonic() + 5
+    budget = scan_budget(tracked)
+    deadline = time.monotonic() + budget
     # A review snapshot has no legitimate ignored content, so scan all of it.
     ignored = ignored_directory_prefixes(repo, deadline) if allow_symlinks else set()
 
     def visit(directory: int, depth: int, relative: tuple[str, ...]) -> None:
-        if depth > 64:
-            raise OSError('worktree metadata scan exceeded limits')
+        if depth > SCAN_MAX_DEPTH:
+            raise ScanLimitExceeded(f'directory depth over {SCAN_MAX_DEPTH}')
         with os.scandir(directory) as entries:
             for entry in entries:
                 if entry.name == '.git':
                     continue
                 inspected[0] += 1
-                if inspected[0] > 250_000 or time.monotonic() > deadline:
-                    raise OSError('worktree metadata scan exceeded limits')
+                if inspected[0] > SCAN_MAX_ENTRIES:
+                    raise ScanLimitExceeded(f'more than {SCAN_MAX_ENTRIES} entries')
+                if time.monotonic() > deadline:
+                    raise ScanLimitExceeded(f'time budget of {budget:.0f} s for {tracked} tracked entries '
+                                            f'used up after {inspected[0]} entries')
                 info = entry.stat(follow_symlinks=False)
                 if stat.S_ISDIR(info.st_mode):
                     child_relative = (*relative, entry.name)
@@ -643,17 +1130,23 @@ def require_no_special_entries(repo: Path, *, allow_symlinks: bool = True) -> No
                     finally:
                         os.close(child)
                 elif not (stat.S_ISREG(info.st_mode) or (allow_symlinks and stat.S_ISLNK(info.st_mode))):
-                    raise OSError('worktree contains an unsafe special file')
+                    raise SpecialEntry()
 
+    # Do not include filenames or private file contents in diagnostics.
     try:
         root = os.open(repo, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             visit(root, 0, ())
         finally:
             os.close(root)
-    except (OSError, subprocess.TimeoutExpired) as error:
-        # Do not include filenames or private file contents in diagnostics.
-        raise OSError('worktree metadata scan refused a special or unstable entry') from error
+    except ScanLimitExceeded as error:
+        raise ScanLimitExceeded(f'worktree metadata scan exceeded limits ({error})') from error
+    except SpecialEntry as error:
+        raise OSError('worktree metadata scan refused a special file (FIFO, socket, device'
+                      + (')' if allow_symlinks else ' or symlink in a review snapshot)')) from error
+    except OSError as error:
+        name = errno.errorcode.get(error.errno, type(error).__name__) if error.errno else type(error).__name__
+        raise OSError(f'worktree metadata scan refused an entry that changed or could not be read ({name})') from error
 
 
 def bounded_git_listing(repo: Path, args: list[str], deadline: float, limit: int) -> bytes:
@@ -668,13 +1161,13 @@ def bounded_git_listing(repo: Path, args: list[str], deadline: float, limit: int
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0 or not selector.select(remaining):
-                    raise OSError('Git listing exceeded time budget')
+                    raise ScanLimitExceeded('Git listing exceeded time budget')
                 chunk = os.read(process.stdout.fileno(), min(65536, limit + 1 - len(data)))
                 if not chunk:
                     break
                 data.extend(chunk)
                 if len(data) > limit:
-                    raise OSError('Git listing exceeded size budget')
+                    raise ScanLimitExceeded('Git listing exceeded size budget')
         if process.wait(timeout=max(0.1, deadline - time.monotonic())):
             raise OSError('Git listing failed')
     finally:
@@ -687,8 +1180,8 @@ def bounded_git_listing(repo: Path, args: list[str], deadline: float, limit: int
     return bytes(data)
 
 
-def require_unflagged_index(repo: Path) -> None:
-    """Reject index flags that make status and diff hide tracked edits."""
+def require_unflagged_index(repo: Path) -> int:
+    """Reject index flags that make status and diff hide tracked edits; return the entry count."""
     deadline = time.monotonic() + 5
     records = bounded_git_listing(repo, ['ls-files', '-v', '-z'], deadline, 40_000_000)
     count = 0
@@ -696,10 +1189,11 @@ def require_unflagged_index(repo: Path) -> None:
         if not record:
             continue
         count += 1
-        if count > 250_000 or time.monotonic() > deadline:
-            raise OSError('Git index listing exceeded limits')
+        if count > SCAN_MAX_ENTRIES or time.monotonic() > deadline:
+            raise ScanLimitExceeded('Git index listing exceeded limits')
         if len(record) < 3 or record[:2] != b'H ':
             raise OSError('Git index contains a hidden or unsupported entry flag (%r)' % record[:1].decode('ascii', 'replace'))
+    return count
 
 
 def ignored_directory_prefixes(repo: Path, deadline: float) -> set[tuple[str, ...]]:
@@ -755,11 +1249,63 @@ def kimi_attempt(prompt, packet_path, timeout):
     return 0, result['text'], '', 1
 
 
+def reviewer_mode(mode, secondary='default'):
+    if not isinstance(mode, str) or mode not in {'auto', 'codex-only'}:
+        raise OSError('unsupported reviewer routing mode')
+    if mode == 'codex-only' and secondary != 'default':
+        raise OSError('Codex-only routing cannot select a secondary reviewer')
+    return mode
+
+
+def select_reviewer(policy, author_rung, author_harness, available=None, mode='auto'):
+    reviewer_mode(mode)
+    eligible = {'openai': True, 'claude': True, **(available or {})}
+    if mode == 'codex-only':
+        eligible['claude'] = False
+    selection = tiers.reviewer_for(policy, author_rung, author_harness, eligible)
+    if mode == 'codex-only':
+        # A routing restriction is not evidence that the excluded provider is down.
+        selection = dict(selection, why=selection['why'].split(';', 1)[0] + '; requested Codex-only route')
+    return selection
+
+
+def review_routing(selection, mode='auto', secondary='default'):
+    reviewer_mode(mode, secondary)
+    harness = selection.get('harness')
+    if harness not in {'openai', 'claude'} or (mode == 'codex-only' and harness != 'openai'):
+        raise OSError('reviewer selection contradicts the requested routing mode')
+    primary = 'codex' if harness == 'openai' else 'claude'
+    order = [primary]
+    if mode == 'auto':
+        order.append('kimi' if secondary == 'kimi' else 'claude' if primary == 'codex' else 'codex')
+    return {'requested_mode': mode, 'attempt_order': order,
+            'effective_fallback': order[1] if len(order) > 1 else None}
+
+
+def routing_evidence(options):
+    return {**options.get('review_routing', {}), 'actual_reviewer': options.get('actual_reviewer')}
+
+
+def verdict_instruction(stage):
+    """The reviewer's verdict instruction. Reviewers that wrote a preface before the verdict lost real receipts
+    (goodqa#15723), and a PASS after a preface is never accepted (a quoted PASS looks the same), so the prompt asks
+    for the verdict as the very first line and says a later PASS is ignored."""
+    if stage == 'pr':
+        marker, ok, tail = 'VERDICT', 'PASS', ''
+    else:
+        marker, ok, tail = ('PLAN' if stage == 'plan' else 'CODE_INSPECTION') + '_RESULT', 'ACCEPT', ' This is not PR signoff.'
+    return ("Begin exactly %s: %s or %s: BLOCK.%s The first line of your reply must be exactly that line and nothing "
+            "else: no preface, summary, heading, quote mark or formatting before it, and no words after it on that "
+            "line. Put findings on the following lines. A %s anywhere other than the first line is ignored and the "
+            "review counts as invalid output; a BLOCK after a preface is still treated as a BLOCK."
+            % (marker, ok, marker, tail, ok))
+
+
 def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, content: str, options=None):
     options = options or {}
-    verdict = ("Begin exactly VERDICT: PASS or VERDICT: BLOCK." if stage == 'pr' else
-               "Begin exactly " + ('PLAN' if stage == 'plan' else 'CODE_INSPECTION') + "_RESULT: ACCEPT or "
-               + ('PLAN' if stage == 'plan' else 'CODE_INSPECTION') + "_RESULT: BLOCK. This is not PR signoff.")
+    mode = reviewer_mode(options.get('reviewer', 'auto'), options.get('secondary', 'default'))
+    options.pop('actual_reviewer', None)  # a reused internal options dict must not reuse a prior reviewer's identity
+    verdict = verdict_instruction(stage)
     base = options.get('base')
     history = (f"The snapshot holds only the reviewed commit and base {base} (depth 1, no other history); "
                f"check the packet's diff with `git diff {base} HEAD`." if base and base != head else
@@ -777,21 +1323,20 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
     if 'selection' not in options:
         # Direct callers without a selection get the unknown-author choice from the table.
         policy = tiers.load_policy()
-        options['selection'] = tiers.reviewer_for(policy, None, 'unknown')
+        options['selection'] = select_reviewer(policy, None, 'unknown', mode=mode)
         options.setdefault('codex_model', policy['rungs'][options['selection']['rung']]['models']['openai'])
         options.setdefault('claude_model', policy['rungs'][options['selection']['rung']]['models']['claude'])
     selection = options['selection']
+    options['review_routing'] = review_routing(selection, mode, options.get('secondary', 'default'))
     effort, rung = selection['effort'], selection['rung']
     codex_model, claude_model = options['codex_model'], options['claude_model']
     options.setdefault('launches', 0)
     options.setdefault('usage', [])
     codex_entry = ('codex', 'Codex %s %s (rung %s)' % (codex_model, effort, rung), options.get('pool', 'default'))
     claude_entry = ('claude', 'Claude %s %s (rung %s)' % (claude_model, effort, rung), options.get('fallback_pool', 'default'))
-    # The tier table picks the primary; the other harness at the same rung is the one authorized fallback.
-    order = (codex_entry, claude_entry) if selection['harness'] == 'openai' else (claude_entry, codex_entry)
-    if options.get('secondary') == 'kimi':
-        # The one authorized independent fallback is Kimi (subscription CLI) instead of the other harness.
-        order = (order[0], ('kimi', 'Kimi kimi-code/k3.1-pro-highspeed (subscription CLI)', 'kimi'))
+    entries = {'codex': codex_entry, 'claude': claude_entry,
+               'kimi': ('kimi', 'Kimi kimi-code/k3.1-pro-highspeed (subscription CLI)', 'kimi')}
+    order = tuple(entries[name] for name in options['review_routing']['attempt_order'])
     primary = order[0][0]
     for provider, source, pool in order:
         remaining = deadline - time.monotonic()
@@ -799,10 +1344,13 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
             raise ReviewFailure({**provider_failure({}), 'reason': 'BUDGET_EXHAUSTED'}, source)
         timeout = min(720, options.get('timeout', 720), remaining)
         leased = False
-        resolution, code, stdout, stderr = None, None, '', ''
+        launches_before = options['launches']
+        resolution, code, stdout, stderr, last_message = None, None, '', '', ''
+        launch_state, local_detail = 'NOT_STARTED', ''
         try:
             if provider == 'kimi':
                 resolution = {'path': 'kimi_review.py'}
+                launch_state = 'UNCONFIRMED'
                 code, stdout, stderr, launched = kimi_attempt(
                     prompt.replace(verdict, 'Begin exactly KIMI_ADVISORY: ACCEPT or KIMI_ADVISORY: BLOCK.'),
                     options.get('packet_path'), timeout)
@@ -836,36 +1384,68 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                         if timeout <= 0:
                             outcome = {**provider_failure({}), 'reason': 'BUDGET_EXHAUSTED'}
                         else:
+                            launch_state = 'UNCONFIRMED'
                             options['launches'] += 1
                             # The child is recorded for the usage guard's liveness rule when a run record exists.
                             code, stdout, stderr = run(cmd, prompt, snapshot, timeout,
                                                        **({'on_spawn': run_record.note_child} if run_record else {}))
-                            last_message = last.read_text(errors='replace') if last.exists() else ''
+                            last_message = read_bounded(last, PROVIDER_LIMIT + 1)
                             outcome = normalize_provider(provider, code, stdout, stderr, last_message, stage)
         except GuardError as error:
+            local_detail = diagnostics.sanitize(error.message)
             outcome = {**provider_failure({}), 'reason': error.reason,
                        'fallback_allowed': error.reason in {'QUOTA', 'AUTH'}}
+            if isinstance(error, PoolUnavailable) and launch_state == 'NOT_STARTED':
+                # The pool refused its lease before any call: nothing ran, so the one authorised independent fallback
+                # cannot lose or duplicate work. The reserved pool itself is left exactly as it is.
+                holder = error.holder if isinstance(error.holder, str) and RUN_ID.fullmatch(error.holder) else None
+                outcome.update(lease_refused=True, holder=holder, fallback_allowed=provider == primary)
+                if holder:
+                    base = 'python3 ~/.claude/hooks/usage_guard.py reconcile --run ' + holder
+                    local_detail = diagnostics.sanitize(
+                        '%s pool reserved by run %s. Reconcile: `%s --auto`; if it says completed: `%s --actor <who> '
+                        "--reason '<why>' --evidence '<proof>'`" % (provider, holder, base, base), 400)
+        if outcome.get('reason') in {'INVALID_OUTPUT', 'OUTPUT_TOO_LARGE'} and (stdout or stderr or last_message):
+            saved = persist_raw_output(options.get('raw_target'), provider, code, stdout, stderr, last_message)
+            if saved:
+                print('Reviewer output could not be parsed; the raw answer is saved (mode 600): ' + saved, file=sys.stderr)
         options.setdefault('attempts', []).append(
-            diagnostics.provider_attempt(provider, resolution, code, stdout, stderr, outcome))
+            diagnostics.provider_attempt(provider, resolution, code, stdout, stderr, outcome,
+                                         launch_state=launch_state, local_detail=local_detail))
         if outcome.get('usage') is not None:
             options['usage'].append({'provider': provider, 'reported': outcome['usage']})
+        # Per-provider facts for the usage guard: a run whose every launch was refused by its provider before any
+        # review work is not a spent attempt (usage_guard.zero_launch_attempt, goodqa#16725).
+        options.setdefault('attempt_summary', []).append({
+            'provider': provider, 'launched': options['launches'] - launches_before, 'reason': outcome['reason'],
+            'refused_before_work': outcome.get('provider_refused') is True and outcome.get('usage') is None})
         if leased and outcome['reason'] not in {'TIMEOUT', 'UNKNOWN'}:
             # Unknown/timeout ownership remains reserved until explicit reconciliation.
             store.release_pool(provider, pool, run_record.run_id, reason=outcome['reason'],
                                account_cooldown=outcome['account_cooldown'], reset_at=outcome['reset_at'])
         if outcome['result'] != 'NO_RESULT':
             options['outcome'] = outcome
+            options['actual_reviewer'] = provider
             options['reviewer_harness'] = {'codex': 'openai', 'claude': 'claude'}.get(provider, 'unknown')
             return source, stage_report(stage, outcome['report']), failure
-        if provider != primary or not outcome['fallback_allowed']:
+        if len(order) == 1 or provider != primary or not outcome['fallback_allowed']:
             raise ReviewFailure(outcome, source)
-        failure = 'Primary reviewer unavailable (' + outcome['reason'] + '); used authorized independent fallback.'
+        if outcome.get('lease_refused'):
+            failure = ('Primary reviewer pool is reserved%s (no provider was launched); used authorized independent '
+                       'fallback.' % (' by run ' + outcome['holder'] if outcome.get('holder') else ''))
+        else:
+            failure = 'Primary reviewer unavailable (' + outcome['reason'] + '); used authorized independent fallback.'
     raise OSError('no valid reviewer result')
+
+
+RUN_ID = re.compile(r'[0-9a-f]{32}')
 
 
 def provider_toolchains(resolutions):
     specifications = {}
     for provider in ('codex', 'claude'):
+        if provider not in resolutions:
+            continue
         executable = resolutions[provider]['path']
         specifications[provider] = {'executable': provider, 'public': True, 'sha256': None}
         if executable is None:
@@ -918,13 +1498,17 @@ def verify_pr_binding(repository, number, head, *, runner=None):
         raise OSError('could not verify the reviewed PR binding: ' + str(error)) from None
     if not isinstance(value, dict):
         raise OSError('reviewed PR binding is unreadable')
-    match = re.match(r'^https://github\.com/([\w.-]+)/([\w.-]+)/pull/(\d+)$', str(value.get('url') or ''))
-    if (not match or match.group(1) + '/' + match.group(2) != repository.lower()
+    # Exact github.com host, ASCII names and digits, nothing after the number (fullmatch: no trailing newline).
+    match = re.fullmatch(r'https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/([0-9]+)',
+                         str(value.get('url') or ''))
+    # GitHub owner/repo names are case-insensitive (GoodQA #15565): compare ASCII-folded identities on both sides.
+    expected = merge_gate.repo_key(repository)
+    if (not match or expected is None or merge_gate.repo_key(match.group(1) + '/' + match.group(2)) != expected
             or int(match.group(3)) != number or type(value.get('number')) is not int
             or value['number'] != number or value.get('headRefOid') != head
             or str(value.get('state') or '').upper() != 'OPEN'):
         raise OSError('reviewed PR differs from the requested repository, number, HEAD or open state')
-    return {'repo': repository.lower(), 'pr': number}
+    return {'repo': expected, 'pr': number}
 
 
 AUTHOR_TRAILER = re.compile(r'^co-authored-by:\s*(.+)$', re.I | re.M)
@@ -1189,6 +1773,8 @@ def write_selection_receipt(run_id, args, head, packet_sha256, author_rung, sele
         path = root / (run_id + '.json')
         body = json.dumps({'schema': 1, 'run_id': run_id, 'task': args.task, 'stage': args.stage, 'head': head,
                            'packet_sha256': packet_sha256, 'author_rung': author_rung, 'author_harness': args.author_harness,
+                           'review_routing': review_routing(selection, getattr(args, 'reviewer', 'auto'),
+                                                            getattr(args, 'secondary', 'default')),
                            'selection': selection, 'at': ladder.now()}, sort_keys=True)
         path.write_text(body); os.chmod(path, 0o600)
     except OSError as error:
@@ -1246,6 +1832,8 @@ def main() -> int:
     parser.add_argument('--repeat-reason', help='Spend at most one additional declared attempt with a reason')
     parser.add_argument('--pool', default='default', help='Opaque Codex auth-pool alias; never a credential')
     parser.add_argument('--fallback-pool', default='default', help='Opaque independent Claude auth-pool alias')
+    parser.add_argument('--reviewer', choices=('auto', 'codex-only'), default='auto',
+                        help='Execution routing only: codex-only excludes every fallback, without changing author or merge authority')
     parser.add_argument('--secondary', choices=('default', 'kimi'), default='default',
                         help="Authorized independent fallback: 'default' is the other harness; 'kimi' is the user's "
                              "Kimi subscription via kimi_review.py (tool-less, egress-gated, packet text only)")
@@ -1257,7 +1845,12 @@ def main() -> int:
                         help='Harness that wrote the change; the other harness reviews when available')
     parser.add_argument('--github-repo', help='Exact owner/repo binding for an optional reviewed GitHub PR')
     parser.add_argument('--pr', type=int, help='Exact pull request number; requires --github-repo')
+    parser.add_argument('--no-main-stamp', action='store_true',
+                        help='Never look for or consume a main-agent review-auth stamp: the run can bind to a PR '
+                             'but can never mint a merge authorization (the ahc daemon always passes this)')
     args = parser.parse_args()
+    if args.reviewer == 'codex-only' and args.secondary != 'default':
+        parser.error('--reviewer codex-only cannot be combined with --secondary kimi')
     if (args.github_repo is None) != (args.pr is None):
         parser.error('--github-repo and --pr must be supplied together')
     if args.github_repo is not None and args.stage != 'pr':
@@ -1304,6 +1897,7 @@ def main() -> int:
         evidence.close()
         parser.error('--expected-head is required for code-inspection and PR review')
     try:
+        require_complete_repository(repo)
         before = repo_state(repo)
     except (OSError, subprocess.TimeoutExpired) as error:
         target.close()
@@ -1333,7 +1927,10 @@ def main() -> int:
             parser.error(str(error))
         # #134 red-team B2: only a run the main agent's hook saw may mint a merge authorization
         import caller_identity
-        args.main_stamp = caller_identity.take_stamp('review-auth', [args.github_repo, args.pr])
+        # goodqa#16049: a caller that is never the authority (the ahc daemon) opts out, so a run on a host where
+        # main has stamps can neither take main's authority nor burn main's stamp
+        if not args.no_main_stamp:
+            args.main_stamp = caller_identity.take_stamp('review-auth', [args.github_repo, args.pr])
         if args.main_stamp is None:
             print('Note: no main-agent stamp for this --github-repo/--pr run (run it from the main agent); this '
                   'review cannot authorize a merge.', file=sys.stderr)
@@ -1424,28 +2021,33 @@ def main() -> int:
             author_rung = None
     # Availability uses the launch's own trust-checked discovery, so a CLI found only at a policy location counts
     # and a binary inside the reviewed repo does not.
+    providers = ('codex',) if args.reviewer == 'codex-only' else diagnostics.PROVIDERS
     try:
         found = {name: diagnostics.discover_executable(name, policy=review_policy(),
                                                        roots=diagnostics.untrusted_roots(repo=repo))
-                 for name in diagnostics.PROVIDERS}
+                 for name in providers}
     except OSError as error:  # for example a deleted working directory
         target.close()
         evidence.close()
         print(diagnostics.render(diagnostics.classify_isolation_error(error), stage=args.stage, head=before[0]),
               file=sys.stderr)
         return 2
-    available = {'openai': bool(found['codex']['path']), 'claude': bool(found['claude']['path'])}
-    selection = tiers.reviewer_for(policy, author_rung, args.author_harness, available)
+    available = {'openai': bool(found.get('codex', {}).get('path')), 'claude': bool(found.get('claude', {}).get('path'))}
+    selection = select_reviewer(policy, author_rung, args.author_harness, available, args.reviewer)
     if selection['harness'] is None:
         target.close()
         evidence.close()
         if selection['rung'] is None:  # the tier table gives this author rung no reviewer; no CLI is at fault
             print('Review refused: author rung %s is review-only and needs no reviewer' % author_rung, file=sys.stderr)
             return 2
-        print('Review refused: no review harness is available for rung %s (codex and claude both unavailable)'
-              % selection['rung'], file=sys.stderr)
+        if args.reviewer == 'codex-only':
+            print('Review refused: requested Codex-only route has no trusted Codex CLI for rung %s'
+                  % selection['rung'], file=sys.stderr)
+        else:
+            print('Review refused: no review harness is available for rung %s (codex and claude both unavailable)'
+                  % selection['rung'], file=sys.stderr)
         # One diagnostic per provider: their causes and next steps can differ. Nothing was reserved, so no run record.
-        for name in diagnostics.PROVIDERS:
+        for name in providers:
             print(diagnostics.render(diagnostics.provider_attempt(name, found[name], None, '', '', {}),
                                      stage=args.stage, head=before[0]), file=sys.stderr)
         return 2
@@ -1463,7 +2065,9 @@ def main() -> int:
             print('Review refused: reviewer rung %s needs user permission recorded for the task by approve-top '
                   '(--task with a ledger permission); --author-rung alone is not a record' % selection['rung'], file=sys.stderr)
             return 2
-    options = {'packet_path': packet, 'secondary': args.secondary, 'timeout': args.timeout, 'pool': args.pool, 'fallback_pool': args.fallback_pool,
+    options = {'raw_target': target, 'packet_path': packet, 'secondary': args.secondary, 'reviewer': args.reviewer,
+               'review_routing': review_routing(selection, args.reviewer, args.secondary),
+               'timeout': args.timeout, 'pool': args.pool, 'fallback_pool': args.fallback_pool,
                'selection': selection, 'author_rung': author_rung, 'permission': permission,
                'codex_model': policy['rungs'][selection['rung']]['models']['openai'],
                'claude_model': policy['rungs'][selection['rung']]['models']['claude']}
@@ -1476,10 +2080,18 @@ def main() -> int:
             base = make_snapshot(repo, snapshot, before[0], base=base, timeout=args.snapshot_timeout)
             options['base'] = base
             options['repo'] = repo
+            if args.stage == 'pr':
+                # Before any provider budget: a stale ahc release list never earns a merge authorization (PR 247 F4).
+                release_problem, options['release_manifest'] = ahc_release_problem(snapshot, before[0], base)
+                if release_problem:
+                    print('Review refused: ' + release_problem, file=sys.stderr)
+                    target.close()
+                    evidence.close()
+                    return 2
             _CHILD_PATH_ROOTS[:] = diagnostics.untrusted_roots(repo=repo, snapshot=snapshot)
             resolutions = {name: diagnostics.discover_executable(
                 name, policy=review_policy(), roots=list(_CHILD_PATH_ROOTS))
-                for name in diagnostics.PROVIDERS}
+                for name in providers}
             options['resolutions'] = resolutions
             options['domain_section'], options['domain_disabled'] = domain_section(snapshot, base)
             if repo_state(repo) != before:
@@ -1489,6 +2101,7 @@ def main() -> int:
                 argv=['peer_review', args.stage, options['codex_model'], options['claude_model'], selection['effort'],
                       selection['rung'], selection['harness'], args.pool, args.fallback_pool,
                       '--snapshot-base', base or 'none', '--secondary', args.secondary,
+                      '--reviewer', args.reviewer, '--attempt-order', ','.join(options['review_routing']['attempt_order']),
                       # The effective review policy (shipped or override) changes discovery and quota classification.
                       '--review-policy', hashlib.sha256(json.dumps(review_policy(), sort_keys=True).encode()).hexdigest()],
                 cwd=repo,
@@ -1540,6 +2153,8 @@ def main() -> int:
                                            result='NO_RESULT', reason=reason,
                                            usage={'provider_launches': options.get('launches', 0), 'reported': options.get('usage', []),
                                                   'executables': diagnostics.executable_record(options.get('resolutions', {})),
+                                                  'review_routing': routing_evidence(options),
+                                                  'provider_attempts': options.get('attempt_summary', []),
                                                   'diagnostic': diagnosis['code']})
                 record_in_ladder(args, store, failed, before[0], policy)
             except (OSError, GuardError):
@@ -1565,7 +2180,8 @@ def main() -> int:
                               f"Fallback reason: {advisory.failure}\n\n{body}\n", before_publish=evidence.verify)
             target.verify_current()
             run_record.finish(execution='COMPLETED', result='NO_RESULT', reason='ADVISORY', exit_code=4,
-                              usage={'provider_launches': options.get('launches', 0), 'reported': options.get('usage', [])})
+                              usage={'provider_launches': options.get('launches', 0), 'reported': options.get('usage', []),
+                                     'review_routing': routing_evidence(options)})
         except (OSError, subprocess.TimeoutExpired, GuardError) as error:
             print(f'Advisory publication failed: {diagnostics.sanitize(error)}; nothing published.', file=sys.stderr)
             target.close()
@@ -1590,6 +2206,9 @@ def main() -> int:
                  + hashlib.sha256(options['domain_section'].encode('utf-8')).hexdigest() + "\n")
     elif options.get('domain_disabled'):
         note += f"Domain gates: disabled by {options['domain_disabled']}.\n"
+    if options.get('release_manifest'):
+        note += (f"ahc release list: current at this HEAD ({AHC_RELEASE} SHA-256 "
+                 f"{options['release_manifest']})\n")
     finalized = False
     reference = None
     announced = False
@@ -1606,6 +2225,9 @@ def main() -> int:
                           f"Author-Rung: {author_rung or 'unknown'}{' (author unknown: lowest writer rung reviewer)' if selection['author_unknown'] else ''}\n"
                           f"Reviewer-Rung: {selection['rung']}\nReviewer-Selection: {selection['harness']} {selection['model']} "
                           f"{selection['effort']}; {selection['why']}\n"
+                          f"Reviewer-Route: {args.reviewer}; attempts {','.join(options['review_routing']['attempt_order'])}; "
+                          f"fallback {options['review_routing']['effective_fallback'] or 'none'}\n"
+                          f"Reviewer-Actual: {options.get('actual_reviewer', 'unknown')}\n"
                           f"{'Permission: ' + str(permission['ask_id']) + chr(10) if permission else ''}"
                           f"Review input: isolated committed snapshot (depth 1"
                           f"{', base ' + base if base and base != before[0] else ''})\n"
@@ -1627,13 +2249,20 @@ def main() -> int:
                                    author_harness=args.author_harness)
             if binding:
                 review_metadata.update(binding)
+            if base and base != before[0]:
+                # goodqa#16049 spec ahc-m1-v2g: the snapshot base B_r the reviewer diffed against, so the ahc
+                # binding can require B_r to be an ancestor of (or equal to) the current default-branch tip.
+                # Recorded on every PR review that has a base, explicit or the head^1 default, whatever its
+                # relation to the merge-base. Only a root commit (no base) omits it; ahc treats absence as legacy.
+                review_metadata['snapshot_base'] = base
         if ticketed_success:
             review_metadata['ticketed'] = [dict(record, report_sha256=report_sha256) for record in ticketed]
         reference = run_record.finish(execution='COMPLETED', result='CHECK_OK' if passed else 'CHECK_FAILED',
             reason='NONE' if passed else 'CODE_FINDINGS', exit_code=0,
             review=review_metadata,
             usage={'provider_launches': options.get('launches', 0), 'reported': options.get('usage', []),
-                   'executables': diagnostics.executable_record(options.get('resolutions', {}))})
+                   'executables': diagnostics.executable_record(options.get('resolutions', {})),
+                   'review_routing': routing_evidence(options)})
         finalized = True
         final = store.load_ref(reference)
         if final['result'] != ('CHECK_OK' if passed else 'CHECK_FAILED') or final['reason'] != ('NONE' if passed else 'CODE_FINDINGS'):

@@ -1,0 +1,37 @@
+{
+ "v": 1,
+ "reviews": [
+  {
+   "kind": "agent",
+   "identity": "a0c568dfa08e7eb86",
+   "verdict": "ACCEPT",
+   "model": "red-team",
+   "source": "WAL-verified red-team agent",
+   "agent_type": "red-team",
+   "report": {
+    "path": "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-af9e33704216a1ea1/notes/goodqa-15870/review-opus.md",
+    "sha256": "73014b2cd737534dde00d8a9e726925677601da227485ecfef2f1ebeb5c1b13f"
+   },
+   "role": "adversarial",
+   "core_sha": "22a60216e43e3863a1e554f8fb4f691cf31218cb1cc207c496b0515d93710699",
+   "at": "2026-11-13T05:22:51.088566+00:00",
+   "key": "agent:a0c568dfa08e7eb86"
+  },
+  {
+   "kind": "agent",
+   "identity": "a5d878417503c1093",
+   "verdict": "ACCEPT",
+   "model": "red-team",
+   "source": "WAL-verified red-team agent",
+   "agent_type": "red-team",
+   "report": {
+    "path": "/Users/eric/.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/harness-delivery/.claude/worktrees/agent-af9e33704216a1ea1/notes/goodqa-15870/review-sonnet.md",
+    "sha256": "b0aeff088700f4b1504126b80ab7f7c908a1016d7bb8dc221aab6eab6a9015b7"
+   },
+   "role": "acceptance",
+   "core_sha": "22a60216e43e3863a1e554f8fb4f691cf31218cb1cc207c496b0515d93710699",
+   "at": "2026-11-13T05:22:51.611795+00:00",
+   "key": "agent:a5d878417503c1093"
+  }
+ ]
+}

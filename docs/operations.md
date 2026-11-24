@@ -1,5 +1,15 @@
 # Operations and safety boundaries
 
+## Sparse native delivery
+
+Native delivery supports expanded Git indexes in canonical cone sparse checkouts, and a bounded positive anchored non-cone subset: literal files, trailing-slash directories, and final-component `*.extension` selections. Other non-cone syntax, sparse-directory indexes, malformed settings, unsupported Git `sparse-checkout check-rules` capability, and unverifiable state refuse before publication. This does not change separate review snapshot isolation rules.
+
+Uppercase skip-worktree flags are admitted only after native NUL-delimited rule matching exactly partitions every indexed path into included and excluded sets, frozen rule matching agrees, and every skipped path is physically absent. Descriptor-based nofollow traversal refuses symlinks, unreadable ancestors and present skipped content. Index, rules and effective settings are rechecked under bounded metadata/time budgets. Assume-unchanged flags, submodules, executable local filters and existing routing/conflict refusals remain blocked. No sparse rules/index changes, materialization or automatic checkout expansion are performed.
+
+Every new delivery generation uses journal schema 2, with required source and original layout evidence including explicit ordinary state. A valid rule change, sparse-to-ordinary transition, missing evidence or malformed evidence blocks reuse at the same HEAD. Prepare a new reviewed generation only when existing settled-phase rules allow it; unresolved publication/recovery state must first be reconciled through its existing workflow. Schema-1 ordinary generations remain supported, while schema-1 sparse generations cannot resume without a settled fresh prepare. Never remove recovery state to obtain this path.
+
+Normal protected pinned fast-forward preserves the supported layout and ignored-data protection. Delivered checks still run against the actual sparse checkout; a check needing omitted files fails normally. The checks assume a cooperative local account: they detect inspected changes and repeat at delivery boundaries, but do not atomically exclude a malicious concurrent writer.
+
 ## Components
 
 | Component | Role |
@@ -21,12 +31,42 @@
 | `domain_gates.py`, `domain_checklists.json` | Blockchain domain gates: detect blockchain work from repo signals and supply a risk checklist, test scaffolds and follow-up prompts to specs and review prompts. |
 | `worktree_hygiene.py` | Stop/SubagentStop gate (rule S18): no turn ends with uncommitted work in a worktree it touched; reports unpushed, merged and duplicate worktrees (vendored from Hawkeye). |
 | `wal_cadence.py` | Stop/SubagentStop nudge (rule W04): one bounded block when a big uncommitted diff has no recent human-readable WAL entry (ported from Hawkeye). |
+| `mission_coverage.py`, `mission_gate.py` | Mission goals (goodqa#15565): the goals file and its audit chain, the coverage rule, and the Stop gate that blocks main while a goal has no live owner, live disposition or done evidence (see Mission coverage). |
 | `prod_delete_guard.py` | PreToolUse gate on destructive SQL against production databases, lifted only by a user-sourced, target-bound grant (ported from Hawkeye). |
 | `spec_flow.py`, `spec_policy.json`, `spec_template.md` | Spec-driven tickets: spec documents, spec reviews, per-criterion evidence, click-test records, sign-off and the done gate (CLI, plan-review ticket gate, PreToolUse hook on GoodQA status changes). |
 
 No background process is installed. Claude Code runs hooks, and the main agent invokes the other helpers when appropriate. The installer refuses symlinked managed files and directories, including its backup directory, before reading settings or writing files. Reinstallation preserves unrelated hooks even when they share an entry with a managed hook. The installer rejects non-regular managed files (including FIFOs) and files occupying managed directory paths. It reads all source payloads before writing, then backs up the captured original bytes in private files before replacing managed files. It keeps original directory and managed-file inodes open through installation and rollback. A missing directory is created under a random staging name, opened and checked while empty, then published under its final name; the installer does not infer that a newly opened final name is the directory it created. Each file write compares the captured parent and file identity; a replacement is refused before mutation. The published file inode is recorded before the directory `fsync`, so a later write error can still roll back that file. A descriptor for each published managed file remains open through rollback so its inode number cannot be recycled while the guard relies on it. Reads, replacements, and rollback traverse parents without following symlinks, and each replacement rechecks the visible parent after publication. A parent that moves during installation produces an error rather than a success report. On a caught write failure it attempts to restore the original bytes and permission bits of existing files and remove newly installed files. Restoration continues after an individual failure; an incomplete rollback reports affected paths and the backup directory. Backups and newly created empty directories remain. This is per-file atomic replacement with best-effort rollback, not a crash-safe transaction: power loss, process termination, or a second failure during recovery can still require manual restoration. In an eight-process disposable contention test, some installers may refuse an intervening directory creation and succeed on retry; the final installation remains coherent. Concurrent settings editors can still race over read-modify-write settings, so do not run them together.
 
 Before replacing a managed file, both installers also compare its current bytes and permission mode with the original snapshot. If either differs, they refuse the write and leave that path untouched. Rollback acts only on files this run published and refuses to replace or remove one whose published bytes or mode were edited in place. The backup contains the preflight snapshot, not a later external edit. A noncooperating editor can still write in the narrow interval between the final comparison and atomic replacement; filesystem rename has no portable compare-and-swap guard for file contents. Coordinate installers and editors if that race matters.
+
+## Literal Codex WAL notes
+
+The process guard recognizes a bounded append-data operation: a trusted absolute system or Homebrew Python entry, separate `-I -S` flags (optional `-B` and `-u` afterwards), the absolute installed `.codex/agent-harness/wal.py`, and `note` with exactly one each of `--wal`, `--event`, and `--note`. Use the existing absolute private native WAL supplied by the session hook. For Homebrew, prefer the fully resolved, versioned Cellar executable; alias directories such as `bin` or `opt` are refused when writable. Every original alias and intermediate target is checked, not only the final resolved binary. The reviewed writer bytes are pinned; source changes require updating the binding and its test. Symlinked, hardlinked, changed or uncertain writer/WAL paths retain ordinary interpreter analysis.
+
+For example, substitute the verified absolute paths on the executing host:
+
+```sh
+<trusted-absolute-python> -I -S <absolute-home>/.codex/agent-harness/wal.py note --wal <absolute-home>/.agent-harness/codex-wals/SESSION_ID/main.jsonl --event intent --note 'Scoped intent without private values'
+```
+
+Quoted literal prose is data, including signalling vocabulary. Active expansions, substitutions, redirects, wrappers, inline Python and unknown arguments receive ordinary checks. Other command segments are checked independently. Legacy note calls without isolated flags can still be conservatively refused; this recognition does not exempt arbitrary Python or grant authority over processes or another agent's WAL. Filesystem checks observe identity and content before execution; they do not isolate execution from a hostile concurrent writer with the same installed-account authority. System/Homebrew installation owners and OS administrators are trusted. The sole writable-ancestor exception is Darwin's physical `/opt/homebrew/Cellar` owned by root or the caller, group 80 resolving to `admin`, with no world write or extended ACL; other writable ancestors and writable interpreter files are refused. Administrators can already modify this toolchain; these checks do not establish a root-owned or code-signed binary.
+
+Known edit operations are classified before commit-message analysis, including raw patch data under a `command` key. Shell, orchestration, missing and unknown operation names retain command checks. A narrow system `env`/`sudo`/`timeout` grammar avoids scanning supervision options as Python code while retaining inner-command, substitution, redirection and stdin analysis; uncertain wrappers retain conservative scanning.
+
+## Managed test checkouts
+
+Use one copy per repository and PR or lane. Run the test under the lease.
+
+```sh
+python3 ~/.claude/hooks/copy_hygiene.py acquire --repo "$owner_checkout" --key "pr-$pr" \
+  --ref "$reviewed_commit" --require-reuse --run your-test-command
+```
+
+Omit `--require-reuse` only for an authorized first checkout. Without `--run`, acquisition reports the path and releases its lease immediately. With `--run`, the first output line records the verified path and commit, and the command runs in that checkout with its exit status propagated. The lease survives the CLI controller exiting while the command runs. The command must wait for workers it starts before it exits. The lease is held by the supervisor and ends when the foreground command returns. It does not protect a background worker after that point.
+
+An existing checkout can be reused at the disk floor. An advance to a different commit requires a clean, registered copy with no tracked, untracked or ignored changes and preserves tracked protected logs and WALs. At the same commit a leased command requires clean tracked files and can use existing local byproducts. A busy lease, absent copy under `--require-reuse`, or uncertain checkout fails acquisition without opening a fallback checkout.
+
+Reaping reports by default. If enabled explicitly, it holds the managed checkout lease and checks liveness, service protection and local state. It confirms the same directory, Git registration, commit, tree and index before asking Git to remove the linked checkout without force. Keep legacy and unmanaged copies and copies with tracked protected logs or WALs for separate disposition. Tools that operate outside the managed lease must be stopped before reaping.
 
 ## Installer scan (installer_scan.py)
 
@@ -44,6 +84,7 @@ python3 ~/.claude/hooks/peer_review.py pr --repo <worktree> --packet <p> --outpu
 
 - **The result is advisory, never a sign-off.** Kimi sees only the packet text (and any snapshot files you pass), never the repository, and the author controls that text. Report headers say so: `Reviewer: kimi-code/<model>`, `Reviewer-Rung: n/a`, `Review-Input: packet text only (no repository snapshot, no tools)`, `Advisory: yes`. Other headers: `Reviewed-Model`, `Reviewed-Packet-SHA256` (raw packet bytes), `Reviewed-HEAD` when given, `Tokens-In-Estimate` and `Tokens-Out-Estimate` (the CLI reports no usage, so these are bytes/3), `Cost-USD: 0 (subscription)`, `Request-Id` (the CLI session id). The verdict line is `KIMI_ADVISORY: ACCEPT|BLOCK`. Reports are created exclusively with mode 0600.
 - **peer_review.py:** `--secondary kimi` makes Kimi the single authorized independent fallback in place of the other harness, so one primary plus one fallback with no same-provider loop is unchanged. Kimi runs only after the primary fails with a quota, auth or availability error. Its answer is written to the report path with the advisory headers, the receipt records reason `ADVISORY`, the run exits 4 (not 0 pass, not 3 block), a `VERDICT: PASS` line in its text is neutralised, and nothing is recorded in the task ladder. A main-agent decision is needed before any Kimi opinion counts toward a gate; it would then need to see the gated diff, not the packet alone.
+- **Codex-only execution:** `peer_review.py ... --reviewer codex-only` restricts both tier selection and the actual attempt order to Codex. It never leases or launches Claude or Kimi, including when Codex is absent, capped, unauthenticated or returns no valid result; `--secondary kimi` conflicts and refuses before reservation. Default `--reviewer auto` preserves the existing routing. The reviewer rung, effort, model permissions, evidenced author and review/merge eligibility are unchanged. Requested route, effective attempt order and actual validated reviewer are recorded in invocation, selection/report and execution evidence. A same-harness or unknown-author review can produce a bound review result while remaining ineligible to authorize a merge; selecting Codex does not supply a missing main stamp, human/source/session proof or approval. Source publication, installation and an actual reviewed invocation remain distinct states.
 - **Egress gate (fails closed, before the CLI starts):** it refuses private locations (`~/.agent-harness/scratch` task outputs, local log-backup staging, `.claude/wals`, `.claude/projects`, `.claude/shell-snapshots`, `.claude.json`, `.codex`, `.config/gh`, `.config/gcloud`, `.ssh`, `.gnupg`, `.aws`, `.kimi-code` and the other Kimi directories, harness state, the leak denylist, keychains), matched case-insensitively and by inode, plus `*.jsonl`, `.env*`, names containing `secret`, `token` or `transcript`, and key files. It refuses any file with more than one hard link and any symlink inside a snapshot directory. Content is normalised (NFKC, invisible characters dropped, common lookalike letters folded) and then refused when it matches `redact.py` shapes, other key shapes (Stripe, short keys, base32 seeds, credential URLs, split tokens), long high-entropy strings (git and sha256 digests pass; lockfiles up to 200 KB may carry integrity hashes), WAL or Claude-transcript shaped JSON, the private `~/.agent-harness/leak-denylist.txt`, or the forbidden topics (yates, apex_app_pos, Granola, interview and Solve material). Verbatim user work-instruction quotes in `Source:` lines are allowed. Emails are redacted. The cap is 1.5 MB, collection stops reading at the cap, the gate checks a 20 second limit between scan steps and scans in 64 KB chunks, and because the prompt travels in argv the CLI path also refuses payloads over 600 KB (the Mac limit; Linux limits one argument to 128 KB). A refusal names the rule and line, never the matched text, and a refused call is not counted as a launch. In `peer_review.py` the gate also checks the packet path itself.
 - **Isolation:** the agent file is parsed back and must declare `tools: []`; any tool call or tool record in the output fails the review closed. The CLI runs in an empty directory outside any repository, with a minimal environment (`HOME`, `XDG_*`, `TMPDIR`, `PATH`, `LANG`, `KIMI_*` limits), a scratch `HOME`, and a scratch `KIMI_CODE_HOME` whose `config.toml` carries only the managed provider, the one model and `default_permission_mode = "manual"`. The login directories are symlinked in, never read. The user's plugins (including kimi-cu), MCP servers, hooks and permission mode therefore cannot apply. `KIMI_LOOP_MAX_STEPS_PER_TURN=1` and `KIMI_LOOP_MAX_ATTEMPTS_PER_STEP=1` bound the CLI's own loop and its internal 429 retry. The CLI version must be 2.5.x (tested range) and its path passes the same executable trust checks as codex and claude. The child runs in its own process group, which is killed on exit. The CLI writes its session records into the scratch home, which is deleted when the call ends; nothing is added to `~/.kimi-code/sessions`.
 - **Fast mode and swarm:** every call defaults to K3.1 Pro fast mode, which the CLI exposes as the alias `kimi-code/k3.1-pro-highspeed` (listed as "2x usage cost" against the subscription quota). Swarm cannot be enabled: the Kimi Code docs say only the user can turn swarm mode on (`/swarm` in the TUI), swarms are unavailable in `kimi -p`, and there is no flag or config key for it (confirmed by experiment on CLI 2.5.2). Docs checked 2026-11-07: https://moonshotai.github.io/kimi-code/ (llms-full.txt, release 2.3.2 and the AgentSwarm tool entry).
@@ -66,6 +107,37 @@ Claude Code's `--safe-mode` disables customizations, including these hooks and `
 Both WAL writers refuse symlinks from `.claude` down to the log, hardlinked logs, and non-regular files such as FIFOs. They open directories without following links, enforce mode `0700` on the WAL root and session directory, and mode `0600` on new and existing log files. If a concurrent first write gets `ENOENT` while creating the log, the writer retries at most three times with short delays. It verifies the pinned `.claude`, `wals`, and session directory components through their parent descriptors before retrying, then checks those components and the log file identity before writing and after `fsync`. Under the file lock, an append removes an unterminated final suffix left by an interrupted writer, then adds the next complete JSONL record. Recovery scans at most 64 KiB; a longer suffix fails closed for manual inspection without truncating the file. A removed or replaced path fails the hook. If a path moves during a write, a record may remain in the moved file even though the hook returns an error; inspect it before retrying. Mutation after the final identity check is outside this protection. Semantic note commands reject common credential-shaped values and assignments, including compound environment variable names, before writing. This guard cannot recognize every secret. Record redacted summaries, keep `~/.claude/wals` and `~/.agent-harness/codex-wals` private, review them before sharing, and do not commit them.
 
 For behavior changes, use matching `PENDING_REAL_TEST <id>:` and `REALLY_TESTED <id>:` notes through `wal_note.py` before editing and after observation. Use `status` for the pending note and `check` for the verified note. The latter names the command or live steps, result, and applicable commit; any unmatched pending ID stays visible in the handoff. This is a concise audit trail, not an automated Stop gate. A disposable live slug-fix trial recorded `V1` before the edit, observed the baseline test fail, reran it successfully after the edit, and recorded the matched proof. A separate Stop-hook probe showed why the global gate was rejected: it ran on a simple arithmetic answer and forced an unnecessary second turn when configured to demand a test.
+
+### Exporting a session (`ah export`)
+
+`ah export --session SESSION_ID` writes one self-contained HTML file. It is meant for reading a handoff or review without opening the raw WALs. The idea comes from Pi's `/export` (pi.dev, MIT); Pi's `/share` upload has no counterpart here (goodqa#15788).
+
+```sh
+python3 ~/.claude/hooks/ah.py export --session SESSION_ID                    # all rows
+python3 ~/.claude/hooks/ah.py export --session SESSION_ID --since 6h --agent AGENT_ID
+python3 ~/.claude/hooks/ah.py export --session SESSION_ID --out ~/exports/handoff.html
+```
+
+What the page contains:
+- The agent tree.
+- Every row that carries a note: intents, decisions, asks, results, commits, blockers, handoffs and the like.
+- The evidence classes, computed by the same `status_report` rules as `ah status`.
+- A list of the WALs it did not read: symlinks, non-regular files, files over 64 MB, and anything past the 256 MB or 4,096-file session caps.
+
+Redaction:
+- Every string in every row goes through `redact.py`, keys and values alike.
+- E-mail local parts, home-directory paths and IPv4 addresses are masked.
+- Redaction runs on the original text, then again after control, bidi and zero-width characters are removed; a long token-like run that held or touched a removed character is masked as `[REDACTED:split]`. So neither a token split by an invisible character nor one whose only boundary was a control character slips through. Each field is capped at 2,000 characters, and each evidence section shows at most 500 entries plus a count of the rest.
+- The evidence classes are computed on the raw rows, so a cap or mask cannot change a verdict. Each entry is then displayed from its redacted row.
+- Redaction is pattern-based, so names, hostnames, ticket text and phone numbers stay. The page says so in a banner.
+
+The page has no script, no external reference and a strict CSP.
+
+Where the file goes:
+- By default it goes under `~/.agent-harness/work/SESSION_ID/exports/`, with the file 0600 and the directory 0700.
+- `--out` writes a new file elsewhere. It refuses an existing name, a symlink, any folder inside a repository work tree, and sync folders (Dropbox, OneDrive, Google Drive, Box, `~/Library/CloudStorage`, `~/Library/Mobile Documents`). Desktop and Documents only get a `sync_warning`.
+- `ah` never uploads the file. Note that the hourly log backup copies `~/.agent-harness/work`, together with the raw WALs it was built from, to your private backup. Use `--out` for a folder outside it.
+- If the redactor is missing, the export refuses. Review the file before sharing it with anyone.
 
 ## Usage guard
 
@@ -122,14 +194,16 @@ python3 ~/.codex/agent-harness/usage_guard.py reconcile --run RUN_ID --actor own
 python3 ~/.codex/agent-harness/usage_guard.py ack-pool --provider codex --pool default --actor owner-a --reason 'Availability change verified' --evidence 'private-evidence-reference'
 ```
 
-Every START also records who holds the reservation (`owner_process`: pid, host, boot id, a process start-time token taken with TZ=UTC, and a deadline of the run's recorded timeout plus 60 s of grace; `AGENT_HARNESS_DEADLINE_GRACE` 0..3600 shortens the grace for live tests). A supervisor records each child it spawns through `process.run(on_spawn=run.note_child)` in `children.json`; peer_review records its reviewer process. A reservation without a FINAL is reconciled automatically, on the next `begin`, `acquire_pool`, `reconcile --auto` or `sweep`, only when all of these are proven on the same host: the owner is dead (pid gone, or alive with a different start token of the same scheme, or the boot id changed), every recorded child is dead by the same rule, and the deadline has passed. The record is a `reconciled.json` of kind `automatic_reconciliation` with the liveness facts as evidence; it keeps the run UNKNOWN / NO_RESULT, releases the pools the run held with a `RECONCILED` event, and never writes a FINAL; a late `finish` on a reconciled run is refused and its result discarded. A dead owner before its deadline, an owner on another host, a live owner or child, a START without owner facts, a boot id that cannot be read, and any pool held by a FINAL that itself says TIMEOUT or UNKNOWN stay uncertain and still need the manual command above.
+Every START also records who holds the reservation (`owner_process`: pid, host, boot id, a process start-time token taken with TZ=UTC, and a deadline of the run's recorded timeout plus 60 s of grace; `AGENT_HARNESS_DEADLINE_GRACE` 0..3600 shortens the grace for live tests). A supervisor records each child it spawns through `process.run(on_spawn=run.note_child)` in `children.json`; peer_review records its reviewer process. Automatic reconciliation on the next `begin`, `acquire_pool`, `reconcile --auto` or `sweep` requires same-host proof that the owner and every recorded child are dead, plus an expired deadline. An incomplete reservation without a valid completion-bound FINAL additionally requires independent reboot proof: matching supported `procboot` or `bootsession` schemes, canonical UUID payloads from the recorded and current kernel boot identities, and distinct UUID values. Letter-case differences alone are not a reboot. On the same boot, even an empty list or all registered children being dead cannot establish that an unregistered spawn is gone; START and children.json have no terminal launch-completeness certificate. Such runs remain UNKNOWN and need the manual evidence path above. A bare final.json without its valid completion reference does not supply that certificate; malformed completion evidence is refused.
+
+A completion-bound FINAL with NO_RESULT and TIMEOUT or UNKNOWN can release an exact still-held pool under the existing strict completed-run rule: complete, unique recorded child identities matching the declared provider-launch count, or independent same-host reboot proof. Zero-launch evidence additionally requires NOT_STARTED; an absent/unknown count or missing child record alone never proves cleanup. Completion, FINAL and indexed START identities are checked before using this history. The append-only `reconciled.json` keeps UNKNOWN / NO_RESULT and releases only matching pool pointers through `RECONCILED` events; old FINAL/completion records stay unchanged. An interrupted publication resumes outstanding matching pointers using the original valid marker, preserving newer owners and cooldown. This does not retroactively rewrite prior reconciliation history. A late `finish` stays refused. Other-host/live/unprovable owners or children, incomplete launch evidence and pre-deadline reservations remain unresolved. No blanket pool clearing or reboot is prescribed as recovery.
 
 ```sh
 python3 ~/.codex/agent-harness/usage_guard.py reconcile --run RUN_ID --auto
 python3 ~/.codex/agent-harness/usage_guard.py sweep
 ```
 
-`sweep` prints one report per run (`reconciled`, `why`, `liveness`), probes only runs without a completion, and is safe to run on a schedule; the dead-man check uses it.
+`sweep` prints one report per run (`reconciled`, `why`, `liveness`), examines incomplete or eligible uncertain reservations, and is safe to run on a schedule; the dead-man check uses it. Review diagnostics distinguish a positively observed local `REVIEW_NOT_STARTED` refusal from `REVIEW_LAUNCH_UNCONFIRMED`: no exit status alone cannot prove that no child started, because child-record callbacks run after process creation. Neither diagnostic is evidence of an external provider outage; inspect the local receipt and pool/child state before a changed-state retry.
 
 Attempt budget: an attempt is zero-launch only when its FINAL shows `provider_launches` 0 (an int), no reported usage, execution `NOT_STARTED` and reason TRANSIENT_INFRA, LOW_DISK, QUOTA or AUTH: the provider was never launched and the refusal was infrastructure. Such attempts do not spend the two-launch repeat budget and the next attempt needs no `--repeat-reason`. Launched attempts, content outcomes (CODE_FINDINGS, INPUT_CHANGED, INVALID_OUTPUT), uncertain results and reconciled runs without a FINAL still count. Zero-launch attempts are bounded to 6 per rolling hour per invocation (`ZERO_LAUNCH_CAP`, `ZERO_LAUNCH_WINDOW`) and 32 attempt slots in all (`MAX_ATTEMPTS`); the refusal is `BUDGET_EXHAUSTED` and names the infrastructure, not the packet. Every attempt's elapsed time still counts against the declared aggregate budget.
 
@@ -164,9 +238,9 @@ python3 ~/.claude/hooks/escalation.py approve-top --task TASK --ask ASK_ID --wal
 - The cited excerpt is part of that sentence.
 - The turn is less than 12 hours old (`caps.top_assent_max_age_seconds`).
 
-`ah approve-top` also refuses if the user mentioned the top rung again later; the latest words decide. "Keep fable disabled", "fable? no" and a hand-written pair that cites an unrelated message are all refused (review F1 and F2). A state file that is missing, corrupt or locked resets the task to the lowest rung with a durable reset record (reason code, prior state hash, preserved copy) and a notification in `notifications.jsonl`; a corrupt file can never raise a rung. Every escalation or reset also appends a decision entry to the WAL named by `AGENT_HARNESS_MAIN_WAL`. Ladder limits (8 failing review launches, 3 automatic climbs, $60 per task, each counted launch spending the rung's review budget until helpers report real cost) block further writer spawns until a human signs off; `escalation.py gate-digest` lists what the hook refused or would have refused. On its own errors (an unreadable table, a symlinked or unwritable state directory) the hook denies spawns and `claude`/`codex`/`rescue.py`/`peer_review.py` launch lines only and never blocks plain shell use. `python3 ~/.claude/hooks/model_tiers.py mode` shows the installed mode and `mode --set warn` is the one-command rollback after the enforce flip (the rewrite reformats the table: sorted keys, indent 1). The Bash check reads literal tokens: `$c` and `--model $M` variable indirection, `xargs` and data-driven forms are not parsed (a `claude --model $M` line is denied as an off-table model under enforce: spell the model out), and a heredoc body mentioning a launch is split like text, so under enforce write such text to a file instead of a heredoc.
+A recorded permission can be published to the GoodQA ledger with `ah decision publish --task TASK`, so the worker host accepts it without a local session (signed, per task, at most 12 h, revocable; see `docs/central-decisions.md`, goodqa#16651). `ah approve-top` also refuses if the user mentioned the top rung again later; the latest words decide. "Keep fable disabled", "fable? no" and a hand-written pair that cites an unrelated message are all refused (review F1 and F2). A state file that is missing, corrupt or locked resets the task to the lowest rung with a durable reset record (reason code, prior state hash, preserved copy) and a notification in `notifications.jsonl`; a corrupt file can never raise a rung. Every escalation or reset also appends a decision entry to the WAL named by `AGENT_HARNESS_MAIN_WAL`. Ladder limits (8 failing review launches, 3 automatic climbs, $60 per task, each counted launch spending the rung's review budget until helpers report real cost) block further writer spawns until a human signs off; `escalation.py gate-digest` lists what the hook refused or would have refused. On its own errors (an unreadable table, a symlinked or unwritable state directory) the hook denies spawns and `claude`/`codex`/`rescue.py`/`peer_review.py` launch lines only and never blocks plain shell use. `python3 ~/.claude/hooks/model_tiers.py mode` shows the installed mode and `mode --set warn` is the one-command rollback after the enforce flip (the rewrite reformats the table: sorted keys, indent 1). The Bash check reads literal tokens: `$c` and `--model $M` variable indirection, `xargs` and data-driven forms are not parsed (a `claude --model $M` line is denied as an off-table model under enforce: spell the model out), and a heredoc body mentioning a launch is split like text, so under enforce write such text to a file instead of a heredoc.
 
-**Owner cap.** `caps.session_owner_agents`, 4 by default, is the user's limit on active owners; `caps.session_live_agents` is 12. Two rules decide what counts:
+**Owner cap.** `caps.session_owner_agents`, 8 by default (raised from 4 by the user on 2026-11-09), is the user's limit on active owners; `caps.session_live_agents` is 16. Two rules decide what counts:
 - **Which agents.** Every spawn type that is not in `caps.helper_types` counts as an owner. The helper types are red-team, click-tester, reviewer, fixer, Explore, Plan, claude-code-guide and statusline-setup. So general-purpose, claude and fork agents, an unknown type and an invented type all count (review F3 and 50bca42).
 - **Which states.** The count comes from `ah owners` on the session WALs, and every running state counts: live, quiet and SILENT. Only a stopped owner frees its slot. When the session has no main WAL yet, the SubagentStart live map is used instead.
 
@@ -175,6 +249,36 @@ A refusal lists the live owner ids. The cap ships in warn mode with the rest of 
 `tier_gate.py` is the PreToolUse hook for Agent, Task, Workflow and Bash. Bash lines launching `claude`, `codex`, `rescue.py` or `peer_review.py` are checked segment by segment (the line is split on unquoted `;`, `&&`, `||`, `|`, `&` and newlines; any denied segment denies the line; a review line at a permission rung needs the installed ledger's permission). A spawn names its task with `[task:KEY]` in the prompt or description; without it the hook generates a key and resets to the lowest rung. The requested model and effort must match the task's rung: above it is downgraded through `updatedInput`, below it needs a `[rung-below:REASON]` token, review-only rungs never write, reviewer spawns (red-team, click-tester, reviewer) sit one rung above, and the top writing rung needs the recorded permission. `mode` in `model_tiers.json` is `warn` (the hook only adds context and logs what enforce would do to `~/.agent-harness/escalation/gate.jsonl`) or `enforce`; an unreadable table denies. SubagentStart and SubagentStop keep a per-session live-agent count under `caps.session_live_agents` (default 40).
 
 `peer_review.py --task TASK [--author-rung R] [--author-harness claude|openai]` picks the reviewer from the table (one rung above the author, the other harness preferred, the same harness one effort up when the other is unavailable, an unknown author reviewed at Opus/Sol medium and flagged), writes a selection receipt under `~/.agent-harness/escalation/selections/`, stamps `Author-Rung`, `Reviewer-Rung` and `Reviewer-Selection` on the report, and records the FINAL receipt in the task ledger so reviews count where they are consumed. `rescue.py --task TASK` runs at the task's computed writing rung on the other harness; `--rung` overrides it; a rung that needs permission is refused before any launch unless `approve-top` recorded it.
+
+### Dispatch records
+
+The ladder records which model each spawn actually ran on (goodqa#15794). This stops an author who was run below the task's rung from pushing the ladder up with failures that the rung's model did not produce.
+
+- **Open:** PreToolUse appends one line to `~/.agent-harness/escalation/<task>.dispatch-open.jsonl` for every Agent, Task or Workflow spawn that will run (allowed, or denied in warn mode), and for claude/codex/rescue Bash launches whose task key resolves. It takes no ledger lock. Every locked ledger operation merges the complete lines past a stored (inode, offset). Merging never truncates the file in place; an over-bound file (over 256 KiB) is renamed to `.old` after the ledger write.
+- **Close:** the PostToolUse `tier_gate.py dispatch` action closes the record with `resolvedModel` and `modelsUsed` and indexes `agent_id -> task`. It prints nothing and cannot block a tool that already ran.
+- **End:** SubagentStop sets `ended_at` and `ended_seq` and records `observed_effort` from the hook's `effort.level`. A foreground stop that arrives before its close is held as a pending stop for up to an hour.
+- **Resume:** SubagentStart for an indexed agent, or a SendMessage to its agent id (the PostToolUse matcher includes SendMessage), appends a `resume` line to the side file without taking the ledger lock; the next merge clears `ended_at` and reopens the dispatch as `phase: open` (reason `resumed`), so it is live again and never proven below: every window it overlaps keeps counting, even after its next stop. A forged resume line can only make windows count. A resume of an agent whose record was already shed adds a synthetic unknown (`resumed_unknown`). A SendMessage resolves its agent from the response's `resumedAgentId` first, then from `to` when `to` is an agent id; only the response's key names are logged. LIMITATION until the live check (spec AC-8 step 5): if neither resolves and SubagentStart does not reopen the dispatch, that resumed run is invisible and can under-count. The index keeps the newest 4,096 agents, so an agent resumed after 4,096 newer spawns is not found either. A resume line written before the agent's last stop is ignored. A resumed owner is never proven below again in the windows it touches, so continuing a Sonnet owner by SendMessage stops exclusions there. Resuming a reviewer whose record was already shed adds a `resumed_unknown`, which also keeps counting.
+- **Switch:** the exclusion below is off until `caps.dispatch_exclude_below_rung` is true in `model_tiers.json`. It ships false; main turns it on after the AC-8 live proof. While it is false, every FAIL counts. A FAIL that the rule would have excluded records `dispatch_check.decision: would_exclude` and appears in status as `would_exclude_below_rung`. `exclusion_enabled` shows which mode is active.
+  - The value must be the JSON literal `true` or `false`. The same applies to `caps.dispatch_narrow_by_stop_effort`. Inside the ledger, only `true` counts as on.
+  - Any other value, such as a quoted `"false"` or `1`, makes the whole tier table fail validation. The table then fails closed: tier_gate denies every Agent, Task and Workflow spawn and every claude/codex launch line, even in warn mode, and `escalation.py record` cannot run, so FAILs go unrecorded until the table is fixed.
+  - After every hand edit of this table, whether a flip or a rollback, load it once before anything else: run `python3 ~/.claude/hooks/escalation.py status --task <T>`. If that run reports a tier-table error, revert the edit at once.
+  - `install.py` copies `model_tiers.json`, so a reinstall resets a flipped switch to the shipped `false`. Check `exclusion_enabled` after every install and record the flip again if needed.
+- **Rule:** a FAIL at rung R is NOT_COUNTED ("dispatched below rung") only when at least one owner dispatch is considered and every considered non-reviewer dispatch (owners, fixers and other helpers) is a closed agent run whose candidate rungs all sit below R. Considered means: opened, resumed or ended since the ledger entered R, or still live. A run that started before the window and ended inside it is considered.
+- **ASSUMPTION:** before a stop, only the model family is known, so only Sonnet under an Opus rung (or Opus under a Fable rung) is excluded. An opus run at the wrong effort keeps counting. It appears in `counted_requested_below` ("counted, requested below rung, effort unverified"). `observed_effort` narrows candidates only when `caps.dispatch_narrow_by_stop_effort` is true. That flag is false until a live check proves the field reports the subagent's own effort (spec AC-9).
+- **What keeps counting:** an open dispatch, an unknown model, a Workflow or Bash dispatch, an at-rung fixer, or a synthetic unknown dispatch. Synthetic unknowns come from an over-bound, garbled (for example a crashed mid-line append), rewritten or non-regular side file, and each carries a `reason`.
+- **Not seen:** main working directly under a task key leaves no dispatch. A FAIL from main's own work during a window holding only below-rung owner dispatches is therefore excluded.
+- **Bounds:** at most 64 dispatches. Shedding goes reviewers first, then records no window can consider, then closed below-rung runs, then other window records, then live ones. Shedding a record that could block an exclusion writes `dispatch_taint`, and a tainted window keeps counting (`window_tainted` in status, `tainted` in `dispatch_check`). A shed live record taints every window for up to 24 hours and survives a reset, so a flood of forged valid side-file lines can block exclusions for that long; that errs toward counting. Dispatch records are also shed before they could push the ledger over its size bound; a merge alone never resets a ledger.
+- **Reviewer types:** red-team and click-tester dispatches are left out of the decision even though those agents can write. The type is the boundary; do not route writing through a reviewer spawn.
+- **Staleness:** a dispatch with no `ended_at` is presumed ended after 24 hours. A SubagentStop that never fires only keeps failures counting for that long.
+
+Read it with `python3 ~/.claude/hooks/escalation.py status --task TASK`:
+- `last_dispatch`;
+- `window_dispatches` (up to 8, each with phase, models, observed_effort, requested and selected rung, candidates, match against the current rung, and a reason for synthetic entries);
+- `excluded_below_rung` (count and latest reason);
+- `below_rung_dispatches`;
+- `counted_requested_below`.
+
+Every dispatch also writes a `dispatch` line to `gate.jsonl`. Open failures appear there as `dispatch_open_failed`.
 
 ## Review and rescue
 
@@ -221,10 +325,13 @@ The rescue wrapper does not stage or commit leftover model edits. It always exit
 | `PROVIDER_USAGE_LIMIT` | `QUOTA` | The provider reported a usage limit in free text (no structured code). | Wait for the limit to reset or use the other authorized provider; the helper already tries one independent fallback and will not retry this provider. No account-pool cooldown is written because the text is unstructured. |
 | `PROVIDER_AUTH` | `AUTH` | The provider rejected authentication. | Sign in again with the provider CLI, then rerun once. |
 | `PROVIDER_UNAVAILABLE` | `TRANSIENT_INFRA` | The provider was overloaded, rate limited or its model was unavailable. | Rerun once later; the helper already tried the independent fallback if one was allowed. |
+| `REVIEW_NOT_STARTED` | `TRANSIENT_INFRA` | Local review infrastructure refused before the provider launch boundary (NOT_STARTED); no provider response was observed. | Inspect the local run receipt and provider-pool reservation or cooldown. Reconcile only with the required ownership evidence; do not retry unchanged. |
+| `REVIEW_LAUNCH_UNCONFIRMED` | `UNKNOWN` | No reviewer exit status was recorded; a provider process may have started. This does not establish a provider outage. | Inspect the run and child records and reconcile uncertain process ownership before any retry. Do not assume best-effort cleanup succeeded. |
 | `BUDGET_EXHAUSTED` | `BUDGET_EXHAUSTED` | The 1440 second review budget (720 per provider) was used up. | Do not loop. Reconcile the usage store, then decide with the main agent whether one repeat with --repeat-reason is justified. |
 | `PROVIDER_TIMEOUT` | `TIMEOUT` | The provider exceeded its 720 second deadline. | Reconcile the run in the usage store before any retry; do not loop. |
 | `PROVIDER_IO_UNKNOWN` | `UNKNOWN` | The provider process could not be supervised to a known end. | Reconcile the unknown run in the usage store before any retry. |
 | `PROVIDER_INVALID_OUTPUT` | `INVALID_OUTPUT` | The provider produced no valid stage verdict. | Inspect the excerpt below; a rerun needs a changed packet or a declared repeat reason. |
+| `PROVIDER_OUTPUT_TOO_LARGE` | `OUTPUT_TOO_LARGE` | The provider output passed its size bound (16 MiB raw stream, or 1 MB of verdict-bearing text; Codex command output is exempt from the 1 MB bound). | Inspect the saved raw answer; a runaway reviewer or an oversized answer needs a changed packet or a declared repeat reason, not an unchanged rerun. |
 | `FALLBACK_NO_RESULT` | `INVALID_OUTPUT` | The independent fallback produced no valid result and no more providers remain. | Check the exit code and excerpt below, fix the cause, and rerun once with --repeat-reason. |
 | `SNAPSHOT_TIMEOUT` | `TRANSIENT_INFRA` | Preparing the review snapshot exceeded its deadline. | Rerun with a larger --snapshot-timeout (maximum 7200) or tune snapshot_timeout in review_policy.json. The snapshot deadline is separate from the 720 second per-provider budget. |
 | `SNAPSHOT_GIT_FAILED` | `TRANSIENT_INFRA` | An isolated Git step failed. | Run `git -C <repo> fsck --connectivity-only` and `git -C <repo> status` to see why. |
@@ -236,10 +343,14 @@ The rescue wrapper does not stage or commit leftover model edits. It always exit
 | `SNAPSHOT_CASE_COLLISION` | `TRANSIENT_INFRA` | Reviewed paths differ only by case or Unicode form and this filesystem is case-insensitive. | Run the review on a case-sensitive filesystem (for example dev2) or a case-sensitive APFS volume. |
 | `SNAPSHOT_GITLINK` | `TRANSIENT_INFRA` | The reviewed tree contains submodule gitlinks or unsupported entries. | Review the submodule repositories separately; the packet must list their commits. |
 | `SNAPSHOT_SOURCE_CHANGED` | `TRANSIENT_INFRA` | The source checkout changed during the review. | Commit or stash changes, keep the worktree untouched while reviewing, rerun. |
+| `WORKTREE_SCAN_LIMIT` | `TRANSIENT_INFRA` | The bounded worktree metadata scan or Git listing used up its time, entry or depth budget before finishing. It is not evidence of a special file. | Rerun once when the host is less loaded, or run the review from a full clone on the fleet (T2). Trees over 250000 entries or 64 directory levels are unsupported; the budget is 5 seconds plus 0.5 ms per tracked entry. |
+| `WORKTREE_SPECIAL_ENTRY` | `TRANSIENT_INFRA` | The worktree holds a FIFO, socket or device file (or, in a review snapshot, a filesystem symlink) that Git status does not show. | Find it with `find <repo> -path <repo>/.git -prune -o ! -type f ! -type d -print` and remove it, then rerun. A committed symlink is checked out as a plain file in the snapshot; a real one there means something rewrote the snapshot. |
 | `PYTHON_UNSUPPORTED` | `TRANSIENT_INFRA` | The Python interpreter is older than 3.9. | Run with python3.9 or newer, for example `python3.12 ~/.claude/hooks/peer_review.py ...`. |
 | `ISOLATION_FAILED` | `UNKNOWN` | Review isolation failed for a reason without a specific code. | Read the Detail line, fix the cause, rerun once; reconcile if a provider was launched. |
 
 ## Delivery workflow
+
+Delivery and integration admit the official Desktop Sites indexed Git metadata only when `GIT_CONFIG_COUNT` is canonical `0` through `20`, all indexed key/value names are present without extras, and every key is one of the exact credential-helper/useHttpPath or HTTP proactiveAuth/followRedirects keys scoped to `https://chatgpt.com/backend-api/codex/sites/git/` or `https://chatgpt-staging.com/backend-api/codex/sites/git/`. The classifier reads key metadata, never indexed values. This admits and strips ambient Sites metadata; it grants no authentication or configuration authority. Helper-owned Git processes discard the inherited indexed family and compose their own settings. Other routing overrides remain refused, and the existing global-config/test-isolation policy is unchanged. User-approved external check commands retain their separate environment contract.
 
 Both editions install the same delivery implementation and dependencies. Claude uses `~/.claude/hooks/deliver.py`; Codex uses `~/.codex/agent-harness/deliver.py` and needs no Claude installation. Remote delivery also needs an authenticated Git transport and GitHub CLI (`gh`). The helper never merges a remote PR. Repository review, authorization and scope checks remain the main agent's responsibility.
 
@@ -504,7 +615,7 @@ Two one-off routes are the only exceptions: a fixed table in `command_guard.py`,
 
 ### How it decides
 
-The command is lexed like a shell before any rule runs. The lexer handles quotes, `$'..'`, escapes, line continuations, heredocs (the body ends at its delimiter and the rest of the text is commands again), `$(..)`, backticks, pipes, redirects, brace expansion, prefix assignments, wrappers (`sudo`, `env`, `nice -n`, `timeout`, `xargs` including its here-string, heredoc, `< <(..)` and `-a` input, package runners `npx`, `bunx`, `pnpm dlx`, `yarn dlx`, `npm exec`, `uvx`, `pipx run`, `yarn`/`pnpm` (and `yarn run`) with a deleter bin, `shx`, `cross-env` and `cross-env-shell`, `eval "$(..)"`, `flock`, `script -c`, `tmux send-keys`, `osascript`, `at`), `sh -c` strings, `ssh` and `docker exec` commands, scripts written and then run in the same command, `$(which rm)`, absolute binary paths, and case and Unicode lookalikes. An unterminated quote or substitution, nesting that is too deep, or input over the analysis budget is blocked when the raw text names a protected location, a secret source, or a code-execution step (a pipe into a shell, `eval`, `-c` or `-e` code, a decoder) together with a destructive verb. Otherwise it is a warning. Block messages are passed through `redact.py` and never echo a secret.
+The command is lexed like a shell before any rule runs. The lexer handles quotes, `$'..'`, escapes, line continuations, heredocs (the body ends at its delimiter and the rest of the text is commands again), `$(..)`, backticks, pipes, redirects, brace expansion, prefix assignments, wrappers (`sudo`, `env`, `nice -n`, `timeout`, `xargs` including its here-string, heredoc, `< <(..)` and `-a` input, package runners `npx`, `bunx`, `pnpm dlx`, `yarn dlx`, `npm exec`, `uvx`, `pipx run`, `yarn`/`pnpm` (and `yarn run`) with a deleter bin, `shx`, `cross-env` and `cross-env-shell`, `eval "$(..)"`, `flock`, `script -c`, `tmux send-keys`, `osascript`, `at`), `sh -c` strings, `ssh` and `docker exec` commands, scripts written and then run in the same command, `$(which rm)`, absolute binary paths, and case and Unicode lookalikes. An unterminated quote or substitution, nesting that is too deep, or input over the analysis budget is blocked when the raw text names a protected location, a secret source, a credential location (`CRED_TEXT`: the GoodQA token and gq-browser directories, `.ssh`, `.aws` and the other credential paths, matched as written and with quotes and backslashes removed), or a code-execution step (a pipe into a shell, `eval`, `-c` or `-e` code, a decoder) together with a destructive verb. Otherwise it is a warning. When the analyser itself crashes or times out, the launcher `command_guard_hook.py` applies the same raw-text checks, its own copy of `CRED_TEXT` included, and allows a command that matches none of them. These raw-text checks decode nothing, so a credential path spelled with an ANSI-C escape (`goodq$'\x61'`), a segment held in a variable or a glob that hides its parent is not refused on that path: it is a warning, or allowed under the launcher. This is an accepted known limit (GoodQA goodqa#15905; OS-level redesign goodqa#15906). Block messages are passed through `redact.py` and never echo a secret.
 
 zsh and bash read `>!` differently, and the guard cannot tell which shell will run the text. zsh takes `>! w`, `>>! w`, `&>! w`, `>&! w`, `&>>! w` and `>>&! w` as a single clobber or append operator with `w` as its target. bash stops the operator before the `!`, so it writes a file named `!` and `w` is a command word; it rejects `>>&!` as a syntax error. A script containing one of these operators, quoted forms excepted, is analysed once under each reading, each starting from the same state, and refused if either reading refuses. This happens at every parse, including `bash -c`, `eval`, `ssh` and `$(..)` text, because a nested shell can read the operator differently from its parent.
 
@@ -533,6 +644,8 @@ The agent may approve a delete itself, but only after a backup that the approval
 ```bash
 python3 ~/.claude/hooks/command_guard.py approve-delete --path <literal path> --remote dropbox:<mirror dir> --wal <WAL path>
 ```
+
+For a clean, published linked worktree retired through `ah worktree-remove`, register a backup approval on the executing host for each otherwise-blocking ignored file. A collapsed ignored subtree qualifies only when every regular file has its own valid approval. The delegated verifier rejects mounted subtrees, special files, links, nested repositories, open backed files and any unfamiliar or changed path. Preview leaves approvals available. During removal, it verifies content, then rebuilds Git status, index flags and the complete ignored coverage under the approval lock after activity checks. Bounded directory identities and membership include the root and ignored-path ancestors, so a new sibling during activity checking or lock waiting refuses without spending any grant. The same full grant set is consumed once before non-forced Git removal. Observed quiescence remains required; this does not make an uncontrolled external writer atomic with Git removal. A removal that fails or is unconfirmed after consumption requires fresh backup verification and approval. Raw `git worktree remove` keeps its own guard.
 
 `approve-delete` refuses in these cases:
 
@@ -666,7 +779,7 @@ Run `replay` over recent transcripts and the red-team hold-out set before the en
 |---|---|
 | `pkill`, `killall`, `killall5`, `skill`, `slay`, `fkill`, `kill-port`, `fuser -k`, `taskkill`, `Stop-Process`, `systemctl kill`, `launchctl kill`, `tmux kill-server`, `pm2 kill`, `loginctl kill-*` and `terminate-*`, the PowerShell `kill` alias | blocked in any form, including after any wrapper (`sudo`, `env`, `time -p`, `gtimeout`, `xargs` with any options, `systemd-run`, `tmux`, `at`, `npx` ...): the first later word that is a kill verb starts the real command |
 | `kill` fed by `xargs`, `$(...)`, backticks, `while read` or a `for` loop variable, or any variable, glob or negative, zero or non-ASCII PID | blocked: the targets cannot be proven yours |
-| interpreter code (`-c`, `-e`, here-documents, here-strings) or PowerShell text that mentions `kill`, `terminate(`, `send_signal`, `taskkill`, `Invoke-CimMethod` or `GetProcessById` (a liveness probe `os.kill(pid, 0)` is exempt) | blocked; this is deliberately broad and can block code that merely prints the word. Set `script_kill_pattern` to an empty string in the policy to turn this check off |
+| interpreter code (`-c`, `-e`, here-documents, here-strings) or PowerShell text that mentions `kill`, `terminate(`, `send_signal`, `taskkill`, `Invoke-CimMethod` or `GetProcessById` (a liveness probe `os.kill(pid, 0)` is exempt) | blocked; this is deliberately broad and can block code that merely prints the word. A kill word only inside the test path of an exact test-runner line is a file name, not code (goodqa#16124): `python3 lanes/pgpool.py run --job N --lane L --ttl 1500 --mode server -- ~/qacp-work/fable-b1/dbtest-any.sh WT LOG test/qac-kill-switch-ceiling.test.ts [-t NAME]` passes, directly or as an ssh remote command. This is an allowlist. The whole interpreter command must be `python3 [-I\|-u\|-B] lanes/pgpool.py run`, using only the options `--job`, `--lane`, `--ttl`, `--mode`, `--template` and `--database` (each with a VALUE), then `--` and exactly one of `[/abs/\|~/]dbtest-any.sh WT LOG TEST [-t NAME]`, `npx [-y] vitest run TEST...` or `pnpm --filter PKG exec vitest run TEST...`. The other allowed lines are `python3 [-I\|-u\|-B] -m pytest TEST...` and `node --test TEST...`. Every word must be literal. TEST is a plain unquoted relative path word (no leading `/`, no `~`, no empty, `.` or `..` component, so `tests/../tools/kill-all.js` is scanned) with a `test/`, `tests/` or `__tests__/` directory component and a test-shaped file name (`.test.` or `.spec.`, or a `test_` or `test-` prefix). A symlink inside a test directory cannot be seen by a static check. A wrapper before the interpreter (`env CI=1 python3 -m pytest ...`) also keeps the full scan. Only TEST words are exempt; WT, LOG, PKG, option values and the `-t` name stay scanned. Anything else keeps the full scan, including any wrapper (`env`, `timeout`, `sudo`), any other runner (`tsx`, `bunx`, `yarn dlx`, `deno run`), any extra option and any generic script (`python3 tools/lint.py src/kill-switch.go`). Set `script_kill_pattern` to an empty string in the policy to turn this check off |
 | `find -exec kill`, `parallel kill`, `netwatch orphans --kill` with `--all`, `--force`, `--match` or without `--pid` | blocked |
 | text that names a kill and is run as shell code: anything on the left of a pipe into a shell (`sh`, `zsh`, `bash -s`, `sudo sh`, `ssh host bash`, `timeout 30 ssh host bash`, `ssh jump ssh host bash`, `docker exec -i c sh`, `S="ssh host"; ... \| $S bash`, `S=(ssh host bash); ... \| "${S[@]}"`, `xargs -I{} sh -c {}`), including a `for`, `while`, `if`, `{ }` or `( )` body and a here-document, or a substitution given to `eval`, `sh -c` or a shell as a file operand (`bash <(...)`) | blocked as `text-to-shell`, even when the PIDs are yours; the guard does not compute what the left side prints. Text that is only printed, searched or piped to something else stays allowed. A word after an option may be that option's value (`sudo -u git bash`), so it does not end the search for the shell; with kill text on the left, `\| sudo -n grep sh` is refused for that reason. `skill`, `slay`, `spps` and `wmic` do not count as kill words in text, so `echo 'skill -9 foo' \| ssh dev2 bash` is allowed. Other routes into a shell are in Known limits, rows 19, 21, 22 and 25 |
 | `kill PID...` with literal PIDs | allowed only when every PID is proven yours (below) |
@@ -918,7 +1031,7 @@ Run `python3 -m unittest tests.test_worktree_hygiene`. This runs Hawkeye's 108-c
 
 Every want, need, finding or bug is a GoodQA ticket. When an agent picks one up, it writes a spec, gets the spec reviewed and attaches it to the ticket. As it works, it attaches proof for each acceptance criterion. After deploy, it attaches the click-test record. Once signed off, the ticket can be marked done.
 
-The ticket is the record of truth. Each step posts one comment containing a readable summary and a fenced `harness-spec-record` JSON block, with its files attached. Attaching costs four calls: `file_upload_start` (project surface), a presigned `PUT`, `file_upload_complete` with the sha256, then `comment_on_issue` with `attachmentIds`. The done gate trusts a file only when `issue_attachments_list` shows it completed, on that comment, with the server-computed sha256 that the record names. Retries are idempotent: a record whose content key is already on the ticket is reported `ALREADY_RECORDED`, and the comment `operationId` is derived from that key.
+The ticket is the record of truth. Each step posts one comment containing a readable summary and a fenced `harness-spec-record` JSON block, with its files attached. Attaching costs four calls: `file_upload_start` (project surface), a presigned `PUT`, `file_upload_complete` with the sha256, then `comment_on_issue` with `attachmentIds`. The posting command returns `RECORDED` only after `issue_attachments_list` confirms each file is completed, active, bound to the returned comment, and has the expected server-computed SHA-256. The done gate uses the same attachment verification. An already verified content key returns `ALREADY_RECORDED`, and the comment `operationId` is derived from that key.
 
 ```sh
 S=~/.claude/hooks/spec_flow.py
@@ -940,6 +1053,7 @@ python3 $S done --ticket 'GoodQA harness#168' [--apply]          # status: same 
 - **Header lines:**
   - `Ticket: GoodQA <project>#<n>`. The project slug is required; a bare `GoodQA #N` is rejected.
   - `Author: agent:<id> (<model>)`, `human:<name>` or `model:<name>`.
+  - Optional `Owners: agent:<native UUID>, agent:<native UUID>`. This reviewed declaration lists all substantive component owners, includes the author, and accepts 1–8 unique lowercase native UUID identities. Changing it changes the core and stales reviews. A missing header keeps legacy conservative owner inference from posting actors; an empty or malformed header never selects legacy behavior.
   - `Click-test: required` or `not-applicable (<reason>)`.
   - `Sign-off: main` or `human`.
 - **Sections:** `## Outcome`, `## Scope`, `## Acceptance criteria`, `## Negative cases` and `## Risks`.
@@ -949,6 +1063,56 @@ python3 $S done --ticket 'GoodQA harness#168' [--apply]          # status: same 
 - **Reviews section:** `## Reviews` is generated from the sidecar `<spec>.reviews.json`. The *spec core* is everything above it, normalized to NFC and LF with trailing spaces trimmed. Reviews bind to the core's sha256. Editing the spec after review therefore makes its reviews stale, while regenerating the reviews table does not. Keep `## Reviews` last: `attach` refuses a spec with a section after it, since that section would be lost.
 
 ### Reviews
+
+For an explicit native `Owners:` declaration, attachment also needs
+`--owners-wal ~/.agent-harness/codex-wals/SESSION_UUID/main.jsonl`. The attacher
+checks each owner's native parent and `harness_owner` assignment, then captures
+an owner-recorded `handoff` or `result` from its exact sibling agent WAL. This
+attestation is not native process completion or cryptographic proof of code
+ownership. Completeness of the declared owner list remains a semantic review
+duty. Missing, torn, aliased or changing evidence refuses attachment.
+
+Explicit-owner specs produce a version-2 spec record and a digest-mirrored
+`owner-provenance.json` attachment. Only identity/role, timestamps and digests
+are retained; owner notes and full WALs are not uploaded. Current remote gates
+verify the frozen proof without querying the Mac database. Missing or malformed
+explicit metadata refuses instead of choosing older legacy ownership data.
+Update participating helpers before using this record version; older helpers
+do not enforce explicit-owner semantics.
+
+Owner attestations must follow the matching native `SubagentStart` event; both
+timestamps and event digests are retained. The gate derives Author, Owners and
+the core from actual checksum-verified attached specification bytes, selected
+by server comment binding rather than mutable JSON roles/version. Stripping
+record fields, downgrading a record or remirroring a smaller owner list cannot
+turn an explicit artifact into legacy ownership. An unavailable current source
+refuses rather than selecting an older specification.
+
+Artifact reads use the existing authenticated API read-target route. A separate
+empty HTTP client fetches approved storage without API credentials, cookies,
+environment proxies or redirects, after checking the actual public peer. The
+production default permits only `https://goodqa-uploads.tor1.digitaloceanspaces.com`
+for the production `https://goodqa.app` API; development is not implicitly
+allowed. Custom deployments need an explicit trusted `artifact_download_origins`
+list. Header and body receives enforce the absolute verification deadline at
+each socket read, including final completion; slow byte streams cannot extend
+it by resetting an idle timeout. OS DNS resolution and multi-address connection
+setup are not hard wall-clock bounded: connection/TLS timeouts and post-connect
+deadline checks remain, so this is not a whole-command cancellation guarantee.
+Reads have a 64 KiB target-JSON limit, a 1 MB source
+limit, 64 markdown candidates and an 8 MB aggregate source budget. Download
+capabilities and headers are never logged. Access failures remain verification
+failures, not permission changes.
+
+In explicit mode, a coordinator can transport someone else's spec, evidence or
+tester report without becoming an inferred owner. Author, declared owners,
+current spec reviewers and all historical attachment-verified actual testers
+remain excluded from signoff through the same CLI/done-gate calculation.
+Unverified comments cannot manufacture a tester role. The actual tester must
+remain independent of the current owners, author and reviewers. Posting an
+attachment grants neither a role nor authority, and record identities retain
+their existing disclosed trust limits. Legacy specs keep conservative posting
+actor inference; CLI signoff now also refuses an actual tester immediately.
 
 - **Two roles, distinct reviewers.** The `adversarial` and `acceptance` roles each need an `ACCEPT` on the current core.
   - The two reviewers must differ in model, agent or person. Two runs of the same helper model count as one reviewer.
@@ -981,6 +1145,7 @@ python3 $S done --ticket 'GoodQA harness#168' [--apply]          # status: same 
     - The agent must be recorded as `click-tester` in the session's `main.jsonl`.
     - The start time is its SubagentStart record. The end time is its first `subagent_stop` record (from the SubagentStop hook). If there is none, `ended_at` is null and `last_activity_at` is recorded.
     - A pass counts only if it comes from the click-tester: its report (first line `CLICK_TEST_RESULT: PASS|FAIL`, matching `--result`) has its sha256 noted in the agent's own WAL, or `--really-tested <id>` is found there.
+    - Codex native `harness_click_tester` records use the exact `CLICK_TEST_WITNESS_V1` procedure above, including current spec, observation window, deployed commit and report binding. Report-digest-only final text cannot substitute for that witness.
   - **Human click-tests** are self-attested.
 - **Sign-off:**
   - It must come from someone other than the spec author, either spec reviewer, a click-tester, or anyone who posted spec, evidence or click-test records. By default this is the main agent. When the main agent directed the work, its independence is nominal; ask for `Sign-off: human` when that matters.
@@ -1077,7 +1242,7 @@ What it checks, with a fake-gh-tested read of `gh pr view --json statusCheckRoll
 - Unknown state (required checks unreadable, truncated lists) is a waivable reason: the main agent may override it with a waiver, which is recorded. Fail closed: a gh failure, timeout (8 s per call, 40 s total, output capped at 4 MB), non-JSON, truncated check list, closed PR or unreadable input blocks (exit 2).
 - `--auto`: the gate needs green now, so arming auto-merge on pending checks needs a waiver or a later plain merge.
 
-Waiver: `python3 ~/.claude/hooks/merge_gate.py waive --repo owner/name --pr N --head <full sha> --ticket 'GoodQA #N' --reason '<10+ characters>'`. It is bound to repo, PR and head, single use, expires after 24 hours and a waived merge still needs the head flag. The main agent runs it; the hook stamps the approver from the session. **Main approval is not authenticated.** The hook refuses `waive` and shell or write-tool access to the state files when the payload carries `agent_id` (a Claude Code subagent). Since goodqa#15122 a subagent command that names merge_gate and a waiver word is allowed only when every simple command in it is a known free-text form: print and search commands (`echo`, `printf` without `-v`, `grep`, `cat`, a stored heredoc), `cd`, git `log`/`show`/`diff`/`status`/`add`/`grep`/`rev-parse`/`branch`/`tag` with only the options on a per-subcommand allow-list (`GIT_OPTIONS`; abbreviated long options are refused), `commit`, `add`, `status`, `branch` and `tag` only with `-c core.hooksPath=/dev/null` (they can run hooks; any other `-c` and `-C` are refused; `--no-pager` is allowed), no git or gh argument built at run time (a word starting with `$`, except a quoted `"$( )"` body after `--body`/`-m`, and no unquoted `$`, glob or brace in a command that runs git or gh), the text verbs of `gh issue`/`gh pr` and `gh api`/`search` without `--web` (also joined, `-cw`), and the harness helpers `~/.claude/hooks/{wal_note,ah,commit_policy,provenance,spec_flow}.py` named by `~` or the literal home; every `$( )` inside it must be free text too. Such a command is still blocked when it assigns `HOME`, `PATH`, `PYTHON*`, `GIT_*` or a similar variable, uses process substitution, or writes a file (redirect or `tee`) while it also runs git or python. Known limit: git and gh can still start a program from configuration that already exists (a pager, `core.fsmonitor`, diff or textconv drivers, clean filters, a signing program, the editor, the browser), chosen by the repository the command runs in (`cd`); a file written by an earlier command or the Write tool and run later is not linked to this check. Anything else (an interpreter, a shell, `awk`, `sed`, `rg`, `pytest`, `find -exec`, `make`, a git alias, a wrapper such as `env` or `sudo`, a variable as command word) keeps the old text rule and blocks. It normalizes quotes, `$` and globs first, but this is best-effort and only inspects the command text: a subagent that writes a script with the Write tool and then runs it, or builds the command at runtime (base64), can evade it, and Codex sends no `agent_id`, so there every caller counts as main. Without a stamp the caller passes `--approved-by main:<agent-id>` and the record is marked `asserted`; anyone with shell access can type that. The hash chain is unkeyed: it catches accidental edits and truncation (a corrupt, truncated or edited log honours no waiver) but not a deliberate forger who knows the format. Treat the waiver as an audited honesty control against careless agents, not as proof that the main agent approved; the report shows who and how. State lives in `~/.agent-harness/state/` (`merge-gate-waivers.jsonl`, `merge-gate-audit.jsonl` with command hashes only). `merge_gate.py report` lists waivers (used, unused, expired, approval source) and recent decisions; `merge_gate.py check --repo owner/name --pr N` runs the check without a merge. A waiver is consumed when the hook allows the command, so a merge that then fails burns it.
+Waiver: `python3 ~/.claude/hooks/merge_gate.py waive --repo owner/name --pr N --head <full sha> --ticket 'GoodQA #N' --reason '<10+ characters>'`. It is bound to repo, PR and head, single use, expires after 24 hours and a waived merge still needs the head flag. The main agent runs it; the hook stamps the approver from the session. The stamp is single use, keyed by repo, PR, head and ticket, and lives 120 seconds. The hook offers it only for one plain command that bash, zsh and the hook read as the same words, and writes it only after it has decided to allow the command (goodqa#15684). It mints nothing for: `$`, a backtick or a control character (CR and tab included) anywhere; an unquoted `#`, brace, glob, parenthesis, `!`, `^` or `~` (a leading `~/` is fine); an unquoted word starting with `=`; an interpreter other than a `python3`/`python3.N` this host can find (or an absolute path to an executable one); a script other than `~/.claude/hooks/merge_gate.py`, `~/.codex/agent-harness/merge_gate.py` or the running gate; `-h`/`--help`; and any argument the CLI would read differently or refuse. Such a command still runs and is judged as usual; the CLI then asks for `--approved-by`. Known limit: the stamp is written before the command runs, so if the user denies the permission prompt or a later hook blocks the command, the stamp stays unconsumed for up to 120 seconds, and an identical `waive` run another way in that window is recorded as `hook` instead of `asserted`. That is a provenance error, not extra merge authority (which waivers authorize a merge is goodqa#15732). **Main approval is not authenticated.** The hook refuses `waive` and shell or write-tool access to the state files when the payload carries `agent_id` (a Claude Code subagent). Since goodqa#15122 a subagent command that names merge_gate and a waiver word is allowed only when every simple command in it is a known free-text form: print and search commands (`echo`, `printf` without `-v`, `grep`, `cat`, a stored heredoc), `cd`, git `log`/`show`/`diff`/`status`/`add`/`grep`/`rev-parse`/`branch`/`tag` with only the options on a per-subcommand allow-list (`GIT_OPTIONS`; abbreviated long options are refused), `commit`, `add`, `status`, `branch` and `tag` only with `-c core.hooksPath=/dev/null` (they can run hooks; any other `-c` and `-C` are refused; `--no-pager` is allowed), no git or gh argument built at run time (a word starting with `$`, except a quoted `"$( )"` body after `--body`/`-m`, and no unquoted `$`, glob or brace in a command that runs git or gh), the text verbs of `gh issue`/`gh pr` and `gh api`/`search` without `--web` (also joined, `-cw`), and the harness helpers `~/.claude/hooks/{wal_note,ah,commit_policy,provenance,spec_flow}.py` named by `~` or the literal home; every `$( )` inside it must be free text too. Such a command is still blocked when it assigns `HOME`, `PATH`, `PYTHON*`, `GIT_*` or a similar variable, uses process substitution, or writes a file (redirect or `tee`) while it also runs git or python. Known limit: git and gh can still start a program from configuration that already exists (a pager, `core.fsmonitor`, diff or textconv drivers, clean filters, a signing program, the editor, the browser), chosen by the repository the command runs in (`cd`); a file written by an earlier command or the Write tool and run later is not linked to this check. Anything else (an interpreter, a shell, `awk`, `sed`, `rg`, `pytest`, `find -exec`, `make`, a git alias, a wrapper such as `env` or `sudo`, a variable as command word) keeps the old text rule and blocks. It normalizes quotes, `$` and globs first, but this is best-effort and only inspects the command text: a subagent that writes a script with the Write tool and then runs it, or builds the command at runtime (base64), can evade it, and Codex sends no `agent_id`, so there every caller counts as main. Without a stamp the caller passes `--approved-by main:<agent-id>` and the record is marked `asserted`; anyone with shell access can type that. The hash chain is unkeyed: it catches accidental edits and truncation (a corrupt, truncated or edited log honours no waiver) but not a deliberate forger who knows the format. Treat the waiver as an audited honesty control against careless agents, not as proof that the main agent approved; the report shows who and how. State lives in `~/.agent-harness/state/` (`merge-gate-waivers.jsonl`, `merge-gate-audit.jsonl` with command hashes only). `merge_gate.py report` lists waivers (used, unused, expired, approval source) and recent decisions; `merge_gate.py check --repo owner/name --pr N` runs the check without a merge. A waiver is consumed when the hook allows the command, so a merge that then fails burns it.
 
 Known limits: merge queues (the PR head is checked, not the queue branch), MCP GitHub tools and browser merges (the Bash matcher never sees them), aliases defined outside the command, scripts that hide a merge in a file, and the check state changing in the seconds after the check. Commands that merely print or search text are not merges (`git commit -m`, `echo`, `grep`, `pytest -k`, a `cat` or `git commit -F -` heredoc body), but a merge string inside any other command that is not a plain gh call (a variable, `awk`, `xh`, an unreadable script) blocks. `gh pr merge --help` and `--disable-auto` are not merges. A command word that is only a variable or substitution (`$A $B $C 5`, `$'gh' ...`, `eval $A`), a gh subcommand word built at run time (backticks, braces, `${IFS}`) and a write to a `gh api` endpoint whose last path part is built at run time block when the command mentions gh or a merge. A command word or gh subcommand word taken from a variable assigned once from a literal by a top-level statement earlier in the same command (`SUB=view; gh pr $SUB 5`, `GH=gh; $GH pr view 5`) is read as that word: reads pass, and a merge reached that way still blocks; an assignment inside a group, loop, branch, function, pipeline or `&&`/`||` list, a prefix assignment, or any builtin that can assign anywhere in the command (`eval`, `source`, `read`, `mapfile`, `declare`/`typeset`/`local` (also `-n` namerefs), `printf -v`, `trap`, `unset`, `export`, `let`, `getopts`) leaves every variable unknown (goodqa#15122). A token named `gh` inside `git push`, `fetch`, `remote` and other git subcommands that run no program is a remote or branch, not a gh call. A `git push` whose destination is main or master (`origin main`, `x:refs/heads/main`, `x:heads/main`, `+x:master`, `--delete main`), `--all`, `--mirror`, a destination built at run time, refspecs appended by `xargs`/`parallel`, or a git command given `-c alias.*`, `-c push.*`, `-c remote.*.push`, `-c branch.*.merge` or `--config-env` blocks as a merge without a pull request; a push with no refspec or to `HEAD` is not resolved against the current branch, and only main and master count as default branches; this is a best-effort net, not a proof against every obfuscation. The hook never executes the command text. Fail-closed wiring: on Claude Code the hook entry uses `onFailure: block` (the convention this installer uses for its other gates; the hook also exits 2 itself if its helper module cannot be imported); on Codex the command ends in `|| exit 2`. A missing `python3` binary is a spawn failure that only `onFailure` can turn into a block. To uninstall, remove the `merge_gate.py` hook entries from `settings.json` (Claude Code) or `hooks.json` (Codex).
 
@@ -1115,7 +1280,7 @@ Local-only delivery leaves publication outstanding. A later GitHub merge may hav
 
 The publication helper requires `--repo` to resolve to the feature worktree root before inspecting the branch or remote; a nested directory returns `BLOCKED_POLICY` (exit 2), because a directory-scoped index scan could miss hidden root entries. It resolves `origin`’s effective push URL (including `pushurl` and `pushInsteadOf`) and asks that destination for its advertised default branch and refuses to push that branch, including nonstandard names such as `trunk`. If the default is unknown (for example, an empty remote) or the query fails, it returns `BLOCKED_REMOTE` (exit 4) and local integration continues. Multiple push destinations, or an effective URL that would be rewritten again during inspection, are rejected with `BLOCKED_POLICY` before any push; they cannot be checked or updated atomically across repositories. This follows Git’s [push URL semantics](https://git-scm.com/docs/git-push#REMOTES). It canonicalizes source-relative local push URLs, including paths with a colon after a slash, and preserves the source object format, then exposes the reviewed commit to a temporary bare repository through Git object alternates (without copying the project's history), then pushes that object to the inspected feature ref using a temporary remote pinned in command environment. This prevents a moving source branch, source-local URL rewrite, or source `pre-push` hook from changing the delivered object or destination. Because the isolated transport bypasses source `pre-push` hooks, publication scans the commits the push can add for [Git LFS pointer blobs](https://github.com/git-lfs/git-lfs/blob/main/docs/spec.md) and returns `BLOCKED_POLICY` if any are found; use an LFS-aware push path or make an explicit local-only delivery decision; a policy refusal is not a remote outage. The LFS scan runs in that prepared transport immediately before pushing, using the same original object graph as the transfer. It asks the pinned destination for its `refs/heads/*` and `refs/tags/*` tips, peels those present locally to commits, and scans every commit reachable from the feature head but not from those tips. Local remote-tracking refs are never trusted to shrink the range. Each such commit is diffed against every parent (or as a root), so the scan covers new blobs and older blobs a new commit adds at a changed path, as the Git LFS pre-push hook does. Pointers only in history the destination already advertises do not block publication. If a destination ref disappears between this listing and the push, Git may send objects that already existed on the destination without this scan; those objects were not introduced by the feature commits. Source shallow boundaries and grafts cannot hide retained ancestor objects from inspection. A shallow source can publish when the unpublished range is complete locally and adds no pointer; missing objects inside the unpublished range make verification fail closed with `BLOCKED_REMOTE`, even if the destination might already have them. All publication Git commands disable replacement objects. The scan conservatively rejects small blobs containing a recognized LFS version line, including CRLF, surrounding Unicode whitespace, extension records and legacy version aliases; malformed pointer-like text can therefore also require manual publication. Enumeration streams commit IDs and raw diff records without retaining paths and refuses more than 200,000 destination refs or 64,000,000 ref-listing bytes, 100,000 unpublished commits, 300,000 candidate blobs, 19,500,000 commit-list bytes, 256,000,000 diff bytes, or malformed/oversized records before buffering the complete enumeration. Candidate blob content is limited to 30,000,000 bytes. The whole scan shares one `--timeout` deadline. If the scan cannot complete within these budgets or that deadline, it returns `BLOCKED_REMOTE` with a fixed `reason` (for example `LFS scan commit budget exceeded`) without pushing; the read-only enumeration process group is killed immediately on refusal or timeout. It does not create a PR; the main agent does that separately when available. A concurrent change to global Git URL rewrites or external DNS/transport routing remains outside this protection. Git terminal credential prompts are disabled during the push. Credential helpers and SSH can still stall; `--timeout` (default 600 seconds) bounds each Git command, including local inspection, temporary transport setup, and the push. Local inspection timeouts return `BLOCKED_REMOTE` before any push; the default-branch query has the smaller of this deadline and 30 seconds. For other Git commands, on timeout the helper terminates Git and descendants in its process group with SIGTERM, then kills anything still running after a two-second grace, before reporting. A timeout does not prove that the remote ref was unchanged: verify it before retrying.
 
-The integration helper accepts a small fixed set of test/build commands and lockfile installs, parsed as argv without a shell. Besides the full-suite forms it accepts exactly one focused form, `python3 -m unittest discover -s tests -p test_<name>.py` (`python` is accepted too), where the name is one literal ASCII file name (no glob, path separator, `..`, option or extra argument; discovery matches that file name in `tests/` and its subpackages, so a same-named file in a subpackage runs as well); it is shared by `finish --check`, `finish --resolve-baseline` and `integrate_local.py --resolve-journal`; like every `unittest discover` check it fails when the pattern runs no tests or only skipped tests (GoodQA #14729). An unparseable or unapproved command returns `BLOCKED_POLICY` (exit 2) before integration. `--repo` must be the root of the original worktree, and the named original branch and HEAD and reviewed source branch and commit must still match. The original checkout must be clean. The helper refuses inherited `GIT_*` routing, index, and configuration overrides before Git inspection; identity variables, `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_NOSYSTEM`, `GIT_TERMINAL_PROMPT`, `GIT_PAGER`, and (since 2026-11-06) `GIT_EDITOR`/`GIT_SEQUENCE_EDITOR`, which the non-interactive helpers never consult, are allowed. Helper-owned Git commands strip `GIT_PAGER`. A blocked or changed original checkout is preserved; do not reset it to make delivery pass.
+The integration helper accepts a small fixed set of test/build commands and lockfile installs, parsed as argv without a shell. Besides the full-suite forms it accepts exactly one focused form, `python3 -m unittest discover -s tests -p test_<name>.py` (`python` is accepted too), where the name is one literal ASCII file name (no glob, path separator, `..`, option or extra argument; discovery matches that file name in `tests/` and its subpackages, so a same-named file in a subpackage runs as well); it is shared by `finish --check`, `finish --resolve-baseline` and `integrate_local.py --resolve-journal`; like every `unittest discover` check it fails when the pattern runs no tests or only skipped tests (GoodQA #14729). The delivery helpers also accept exactly `node --test PATH`, where `PATH` is one literal repository-relative ASCII `.test.js`, `.test.cjs` or `.test.mjs` file (no flags, globs, dot components, absolute paths, backslashes or symlink components). Node must resolve to a canonical native executable outside the repository, initially version 22 or newer, without inherited Node preload/test-routing or dynamic-loader injection controls. A major version alone is insufficient: before any original-checkout effect, two fixed private fixtures exercise the exact trusted structured reporter/parser; a genuine assertion must pass and an empty module must fail. Missing per-file summaries, changed protocols or uncertain probes block delivery. The static sibling `node_check_reporter.mjs` is hash checked before preflight and execution and is installed by both installers; a missing or changed reporter requires reinstalling the reviewed helper set, never a wrapper or environment override. The helper requires matching selected-file/root counts, positive passed cases, zero failures/cancellations and completed end-of-stream evidence. Empty modules, suites without cases, all-skipped/TODO selections and early exit zero cannot pass; mixed passing and skipped cases are permitted. Worker stdout/stderr remain typed diagnostics and cannot supply result records. Node checks use native CLI isolation with concurrency 1. An unparseable or unapproved command returns `BLOCKED_POLICY` (exit 2) before integration. `--repo` must be the root of the original worktree, and the named original branch and HEAD and reviewed source branch and commit must still match. The original checkout must be clean. The helper refuses inherited `GIT_*` routing, index, and configuration overrides before Git inspection; identity variables, `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_NOSYSTEM`, `GIT_TERMINAL_PROMPT`, `GIT_PAGER`, and (since 2026-11-06) `GIT_EDITOR`/`GIT_SEQUENCE_EDITOR`, which the non-interactive helpers never consult, are allowed. Helper-owned Git commands strip `GIT_PAGER`. A blocked or changed original checkout is preserved; do not reset it to make delivery pass.
 
 Before the scratch merge can run merge drivers, hooks, or checks, the helper reserves an owner-only journal under the repository Git common directory at `agent-harness/delivery-scratch`. This state is independent of `HOME` and shared by linked worktrees. A private lock serializes integration for one original checkout inode and branch. Each original checkout and branch has its own `scopes/<scope>/active` namespace. A scan of at most 4096 active or legacy journals shares a deadline of the smaller of `--timeout` and 30 seconds; an unsafe or over-budget set requires recovery before new merge/check effects. Unresolved attempts block across changed baseline or feature inputs. Completed and explicitly resolved metadata moves to `scopes/<scope>/archive`; a new feature never rescans archived history or depends on old candidate ancestry. An exact completed repeat checks that candidate, current clean checkout, and remaining artifacts before returning `ALREADY_INTEGRATED`; natural completion of retained-artifact cleanup is accepted. An unfinished reservation in another linked worktree does not block this scope. The scratch worktree is created in a separate owner-only temporary container outside `.git`, `.hg`, and `.sl` path components so VCS-ignoring test tools can see its files. The journal binds its absolute path and container device/inode; changing `HOME` does not move recovery state. The scratch worktree shares the repository's objects, refs, and local Git configuration. It lets the helper validate the candidate before deliberately changing the original HEAD, **not** sandbox repository code: merge drivers, hooks, package lifecycle scripts, and tests can execute and can affect external paths or shared Git metadata. Use trusted repositories and inspect a retained scratch worktree before recovery.
 
@@ -1137,7 +1302,7 @@ After `RESOLVED`, a corrected feature can be attempted as a new delivery. If the
 
 Git cleanliness inspections disable fsmonitor and untracked caches, force normal stat, executable-bit, and symlink-type checks, include untracked files and dirty submodules despite user configuration, and reject gitlinks and hidden `assume-unchanged` or `skip-worktree` index entries. The NUL-delimited index scan reads no file contents or paths into reports and refuses more than 40 MB, 250,000 entries, a 1 MB path record, or 30 seconds. Sparse checkouts with skip-worktree entries and submodule gitlinks need a separate delivery path; do not clear flags automatically. These checks are not byte-for-byte filesystem attestation: forged stat metadata, concurrent edits, and changes after final verification remain limits. A repository's `.gitattributes` may select a user-global clean filter during status, and scratch integration retains merge drivers and Git hooks for its merge and commit. Source checks constrain known execution and concealment paths but cannot isolate or pin all repository code and shared configuration.
 
-Each Git command, preparation, check, and abort attempt has a positive `--timeout` in seconds (default 600 **per command**, not for the whole workflow). The helper terminates a timed-out command's process group with SIGTERM, then SIGKILL after a bounded grace. Detached descendants remain outside that cleanup. Failure reports give a phase, status, and available exit code without child stdout or stderr, which might contain secrets; `merge_aborted` describes the scratch merge only. Approved `unittest discover` checks require at least one non-skipped test invocation, but a test can still lack meaningful assertions; other allowlisted runners retain their own exit-status semantics. The main agent must judge test sufficiency and review evidence. The helper does not publish the original branch.
+Each Git command, preparation, check, and abort attempt has a positive `--timeout` in seconds (default 600 **per command**, not for the whole workflow). The helper terminates a timed-out command's process group with SIGTERM, then SIGKILL after a bounded grace. Detached descendants remain outside that cleanup. Failure reports give a phase, status, and available exit code without child stdout or stderr, which might contain secrets; `merge_aborted` describes the scratch merge only. Approved `unittest discover` checks require at least one non-skipped test invocation; focused Node checks require the structured evidence described above. A test can still lack meaningful assertions; other allowlisted runners retain their own exit-status semantics. The main agent must judge test sufficiency and review evidence. The helper does not publish the original branch.
 
 ## Integration command output
 
@@ -1157,6 +1322,8 @@ python3 ~/.claude/hooks/bg_job.py wait --name suite --timeout 3600 --dir /abs/ta
 - `wait` exit codes: 0 the status file says exit 0; 1 the job ran and failed (`EXIT_STATUS=n`); 2 no trustworthy status (missing, garbled, belongs to another job, or the process is gone without a status, including a reused PID); 3 timeout while still running. PID liveness is proven by the wrapper nonce in the process command line, never by `kill -0` alone, and the status file is written atomically by the wrapper. Never use the last command of a loop, or a systemd unit `Result` alone, as the outcome.
 - Per-stage pipeline status: use `set -o pipefail`, or read `PIPESTATUS` immediately after the pipeline itself (not after `X=$(...)`), or write each stage's status to its own file.
 - `bg_lint.py` is an advisory PreToolUse hook (Claude Code only; Codex ships `bg_job.py` as a helper but has no lint hook). It warns, never blocks, and names `bg_job.py` for: a success echo after `;` or `&`; a wait/poll loop whose last command is `ls`, `cat` or `tail`; `PIPESTATUS` after a command-substitution assignment; a while/until loop polling `pgrep -f PATTERN` or `ps | grep PATTERN` (without `grep -v grep`) where the pattern also occurs in the loop's own shell command line, so it never exits (one ran 12 h on dev2 on 2026-11-06; use `pgrep -f "[t]sc ..."`, a PID wait or an exit file). It is a heuristic over a shell string, so it can miss wrapped or generated commands; the helper itself is opt-in.
+
+For unattended evidence delivery, launch a single, predeclared task script that runs the bounded job, validates its exact versioned evidence, posts it to the named ticket, and exits with the verified posting result. Keep its inputs, log, and receipt under the private task directory. Record the job name and receipt path in the WAL before handing off. `STARTED` confirms launch. A successful terminal receipt confirms the script completed its requested checks. Reconcile an interrupted or uncertain external write by checking GoodQA before restarting a script.
 
 ## Test watcher
 
@@ -1236,6 +1403,265 @@ work directory (`git -C <repo> worktree add -b <branch> ~/.agent-harness/work/<s
 `WorktreeCreate` hook is deliberately not installed: it replaces Claude's worktree logic for every worktree, including
 owners already working in real repositories, and Claude never auto-removes the worktrees such a hook makes for subagents.
 
+## Mission coverage
+
+Every active mission goal must be held by someone, wait on something named, or be done with evidence (goodqa#15565).
+The dropped-owner gate only sees owners that existed and stopped; on 2026-11-10 the leads goal (goodqa#15095) had no
+owner all night and nothing said so. `harness/hooks/mission_coverage.py` holds the rule, `mission_gate.py` enforces it
+at main's Stop (and stamps main's main-only commands), and the ops-watch `mission` check alerts on it.
+
+### Goals file
+
+One canonical file, `~/.agent-harness/mission/goals.json` (directory 0700 and not a symlink, file 0600, at most 1 MiB,
+500 goals, nesting depth 8; a symlink, FIFO or any wrong type makes the whole file unreadable). It is a JSON object
+`{"mission_session": "<session id>", "goals": [...]}` (a bare list, the first format, has no mission session):
+
+| field | type | meaning |
+| --- | --- | --- |
+| `mission_session` | session id | the main session the Stop gate holds to the mission; set by the first `import-initiatives` or by `set-session` (main only; see the hand-over rule below) |
+| `id` | `[a-z0-9][a-z0-9_-]{0,63}` | unique goal id (the dashboard initiative id) |
+| `title` | text, up to 300 | what the goal is |
+| `ticket` | `goodqa#N`, `Project#N` or `""` | the stream ticket; owners are matched by it, never by name. Changing it is main only |
+| `priority` | integer 1..9 | 1 is the most important |
+| `status` | `imported`, `active`, `done`, `deferred`, `retired` | `imported` is reported, not enforced, until `activate`; `done` only through `done`, `deferred` only through `defer --user-source`, `retired` only through `retire` |
+| `deferral` | `{by: user\|ask\|ticket, ref, until, source, renewal}` | what the goal waits on; `ref` must be an ask id (`ask`) or a ticket (`ticket`), `until` an ISO time, or the file is unreadable |
+| `wait_count` | integer | ask/ticket waits in a row without the user's word |
+| `bound` | list of full agent ids | owners main bound to the goal (`bind`) |
+| `retire` | `{source}` | the user's words that cancelled the goal |
+| `done_evidence` | `[{kind: deploy\|really_tested, ref, session}]` | WAL ids proving it is live and tested |
+| `repos` | list of paths, optional | repositories whose commits naming the ticket count as progress (main only) |
+| `dashboard` | object, informational | copied from the dashboard on import; never read by the rule (its `owner` field covers nothing) |
+
+Write it only through the tool. Each write appends a hash-chained row to
+`~/.agent-harness/state/mission-goals-audit.jsonl`: `prev` is the sha256 of the previous row, the last row's hash is in
+`mission-goals-audit.head`, the goals file's sha256 is in `after_sha`, and the mission session is in `session`. Past
+16 MiB the file is renamed to `mission-goals-audit.NNNNNN.jsonl` and the chain continues in a new file. A goals file
+that does not match the chain head is treated as tampered: a goal removed or edited by hand, or an audit row edited or
+deleted in any segment. The gate then blocks the session the chain names (never a session the edited file names), and
+every write is refused until main runs `reseal --reason`.
+
+Readers take a shared lock on `mission-goals.lock`, so a concurrent write is never read as tampered.
+
+    mission_coverage.py import-initiatives ~/.agent-harness/work/<session>/dashboard/initiatives.json   # main
+    mission_coverage.py activate --goal leads                                                             # main
+    mission_coverage.py add --goal leads --title "1,000 leads in the CRM view" --ticket goodqa#15095 --priority 1
+    mission_coverage.py set --goal leads [--title T] [--priority N] [--status active] [--clear-deferral]
+    mission_coverage.py set --goal leads --ticket T | --repo PATH...                                      # main
+    mission_coverage.py bind --goal leads --agent <full agent id> --source ticket:goodqa#15095 [--remove] # main
+    mission_coverage.py defer --goal leads --ask <open ask naming the goal> --until <ISO, at most 7 days ahead>
+    mission_coverage.py defer --goal leads --ticket <open blocking ticket> --until <ISO, at most 7 days ahead>  # main
+    mission_coverage.py defer --goal leads --user-source "<user: or answer: source>" [--until <ISO>]     # main
+    mission_coverage.py retire --goal leads --user-source "<user: or answer: source>"                    # main
+    mission_coverage.py done --goal leads --deploy <deploy WAL id> --live-test <REALLY_TESTED id>
+    mission_coverage.py set-session [--session S] | --user-source "<user: source in this session>"       # main
+    mission_coverage.py reseal --reason "<what changed and why>" [--force]                                # main
+    mission_coverage.py verify | report [--json] | check
+
+Main-only commands need a one-shot stamp (`caller_identity.put_stamp`, purpose `mission-main`, single use, 60 s,
+bound to main's tool call) that `mission_gate.py pretool` writes only when the PreToolUse payload proves main
+(`caller_identity.is_main`) and the Bash command runs `mission_coverage.py` itself:
+
+- The stamp carries the call's `tool_use_id`, main's transcript path and the transcript size at that moment
+  (goodqa#15754 red-team F1). The command honours it only while that call is still running: once main's transcript
+  holds the call's `tool_result` (the call ended, or another hook denied it, or the user rejected it), the stamp is
+  dead for every process. `mission_gate.py posttool` (PostToolUse, PostToolUseFailure and PermissionDenied, Bash) also
+  deletes the call's unconsumed stamps. A payload without `tool_use_id` gets no stamp. Run main-only commands in the
+  foreground: a `run_in_background` call returns its tool_result at once, so its command is refused.
+- `take_stamp` runs every check (purpose, TTL, the call still running) before it claims the stamp; a caller that fails
+  one leaves the stamp in place, so a probe cannot burn main's stamp (PR 226 review M1).
+- What the stamp proves today, and its window (PR 226 review M1, not closed): "main's PreToolUse hook saw exactly this
+  argument list in a main call that has not ended yet, at most 60 s ago". It does not prove that the consuming process
+  is main's. Any same-user process that runs the identical argument list inside that window (from PreToolUse until the
+  call's tool_result or Post hook, at most 60 s, including while a permission prompt is open) is taken for main. A
+  per-call nonce (PreToolUse `updatedInput` prefixing `AH_MAIN_NONCE=<random>`, the stamp holding only its hash) would
+  close it: Claude Code 2.1.322 applies `updatedInput` from a settings hook without a permission decision, but it also
+  stores every PreToolUse hook's stdout verbatim in main's transcript, so the nonce would sit in clear text in a Claude
+  log during the call. It was not shipped for that reason; it is the design to reuse for the `review-auth` and
+  `ack-handoff` stamps (goodqa#15829) if that copy is accepted.
+
+- The stamp is keyed by the sha256 of the exact argument list after the script (`argv_key`; `--flag=value` reads as
+  `--flag value`), so it covers that one command and nothing else.
+- The hook stamps only a script at command position: the first word of a simple command (after `;`, `&&`, `||`, `|`,
+  `(` or a newline), optionally after `VAR=x` words and `python3 [-flags]`. Redirections and their targets (`2>&1`,
+  `> out`) and `#` comments are left out of the argument list. Text that only mentions the script is never stamped:
+  `echo`, `grep`, `printf '...'`, `bash -c '...'`, and any command with a here-document (`<<`). `goodqa#9` is one word,
+  as in bash.
+- The line is split by a quote-aware tokenizer (`mission_gate.shell_tokens`), not by shlex: a quoted or backslash-escaped
+  `;`, `&&`, `|`, `(`, `)` or newline is part of a word and never starts a command, so `echo ";" mission_coverage.py
+  reseal ...` gets no stamp (r14 F1). A line with `$(...)`, backticks, `<(...)`, `$'...'`, a here-document or an
+  unbalanced quote gets no stamp at all, nor does an argument the shell computes (`$VAR`, an unquoted glob or brace).
+- The command takes (consumes) its stamp first, before argparse or any validation. A main command that then fails,
+  prints `--help` or exits on an argparse error leaves nothing a later process could use.
+- Once goals.json names a mission session, the stamp must come from that session. Another top-level session (another
+  main, or a sub-agent's own `claude -p`) is refused even with a stamp of its own.
+- A leading unquoted `~/` is expanded as bash does. Other arguments the shell computes (`$VAR`, `$(...)`, globs) differ
+  from what the hook saw, so such a command is refused. Run main-only commands with literal arguments.
+
+A sub-agent's shell, a copied script or a cron job finds no stamp and gets a refusal naming main. Every main-only
+change, and every ask or ticket wait, raises a high `mission:goals:changed` alert (source `mission-coverage`) with the
+old and new value.
+
+Hand-over (`set-session`): with no mission session yet, any main sets it. The mission main may move it, to itself or to
+another session id. Any other session may take it only for itself, with `--user-source`: a `user:` or `answer:` source
+from its own transcript whose whole sentence says to move the mission ("take over the mission in this session"), as a
+one-segment quote with no condition or refusal. The sentence must say take over the mission, or hand, move, transfer,
+pass or bring the mission here or to this session, and either name this session as the destination ("here", "this
+session", "you") or be an imperative ("Take over the mission."). A refusal, condition or question anywhere in it, a
+cancelling word (stop, cancel, drop, abort, keep, leave, block) or another destination ("the other session", "to
+session <id>") refuses it (r14 F2). The same shared checker (`user_words_ok`) judges defer, retire and takeover
+quotes. That is the recovery when the old main died. The change re-checks the
+mission session under the write lock.
+
+Limit (threat model): stamps are not signed. A same-user process can write a stamp file into
+`~/.agent-harness/state/main-stamps/` itself, as it can edit the hooks or the HMAC key. Stamps stop careless agents and
+the copied-command, leftover-stamp and other-session cases above, not a same-user agent that sets out to forge them. A
+stamp left by a main command that never ran (for example `false && mission_coverage.py reseal ...`) can still be used
+within 10 minutes by a process that runs exactly the same argument list. `reseal` is refused while the chain is intact unless
+main passes `--force`; its audit row records the sealed hash, the hand-edited file's hash and the removed goal ids.
+
+`ah task register` rows no longer bind owners: ah records the caller from the environment (`AH_AGENT_ID`, else
+`unknown`), so a registration cannot prove that main wrote it. Use `bind`, which needs main's stamp, a full agent id
+(16+ characters, never a prefix) and a `user:`, `answer:`, `queue:` or `ticket:` source. The binding covers only while
+`ah owners` reports that exact id as a live owner-type row.
+
+`import-initiatives` is an idempotent merge. New ids come in as `imported`: reported, not enforced. Dashboard rows whose
+state starts with done, live, complete, shipped or retired are marked `needs_evidence`. Existing goals keep every field,
+their status included, and only gain a missing ticket and the informational `dashboard` block. Nothing is removed and
+nothing is marked done (a dashboard "Done" is not evidence).
+
+### The rule
+
+A goal with status `active` (or `deferred`) is covered by
+
+1. a live owner: an `ah owners` row of an owner type (never a helper such as red-team, click-tester, fixer, Explore,
+   Plan) in state live, working, quiet or SILENT (SILENT not after an ending disposition), whose stream ticket (the
+   first GoodQA ticket in its WAL) equals the goal's ticket, or whose exact agent id main bound to the goal;
+2. a live disposition:
+   - an `ah task dispose` waiting, resumed or reassigned disposition that ah reports live, on such an owner row;
+   - a wait on an ask that is open in main's WAL and whose text names the goal id or ticket;
+   - a wait on another ticket (main only) that was open in GoodQA when it was recorded (checked through ah's adapter,
+     10 s bound). The Stop gate and `report` check it again: a waited-on ticket that is now closed or missing no longer
+     covers. Those lookups run in parallel within 2.5 s; an "open" answer is reused for 10 minutes, and no answer in time
+     keeps the wait with "open state not confirmed this turn";
+   - an ask or ticket wait needs `until` in the future and at most 7 days ahead, and at most 2 waits in a row
+     without the user's word; the third makes the goal UNCOVERED again;
+   - a deferral the user decided: its `user:`/`answer:` source resolves through provenance.py to the user's own words,
+     quoted as one segment (no `...`). The verb must sit right next to the goal (id, also hyphenated or spaced, or
+     `#<ticket number>`, with "the", "goal", "work" and the project name folded in): defer, park, pause, postpone or
+     shelve the goal, hold off on it, put it on hold, "<goal> can wait", or "<goal> is deferred/parked/paused/on hold".
+     The whole sentence of the user's turn that holds the quote (not only the quoted fragment) must contain no refusal,
+     condition or negation (don't, not, no, never, any "n't" form, if, unless, maybe, should, might, a question mark,
+     stop, quit, resume, restart, abort, except, instead, never mind). The sentence is judged as written: no word is
+     removed first, so "Do not now pause leads" and "do not pause leads, not now" are refusals (r14 F3). "wait",
+     "later", "hold" and "stop" alone are not a decision. `report` prints the quoted
+     words. `retire` follows the same rules with drop, cancel, retire, abandon or scrap (or the word kill) next to the
+     goal, or "<goal> is dropped/cancelled/retired/dead";
+3. done evidence (status `done`): a deploy record and a later REALLY_TESTED entry against a live target, both from the
+   mission session's WALs and both naming the goal's ticket, checked with `ah`'s own evidence resolvers (the DONE_LIVE
+   rule).
+
+`retired` counts only while the user's quoted words name the goal and say drop, cancel, retire or stop. `imported`
+never blocks. Anything else is UNCOVERED.
+
+A covered goal is STALLED when none of its owners wrote an own WAL entry for more than 45 minutes and no commit in its
+`repos` names the ticket in that time. Hook lifecycle rows and rows another agent wrote into the owner's WAL do not
+count. The report gives the age.
+
+When the owner cap (`model_tiers.json` caps.session_owner_agents) is full and a goal is uncovered, the message names the
+owner to free or queue: owners on no mission goal first (most idle first), then owners of the lowest-priority, most
+stalled goal, plus the option to queue the goal on its ticket.
+
+### Owner lists and signatures
+
+`ah owners` has no cheaper mode; on a 2,089-owner session it takes 10-25 s, more than a Stop hook can spend.
+
+- ops-watch (every 10 minutes) runs the full scan, bounded by `mission.timeout_s` (default 120). It writes the scan to
+  `~/.agent-harness/state/mission/owners-<session>.json`, signed with HMAC-SHA256 and carrying `by: ops_watch` and a
+  monotone `seq` that is kept in a signed seq file. ops-watch is the only writer; the gate never writes it.
+- The Stop gate uses that snapshot when its signature, session, writer and seq check out and it is at most 15 minutes
+  old. Otherwise it scans live within 9 s.
+- A missing, forged, replayed, foreign or stale snapshot plus an overrun scan never counts as coverage. The turn may
+  end with "owner list unavailable", and the gate raises a high `mission:scan:unavailable` alert.
+- The verification cache (`state/mission/verify-cache.json`) is signed the same way. It remembers a pass for a day and
+  a failure for 60 s; a failure is never cached as a pass.
+- Limit: the key (`state/mission/hmac.key`, 0600) is readable by every process of the same user. The signatures stop a
+  stray write or a careless agent, not a same-user agent that sets out to forge them. Such an agent can also edit the
+  hooks (see `caller_identity.py`).
+
+### Enforcement
+
+- Stop gate (`mission_gate.py`, registered next to the dropped-owner gate):
+  - It runs only for main (`caller_identity.is_main`) and only in the mission session. Other sessions, sub-agents and
+    hosts without a goals file never block.
+  - It blocks with the 5 worst uncovered goals, the count of the rest, `mission_coverage.py report` and the fixes once,
+    in at most 1.5 KB. Every value from the goals file, a WAL or a ticket is stripped of control characters and capped
+    at 80 characters. A goal without a ticket gets "give it a ticket with `set --goal ID --ticket T` first".
+  - An unreadable or tampered file blocks with one line.
+  - At most 25 blocks per signature (the sorted uncovered ids). After that the turn may end and a high
+    `mission:gate-valve` alert goes to the ring. The count starts again from zero when the signature clears or changes.
+  - A repeated Stop in the same turn is not blocked.
+- ops-watch `mission` check (enabled by default; `{"mission": {"enabled": false}}` in ops-watch.json turns it off):
+  - It checks the session in `mission_session` and raises `mission:<goal>:uncovered` (high, `stop_block`),
+    `mission:<goal>:stalled` (warning) and `mission:goals:unreadable` (high). Alerts clear when the goal is covered.
+  - When the owner scan is unavailable, it keeps the last mission alerts, raises `mission:scan:unavailable`
+    (warning) and sends no "covered again" notice.
+- Waking main: when the uncovered set gains a goal, `notify_main` raises `mission:notify` (source `mission-coverage`).
+  Where `mc_chat` (Mission Control, goodqa#15585) is installed and main registered a target, it also drops an inbox
+  message marked as coming from the harness, not the user. It clears when nothing is uncovered.
+- Checkpoint: `mission_coverage.py report --json` lists goals slowest first: UNCOVERED by priority, STALLED oldest
+  first, covered by least recent progress, then waiting, deferred, imported, done and retired. It includes a
+  `coverage` map for Mission Control, keyed by goal id and ticket, with `{status: uncovered|stalled|moving, reason,
+  action}`.
+
+### Goal status: `ah goals` and the status lint (goodqa#15754)
+
+- `ah goals` reports every goal of the ledger with its state and its evidence of any age (`--json` for all of it,
+  `--candidates` for unattached deploy and REALLY_TESTED rows that name a goal, read only). It is the source for a
+  "whats left" answer; `ah status --since` lists recent evidence only.
+- Evidence: main attaches rows with `mission_coverage.py attach --goal G --evidence wID --kind test|live_test|deploy`;
+  owners may attach rows from WALs that name the goal, with an explicit PASS or FAIL, and never re-attach main's
+  rows. Owners tag rows with `wal_note.py --goal G --result PASS|FAIL [--live]` and write deploy records with
+  `--event deploy` (naming a sha or version). States: DONE_LIVE (main-attached deploy and a later main-attached live
+  PASS), LIVE_TESTED (main-attached live PASS, no deploy), LIVE_UNTESTED, VERIFIED, FAILING (a main-attached FAIL
+  clears only with a main-attached PASS of the same check), IN_PROGRESS, UNKNOWN (no record, never "not started").
+- Attach pins the row (red-team F2): the ledger entry stores `row_sha` (sha256 of the row as canonical JSON with
+  ASCII escapes), `row_verdict` and `row_at`. A row whose WAL content changed after attach shows as `TAMPERED` in
+  `ah goals`, a pinned row that no longer resolves as `MISSING`; both are named on a WARNING line.
+- A TAMPERED or MISSING pinned row is scored by its pin (PR 226 review H1): its pinned verdict at its pinned `at`, so
+  rewriting or deleting a FAIL row never removes the FAIL. The goal is also capped at `UNCONFIRMED` (unless it is
+  FAILING), with `cap.would_be` and the row ids in `ah goals --json` and a `capped:` line in the text, until main reads
+  the row and re-attaches it or removes it with `--remove`. An owner cannot re-attach (re-pin) a row that changed
+  since it was attached. The Stop lint treats UNCONFIRMED like any state below DONE_LIVE ("done" is an over-claim).
+  `ah status --since` does not read the goal ledger, so the cap shows in `ah goals` and the status-truth hooks only.
+- Entries attached before pinning still count but are flagged `(unpinned)`, and an unpinned row cannot carry a goal to
+  DONE_LIVE (review L3: the goal reads UNCONFIRMED with `cap.unpinned`). Rollout, once per host that has a ledger
+  (`~/.agent-harness/mission/goals.json`; the Mac has none yet): run `ah goals --json`, and for every id in a goal's
+  `unpinned` list main reads the WAL row and runs `mission_coverage.py attach --goal G --evidence ID --kind KIND`
+  (the same kind) to pin it, or `--remove` to drop it. A row edited before that re-pin cannot be detected; read it.
+- Pins written by the first PR 226 build (ensure_ascii=False digest) still match: `row_matches` accepts that digest
+  for any row without a lone surrogate (the only rows where it collided).
+- One pass per WAL file (red-team F5): `ah goals` and the hooks read each WAL file once for all attached ids and goal
+  tags, within one time budget (hooks 5 s, `ah goals` 20 s). A read that runs out of time is the state `timeout`
+  (`GOALS UNAVAILABLE (timeout)`, exit 2), never a partial answer. So is a WAL file cut at its 256 MB scan cap while
+  attached rows in it are still unresolved (PR 226 review H2); a capped file whose attached rows all resolved only
+  adds a warning.
+  `ah status` calls a deploy record linked to a REALLY_TESTED row LINKED_LIVE; prose live claims are LIVE_LEGACY.
+- `status_truth.py` hooks, mission session only (decided from the ledger, remembered in
+  `~/.agent-harness/state/status-truth/mission-session` so a broken ledger never widens it; before the first remembered
+  value, from the verified ledger header, so a first-run timeout still says GOALS UNAVAILABLE there): UserPromptSubmit injects
+  the goals for a status question; SessionStart re-injects them after a compaction; Stop lints the final assistant
+  text (contradictions against the ledger, and a status answer given without running `ah goals`). Injected text holds
+  only fixed-pattern fields (ids, check names, enums, ages, the main-set target). Policy key `status_lint` in
+  provenance_policy.json: `warn` (shipped: a systemMessage the user sees, and a flag row in
+  `~/.agent-harness/state/status-truth/flags.jsonl` with ids and rules only), `enforce` (blocks once per human turn
+  through `stop_blocks.py`; main switches it only on the spec's precision bound) or `off`. When the transcript tail
+  holds no user prompt the turn is unknown and the lint only warns, in enforce too.
+  `status_truth.py calibrate <transcript>` replays both rules over a transcript.
+- `ah owners` lists in `attention` each SILENT owner whose recorded wait expired, or that has been silent 6 h with no
+  disposition (row reason `wait-expired` or `silent-undisposed`); `ah status` prints the same list on its owners line.
+  It is a report for main to look at: it does not set `decision_required`, so the dropped-owner Stop gate and ahd
+  successor requests ignore it (a silent owner may be a long build that writes no WAL lines).
+
 ## Design limits
 
 The policy is intentionally risk-scaled. The small fix path skips worktrees and review loops. A normal code task gets only relevant tests and documents. The agents must not infer that the presence of a test or a reviewer PASS proves quality. Independent checks, reviewer availability, UI tool access and remote permissions vary by environment; handoffs must say exactly what ran and what did not.
@@ -1260,7 +1686,12 @@ An approval recorded on one host (for example `approve-delete` on the Mac) is a 
 names the session, the approving host, the exact canonical path list, the pre-delete tree hash, an expiry (24 h) and a
 one-use nonce, and it is signed with a key the agent cannot invoke (the user's SSH agent or Secure Enclave key). The
 remote guard verifies the signature against the main host's public key, consumes the nonce atomically, and refuses a
-record whose path list or tree hash differs from what it sees. Not implemented; #139 added the remote delete route this builds on.
+record whose path list or tree hash differs from what it sees. Not implemented for remote delete. PR #139 added the
+existing remote delete route.
+
+The dedicated [T2Scan direct Astra broker](t2scan-portable-consent.md) implements signed portable consent for
+that operation with a separate issuer, short-lived exact scope, replay state and protected provisioning.
+The [macOS operator signer](t2scan-operator-signing.md) prepares and signs that consent.
 
 ### Audited Windows stop route (B3.10)
 
@@ -1311,3 +1742,16 @@ directory under `~/.agent-harness/work/<session>/` that is a clean, pushed workt
   are rotated and narrowed before agent login authority widens; transcript backups get secret scanning.
 - B29 ref regrowth: auto-delete-on-merge everywhere, TTL ownership for `claude/*` and `codex/*` branches, backup-ref
   expiry, and replay tests for the ten known repo-guard bypasses (#128).
+
+
+### Main-idle guard (goodqa#15943)
+
+`idle_guard.py` stops main from sitting idle while work that does not need the user exists. A user rejecting one question pauses that question only.
+
+- Stop hook (`idle_guard.py stop`, main only, bounded to 2 blocks per problem signature, fails open): blocks with the named streams and next steps when no progress happened for `AH_IDLE_GUARD_MIN` minutes (default 30) and a stream holds a non-user next step; also when every owner waits on a user ask while another owner holds a returned result nobody took; also when a user rejection is in this turn and independent work exists. A Bash-only checkpoint script is not progress.
+- ops-watch check `idle_guard` raises the high `idle-guard:<session8>` alert from the same `assess()`.
+- `ah owners` is the only judge of whether an owner needs main; `assess()` re-derives no rule. An owner is actionable exactly when its row is `decision_required` or has `attention`, and a user wait only when it is not actionable and its `wait_on` is an open ask. `attention` now also carries `result-unacked` (a done, handoff or returned result younger than 24 h that nobody took: taken only by a resume, reassignment, terminal disposition or main's `--ack-handoff` wait recorded at or after the result's own WAL time (whole seconds, no slack; each row's `result_at`), or by the live parent of a nested helper; later owner notes neither revoke an ack nor restart the 24 h window) and `wait-not-user` (a live wait on a ticket, agent or main). An owner's own `waiting` disposition never takes its result. `decision_required` is unchanged.
+- `idle_guard.py reject` (PostToolUseFailure, PermissionDenied, UserPromptSubmit) adds "A rejected question pauses only that question; keep every independent stream moving." after a user rejection. A rejection may produce no Post event, so the next prompt and the Stop hook also catch it from the transcript. A turn starts only at a human prompt as `provenance.user_authorship()` defines one (string or text blocks, origin `human`); task notifications, peer messages, reminders and tool results do not end the rejected turn.
+- A `waiting` disposition on an ask is per owner: `ah task dispose --kind waiting` refuses an ask that names another owner (`wal_note.py --event ask --owner <agent>`) or is already another owner's live wait.
+- `ah owners` carries `agents_active_1h` (and each row `active_1h`); `ah status` repeats it under `owners`. Collectors that read transcripts skip an unreadable file, never the section.
+- Limits: unreviewed PRs and specs are not looked up over the network; SendMessage is not hooked, so it is not progress.

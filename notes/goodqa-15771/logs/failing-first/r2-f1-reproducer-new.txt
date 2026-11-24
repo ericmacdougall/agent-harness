@@ -1,0 +1,5 @@
+script format: pvesm list + find (new)
+PASS: container rootdir 300G (qm list does not show CT 120): allocation_complete=True provisioned_gib=1836.0 overcommit_ratio=2.1 allocunknown=False (needs provisioned>=1836 or incomplete)
+PASS: unused0 detached 300G disk on VM 103: allocation_complete=True provisioned_gib=1836.0 overcommit_ratio=2.1 allocunknown=False (needs provisioned>=1836 or incomplete)
+0 of 2 scenarios under-report
+exit 0

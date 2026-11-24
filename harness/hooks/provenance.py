@@ -18,7 +18,9 @@ ticket sources are syntax-checked and flagged `deferred` unless a local cache al
 
 from __future__ import annotations
 
+import datetime
 import json
+import math
 import os
 import re
 import sys
@@ -32,9 +34,191 @@ import safe_input  # noqa: E402
 POLICY_FILE = HERE / "provenance_policy.json"
 MAX_LINE = 8 * 1024 * 1024        # a transcript or WAL line larger than this is never parsed
 MAX_HITS = 200                    # lines parsed per lookup
+LEDGER_MAX_HITS = 100_000         # the asks ledger reads every ask and resolution; a cap here silently hid late ones
 MAX_TEXT = 2 * 1024 * 1024
 MAX_SCAN_BYTES = 1 << 30          # a transcript or WAL larger than this is not scanned
 SCAN_SECONDS = 3.0                # wall-clock budget for one scan
+# PR 234 v8 (receipt v7 F1/F4): the one rule every read-only producer uses for a line it cannot parse. It counts as
+# skipped (its record is missing from the result) unless it is the file's unterminated last line and the file was
+# written in the last APPEND_GRACE_S seconds: that line is a write in progress, not a lost record. An unterminated
+# last line in a file nobody is writing is a torn record and counts.
+APPEND_GRACE_S = 60.0
+
+
+def tail_in_progress(at_tail: bool, mtime: float, now: float | None = None) -> bool:
+    return bool(at_tail) and (time.time() if now is None else now) - mtime <= APPEND_GRACE_S
+
+
+# ---- one WAL record validator and one unread-entry shape (PR 234 v11; receipt v10 F1, F2), shared by every reader
+def _record_time(value) -> float:
+    if not isinstance(value, str) or not value:
+        return 0.0
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.timestamp()
+
+
+# The revision of the record contract below. An index built from WAL records (ah owners' agent-WAL index) stores it,
+# and one built under another revision (or none: every index written before PR 234 v11) is rebuilt from the start of
+# the WAL, so no record the current contract rejects keeps counting as activity (receipt v11 F2). Bump it whenever
+# wal_record_problem changes what it accepts.
+RECORD_RULE = "harness.wal-record/1"
+
+
+def wal_record_problem(rec) -> str:
+    """Why a parsed WAL line is not a record ("" when it is). A record is a JSON object with a non-empty string
+    `event`; an `at`, when present and not null, must be an ISO time. A line that fails is a lost line for every reader:
+    it is never activity (no liveness), never dated evidence, never a row. An undated record (no `at`, or `at: null`, as
+    some hand-written notes are) is a record that proves no time; an ask written that way is still listed (red-team F8,
+    tests/test_provenance.py)."""
+    if not isinstance(rec, dict):
+        return "not an object"
+    event = rec.get("event")
+    if not isinstance(event, str) or not event.strip():
+        return "no event" if event is None or event == "" else "event is not a string"
+    if rec.get("at") is not None and _record_time(rec.get("at")) <= 0:
+        return "bad timestamp"
+    return ""
+
+
+def unread_entry(entry) -> dict:
+    """The one shape of an unread-source entry, for every producer and renderer: source and reason always; the WAL
+    file name and agent when the source is a WAL. Producers may name the source `wal` (a WAL) or `source`."""
+    entry = entry if isinstance(entry, dict) else {}
+    wal = clip(str(entry.get("wal") or ""), 120)
+    out = {"source": clip(str(entry.get("source") or wal or "(unnamed source)"), 120),
+           "reason": clip(str(entry.get("reason") or "unread"), 200)}
+    if wal:
+        out["wal"] = wal
+    if entry.get("agent"):
+        out["agent"] = clip(str(entry["agent"]), 60)
+    return out
+
+
+def unread_text(entry) -> str:
+    """The one text rendering of an unread entry (ah --text status and any other text report)."""
+    e = unread_entry(entry)
+    return f"  {e['source']:<40} {e['reason'][:80]}"
+
+
+# ---- lost lines and the window a read covers (PR 234 v10; receipts v9 F1/F2; the user's last-round decision)
+# A read covers a window (ah status: its --since window; ah owners: the rows its default view shows). A line that
+# could not be used is inside the window unless the evidence about that line itself places it before the cutoff.
+# This is the ONLY place that decides it, for every producer: lost_outside is called by LostWindow.place alone,
+# and only LostWindow counts outside_window (tests/test_mission_control_producer_reads.py guards both).
+LOST_WINDOW_RULE = "harness.lost-window/1"
+MAX_LOST_KEPT = 2000   # per file: lost lines past this keep no evidence, so they are inside
+
+
+def lost_outside(next_date, ordered: bool, mtime, cutoff) -> bool:
+    """Whether one lost line was provably written before `cutoff` (a Unix time; None: the read has no window, so
+    every lost line is inside). Outside only if (b) its file was last written before the cutoff, or (a) the first
+    dated record after it in the same file is dated before the cutoff AND the file's dated records never go back in
+    time (receipt v9 F2: a file whose dates are out of order proves nothing about position, so (a) does not apply).
+    Everything else, including a torn tail or a lost line with no dated record after it, is inside."""
+    if cutoff is None:
+        return False
+    if isinstance(mtime, (int, float)) and mtime < cutoff:
+        return True
+    return bool(ordered) and isinstance(next_date, (int, float)) and 0 < next_date < cutoff
+
+
+class LostTrail:
+    """The evidence for the lost lines of one file, in file order: for each, the date of the first dated record after
+    it (None until one is read), and whether the file's dated records are in time order. It can be kept in an index
+    (state()/from_state) so an incremental reader places a line seen in an earlier call with the same evidence."""
+
+    def __init__(self, nexts=None, ordered=True, last=0.0, extra=0):
+        self.nexts, self.ordered, self.last, self.extra = list(nexts or []), bool(ordered), float(last or 0.0), int(extra or 0)
+
+    @classmethod
+    def from_state(cls, state):
+        """None for anything that is not a state() of this class, field by field (PR 245 m2 receipt): a hand-edited
+        or corrupt index is evidence of nothing and is rebuilt, never a ValueError or TypeError in a reader."""
+        if not isinstance(state, dict):
+            return None
+        nexts = state.get("nexts")
+        if not isinstance(nexts, list) or not all(n is None or (isinstance(n, (int, float)) and not isinstance(n, bool))
+                                                  for n in nexts):
+            return None
+        last, extra, ordered = state.get("last"), state.get("extra"), state.get("ordered", False)
+        if not (last is None or (isinstance(last, (int, float)) and not isinstance(last, bool))) \
+                or not (extra is None or (isinstance(extra, int) and not isinstance(extra, bool) and extra >= 0)) \
+                or not isinstance(ordered, bool):
+            return None
+        try:   # PR 245 m3 receipt: a value float() cannot hold (10**309) or a non-finite one is no state either
+            trail = cls(nexts, ordered, last or 0.0, extra or 0)
+            if not all(math.isfinite(v) for v in [trail.last] + [n for n in trail.nexts if n is not None]):
+                return None
+        except (OverflowError, ValueError, TypeError):
+            return None
+        return trail
+
+    def state(self) -> dict:
+        return {"nexts": self.nexts, "ordered": self.ordered, "last": self.last, "extra": self.extra}
+
+    def copy(self):
+        return LostTrail(self.nexts, self.ordered, self.last, self.extra)
+
+    def lost(self) -> None:
+        if len(self.nexts) < MAX_LOST_KEPT:
+            self.nexts.append(None)
+        else:
+            self.extra += 1
+
+    def dated(self, at) -> None:
+        """A record in file order with date `at` (0 or None: undated, which proves nothing and is ignored)."""
+        if not isinstance(at, (int, float)) or at <= 0:
+            return
+        if at < self.last:
+            self.ordered = False
+        self.last = max(self.last, at)
+        i = len(self.nexts) - 1
+        while i >= 0 and self.nexts[i] is None:   # the lost lines just before this record
+            self.nexts[i] = float(at)
+            i -= 1
+
+    def count(self) -> int:
+        return len(self.nexts) + self.extra
+
+
+class LostWindow:
+    """One read's window: how many lost lines are inside it (they make the read partial) and outside it (disclosed as
+    outside_window, never partial). `cutoff` None: no window, every lost line is inside."""
+
+    def __init__(self, cutoff=None):
+        self.cutoff, self.inside, self.outside = cutoff, 0, 0
+
+    def place(self, trail, mtime, hidden: bool = True) -> None:
+        """Place every lost line of one file. `hidden` False (an owner row the view shows): all inside, whatever the
+        evidence, since the read claims that row."""
+        if trail is None:
+            return
+        for nxt in trail.nexts:
+            if hidden and lost_outside(nxt, trail.ordered, mtime, self.cutoff):
+                self.outside += 1
+            else:
+                self.inside += 1
+        for _ in range(trail.extra):
+            if hidden and lost_outside(None, False, mtime, self.cutoff):
+                self.outside += 1
+            else:
+                self.inside += 1
+
+    def fields(self) -> dict:
+        """The read-block fields: the outside count, and the rule that produced it (only a read with a window)."""
+        out = {"outside_window": self.outside}
+        if self.cutoff is not None:
+            try:   # `ah status --since` with a very long window puts the cutoff before the epoch, or out of range
+                cutoff = datetime.datetime.fromtimestamp(max(0.0, float(self.cutoff)), datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            except (OverflowError, OSError, ValueError):
+                cutoff = ""
+            out["window"] = {"rule": LOST_WINDOW_RULE, "cutoff": cutoff}
+        return out
 SMALL_FILE = 1 << 20              # policy, cache and similar small files
 MAX_RESOLVES = 40                 # sources resolved per top-level claim
 MAX_DEPTH = 8                     # wal: pointer chain depth
@@ -42,14 +226,14 @@ EXCERPT_MIN, EXCERPT_MAX, EXCERPT_SEGMENTS = 12, 300, 3
 RATIONALE_MIN = 10
 MODES = ("off", "warn", "enforce")
 DEFAULT_POLICY = {
-    "schema": 1, "spec": "enforce", "plan_packet": "warn", "ask_user_question": "enforce", "stop_lint": "warn", "ticket_lookup": "enforce",
+    "schema": 1, "spec": "enforce", "plan_packet": "warn", "ask_user_question": "enforce", "stop_lint": "warn", "ticket_lookup": "enforce", "status_lint": "warn",
     "wal": {"requirement": "enforce", "ask": "enforce", "blocker": "warn", "scope": "warn", "decision": "warn"},
 }
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{4,40}$")
 SESSION_RE = re.compile(r"^[A-Za-z0-9._-]{1,120}$")
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
-LABELS = {"user": "USER", "pasted": "PASTED", "ticket": "TICKET", "file": "FILE"}
+LABELS = {"user": "USER", "pasted": "PASTED", "ticket": "TICKET", "file": "FILE", "dashboard": "DASHBOARD"}
 
 
 class Problem(Exception):
@@ -100,7 +284,7 @@ def read_text_arg(path, limit: int = 4 * SMALL_FILE) -> str:
 
 
 MODE_RANK = {"off": 0, "warn": 1, "enforce": 2}
-POLICY_KEYS = ("spec", "plan_packet", "ask_user_question", "stop_lint", "ticket_lookup")
+POLICY_KEYS = ("spec", "plan_packet", "ask_user_question", "stop_lint", "ticket_lookup", "status_lint")
 
 
 def stricter(current, wanted):
@@ -356,6 +540,17 @@ def parse_source(text: str) -> dict:
             raise Problem("excerpt-missing", f"a {kind}: source needs a verbatim quoted excerpt of the user's words")
         return {"kind": "user", "variant": kind, "session": found.group(1).lower(), "ident": ident, "excerpt": excerpt,
                 "uuid": ident if kind == "answer" else f"{ident[0]}#{ident[1]}"}
+    if kind == "mc":
+        # A Mission Control dashboard approval (spec GoodQA #15585). Its own kind and origin ("dashboard"), never
+        # "user": every consumer that asks for a user turn refuses it by construction, and resolve() accepts it
+        # only for the caller that closes an ask (ask_resolved).
+        found = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]{0,127})/(dash-[0-9A-HJKMNP-TV-Z]{26})\s*(.*)$", rest, re.S)
+        if not found:
+            raise Problem("bad-syntax", "mc: needs <session>/<dash-id> then a quoted excerpt")
+        excerpt = parse_excerpt(found.group(3))
+        if excerpt is None:
+            raise Problem("excerpt-missing", "an mc: source needs a verbatim quoted excerpt of the decision line")
+        return {"kind": "mc", "session": found.group(1), "ident": found.group(2), "excerpt": excerpt}
     if kind == "ticket":
         found = re.match(r"^GoodQA\s+([A-Za-z0-9_.-]{1,80})#(\d{1,9})(?:\s+comment\s+([0-9A-Za-z-]{4,64}))?$", rest)
         if not found:
@@ -444,17 +639,20 @@ def _line_around(fd: int, index: int, size: int):
             fwd *= 4
 
 
-def _lines_containing(path: Path, needle: bytes):
+def _lines_containing(path: Path, needle: bytes, max_hits: int = MAX_HITS, *, tails: bool = False):
     """Yield the line (or None when oversized) for each line containing needle. bytes.find on 8 MiB chunks:
-    mmap.find is a naive loop on Python 3.9 and 5 to 10 times slower on a 75 MB transcript."""
+    mmap.find is a naive loop on Python 3.9 and 5 to 10 times slower on a 75 MB transcript.
+    tails=True yields (line, in_progress) instead: in_progress is tail_in_progress for the file's unterminated last
+    line (a line that fails to parse is then a write in progress, not a skipped record)."""
     fd = open_regular(path)
     try:
-        size = os.fstat(fd).st_size
+        info = os.fstat(fd)
+        size = info.st_size
         if size > MAX_SCAN_BYTES:
             raise Problem("file-too-large", f"{clip(path.name, 60)} is larger than {MAX_SCAN_BYTES >> 20} MiB; not scanned")
         deadline = time.monotonic() + SCAN_SECONDS
         offset, hits, carry, next_line = 0, 0, b"", 0
-        while offset < size and hits < MAX_HITS:
+        while offset < size and hits < max_hits:
             if time.monotonic() > deadline:
                 raise Problem("scan-timeout", f"scan of {clip(path.name, 60)} exceeded {SCAN_SECONDS:.0f}s")
             chunk = os.pread(fd, min(CHUNK, size - offset), offset)
@@ -463,7 +661,7 @@ def _lines_containing(path: Path, needle: bytes):
             base = offset - len(carry)
             data = carry + chunk
             pos = 0
-            while hits < MAX_HITS:
+            while hits < max_hits:
                 index = data.find(needle, pos)
                 if index < 0:
                     break
@@ -475,10 +673,10 @@ def _lines_containing(path: Path, needle: bytes):
                 hits += 1
                 if line is None:
                     next_line = absolute + MAX_LINE  # skip the rest of an oversized line, do not re-read it per hit
-                    yield None
+                    yield (None, False) if tails else None
                 else:
                     next_line = start + len(line) + 1
-                    yield line
+                    yield (line, tail_in_progress(start + len(line) >= size, info.st_mtime)) if tails else line
             offset += len(chunk)
             carry = data[-(len(needle) - 1):] if len(needle) > 1 else b""
     except (OSError, ValueError) as error:
@@ -566,6 +764,8 @@ def user_authorship(record: dict, pasted: bool = False):
 
 QUEUE_WRAPPER = re.compile(r"^\s*<[A-Za-z][\w:-]*[\s>/]")
 ANSWER_TRUST = "AskUserQuestion tool result bound to an AskUserQuestion tool_use in the same transcript"
+MC_TRUST = ("Mission Control dashboard approval, HMAC-signed by the local server after an authenticated session click "
+            "(accidental-damage threat model: a process running as this user could forge it)")
 QUEUE_TRUST = "transcript queue-operation record without an origin marker (accidental-damage threat model)"
 
 
@@ -606,9 +806,15 @@ def answer_text(record, ask_ids):
         return None
     if blocks[0].get("is_error"):
         return None
-    # Only the user's selections count (toolUseResult.answers: question -> answer). The rendered tool_result string
-    # embeds the agent's own question text, so it is never parsed; no structured answers means no answer.
-    answers = record["toolUseResult"].get("answers") if isinstance(record["toolUseResult"], dict) else None
+    return ask_answers_text(record["toolUseResult"])
+
+
+def ask_answers_text(result):
+    """The user's selections in an AskUserQuestion result object (the transcript's toolUseResult, which is also the
+    PostToolUse hook's tool_response): its `answers` mapping, question -> answer, joined by newlines; else None.
+    The rendered tool_result string embeds the agent's own question text, so it is never parsed; no structured
+    answers means no answer. The one extractor for the local grant path and the central revocation hook."""
+    answers = result.get("answers") if isinstance(result, dict) else None
     if not isinstance(answers, dict):
         return None
     values = [v.strip() for v in answers.values() if isinstance(v, str) and v.strip()]
@@ -716,6 +922,54 @@ def _has_human_turn(path: Path) -> bool:
         if isinstance(record, dict) and user_authorship(record)[0] is not None:
             return True
     return False
+
+
+def mc_turn(session: str, ident: str, home=None) -> dict:
+    """The signed, delivered Mission Control approval record, or Problem. Every field comes from the signed record."""
+    import mc_chat  # noqa: PLC0415
+    try:
+        evidence = mc_chat.approval_evidence(session, ident)
+    except mc_chat.ChatError as error:
+        raise Problem("message-not-found", f"no usable dashboard approval {clip(str(ident), 40)}: {error}") from None
+    return {"text": evidence["text"], "timestamp": evidence["created"], "uuid": ident, "session": session,
+            "evidence": evidence}
+
+
+def mc_bind(source: str, ref: str, decision, ask: dict | None = None, session: str | None = None,
+            wal: str | None = None) -> str | None:
+    """None when the mc: source is a verified approval of exactly ask `ref` with the matching decision, else why not.
+    With `ask` (the ask entry of the WAL being closed), `session` and `wal` (that WAL's session and stem) it also
+    proves the approval is for this session's ask as it reads now: the digest is recomputed from the entry."""
+    try:
+        parsed = parse_source(source)
+        if parsed.get("kind") != "mc":
+            return "not an mc: source"
+        evidence = mc_turn(parsed["session"], parsed["ident"])["evidence"]
+    except Problem as problem:
+        return problem.message
+    if evidence["ask_id"] != ref:
+        return f"that dashboard decision is for ask {evidence['ask_id']}, not {ref}"
+    expected = "approved" if evidence["decision"] == "approve" else "declined"
+    if decision != expected:
+        return f"that dashboard decision is {expected}; --decision must say {expected}"
+    if ask is not None or session is not None or wal is not None:
+        import mc_chat  # noqa: PLC0415
+        if parsed["session"] != session:
+            return "that dashboard decision belongs to another session"
+        if wal != "main" or evidence["wal"] != "main":
+            return "a dashboard decision closes only an ask of the session's main WAL"
+        if not isinstance(ask, dict) or ask.get("id") != ref:
+            return f"no ask {ref} in this WAL to compare the decision with"
+        blocked = mc_chat.terminal_only(ask.get("note"), ask.get("reason"))
+        if blocked:
+            return blocked + "; a dashboard decision cannot close this ask (answer it in the terminal)"
+        try:
+            current = mc_chat.ask_snapshot(session, wal, ref, ask.get("note"), ask.get("reason"))
+        except mc_chat.ChatError as error:
+            return f"the ask cannot be compared with the decision ({error.code})"
+        if current["digest"] != evidence["digest"]:
+            return "the ask text or reason changed after the dashboard decision; it must be decided again"
+    return None
 
 
 def queue_turn(session: str, ident, home=None) -> dict:
@@ -988,6 +1242,23 @@ def _resolve(source, ctx, depth, seen, result):
         node["excerpt"] = parsed["excerpt"]
         result["chain"].append(node)
         result["origin"], result["ok"], result["backed"] = "user", True, True
+    elif kind == "mc":
+        # Only the top-level source of an ask_resolved may be a dashboard approval: never an input of inferred:,
+        # never reached through a wal: pointer, so it cannot ground a requirement or another decision.
+        if not ctx.get("allow_mc") or depth:
+            raise Problem("mc-not-allowed", "an mc: source may only close the ask it names (ask_resolved); it is not a user turn")
+        turn = mc_turn(parsed["session"], parsed["ident"], home)
+        reason = excerpt_in(turn["text"], parsed["excerpt"])
+        if reason:
+            raise Problem("excerpt-not-found", reason)
+        evidence = turn["evidence"]
+        node = {"kind": "mc", "session": parsed["session"], "uuid": parsed["ident"], "timestamp": turn["timestamp"],
+                "status": "verified", "trust": MC_TRUST, "ask": evidence["ask_id"], "decision": evidence["decision"],
+                "digest": evidence["digest"], "excerpt": parsed["excerpt"]}
+        if ctx.get("want_text"):
+            node["text"] = turn["text"]
+        result["chain"].append(node)
+        result["origin"], result["ok"], result["backed"] = "dashboard", True, True
     elif kind == "pasted":
         turn = pasted_turn(parsed["session"], parsed["uuid"], home)
         reason = excerpt_in(turn["text"], parsed["excerpt"])
@@ -1077,8 +1348,9 @@ def _resolve(source, ctx, depth, seen, result):
                            else problem.message)
                 result["problems"].append({"code": problem.code, "message": f"inferred input `{clip(item, 60)}` {message}"})
                 continue
-            if item_kind == "inferred":
-                result["problems"].append({"code": "inferred-nested", "message": "inferred inputs must be user/ticket/file/wal sources"})
+            if item_kind in ("inferred", "mc"):
+                result["problems"].append({"code": "inferred-nested" if item_kind == "inferred" else "mc-not-allowed",
+                                           "message": "inferred inputs must be user/ticket/file/wal sources"})
                 continue
             sub = resolve(item, ctx, depth + 1, seen)
             result["inputs"].append(sub)
@@ -1107,6 +1379,11 @@ def render(result: dict, indent: str = "  ") -> list:
         lines.append(f"{indent}  ! {problem['code']}: {problem['message']}")
     for node in result["chain"]:
         kind = node["kind"]
+        if kind == "mc":
+            lines.append(f"{indent}  dashboard decision {node['uuid']} in session {node['session']} at {node.get('timestamp')}: "
+                         f"{node.get('decision')} ask {node.get('ask')} (digest {str(node.get('digest'))[:16]})")
+            lines.append(f"{indent}  trust [mc]: {node['trust']}")
+            lines.append(f"{indent}  excerpt: \"{clip(node['excerpt'], 200)}\"")
         if kind == "user":
             lines.append(f"{indent}  user turn {node['uuid']} in session {node['session']} at {node.get('timestamp')}")
             if node.get("trust"):
@@ -1257,46 +1534,106 @@ def packet_gate(text: str, mode=None, ctx=None):
 
 # --------------------------------------------------------------------------- asks ledger
 
-def session_wals(session: str, home=None) -> list:
+READ_SCHEMA = "harness.read/1"
+
+
+def read_block(read_ok: int, unread: list, skipped: int = 0, limited: bool = False, window: "LostWindow | None" = None) -> dict:
+    """What a read-only view actually read, for a consumer that must not take "nothing found" for "nothing there"
+    (goodqa#15920). state: "failed" when no source could be read, "partial" when a source was unread, a matching line
+    could not be parsed or a cap or time budget stopped the read, else "ok". `unread` names each source and why."""
+    window = window if window is not None else LostWindow()
+    skipped = int(skipped) + window.inside   # lost lines inside the window are skipped lines like any other
+    state = "failed" if read_ok <= 0 else "partial" if (unread or skipped or limited) else "ok"
+    return {"schema": READ_SCHEMA, "state": state, "sources_read": max(0, read_ok), "unread_total": len(unread),
+            "unread": [unread_entry(u) for u in unread[:50]],
+            "skipped": skipped, "limited": bool(limited), **window.fields()}
+
+
+def session_wals_read(session: str, home=None) -> tuple:
+    """(paths, unread): the session's main and agent WALs, and why the folder or its main WAL could not be listed. A
+    folder that is missing or cannot be listed is an unread source, never an empty session."""
     if not SESSION_RE.match(session):
         raise Problem("user-session-invalid", "bad session id")
     folder = wals_root(home) / session
     try:
-        return sorted(p for p in folder.glob("*.jsonl") if p.name == "main.jsonl" or p.name.startswith("agent-"))
-    except OSError:
-        return []
+        with os.scandir(folder) as entries:
+            names = sorted(e.name for e in entries if e.name == "main.jsonl" or (e.name.startswith("agent-") and e.name.endswith(".jsonl")))
+    except FileNotFoundError:
+        return [], [{"source": "session WAL folder", "reason": "missing: no WAL folder for this session"}]
+    except OSError as error:
+        return [], [{"source": "session WAL folder", "reason": f"file-unreadable: cannot list it ({type(error).__name__})"}]
+    unread = [] if "main.jsonl" in names else [{"source": "main.jsonl", "reason": "missing: no main WAL for this session"}]
+    return [folder / name for name in names], unread
+
+
+def session_wals(session: str, home=None) -> list:
+    return session_wals_read(session, home)[0]
 
 
 def ledger(session: str, home=None) -> list:
     """Asks and their resolutions across the main and agent WALs of a session."""
+    return ledger_read(session, home)[0]
+
+
+def ledger_read(session: str, home=None) -> tuple:
+    """(records, read): the ledger, and what was actually read for it (read_block). One unreadable WAL does not hide
+    the other WALs' asks, but it is named in `read`, so a reader never takes the rest for the whole ledger."""
     asks, closed = {}, {}
-    for path in session_wals(session, home):
-        for needle in (b'"event":"ask"', b'"event":"ask_resolved"'):
+    paths, unread = session_wals_read(session, home)
+    read_ok, skipped, limited = 0, 0, False
+    for path in paths:
+        failed = None
+        # PR 234 v8: the needle is the JSON string value alone, so `"event": "ask"` (spaced) is read as well as the
+        # compact form; the parsed record decides. Every line that names an ask and is not used is counted.
+        for needle in (b'"ask"', b'"ask_resolved"'):
+            hits = 0
             try:
-                for line in _lines_containing(path, needle):
+                for line, in_progress in _lines_containing(path, needle, LEDGER_MAX_HITS, tails=True):
+                    hits += 1
                     if line is None:
+                        skipped += 1  # an oversized line that names an ask: its ask is not in the result
                         continue
                     try:
                         record = loads_line(line)
                     except ValueError:
+                        if not in_progress:   # receipt v7 F4: a last line still being written is not a lost ask
+                            skipped += 1
                         continue
-                    if not isinstance(record, dict):
+                    if wal_record_problem(record):
+                        skipped += 1  # a line that names an ask but is not a record (receipt v10 F2: one validator)
                         continue
-                    if record.get("event") == "ask" and isinstance(record.get("id"), str):
-                        record["at"] = str(record.get("at") or "")
-                        record["_wal"] = path
-                        asks[record["id"]] = record
-                    elif record.get("event") == "ask_resolved" and isinstance(record.get("ref"), str):
-                        closed[record["ref"]] = record
-            except Exception:  # one unreadable WAL must not hide every other ask
-                continue
+                    event = record.get("event")
+                    if event == "ask" and needle == b'"ask"':
+                        if isinstance(record.get("id"), str):
+                            record["at"] = str(record.get("at") or "")
+                            record["_wal"] = path
+                            asks[record["id"]] = record
+                        else:
+                            skipped += 1  # an ask with no id cannot be listed
+                    elif event == "ask_resolved" and needle == b'"ask_resolved"':
+                        if isinstance(record.get("ref"), str):
+                            closed[record["ref"]] = record
+                        else:
+                            skipped += 1  # a resolution with no ref closes nothing we can name
+            except Problem as problem:  # one unreadable WAL must not hide every other ask; it is reported as unread
+                failed = f"{problem.code}: {problem.message}"
+            except Exception as error:  # noqa: BLE001
+                failed = f"file-unreadable: {type(error).__name__}"
+            limited = limited or hits >= LEDGER_MAX_HITS
+        if failed:
+            unread.append({"source": path.name, "reason": failed})
+        else:
+            read_ok += 1
     for ident, record in asks.items():
         record["_closed"] = closed.get(ident)
-    return sorted(asks.values(), key=lambda r: r["at"])
+    if any(u["source"] in ("main.jsonl", "session WAL folder") for u in unread):
+        read_ok = 0  # without the main WAL the session's ledger was not read
+    return sorted(asks.values(), key=lambda r: r["at"]), read_block(read_ok, unread, skipped, limited)
 
 
-def render_asks(session: str, home=None, ctx=None) -> tuple:
-    entries = ledger(session, home)
+def classify_asks(session: str, home=None, ctx=None, entries=None) -> tuple:
+    """Open asks split by how well their source resolves: (traced, assumptions, unverified, blocked, closed count)."""
+    entries = ledger(session, home) if entries is None else entries
     ctx = dict(ctx or {}, home=home, want_text=True)
     traced, assumptions, blocked, unverified, closed = [], [], [], [], 0
     for record in entries:
@@ -1314,6 +1651,61 @@ def render_asks(session: str, home=None, ctx=None) -> tuple:
             unverified.append(row)
         else:
             traced.append(row)
+    return traced, assumptions, unverified, blocked, closed
+
+
+def ask_items(session: str, home=None, ctx=None) -> dict:
+    """The open asks a person may be shown, as data (Mission Control's "Needs you" list).
+
+    Blocked asks (no resolvable source) are left out, exactly as the text ledger says not to present them."""
+    entries, read = ledger_read(session, home)
+    traced, assumptions, unverified, blocked, closed = classify_asks(session, home, ctx, entries)
+    items = []
+    for kind, rows in (("traced", traced), ("unverified", unverified), ("assumption", assumptions)):
+        for record, result in rows:
+            items.append({"id": record["id"], "kind": kind, "at": record.get("at", ""),
+                          "note": str(record.get("note", ""))[:4000], "reason": str(record.get("reason", ""))[:2000],
+                          "owner": record["_wal"].stem, "source_label": result["label"] if result else "",
+                          **({"until": str(record["until"])[:40]} if record.get("until") else {})})
+    items.sort(key=lambda item: item["at"])
+    # Blocked asks are never presented as asks; a reader that wants to FLAG them (the Needs-you sweeper) gets them
+    # apart, each with the reason its source does not resolve.
+    flagged = []
+    for record, result in blocked:
+        problem = result["problems"][0] if result and result["problems"] else {"code": "no-source", "message": "the ask has no source"}
+        flagged.append({"id": record["id"], "at": record.get("at", ""), "note": str(record.get("note", ""))[:4000],
+                        "reason": str(record.get("reason", ""))[:2000], "owner": record["_wal"].stem,
+                        "problem": f"{problem['code']}: {clip(problem['message'], 200)}"})
+    return {"counts": {"traced": len(traced), "unverified": len(unverified), "assumptions": len(assumptions),
+                       "blocked": len(blocked), "closed": closed}, "items": items, "blocked": flagged,
+            "resolved": resolved_items(session, home, entries=entries), "read": read}
+
+
+def resolved_items(session: str, home=None, days: float = 7.0, limit: int = 100, entries=None) -> list:
+    """Asks resolved in the last `days`, newest first: the page's "Answered" history. Text is raw (the reader
+    redacts, then clips)."""
+    cutoff = time.time() - days * 86400
+    rows = []
+    for record in ledger(session, home) if entries is None else entries:
+        done = record.get("_closed")
+        if not isinstance(done, dict):
+            continue
+        when = str(done.get("at") or "")
+        try:
+            stamp = datetime.datetime.fromisoformat(when.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+        if stamp < cutoff:
+            continue
+        rows.append({"id": record["id"], "at": record.get("at", ""), "note": str(record.get("note", ""))[:4000],
+                     "owner": record["_wal"].stem, "resolved_at": when, "resolved_by": str(done.get("id", ""))[:40],
+                     "resolution": str(done.get("note", ""))[:2000], "decision": str(done.get("decision", ""))[:40]})
+    rows.sort(key=lambda row: row["resolved_at"], reverse=True)
+    return rows[:limit]
+
+
+def render_asks(session: str, home=None, ctx=None) -> tuple:
+    traced, assumptions, unverified, blocked, closed = classify_asks(session, home, ctx)
     lines = [f"Asks ledger for session {session}: {len(traced)} traceable, {len(assumptions)} assumptions, {len(unverified)} unverified citations, "
              f"{len(blocked)} blocked, {closed} resolved"]
 
@@ -1400,6 +1792,7 @@ def build_parser():
     asks = sub.add_parser("asks", help="list the session's open asks with citations")
     asks.add_argument("--session", required=True)
     asks.add_argument("--json", action="store_true")
+    asks.add_argument("--items", action="store_true", help="with --json: also list the presentable open asks")
     return parser
 
 
@@ -1474,6 +1867,10 @@ def main(argv=None) -> int:
             store_ticket(found.group(1), int(found.group(2)), args.title, args.checked_by)
             print(f"cached {args.ref}")
             return 0
+        if args.command == "asks" and args.json and args.items:
+            data = ask_items(args.session)
+            print(json.dumps(data))
+            return 2 if data["counts"]["blocked"] else 0
         if args.command == "asks":
             text, counts = render_asks(args.session)
             print(json.dumps(counts) if args.json else text)

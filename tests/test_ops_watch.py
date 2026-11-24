@@ -511,6 +511,50 @@ class DriftTests(GitFixture):
         self.assertEqual(ow.check_drift(cfg, ow.run), [])
 
 
+class StaleRuntimeTests(Base):
+    """goodqa#15646 plan A: runtime sessions that outlived their binary are listed so restarts are scheduled."""
+
+    ROWS = [{"pid": 2990, "ppid": 761, "name": "claude", "started": 1794126395},
+            {"pid": 4010, "ppid": 1, "name": "codex", "started": 1794200000}]
+
+    def run_check(self, rows):
+        import native_context
+        with mock.patch.object(native_context, "stale_runtime_processes", return_value=rows):
+            return ow.check_stale_runtimes(self.cfg)
+
+    def test_nothing_stale_is_silent(self):
+        self.assertEqual(self.run_check([]), [])
+
+    def test_stale_runtimes_raise_one_warning_naming_pids_and_the_remedy(self):
+        alerts = self.run_check(self.ROWS)
+        self.assertEqual(len(alerts), 1)
+        alert = alerts[0]
+        self.assertEqual((alert["check"], alert["key"], alert["severity"]), ("runtime", "runtime:stale", "warning"))
+        for needle in ("claude pid 2990", "codex pid 4010", "restart"):
+            self.assertIn(needle, alert["message"])
+        self.assertEqual([row["pid"] for row in alert["detail"]["processes"]], [2990, 4010])
+
+    def test_message_and_detail_are_bounded_and_clean(self):
+        rows = [{"pid": 1000 + i, "ppid": 1, "name": "claude", "started": 1} for i in range(40)]
+        alert = self.run_check(rows)[0]
+        self.assertLessEqual(len(alert["message"]), 400)
+        self.assertEqual(len(alert["detail"]["processes"]), 10)
+        self.assertIn("40", alert["message"])
+
+    def test_a_scan_that_raises_is_silent_not_a_crash(self):
+        import native_context
+        with mock.patch.object(native_context, "stale_runtime_processes", side_effect=RuntimeError("boom")):
+            self.assertEqual(ow.check_stale_runtimes(self.cfg), [])
+
+    def test_the_check_is_registered_and_can_be_disabled(self):
+        self.assertIn("runtime", ow.DEFAULT_CHECKS)
+        import native_context
+        with mock.patch.object(native_context, "stale_runtime_processes", return_value=self.ROWS):
+            off = dict(self.cfg, stale_runtime={"enabled": False})
+            self.assertEqual(ow.DEFAULT_CHECKS["runtime"](off, {}, None, 0), [])
+            self.assertEqual(len(ow.DEFAULT_CHECKS["runtime"](self.cfg, {}, None, 0)), 1)
+
+
 class CodexTrustTests(Base):
     def write(self, trust_all=True, tamper=False):
         codex = self.home / ".codex"
@@ -1426,6 +1470,53 @@ class ProcessDeltaTests(Base):
             self.assertIn("mem:swap", a)
         finally:
             sys.platform = orig
+
+
+class DeadmanDeliveredTests(Base):
+    """goodqa#16034 v19 D19: `deadman_delivered` is the only delivery receipt. It is written only after the deadman
+    command succeeds (deadman_sent stays the queue and rate-limit marker), bounded to 500 keys, and readable through
+    the read-only `delivered` query."""
+
+    run_with = ReconcileAndRunTests.run_with
+    CRIT = {"check": "disk", "key": "disk:volume:/", "severity": "critical", "message": "98%", "detail": {}}
+
+    def test_receipt_written_only_after_a_successful_send(self):
+        _rcs, _posted, dead = self.run_with([[self.CRIT]], deadman_ok=False)
+        st = ow.load_state(self.home)
+        self.assertEqual(len(dead), 1)
+        self.assertIn("disk:volume:/", st.get("deadman_sent", {}), "queued and rate-limited")
+        self.assertNotIn("disk:volume:/", st.get("deadman_delivered", {}), "a failed send must not be a receipt")
+        _rcs, _posted, dead = self.run_with([[self.CRIT]], deadman_ok=True)   # the queued mail is retried
+        self.assertEqual(len(dead), 1)
+        self.assertIn("disk:volume:/", ow.load_state(self.home)["deadman_delivered"])
+
+    def test_receipt_map_is_bounded(self):
+        state = {"deadman_delivered": {"k%d" % i: float(i) for i in range(500)}}
+        ow.record_delivered(state, "new", 1000.0)
+        self.assertEqual(len(state["deadman_delivered"]), 500)
+        self.assertNotIn("k0", state["deadman_delivered"], "the oldest receipt is evicted first")
+        self.assertEqual(state["deadman_delivered"]["new"], 1000.0)
+
+    def query(self, key):
+        out = io.StringIO()
+        with mock.patch.object(ow.Path, "home", return_value=self.home), contextlib.redirect_stdout(out):
+            rc = ow.main(["delivered", "--key", key, "--json"])
+        return rc, json.loads(out.getvalue())
+
+    def test_delivered_query_hit_miss_and_malformed_state(self):
+        self.run_with([[self.CRIT]], deadman_ok=True)
+        rc, hit = self.query("disk:volume:/")
+        self.assertEqual(rc, 0)
+        self.assertEqual(hit["key"], "disk:volume:/")
+        self.assertIsInstance(hit["delivered_at"], float)
+        self.assertIsNone(self.query("never-sent")[1]["delivered_at"])
+        ow.state_path(self.home).write_bytes(b"{garbage" * 10)
+        rc, bad = self.query("disk:volume:/")
+        self.assertEqual(rc, 0)
+        self.assertIsNone(bad["delivered_at"], "malformed state is never a receipt")
+
+    def test_capability_is_listed(self):
+        self.assertIn("deadman-delivered", ow.capabilities())
 
 
 class ReadOnlyTests(unittest.TestCase):

@@ -54,6 +54,7 @@ func run(args []string, out io.Writer) error {
 	noOpen := flags.Bool("no-open", false, "Print the local URL without opening a browser")
 	listen := flags.String("listen", "127.0.0.1:0", "Loopback listener address")
 	dataDir := flags.String("data-dir", "", "New private directory for this unreleased baseline (required)")
+	capacityWake := flags.Bool("workspace-capacity-wake", false, "Allow one automatic continuation after verified local workspace capacity recovery (experimental)")
 	showVersion := flags.Bool("version", false, "Print version")
 	if err := flags.Parse(args); err != nil {
 		if err == flag.ErrHelp {
@@ -64,6 +65,9 @@ func run(args []string, out io.Writer) error {
 	if *showVersion {
 		fmt.Fprintln(out, "Agent Harness Console", version)
 		return nil
+	}
+	if *capacityWake && !workspaceCapacitySupported() {
+		return fmt.Errorf("workspace capacity wake is unsupported on this platform")
 	}
 	admitted, err := baselineDataDir(*dataDir, protectedRoot())
 	if err != nil {
@@ -92,6 +96,11 @@ func run(args []string, out io.Writer) error {
 		if err = settingsInit(a); err != nil {
 			return err
 		}
+	}
+	if *capacityWake {
+		a.workspaceWakeEnabled = true
+		a.workspaceWakeDone = make(chan struct{})
+		go a.watchWorkspaceCapacity(a.workspaceWakeDone)
 	}
 	listener, err := net.Listen("tcp4", *listen)
 	if err != nil {

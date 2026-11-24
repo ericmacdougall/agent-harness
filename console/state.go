@@ -116,6 +116,8 @@ type session struct {
 	Supervision         supervision    `json:"supervision"`
 	policy              resolvedPolicy
 	lastRequest         string
+	cwdInfo             os.FileInfo
+	workspaceWake       *workspaceWake
 	filters             map[string]streamRedactor
 	turnID              string
 	codexTurn           *codexTurnBinding
@@ -197,6 +199,10 @@ type app struct {
 	gitMu              sync.Mutex
 	reviews            []*session
 	origin             string
+
+	workspaceWakeEnabled bool
+	workspaceWakeDone    chan struct{}
+	workspaceProbe       func(string) (workspaceCapacitySample, error)
 }
 
 func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
@@ -360,7 +366,7 @@ func (a *app) state() map[string]any {
 		s["pendingInputs"] = a.inputStateLocked(current)
 		unresolved := current.abandoned == nil && requestUnresolved(current.requests[current.lastRequest])
 		s["unresolved"] = unresolved
-		s["canStop"] = unresolved && !current.Restored && (current.codex != nil || current.claude != nil)
+		s["canStop"] = !current.Restored && ((unresolved && (current.codex != nil || current.claude != nil)) || current.Supervision.State == waitingForCapacity)
 		s["canDiscard"] = canAbandonLocked(current)
 		s["discardRequestId"] = current.lastRequest
 		// The record decides, so a queue or lifecycle failure cannot make a discarded
@@ -415,6 +421,11 @@ func emptySession(provider, cwd, profile string) *session {
 }
 func (a *app) close() {
 	a.mu.Lock()
+	a.workspaceWakeEnabled = false
+	if a.workspaceWakeDone != nil {
+		close(a.workspaceWakeDone)
+		a.workspaceWakeDone = nil
+	}
 	clients := make([]*rpcClient, 0, len(a.clients))
 	for _, c := range a.clients {
 		clients = append(clients, c)

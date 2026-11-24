@@ -43,9 +43,13 @@ python3 ~/.codex/agent-harness/wal.py continuation --wal "$session_wal" active
 python3 ~/.codex/agent-harness/wal.py continuation --wal "$session_wal" status
 ```
 
-With trusted hooks, Stop can request one automatic continuation per session when the checkpoint is active. It keeps the checkpoint visible after that allowance is spent. This helps catch an early final reply while a test or worker is still running. It requires explicit tracking and does not supervise detached jobs. See [checkpoint and handoff rules](codex/skills/agent-harness/references/delivery.md).
+With trusted hooks, Stop can request one automatic continuation per session by default when the checkpoint is active. For authorized autonomous work, add `--max-continuations 4` to the `active` command before the first pass. The checkpoint remains visible after its passes run out. This helps catch an early final reply while a test or worker is still running. An idle chat requires a separate wake. [Checkpoint and handoff rules](codex/skills/agent-harness/references/delivery.md)
 
 ## Capabilities by edition
+
+For existing workstation and SSH worker installations, the [repair command](docs/harness-repair.md)
+previews both hosts, applies a reviewed merged revision and verifies the installed files.
+
 
 | | Claude Code | Codex |
 | --- | --- | --- |
@@ -131,6 +135,7 @@ Verified against this repository on 2026-11-08 (main at `2eca3c5`). "Shipped" me
 - Optional log backup and netwatch installs, and the Harness TUI plugin ([docs/tui-plugin.md](docs/tui-plugin.md)).
 
 **In progress**
+- Mission Control, the local realtime fleet dashboard (`goodqa#15585`; [docs/mission-control.md](docs/mission-control.md)).
 - Console durable event-log rebuild (`GoodQA #35692`). The console on `main` is an unreleased baseline with three tests skipped by name until the rebuild lands ([console/README.md](console/README.md)).
 - Log-backup bulk lane and heavy-work guards (`goodqa#15062`, `goodqa#15147`, `goodqa#14817`; see the Unreleased section of [CHANGELOG.md](CHANGELOG.md)).
 

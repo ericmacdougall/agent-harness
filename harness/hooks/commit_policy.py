@@ -31,16 +31,21 @@ import subprocess
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))  # sibling imports also work for isolated-mode installed helper invocations
+from native_context import OriginObservation, probe_commit_runtime_origin  # noqa: E402
+
 POLICY_FILE = HERE / "commit_policy.json"
 LOCAL_PROFILE_NAME = "commit_policy.local.json"
 LEDGER = Path.home() / ".agent-harness" / "commit-policy" / "waivers.jsonl"
 SECTION_NAMES = ("Why", "What", "Testing", "Refs", "Risk", "Reason", "Authorized-by")
 SECTION_LINE = re.compile(r"^(Why|What|Testing|Refs|Risk|Reason|Authorized-by)\s*:\s?(.*)$", re.I)
-TRAILER_LINE = re.compile(r"^(?:[A-Za-z][A-Za-z0-9]*-)+[Bb]y:\s+\S|^(?:Change-Id|Reviewed-on|Cc|Fixes|Closes|Co-authored-by):\s+\S", re.I)
+TRAILER_LINE = re.compile(r"^(?:[A-Za-z][A-Za-z0-9]*-)+[Bb]y:\s+\S|^(?:Change-Id|Reviewed-on|Cc|Fixes|Closes|Co-authored-by):\s+\S"
+                          r"|^(?-i:Claude-Session):[ \t]+https://claude\.ai/code/session_[A-Za-z0-9_-]+[ \t]*$", re.I)
 SUBJECT = re.compile(r"^(?P<type>[A-Za-z]+)(?:\((?P<scope>[^()]*)\))?(?P<bang>!)?: (?P<summary>.*)$")
 PR_REF = re.compile(r"\bPR\s*#[1-9]\d*\b|\b[\w.-]+/[\w.-]+#[1-9]\d*\b|https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
 NONE_REF = re.compile(r"^none\s*\((?P<reason>.+)\)\s*\.?$", re.I | re.S)
@@ -205,9 +210,16 @@ def parse_message(message: str):
             current = []
     if current:
         paragraphs.append(current)
-    trailers = []
+    trailers, unrecognised = [], []
     if paragraphs and all(TRAILER_LINE.match(line) and not SECTION_LINE.match(line) for line in paragraphs[-1]):
         trailers = paragraphs.pop()
+        # published commits put Claude-Session in its own paragraph before Co-Authored-By: a paragraph made only
+        # of trailer lines directly before the trailer block belongs to it (goodqa#16106)
+        while paragraphs and all(TRAILER_LINE.match(line) and not SECTION_LINE.match(line) for line in paragraphs[-1]):
+            trailers = paragraphs.pop() + trailers
+    elif paragraphs and any(TRAILER_LINE.match(line) and not SECTION_LINE.match(line) for line in paragraphs[-1]):
+        # a mixed final paragraph is not a trailer block: name the lines that are not trailers (goodqa#16106)
+        unrecognised = [line for line in paragraphs[-1] if not TRAILER_LINE.match(line) or SECTION_LINE.match(line)]
     sections, order, stray = {}, [], []
     name = None
     for paragraph in paragraphs:
@@ -225,7 +237,7 @@ def parse_message(message: str):
     joined = {key: "\n".join(value).strip() for key, value in sections.items()}
     misplaced = [line for paragraph in paragraphs for line in paragraph
                  if TRAILER_LINE.match(line) and not SECTION_LINE.match(line)]
-    return subject, (lines[1] if len(lines) > 1 else None), joined, order, stray, trailers, misplaced
+    return subject, (lines[1] if len(lines) > 1 else None), joined, order, stray, trailers, misplaced, unrecognised
 
 
 def tickets_required_for(origin: str | None, policy: dict) -> bool:
@@ -353,14 +365,24 @@ def ledger_checker(policy: dict, context, as_of_ms: int):
 
 # goodqa#15253 B1: which harness a commit is made from. Delta red-team D-F1: not where this file is installed,
 # because both the ~/.claude and the ~/.codex commit-msg hooks run on every commit, so an install-path rule made each
-# copy refuse the other harness's trailer. The committing process's own markers decide; with neither or both, or
-# only the ambiguous AI_AGENT, the check does not apply.
+# copy refuse the other harness's trailer. Legacy/history callers retain marker-only behavior.
+# Current-message entry points pass explicit runtime attribution; no ambient mode reinterprets history.
 HARNESS_OVERRIDE = None  # tests set 'claude', 'openai' or '' (unknown)
 CLAUDE_MARKERS = ("CLAUDECODE",)
 CODEX_MARKERS = ("CODEX_THREAD_ID", "CODEX_TOOL_CALL_ID", "CODEX_SANDBOX")
 
 
-def commit_harness(env=None):
+@dataclass(frozen=True)
+class CommitAttribution:
+    harness: str | None
+    evidence: str
+    reason: str
+    blocked: bool = False
+
+
+def commit_harness(env=None, *, attribution=None):
+    if attribution is not None:
+        return attribution.harness
     if HARNESS_OVERRIDE is not None:
         return HARNESS_OVERRIDE or None
     env = os.environ if env is None else env
@@ -369,6 +391,49 @@ def commit_harness(env=None):
     if claude == codex:
         return None
     return "claude" if claude else "openai"
+
+
+def current_commit_attribution():
+    """Origin of this current message only; never a main, approval or human identity.
+
+    Called explicitly by current-commit entry points, not validate/history by default.
+    There is no payload, environment or CLI switch that supplies runtime evidence.
+    """
+    try:
+        origin = probe_commit_runtime_origin()
+    except Exception:
+        return CommitAttribution(None, "unknown", "runtime probe unavailable", True)
+    if not isinstance(origin, OriginObservation):
+        return CommitAttribution(None, "unknown", "runtime evidence malformed", True)
+    if origin.origin == "openai" and origin.native_lineage and origin.reason == "running_code_verified":
+        if any(os.environ.get(name) for name in CLAUDE_MARKERS) and any(os.environ.get(name) for name in CODEX_MARKERS):
+            return CommitAttribution(None, "unknown", "mixed harness markers", True)
+        return CommitAttribution("openai", "verified_runtime_origin", "running OpenAI identity")
+    if origin.origin == "claude" and origin.native_lineage is False and origin.reason == "running_claude_code_verified":
+        if any(os.environ.get(name) for name in CODEX_MARKERS):
+            return CommitAttribution(None, "unknown", "Codex marker conflicts with running Anthropic identity", True)
+        return CommitAttribution("claude", "verified_runtime_origin", "running Anthropic identity")
+    if (origin.origin != "unknown" or origin.native_lineage
+            or origin.reason not in {"unsupported_platform", "no_native_runtime"}):
+        return CommitAttribution(None, "unknown", _uncertain_reason(origin), True)
+    return CommitAttribution(commit_harness(), "legacy_marker", "no new runtime evidence")
+
+
+# Named probe failures (goodqa#15646): same refusal, but the text says which process and what to do.
+UNCERTAIN_REMEDY = {
+    "ancestor_binary_replaced": "its runtime binary was replaced by an update; restart the session that owns it, then retry",
+    "ancestor_unreadable": "that ancestor belongs to another user or cannot be read; commit from the session's own shell",
+    "signature_refused": "the OS refused to verify that process's code signature; restart the session that owns it, then retry",
+}
+
+
+def _uncertain_reason(origin):
+    reason, pid = getattr(origin, "reason", None), getattr(origin, "failed_pid", None)
+    if reason not in UNCERTAIN_REMEDY or type(pid) is not int or not 1 < pid < 2 ** 31:
+        return "native runtime attribution uncertain"
+    name = re.sub(r"[^A-Za-z0-9._-]", "", str(getattr(origin, "failed_name", "")))[:32]
+    return "native runtime attribution uncertain: %s (pid %d%s); %s" % (
+        reason, pid, " " + name if name else "", UNCERTAIN_REMEDY[reason])
 
 
 def trailer_harness(line: str):
@@ -383,7 +448,7 @@ def trailer_harness(line: str):
 
 def validate(message: str, *, policy: dict, previous: str | None = None, is_merge: bool = False,
              allow_autosquash: bool = False, strip_comments: bool = False,
-             tickets_required: bool = True, ledger=None) -> list:
+             tickets_required: bool = True, ledger=None, attribution: CommitAttribution | None = None) -> list:
     """Return a list of human-readable violations (empty means compliant).
 
     tickets_required is False for repos no ticket system tracks: Refs must still
@@ -406,7 +471,7 @@ def validate(message: str, *, policy: dict, previous: str | None = None, is_merg
             "squash them (git rebase -i --autosquash) before publication"]
     rules, body_rules, ref_rules = policy["subject"], policy["body"], policy["refs"]
     problems = []
-    subject, separator, sections, order, stray, trailers, misplaced = parse_message(text)
+    subject, separator, sections, order, stray, trailers, misplaced, unrecognised = parse_message(text)
     match = SUBJECT.match(subject)
     kind = None
     if not match:
@@ -525,13 +590,20 @@ def validate(message: str, *, policy: dict, previous: str | None = None, is_merg
                 problems.append("revert: Authorized-by must cite the ticket where the authorization is recorded, "
                                 "e.g. 'Authorized-by: Eric, GoodQA #14151'")
     if misplaced:
-        problems.append("trailers: move Co-Authored-By/Signed-off-by lines to a final paragraph after a blank line")
-    harness = commit_harness()
-    if harness:
-        named = {trailer_harness(line) for line in trailers if re.match(r"(?i)\s*co-authored-by\s*:", line)} - {None}
-        if named - {harness}:
-            problems.append("trailers: Co-Authored-By names %s, but this commit is made from the %s harness; the "
-                            "author trailer is review evidence (goodqa#15253)" % (", ".join(sorted(named - {harness})), harness))
+        detail = ""
+        if unrecognised:
+            shown = "; ".join(repr(line if len(line) <= 80 else line[:77] + "...") for line in unrecognised[:3])
+            detail = (f" (the final paragraph also holds line(s) not recognised as trailers: {shown}; "
+                      "Claude-Session must be https://claude.ai/code/session_<id>)")
+        problems.append("trailers: move Co-Authored-By/Signed-off-by lines to a final paragraph after a blank line" + detail)
+    named = {trailer_harness(line) for line in trailers if re.match(r"(?i)\s*co-authored-by\s*:", line)} - {None}
+    if named and attribution is not None and attribution.blocked:
+        problems.append("trailers: cannot establish the current committing harness (" + attribution.reason +
+                        "); refusing uncertain native attribution")
+    harness = commit_harness(attribution=attribution)
+    if harness and named - {harness}:
+        problems.append("trailers: Co-Authored-By names %s, but this commit is made from the %s harness; the "
+                        "author trailer is review evidence (goodqa#15253)" % (", ".join(sorted(named - {harness})), harness))
     if previous is not None and normalize(previous) == text:
         problems.append("message: identical to the previous commit; describe this change specifically")
     return problems
@@ -1503,6 +1575,8 @@ def block_text(problems, message, policy, *, wal=None, kind="message", subject=N
 
 def run_hook(payload: dict, policy: dict) -> tuple:
     """Return (exit_code, stderr_text)."""
+    if is_edit_tool(payload):
+        return 0, ""
     if policy.get("enforcement") == "off":
         return 0, ""
     command = command_text(payload.get("tool_input"))
@@ -1549,7 +1623,7 @@ def run_hook(payload: dict, policy: dict) -> tuple:
                             is_merge=bool(facts and facts["merging"]),
                             allow_autosquash=bool(facts and not facts["published"]
                                                   and facts["branch"] not in ("main", "master", "")),
-                            tickets_required=required, ledger=ledger)
+                            tickets_required=required, ledger=ledger, attribution=current_commit_attribution())
         if problems:
             subject = digest(message)
             if session_dir is not None and find_waiver("message", subject, policy, session_dir=session_dir):
@@ -1600,6 +1674,12 @@ def _check_pr_create(target, policy, session_dir):
 PREFILTER_ACTION = re.compile(r"\b(?:commit|commit-tree|revert|merge)\b|\bpr\s+create\b")
 SHELL_TOOLS = {"bash", "shell", "local_shell", "exec_command", "unified_exec", "write_stdin", "container.exec",
                "powershell"}
+EDIT_TOOLS = frozenset({"apply_patch", "write", "edit", "multiedit", "notebookedit"})
+
+
+def is_edit_tool(payload) -> bool:
+    """Only exact known edit operations carry file data, including under a command key."""
+    return str(payload.get("tool_name") or payload.get("toolName") or "").casefold() in EDIT_TOOLS
 
 
 def shell_like(payload) -> bool:
@@ -1610,6 +1690,8 @@ def shell_like(payload) -> bool:
 
 def may_commit(payload) -> bool:
     """Cheap test run before the policy file is even loaded."""
+    if is_edit_tool(payload):
+        return False
     command = command_text(payload.get("tool_input"))
     if not command:
         raw = json.dumps(payload.get("tool_input"), ensure_ascii=False) if payload.get("tool_input") else ""
@@ -1661,7 +1743,8 @@ def run_git_hook(path: str, policy: dict) -> tuple:
                         is_merge=facts["merging"],
                         allow_autosquash=not facts["published"] and facts["branch"] not in ("main", "master", ""),
                         tickets_required=ticket_context["tracked"],
-                        ledger=ledger_checker(policy, ticket_context, int(time.time() * 1000)))
+                        ledger=ledger_checker(policy, ticket_context, int(time.time() * 1000)),
+                        attribution=current_commit_attribution())
     if not problems or find_waiver("message", digest(message), policy):
         return 0, ""
     text = block_text(problems, message, policy, subject=digest(message))
@@ -1705,6 +1788,14 @@ def check_range(repo, base, head, policy, *, branch=None, pr=None, verify_ticket
     if policy.get("enforcement") == "off":
         return {"base": base, "head": head, "exclude": list(exclude), "commits": [], "tickets": [],
                 "waivers": [], "status": "PASS", "enforcement": "off"}
+    # A tickets waiver names a full commit SHA (`waive` refuses anything else), while callers may pass a symbolic
+    # head (peer_review passes "HEAD"). Resolve the name ONCE, before the range is read, and use that commit for
+    # the range, the waiver lookup and the report: a ref that moves during the check can then never pair one
+    # commit's waiver with another commit's range (goodqa#16442). A name that does not resolve is left as given
+    # and fails in range_commits as before.
+    resolved = git(repo, "rev-parse", "-q", "--verify", f"{head}^{{commit}}", check=False).strip()
+    if re.fullmatch(r"[0-9a-f]{40}", resolved):
+        head = resolved
     commits = range_commits(repo, base, head, exclude)
     ticket_context = repo_ticket_context(repo, policy, push_url=push_url)
     previous = git(repo, "log", "-1", "--format=%B", base, check=False) or None
@@ -2116,9 +2207,11 @@ def main(argv=None) -> int:
                 return 2
             sys.path.insert(0, str(HERE))
             problems = validate(message, policy=policy, previous=previous, tickets_required=ticket_context["tracked"],
-                                ledger=ledger_checker(policy, ticket_context, int(time.time() * 1000)))
+                                ledger=ledger_checker(policy, ticket_context, int(time.time() * 1000)),
+                                attribution=current_commit_attribution() if agent_environment() else None)
         else:
-            problems = validate(message, policy=policy, previous=previous)
+            problems = validate(message, policy=policy, previous=previous,
+                                attribution=current_commit_attribution() if agent_environment() else None)
         print(json.dumps({"status": "BLOCKED" if problems else "PASS", "problems": problems,
                           "digest": digest(message)}, indent=1))
         return 2 if problems else 0

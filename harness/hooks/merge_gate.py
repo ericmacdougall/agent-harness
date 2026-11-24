@@ -36,6 +36,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -71,7 +72,12 @@ MAX_GH_OUTPUT = 4 * 1024 * 1024
 MAX_STATE_BYTES = 8 * 1024 * 1024
 MAX_REASONS = 20
 WAIVER_TTL_SECONDS = 24 * 3600
-STAMP_TTL_SECONDS = 600
+# The waive stamp is minted in PreToolUse, before the command runs. The hook refuses to mint for anything the shell
+# could run differently (see _stamp_waive), but it cannot see what happens after it allows the command: the user can
+# deny the permission prompt, or a later PreToolUse hook can block it. Such a stamp stays unconsumed, and an identical
+# waive (same repo, PR, head and ticket) run by another route within this TTL is recorded as hook-approved. That is
+# a provenance error bounded to this TTL, not a merge bypass (goodqa#15684; authority itself is goodqa#15732).
+STAMP_TTL_SECONDS = 120
 WAIVER_FILE = "merge-gate-waivers.jsonl"
 WAIVER_HEAD_FILE = "merge-gate-waivers.head"
 AUDIT_FILE = "merge-gate-audit.jsonl"
@@ -113,6 +119,19 @@ GRAPHQL_MERGE = re.compile(r"mergePullRequest|enablePullRequestAutoMerge|enqueue
 REST_MERGE = re.compile(r"(?:repos/([^/\s'\"]+)/([^/\s'\"]+)/)?pulls/(\d+)/merge\b")
 CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 SHA = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+REPO_NAME = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
+def repo_key(value):
+    """The comparable identity of a GitHub owner/repo, or None. GitHub names are ASCII and case-insensitive
+    (GoodQA #15565), so only A-Z fold; str.lower()/casefold() would map KELVIN SIGN to 'k' or SHARP S to 'ss'
+    and let a different name compare equal, so any non-ASCII or malformed value has no identity at all."""
+    if not isinstance(value, str) or not REPO_NAME.fullmatch(value):
+        return None
+    return value.translate(ASCII_LOWER)
+
+
 VALUE_FLAGS = {"-R", "--repo", "--match-head-commit", "-b", "--body", "-F", "--body-file", "-t", "--subject",
                "-A", "--author-email", "-X", "--method", "-H", "--header", "-f", "--raw-field", "--field", "-q",
                "--jq", "--input", "--hostname", "--cache", "-p", "--preview", "--template"}
@@ -548,6 +567,16 @@ def _literal_args(args):
     return True
 
 
+def _inert_merge_arguments(words):
+    """Only existing literal inert heads, never gh/git/python authority forms."""
+    if any(re.fullmatch(r"[;&|()<>]+", word) for word in words):
+        return False  # shlex can group `);`: a later command remains in this segment
+    i = 0
+    while i < len(words) and (words[i] in KEYWORDS or ANY_ASSIGN.match(words[i])):
+        i += 1
+    return (i < len(words) and words[i] in FREE_TEXT_COMMANDS and _free_text(words))
+
+
 def _unquoted_expansion(text):
     """True when the raw command has a $, glob or brace character outside quotes: its expansion is split into words
     that the hook cannot see (delta review N1; main's closure check: {--output=/f,--oneline} is brace expansion)."""
@@ -831,6 +860,7 @@ def find_merges(command, cwd=None, _depth=0, _ctx=None):
     n = len(tokens)
     base = [os.path.basename(t) for t in tokens]
     assigns = _literal_assignments(tokens)
+    risky_environment = any(ENV_RISKY.match(t) for t in tokens)
     if any(b in ("cd", "pushd", "popd", "chdir", "ssh", "docker", "podman", "kubectl", "su", "tmux", "-C", "--chdir")
            for b in base) or any(t.startswith(("GH_REPO=", "GH_HOST=", "--chdir=")) for t in tokens):
         ctx["implicit_ok"] = False
@@ -847,7 +877,21 @@ def find_merges(command, cwd=None, _depth=0, _ctx=None):
     for index, (a, b, sep) in enumerate(segments):
         seg = tokens[a:b]
         handled, seen_xargs = False, False
-        for i in range(a, b):
+        inert = not risky_environment and _inert_merge_arguments(seg)
+        if inert:
+            # A path operand named gh is not an executable. Substitutions still
+            # execute before the inert command, and executor pipelines keep the
+            # existing raw-text analysis below.
+            for token in seg:
+                for inner in _substitutions(token):
+                    found.extend(find_merges(inner, cwd, _depth + 1, ctx))
+            nxt = words[index + 1] if index + 1 < len(segments) else ""
+            next_seg = tokens[segments[index + 1][0]:segments[index + 1][1]] if index + 1 < len(segments) else []
+            consumer = nxt in EXEC_CONSUMERS or bool(INTERPRETERS.match(nxt)) or (
+                nxt == "xargs" and any(os.path.basename(t) in SHELLS or t in ("eval", "gh") for t in next_seg))
+            if not (sep in ("|", "|&") and consumer):
+                continue
+        for i in (() if inert else range(a, b)):
             name = base[i]
             if name == "xargs":
                 seen_xargs = True
@@ -1360,7 +1404,9 @@ def evaluate_pr(client, slug, number, target=None):
     if not m:
         raise GateError("the pull request URL is unreadable")
     real_slug, real_number = m.group(1) + "/" + m.group(2), int(m.group(3))
-    if slug and slug.lower() != real_slug.lower():
+    if repo_key(real_slug) is None:
+        raise GateError("the pull request repository name is unreadable")
+    if slug and repo_key(slug) != repo_key(real_slug):
         raise GateError("the pull request belongs to " + clean(real_slug) + ", not " + clean(slug))
     if number and int(number) != real_number:
         raise GateError("the pull request number differs from the target")
@@ -1582,7 +1628,8 @@ def _active(records, repo, pr, head, now, review_ok=True):
     for r in records:
         if not review_ok and r.get("approval_source") == "settled-review":
             continue  # #134 red-team P1/B1: a review authorization never passes a failing, pending or missing check
-        if (r.get("event") == "waive" and r.get("id") not in used and str(r.get("repo", "")).lower() == repo.lower()
+        if (r.get("event") == "waive" and r.get("id") not in used and repo_key(repo) is not None
+                and repo_key(r.get("repo")) == repo_key(repo)
                 and r.get("pr") == pr and r.get("head") == head and now < float(r.get("ts", 0)) + WAIVER_TTL_SECONDS):
             return r
     return None
@@ -1617,6 +1664,116 @@ def add_waiver(state_dir, repo, pr, head, ticket, reason, approved_by, source="a
     return record
 
 
+def pr_pass_evidence(evidence, *, with_base=False):
+    """The (repo, pr, head, report_sha256) binding of settled, independent, pure PR PASS evidence, or ValueError.
+    With with_base=True it is (repo, pr, head, report_sha256, snapshot_base), where snapshot_base is the reviewer's
+    validated snapshot base B_r (goodqa#16049 spec ahc-m1-v2g, main's ruling). A receipt without snapshot_base is
+    legacy and is refused there (ValueError naming LEGACY_NO_SNAPSHOT_BASE): absence never means "same as the
+    merge-base", and B_r is never inferred. The default 4-tuple path is unchanged and still accepts legacy receipts.
+
+    Pure: it reads only the evidence mapping a UsageStore.inspect() returned and writes nothing. It is the one
+    predicate for "this FINAL is a merge-eligible PR PASS", shared by add_review_waiver (main's merge gate) and the
+    ahc daemon (which never mints a waiver). Authority to merge is a separate fact; this only classifies evidence.
+    """
+    import usage_guard
+
+    if not isinstance(evidence, dict):
+        raise ValueError('merge authorization needs typed PR review FINAL evidence')
+    review = evidence.get('review')
+    if not isinstance(review, dict):
+        raise ValueError('merge authorization needs typed PR review FINAL evidence')
+    usage_guard.validate_review_metadata(review, result=evidence.get('result'))
+    usage = evidence.get('usage') if isinstance(evidence.get('usage'), dict) else {}
+    reviewer = review.get('reviewer', '')
+    reviewer_harness = review.get('reviewer_harness')
+    expected_prefix = {'openai': 'Codex ', 'claude': 'Claude '}.get(reviewer_harness)
+    invocation = evidence.get('invocation') if isinstance(evidence.get('invocation'), dict) else {}
+    subject = evidence.get('subject') if isinstance(evidence.get('subject'), dict) else {}
+    if (evidence.get('review_finalization') != 'SETTLED'
+            or evidence.get('execution') != 'COMPLETED' or evidence.get('result') != 'CHECK_OK'
+            or evidence.get('reason') != 'NONE'
+            or invocation.get('purpose') != 'peer-review-pr'
+            or review.get('stage') != 'PR' or review.get('verdict') != 'ACCEPT'
+            or review.get('findings') != [] or review.get('ticketed')
+            or not all(key in review for key in ('repo', 'pr', 'head', 'report_sha256'))
+            or subject.get('head') != review['head']
+            or review.get('author_harness') not in {'claude', 'openai'}
+            or reviewer_harness not in {'claude', 'openai'}
+            or reviewer_harness == review['author_harness']
+            or not expected_prefix or not isinstance(reviewer, str) or not reviewer.startswith(expected_prefix)
+            or type(usage.get('provider_launches')) is not int or usage['provider_launches'] < 1):
+        raise ValueError('FINAL is not settled independent pure PR PASS evidence')
+    if with_base:
+        if 'snapshot_base' not in review:
+            raise ValueError('LEGACY_NO_SNAPSHOT_BASE: PR PASS evidence has no snapshot base B_r')
+        return review['repo'], review['pr'], review['head'], review['report_sha256'], review['snapshot_base']
+    return review['repo'], review['pr'], review['head'], review['report_sha256']
+
+
+_SHA40 = re.compile(r'[0-9a-f]{40}')
+
+
+AHC_BASE_COMPARE = ('identical', 'ahead')
+
+
+def ahc_bound_pass(evidence, binding):
+    """H/B_r binding for an ahc item (goodqa#16049 spec ahc-m1-v2g2 R4, E2): the PR PASS must be for the reviewed
+    head H, carry the snapshot base B_r the reviewer diffed against, and B_r must be the current default-branch tip
+    B or an ancestor of it. Returns (repo, pr, H, B_r, report_sha256) or raises ValueError. Replaces the withdrawn
+    candidate-M binding (v2e): integration is now a fast-forward of the default branch from B to H.
+
+    `binding` is core's record plus fresh GitHub readbacks, supplied by the caller (freshness is the caller's guard,
+    T2): repo, pr, head (H), base (B, the default-branch tip now), pr_head (the PR head as read back), and two
+    compare readback records {base, head, status}, each naming the two commits GitHub compared:
+    - base_compare, the compare B_r...B: base must be B_r (the receipt's snapshot base) and head must be B; status
+      'identical' exactly when B_r == B, otherwise 'ahead' (B is a proper descendant of B_r);
+    - head_compare, the compare B...H: base must be B and head must be H; status 'ahead' (H is a proper descendant
+      of B, so updating the default branch from B to H is a fast-forward).
+    It also requires pr_pass_evidence(with_base=True) to hold (a legacy receipt without B_r is refused, and so are
+    a same-vendor or unknown-author receipt), the FINAL's repo and PR to be the binding's, its Reviewed HEAD to
+    equal H, and the PR head to be H by readback. Every sha is full 40-hex.
+
+    Established when it returns: the PASS was for H reviewed against B_r; B_r is B or an ancestor of B; H
+    fast-forwards B; and the PR head is H, per readbacks the caller supplied. NOT established: that those readbacks
+    are fresh or genuine (the caller's T2 guard); that the default branch is still at B when the update is sent
+    (the update's beforeOid compare-and-swap, E2); that the commits B_r..B were reviewed (they were already on the
+    default branch, outside the PR's diff); and the author-harness derivation that excludes ahc's own update-branch
+    commits (parked with the held W21 work). Pure: it reads its arguments and writes nothing.
+    """
+    repo, pr, reviewed, report, snapshot_base = pr_pass_evidence(evidence, with_base=True)
+    if not isinstance(binding, dict):
+        raise ValueError('ahc binding needs the item record and its readbacks')
+    head, base = binding.get('head'), binding.get('base')
+    if not all(isinstance(v, str) and _SHA40.fullmatch(v) for v in (head, base)) or head == base:
+        raise ValueError('ahc binding record is malformed')
+    base_cmp = _compare_readback(binding.get('base_compare'), snapshot_base, base, 'B_r...B')
+    head_cmp = _compare_readback(binding.get('head_compare'), base, head, 'B...H')
+    if (repo_key(binding.get('repo')) is None or repo_key(binding['repo']) != repo_key(repo)
+            or type(pr) is not int or type(binding.get('pr')) is not int or binding['pr'] != pr):
+        raise ValueError('PR PASS is for another repo or PR')
+    if reviewed != head:
+        raise ValueError('PR PASS Reviewed HEAD is not H')
+    if binding.get('pr_head') != head:
+        raise ValueError('the PR head read back is not H')
+    if base_cmp not in AHC_BASE_COMPARE or (base_cmp == 'identical') != (snapshot_base == base):
+        raise ValueError('the snapshot base B_r is not B or an ancestor of B')
+    if head_cmp != 'ahead':
+        raise ValueError('H does not fast-forward B (compare B...H is not ahead)')
+    return repo, pr, head, snapshot_base, report
+
+
+def _compare_readback(record, want_base, want_head, name):
+    """A compare readback {base, head, status} is trusted only for the exact pair it names: base and head full
+    40-hex and equal to the expected commits. Returns its status."""
+    if (not isinstance(record, dict) or not isinstance(record.get('base'), str)
+            or not isinstance(record.get('head'), str) or not _SHA40.fullmatch(record['base'])
+            or not _SHA40.fullmatch(record['head']) or not isinstance(record.get('status'), str)):
+        raise ValueError('the %s compare readback is missing or malformed' % name)
+    if record['base'] != want_base or record['head'] != want_head:
+        raise ValueError('the %s compare readback is for another pair of commits' % name)
+    return record['status']
+
+
 def add_review_waiver(state_dir, reference, *, store=None, now=None):
     """Authorize only a loaded, settled, independent pure PR PASS FINAL.
 
@@ -1627,30 +1784,9 @@ def add_review_waiver(state_dir, reference, *, store=None, now=None):
 
     store = store or usage_guard.UsageStore()
     evidence = store.inspect(reference)
-    review = evidence.get('review')
-    if not isinstance(review, dict):
-        raise ValueError('merge authorization needs typed PR review FINAL evidence')
-    usage_guard.validate_review_metadata(review, result=evidence.get('result'))
-    usage = evidence.get('usage') if isinstance(evidence.get('usage'), dict) else {}
-    reviewer = review.get('reviewer', '')
-    reviewer_harness = review.get('reviewer_harness')
-    expected_prefix = {'openai': 'Codex ', 'claude': 'Claude '}.get(reviewer_harness)
-    if (evidence.get('review_finalization') != 'SETTLED'
-            or evidence.get('execution') != 'COMPLETED' or evidence.get('result') != 'CHECK_OK'
-            or evidence.get('reason') != 'NONE'
-            or evidence.get('invocation', {}).get('purpose') != 'peer-review-pr'
-            or review.get('stage') != 'PR' or review.get('verdict') != 'ACCEPT'
-            or review.get('findings') != [] or review.get('ticketed')
-            or not all(key in review for key in ('repo', 'pr', 'head', 'report_sha256'))
-            or evidence.get('subject', {}).get('head') != review['head']
-            or review.get('author_harness') not in {'claude', 'openai'}
-            or reviewer_harness not in {'claude', 'openai'}
-            or reviewer_harness == review['author_harness']
-            or not expected_prefix or not reviewer.startswith(expected_prefix)
-            or type(usage.get('provider_launches')) is not int or usage['provider_launches'] < 1):
-        raise ValueError('FINAL is not settled independent pure PR PASS evidence')
-    repo, pr, head = review['repo'], review['pr'], review['head']
-    report_sha256, final_sha256 = review['report_sha256'], reference['sha256']
+    repo, pr, head, report_sha256 = pr_pass_evidence(evidence)
+    reviewer = evidence['review'].get('reviewer', '')
+    final_sha256 = reference['sha256']
     state_dir = Path(state_dir)
     wid = "mgw-review-" + hashlib.sha256(
         f"{repo.lower()}|{pr}|{head}|{report_sha256}|{final_sha256}".encode("utf-8")).hexdigest()[:24]
@@ -1819,16 +1955,19 @@ def decide(payload, runner, state_dir, now=None):
     if subagent and PEER_REVIEW_AUTH.search(plain):
         return 2, ("merge-gate: a subagent cannot run the PR review that mints a merge authorization (--github-repo/"
                    "--pr); run it without the GitHub binding, or ask the main agent.")
-    if subagent and (STATE_GLOB.search(plain) or _waiver_attempt(command)):
+    # goodqa#15684: a missing agent_id is not proof of main (Codex hook payloads never carry one), so the waiver path
+    # needs the positive proof the review stamp already needs.
+    if (STATE_GLOB.search(plain) or _waiver_attempt(command)) and (subagent or not _may_record_waiver(payload)):
         return 2, "merge-gate: only the main agent may record a waiver; ask the main agent."
-    if WAIVE_CMD.search(command) and not subagent:
-        _stamp_waive(command, payload, state_dir, now)
+    cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
+    stamp = None
+    if WAIVE_CMD.search(command) and not subagent and _plain_waive(command) and _may_record_waiver(payload):
+        stamp = _stamp_waive(command, payload, state_dir)  # written only if this decision allows (red-team M1)
     if PEER_REVIEW_AUTH.search(plain):
         _stamp_review(command, payload, now)
-    cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
     merges = find_merges(command, cwd=cwd)
     if not merges:
-        return 0, ""
+        return _allow(stamp, state_dir, now)
     command_hash = hashlib.sha256(command.encode("utf-8", "replace")).hexdigest()
     client = Client(runner, time.monotonic() + _deadline_seconds() - 2, cwd)
     blocks = []
@@ -1842,26 +1981,186 @@ def decide(payload, runner, state_dir, now=None):
             blocks.append(text)
     if blocks:
         return 2, "\n".join(blocks)
+    return _allow(stamp, state_dir, now)
+
+
+def _allow(stamp, state_dir, now):
+    """Allow the command, writing the pending waive stamp only now that the hook has chosen to allow it, so a command
+    this hook blocks leaves no stamp. A write failure means no stamp (the CLI then asks for --approved-by)."""
+    if stamp:
+        try:
+            put_stamp(state_dir, stamp[0], stamp[1], now)
+        except OSError:
+            pass
     return 0, ""
 
 
-def _stamp_waive(command, payload, state_dir, now):
-    tokens, _ = tokenize(command)
-    values = {}
-    for name in ("--repo", "--pr", "--head", "--ticket"):
-        if name in tokens and tokens.index(name) + 1 < len(tokens):
-            values[name] = tokens[tokens.index(name) + 1]
-    if len(values) == 4 and values["--pr"].isdigit():
-        session = clean(payload.get("session_id") or "unknown", 40)
-        put_stamp(state_dir, stamp_key(values["--repo"], int(values["--pr"]), values["--head"], values["--ticket"]),
-                  "main:session-" + re.sub(r"[^A-Za-z0-9_.-]", "", session) + "(hook)", now)
+def _may_record_waiver(payload):
+    """Positive proof of who is calling: the main agent (caller_identity.is_main), or the current user-driven Codex
+    Desktop root session (native_main.is_desktop_review_root: its own metadata row, nearest verified runtime and signed
+    GUI parent; a spawned child, a standalone CLI and a missing or unqualified row are not roots). Any failure to
+    decide is not proof."""
+    try:
+        import caller_identity  # noqa: PLC0415
+        if caller_identity.is_main(payload):
+            return True
+        from native_main import is_desktop_review_root  # noqa: PLC0415
+        return is_desktop_review_root(payload) is True
+    except Exception:  # noqa: BLE001 - fail closed
+        return False
+
+
+def _plain_waive(command):
+    """Only ONE plain `python3 [-I] .../merge_gate.py waive ...` command mints the stamp: no newline, `;`, `&`, `|`,
+    backtick, `<`, `>` or `$(` anywhere (so no echo, printf, pipe, redirect, wrapper or quoted separator), the same
+    rule `_plain_peer_review` applies to the review stamp."""
+    if _SHELL_SYNTAX.search(command):
+        return False
+    try:
+        argv = shlex.split(command, comments=False)
+    except ValueError:
+        return False
+    if not argv or not _PYTHON.fullmatch(os.path.basename(argv[0])):
+        return False
+    rest = argv[1:]
+    while rest and rest[0] in ("-I", "-u", "-B", "-E", "-s"):
+        rest = rest[1:]
+    return len(rest) >= 2 and os.path.basename(rest[0]) == "merge_gate.py" and rest[1] == "waive"
+
+
+_HEAD = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+
+
+# Anywhere in the raw text, quoted or not: `$` (variables, `$'...'` ANSI-C quoting, `$(`), a backtick, and any control
+# character (CR, tab, NUL, DEL, C1). shlex and the shell can split or expand these differently.
+_STAMP_UNSAFE_ANYWHERE = re.compile(r"[$`\x00-\x1f\x7f-\x9f]")
+# Outside quotes only: comment, brace, glob, zsh glob qualifier, history and tilde characters. Inside single or double
+# quotes they are literal to bash, zsh and shlex alike (the ticket is always the quoted 'GoodQA #N').
+_STAMP_UNSAFE_UNQUOTED = set("#{}*?[]()!^~")
+
+
+def _stamp_lexically_safe(command):
+    """True when bash, zsh and shlex.split read `command` as the same words: none of _STAMP_UNSAFE_ANYWHERE, none of
+    _STAMP_UNSAFE_UNQUOTED outside quotes (a leading `~/`, which both shells expand to $HOME, is the one exception), no
+    `=` starting an unquoted word (zsh `=cmd` expansion), and balanced quotes (red-team PR 207 M1)."""
+    if _STAMP_UNSAFE_ANYWHERE.search(command):
+        return False
+    quote, word_start, i = None, True, 0
+    while i < len(command):
+        char = command[i]
+        if quote == "'":
+            quote = None if char == "'" else quote
+        elif quote == '"':
+            if char == "\\":
+                i += 1
+            elif char == '"':
+                quote = None
+            elif char == "!":
+                return False
+        elif char == " ":
+            word_start = True
+            i += 1
+            continue
+        elif char in "'\"":
+            quote = char
+        elif char == "\\":
+            i += 1
+        elif char == "~" and word_start and command[i + 1:i + 2] == "/":
+            pass
+        elif char in _STAMP_UNSAFE_UNQUOTED or (char == "=" and word_start):
+            return False
+        word_start = False
+        i += 1
+    return quote is None
+
+
+def _stamp_interpreter_ok(word):
+    """`python3` or `python3.N` that this host can actually find on PATH, or an absolute path to an executable file
+    with that name. `python3.99` (not installed) and a missing path would make the shell fail after the stamp."""
+    if not re.fullmatch(r"python3(?:\.\d+)?", os.path.basename(word)):
+        return False
+    if "/" not in word:
+        return bool(shutil.which(word))
+    return os.path.isabs(word) and os.path.isfile(word) and os.access(word, os.X_OK)
+
+
+def _stamp_gate_paths():
+    """The gate copies a stamped command may name: this running file and the two install targets (install.py puts it
+    in ~/.claude/hooks, install_codex.py in ~/.codex/agent-harness). Resolved at call time from the current HOME."""
+    home = Path(os.path.expanduser("~"))
+    return {Path(__file__).resolve(), (home / ".claude" / "hooks" / "merge_gate.py").resolve(),
+            (home / ".codex" / "agent-harness" / "merge_gate.py").resolve()}
+
+
+def _stamp_script_ok(word):
+    """The script word must be absolute (or `~/...`) and resolve to an installed gate; a relative path, another
+    directory or a missing file elsewhere is not the gate the CLI lookup belongs to."""
+    if word.startswith("~/"):
+        word = os.path.expanduser(word)
+    return os.path.isabs(word) and Path(word).resolve() in _stamp_gate_paths()
+
+
+def _stamp_waive(command, payload, state_dir):
+    """The pending (key, approved_by) stamp for a plain waive command, or None. decide() writes it only when it
+    allows the command. A stamp is offered only when:
+    - bash, zsh and shlex read the text as the same words (_stamp_lexically_safe),
+    - the interpreter is a findable python3 and the script resolves to an installed gate,
+    - the strict CLI parser accepts the arguments and reads them unambiguously: no repeated or abbreviated option, no
+      `--state-dir` other than the hook's own, no help flag, and values `add_waiver` would accept.
+    Anything else leaves no stamp, and the command is still judged normally (red-team m-1, F1, F2, PR 207 M1/L1).
+    Stamp-before-run limit: a stamp offered here can still go unconsumed if the user denies the permission prompt or a
+    later PreToolUse hook blocks the command; STAMP_TTL_SECONDS (120 s) bounds that."""
+    try:
+        if not _stamp_lexically_safe(command):
+            return None
+        argv = shlex.split(command, comments=False)
+        if not _stamp_interpreter_ok(argv[0]):
+            return None
+        rest = argv[1:]
+        while rest and rest[0] in ("-I", "-u", "-B", "-E", "-s"):
+            rest = rest[1:]
+        if not _stamp_script_ok(rest[0]):
+            return None
+        rest = rest[2:]  # skip merge_gate.py and the subcommand
+        names = [t.split("=", 1)[0] for t in rest if t.startswith("--")]
+        if len(names) != len(set(names)):
+            return None
+        args = _build_parser(strict=True).parse_args(["waive"] + rest)
+        raw_pr = next((rest[i + 1] for i, t in enumerate(rest[:-1]) if t == "--pr"), None)
+        raw_pr = raw_pr if raw_pr is not None else next((t[5:] for t in rest if t.startswith("--pr=")), "")
+        if not (raw_pr.isascii() and raw_pr.isdigit()):  # int() also takes spaces, signs, underscores, other scripts
+            return None
+        if args.state_dir is not None and Path(args.state_dir).resolve() != Path(state_dir).resolve():
+            return None
+        if not (isinstance(args.pr, int) and args.pr > 0 and _HEAD.fullmatch(args.head or "")):
+            return None
+        if not re.match(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", args.repo) or \
+                not re.match(r"^GoodQA (?:[\w-]+)?#\d+$", args.ticket) or not (10 <= len(args.reason) <= 500) or \
+                CTRL.search(args.reason):
+            return None
+    except (_ParseRefused, ValueError, OSError, IndexError, SystemExit):
+        # SystemExit: any argparse exit path (red-team L1, `-h`/`--help`) means no stamp, never the end of the hook.
+        return None
+    session = clean(payload.get("session_id") or "unknown", 40)
+    return (stamp_key(args.repo, args.pr, args.head, args.ticket),
+            "main:session-" + re.sub(r"[^A-Za-z0-9_.-]", "", session) + "(hook)")
 
 
 def _stamp_review(command, payload, now):
     """B2: the peer_review run that may mint a merge authorization gets a one-shot stamp, only from proven main."""
     import caller_identity  # noqa: PLC0415
-    if not caller_identity.is_main(payload) or not _plain_peer_review(command):
+    if not _plain_peer_review(command):
         return
+    if not caller_identity.is_main(payload):
+        # A Codex Desktop root is accepted here for the review receipt and, by the user's decision (answer
+        # b6714826, goodqa#15565), for recording merge waivers (_may_record_waiver). Generic main authority still
+        # controls protected Stop and owner handoffs.
+        try:
+            from native_main import is_desktop_review_root  # noqa: PLC0415
+            if is_desktop_review_root(payload) is not True:
+                return
+        except Exception:
+            return
     tokens, _ = tokenize(command)
     values = {}
     for index, token in enumerate(tokens):
@@ -1956,12 +2255,29 @@ def _fault(error, text, stderr):
 
 # ---------------------------------------------------------------------------------------------------- cli
 
-def main(argv=None, runner=None, stdin=None, stdout=None, stderr=None):
-    stdout, stderr = stdout or sys.stdout, stderr or sys.stderr
-    parser = argparse.ArgumentParser(description="PR merge gate: hook, check, waive, report.")
-    sub = parser.add_subparsers(dest="command", required=True)
+class _ParseRefused(Exception):
+    """A strict parse refused the arguments (the hook minting a stamp must refuse what the CLI would)."""
+
+
+class _Parser(argparse.ArgumentParser):
+    strict = False
+
+    def error(self, message):
+        if self.strict:
+            raise _ParseRefused(message)
+        super().error(message)
+
+
+def _build_parser(strict=False):
+    """The CLI's own parser. The hook parses a candidate command with the same one (strict, no abbreviations) so a
+    stamp is minted only for arguments the CLI reads identically (red-team F1)."""
+    parser = _Parser(description="PR merge gate: hook, check, waive, report.", allow_abbrev=not strict,
+                     add_help=not strict)  # strict: `-h` is a refused argument, not a print-and-exit
+    parser.strict = strict
+    sub = parser.add_subparsers(dest="command", required=True, parser_class=_Parser)
     for name in ("hook", "report", "check", "waive"):
-        p = sub.add_parser(name)
+        p = sub.add_parser(name, allow_abbrev=not strict, add_help=not strict)
+        p.strict = strict
         p.add_argument("--state-dir", default=None)
         if name in ("check", "waive"):
             p.add_argument("--repo", required=True)
@@ -1971,6 +2287,12 @@ def main(argv=None, runner=None, stdin=None, stdout=None, stderr=None):
             p.add_argument("--ticket", required=True)
             p.add_argument("--reason", required=True)
             p.add_argument("--approved-by", default=None)
+    return parser
+
+
+def main(argv=None, runner=None, stdin=None, stdout=None, stderr=None):
+    stdout, stderr = stdout or sys.stdout, stderr or sys.stderr
+    parser = _build_parser()
     try:
         args = parser.parse_args(argv)
     except SystemExit as error:
@@ -1988,13 +2310,15 @@ def main(argv=None, runner=None, stdin=None, stdout=None, stderr=None):
         stdout.write(("merge-gate: all checks green on " + str(info.get("head")) + "\n") if allowed else text + "\n")
         return 0 if allowed else 2
     approved, source = args.approved_by, "asserted"
-    if re.match(r"^[0-9a-f]{40}", args.head or ""):
+    if _HEAD.fullmatch(args.head or ""):
         stamped = take_stamp(state_dir, stamp_key(args.repo, args.pr, args.head, args.ticket))
         if stamped:
             approved, source = stamped, "hook"
     if not approved:
         stderr.write("merge-gate: a waiver needs main-agent approval: run it through the main agent so the hook stamps "
-                     "it, or pass --approved-by main:<agent-id>.\n")
+                     "it, or pass --approved-by main:<agent-id>. The hook stamps only ONE plain command: a ; & | < > "
+                     "backtick, $ or control character anywhere in it, including inside --reason, or an unquoted # "
+                     "glob, brace or ~user, means no stamp; a stamp lives 120 s.\n")
         return 3
     try:
         record = add_waiver(state_dir, args.repo, args.pr, args.head, args.ticket, args.reason, approved, source)

@@ -19,24 +19,29 @@ func inputLifecycleBlocked(s *session) bool {
 }
 
 func (a *app) turnAdmission(s *session, epoch uint64, request string) inputAdmission {
+	return a.turnAdmissionGuarded(s, epoch, request, nil)
+}
+
+func (a *app) turnAdmissionGuarded(s *session, epoch uint64, request string, guard func(*session) error) inputAdmission {
 	if s.reviewParent != "" {
 		return a.managedReviewAdmission(s)
 	}
 	return func() (func(), error) {
 		s.dispatchMu.Lock()
 		a.mu.Lock()
-		valid := s.controlEpoch == epoch && s.Status == "running" && s.lastRequest == request && !inputLifecycleBlocked(s)
-		if valid {
-			if err := a.commitDeliveryLocked(s, request); err != nil {
-				a.mu.Unlock()
-				s.dispatchMu.Unlock()
-				return nil, err
-			}
+		var err error
+		if s.controlEpoch != epoch || s.Status != "running" || s.lastRequest != request || inputLifecycleBlocked(s) {
+			err = refused("turn admission changed or user paused before dispatch")
+		} else if guard != nil {
+			err = guard(s)
+		}
+		if err == nil {
+			err = a.commitDeliveryLocked(s, request)
 		}
 		a.mu.Unlock()
-		if !valid {
+		if err != nil {
 			s.dispatchMu.Unlock()
-			return nil, refused("turn admission changed or user paused before dispatch")
+			return nil, err
 		}
 		return s.dispatchMu.Unlock, nil
 	}

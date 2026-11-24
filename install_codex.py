@@ -32,23 +32,38 @@ AGENTS = ('harness_owner.toml', 'harness_reviewer.toml', 'harness_red_team.toml'
 SKILL_FILES = ('SKILL.md', 'references/owner-workflow.md',
                'references/testing-and-evals.md', 'references/delivery.md')
 DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report_file.py',
-                    'usage_guard.py', 'publish_feature.py', 'integrate_local.py', 'deliver.py',
+                    'usage_guard.py', 'publish_feature.py', 'integrate_local.py', 'node_check_reporter.mjs', 'deliver.py',
                     'ticket_adapters.py', 'commit_policy.py', 'commit_policy.json',
                     # Spec flow commands work by hand in Codex; its done hook is Claude Code only.
                     'spec_flow.py', 'spec_policy.json', 'spec_template.md', 'provenance.py', 'provenance_policy.json',
                     'provenance_hooks.py', 'safe_input.py', 'caller_identity.py', 'domain_gates.py', 'domain_checklists.json',
+                    'native_context.py', 'native_user_source.py', 'native_admission.py', 'native_main.py', 't2scan_consent.py',
+                    'idle_guard.py',  # ops_watch's default idle_guard check imports it (goodqa#15943)
+                    'wal_note.py',  # ah task/ticket writes and doctor import this helper.
                     'commit_policy.local.json.example', 'spec_policy.local.json.example',
                     'model_tiers.py', 'model_tiers.json', 'escalation.py', 'tier_gate.py',
                     # Destructive and config-dump command guard (GoodQA #14471): launcher plus analyser.
-                    'command_guard.py', 'command_guard_hook.py', 'redact.py', 'kill_guard.py', 'kill_guard_policy.json', 'merge_gate.py', 'bg_job.py',
+                    'command_guard.py', 'command_guard_hook.py', 'redact.py', 'kill_guard.py', 'kill_guard_policy.json', 'merge_gate.py', 'bg_job.py', 'task_recovery.py',
+                    'copy_hygiene.py', 'lifecycle_cleanup.py',
                     # Dropped-owner gate on Codex Stop and its reads (goodqa#14791 P18)
-                    'dropped_gate.py', 'ah.py', 'liveness.py',
+                    'dropped_gate.py', 'ah.py', 'ah_worktree.py', 'ah_install.py', 'guard_selftest.py', 'liveness.py',
+                    # ah export and ah status: status_report imports goals_view (goodqa#15788)
+                    'ah_export.py', 'goals_view.py',
+                    # goals_view imports mission_coverage at load; spec_flow and others import these lazily
+                    # (tests/test_ah_export.py walks the chain).
+                    'mission_coverage.py', 'resource_budget.py', 'workdir.py',
+                    'shellwords.py',  # dropped_gate's pretool path imports it (PR 208 red-team)
                     # Heavy-job guard (goodqa#14817): keeps large copies, suites and builds off the Mac for Codex too.
                     'heavy_job_guard.py', 'dropbox_budget.conf', 'resource_limits.json',
                     # deliver.py prepare --scan trivy imports it (goodqa#15295)
                     'trivy_gate.py',
                     # AGENTS.md tells Codex to scan third-party installers first (goodqa#15253 step 4)
-                    'installer_scan.py')
+                    'installer_scan.py',
+                    # Mission Control chat by hand from a Codex main session: wait, read, reply --from codex (goodqa#15585).
+                    # No Codex Stop hook: Codex keys hook trust by position and the dashboard's Codex chat uses codex exec.
+                    'mc_chat.py', 'mc_inbox.py',
+                    # Stall-watcher answer inbox (UserPromptSubmit + SessionStart only; appended so trust positions stay).
+                    'owner_inbox.py')
 GIT_HOOK_KEY = 'agent-harness-commit-policy-codex'  # independent of the Claude install's key
 HOOK_EVENTS = ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'SubagentStart', 'Stop', 'Interrupt')
 
@@ -94,6 +109,10 @@ def heavy_guard_command(codex_home: Path) -> str:
     return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'heavy_job_guard.py'))
 
 
+def owner_inbox_command(codex_home: Path) -> str:
+    return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'owner_inbox.py')) + ' hook'
+
+
 def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) -> dict:
     if not isinstance(existing, dict):
         raise ValueError('hooks.json must contain an object')
@@ -107,6 +126,7 @@ def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) ->
     kill_guard = kill_guard_command(codex_home)
     heavy_guard = heavy_guard_command(codex_home)
     gate = gate_command(codex_home)
+    owner_inbox = owner_inbox_command(codex_home)
     for event in HOOK_EVENTS:
         lifecycle = event in {'Stop', 'Interrupt'}
         managed = {'hooks': [{'type': 'command', 'command': command,
@@ -121,7 +141,8 @@ def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) ->
             handlers = [handler for handler in group['hooks']
                         if not (isinstance(handler, dict) and handler.get('type') == 'command'
                                 and handler.get('command') in (command, policy, guard,
-                                                               guard_command(codex_home, ''), gate, kill_guard, heavy_guard))]
+                                                               guard_command(codex_home, ''), gate, kill_guard,
+                                                               heavy_guard, owner_inbox))]
             if lifecycle and len(handlers) != len(group['hooks']) and group != managed:
                 raise ValueError(f'hooks.json has a custom {event} hook invoking the managed command; '
                                  'reconcile that group explicitly before installing')
@@ -147,6 +168,9 @@ def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) ->
             # It fails open on its own errors and denies with exit 2 only for heavy work on the Mac. Codex trust for
             # this hook needs the user to review it in /hooks; until then Codex skips it (ops-watch codex:trust).
             preserved.append({'hooks': [{'type': 'command', 'command': heavy_guard, 'timeout': 30}]})
+        # Appended last so existing Codex hook-trust positions do not move. No Stop hook for Codex.
+        if event in {'SessionStart', 'UserPromptSubmit'}:
+            preserved.append({'hooks': [{'type': 'command', 'command': owner_inbox, 'timeout': 5}]})
         hooks[event] = preserved
     return result
 

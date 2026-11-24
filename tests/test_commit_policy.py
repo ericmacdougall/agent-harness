@@ -6,6 +6,7 @@ import os
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -372,6 +373,32 @@ class Fixture(unittest.TestCase):
         git("remote", "add", "origin", self.ORIGIN, cwd=self.repo, env=self.env)
         self.commit(CHORE)
         self.wal = self.home / ".claude" / "wals" / "sess-1" / "main.jsonl"
+        self.hook_script = HOOKS / "commit_policy.py"
+
+    def use_legacy_origin_fixture(self):
+        """Exercise the real CLI with a deterministic non-native process observation."""
+        def copy_fixture_file(source, destination):
+            if source.resolve(strict=True) != source:
+                raise ValueError(f"aliased fixture source: {source.name}")
+            fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, "rb") as handle:
+                info = os.fstat(handle.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise ValueError(f"unsafe fixture source: {source.name}")
+                destination.write_bytes(handle.read())
+
+        copy = self.root / "legacy-origin-hooks"
+        copy.mkdir(mode=0o700)
+        for name in ("commit_policy.py", "commit_policy.json", "native_context.py", "safe_input.py",
+                     "ticket_adapters.py", "process.py", "wal.py", "wal_note.py"):
+            copy_fixture_file(HOOKS / name, copy / name)
+        profile = Path(__file__).resolve().parent / "data" / "policy_profile_fixture.json"
+        copy_fixture_file(profile, copy / cp.LOCAL_PROFILE_NAME)
+        with (copy / "native_context.py").open("a", encoding="utf-8") as handle:
+            handle.write("\n\ndef probe_commit_runtime_origin():\n"
+                         "    return OriginObservation('unknown', False, 'no_native_runtime')\n")
+        self.env.pop("AGENT_HARNESS_POLICY_LOCAL", None)
+        self.hook_script = copy / "commit_policy.py"
 
     def commit(self, message, extra_env=None):
         path = self.root / "m.txt"
@@ -380,11 +407,15 @@ class Fixture(unittest.TestCase):
                               env={**self.env, **(extra_env or {})}, capture_output=True, text=True, timeout=60)
 
     def run_cli(self, *args, stdin=None, extra_env=None):
-        return subprocess.run([sys.executable, str(HOOKS / "commit_policy.py"), *args], input=stdin,
+        return subprocess.run([sys.executable, str(self.hook_script), *args], input=stdin,
                               env={**self.env, **(extra_env or {})}, capture_output=True, text=True, timeout=60)
 
 
 class PreToolUseHook(Fixture):
+    def setUp(self):
+        super().setUp()
+        self.use_legacy_origin_fixture()
+
     def payload(self, command, **extra):
         return json.dumps({"session_id": "sess-1", "cwd": str(self.repo), "hook_event_name": "PreToolUse",
                            "tool_name": "Bash", "tool_input": {"command": command, "description": "x"},
@@ -630,9 +661,10 @@ class InspectionRegressions(Fixture):
                      "config-based hooks need git 2.54+ (dev2/T2 run 2.43); the backstop is inactive there")
 class GitBackstop(Fixture):
     def install_hook(self):
+        self.use_legacy_origin_fixture()
         git("config", "--global", "hook.agent-harness-commit-policy.event", "commit-msg", cwd=self.repo, env=self.env)
         git("config", "--global", "hook.agent-harness-commit-policy.command",
-            cp.git_hook_command(HOOKS / "commit_policy.py"), cwd=self.repo, env=self.env)
+            cp.git_hook_command(self.hook_script), cwd=self.repo, env=self.env)
 
     def test_backstop_scope_and_chaining(self):
         self.install_hook()
@@ -792,6 +824,55 @@ class TicketVerification(Fixture):
         self.fake.comment(self.issue, f"Fixed in {self.head[:9]} on the branch", now)
         fresh = self.check()
         self.assertEqual((fresh["status"], fresh["tickets"][0]["status"]), ("PASS", "UPDATED"))
+
+    def test_tickets_waiver_for_the_head_commit_covers_a_symbolic_head(self):
+        # goodqa#16442: peer_review passes the literal "HEAD" while a waiver can only name a full commit SHA.
+        old = os.environ.get("HOME")
+        os.environ["HOME"] = str(self.home)
+        self.addCleanup(os.environ.__setitem__, "HOME", old)
+        cp.LEDGER = self.home / ".agent-harness" / "commit-policy" / "waivers.jsonl"
+        self.addCleanup(setattr, cp, "LEDGER", Path.home() / ".agent-harness" / "commit-policy" / "waivers.jsonl")
+        self.wal.parent.mkdir(parents=True, exist_ok=True)
+        self.fake.fail = "reset"
+        reason = "ticket project is not visible to this credential; approved by the owner in GoodQA #16442"
+
+        def by_name():
+            return cp.check_range(str(self.repo), self.base, "HEAD", self.policy, verify_tickets=True)
+        self.assertEqual(by_name()["status"], "UNVERIFIED")
+        cp.record_waiver(self.wal, "tickets", self.base, reason, POLICY)
+        self.assertEqual(by_name()["status"], "UNVERIFIED", "a waiver for another commit must not cover this head")
+        cp.record_waiver(self.wal, "tickets", self.head, reason, POLICY)
+        report = by_name()
+        self.assertEqual(report["status"], "PASS")
+        self.assertEqual([(w["kind"], w["subject"]) for w in report["waivers"]], [("tickets", self.head)])
+        self.assertEqual(self.check()["status"], "PASS", "the full SHA form keeps working")
+
+    def test_head_moving_during_the_check_cannot_borrow_another_commits_waiver(self):
+        # Review F1 on goodqa#16442: the range and the waiver subject must be the same commit even when HEAD moves
+        # between the two reads. HEAD moves to a waived commit right after the range has been collected.
+        old = os.environ.get("HOME")
+        os.environ["HOME"] = str(self.home)
+        self.addCleanup(os.environ.__setitem__, "HOME", old)
+        cp.LEDGER = self.home / ".agent-harness" / "commit-policy" / "waivers.jsonl"
+        self.addCleanup(setattr, cp, "LEDGER", Path.home() / ".agent-harness" / "commit-policy" / "waivers.jsonl")
+        self.wal.parent.mkdir(parents=True, exist_ok=True)
+        self.fake.fail = "reset"
+        reason = "ticket project is not visible to this credential; approved by the owner in GoodQA #16442"
+        real, seen = cp.range_commits, []
+
+        def moving(repo, base, head, exclude=()):
+            commits = real(repo, base, head, exclude)
+            seen.append(head)
+            git("commit", "--allow-empty", "-q", "-m", "chore(test): move head", cwd=self.repo, env=self.env)
+            moved = git("rev-parse", "HEAD", cwd=self.repo, env=self.env)
+            self.assertNotEqual(moved, self.head)
+            cp.record_waiver(self.wal, "tickets", moved, reason, POLICY)
+            return commits
+        cp.range_commits = moving
+        self.addCleanup(setattr, cp, "range_commits", real)
+        report = cp.check_range(str(self.repo), self.base, "HEAD", self.policy, verify_tickets=True)
+        self.assertEqual(seen, [self.head], "the range is read for the commit resolved before it")
+        self.assertEqual((report["status"], report["head"], report["waivers"]), ("UNVERIFIED", self.head, []))
 
     def test_branch_comment_must_be_newer_than_commit(self):
         self.fake.comment(self.issue, "work continues on claude/x-1", datetime.now(timezone.utc) - timedelta(hours=3))
@@ -1084,7 +1165,7 @@ sys.exit(cp.entry(["hook"]))
 
 class AuthorTrailerHarness(unittest.TestCase):
     """goodqa#15253 #134 red-team B1: the author trailer is review evidence, so it must name the committing harness."""
-    BODY = ("fix(x): change a thing\n\nWhy: a reason that is long enough.\n\nWhat: the change.\n\n"
+    BODY = ("fix(x): change a thing\n\nWhy: a reason that is long enough.\n\nWhat: describe the intended fixture change.\n\n"
             "Testing: `python3 -m unittest tests.test_x` 3 OK\n\nRefs: GoodQA #1234\n\n")
 
     def problems(self, harness, trailer):
@@ -1117,7 +1198,11 @@ class AuthorTrailerHarness(unittest.TestCase):
 
     def test_both_installed_copies_accept_the_committing_harness_trailer(self):
         # delta red-team D-F1: the ~/.claude and ~/.codex hooks both run on every commit; neither may refuse the
-        # trailer of the harness actually committing, and both refuse the other one
+        # trailer of the harness actually committing, and both refuse the other one.
+        # A synthetic marker is not the actual test-host origin: provide an
+        # explicit genuine-Claude/no-native or verified-native test condition.
+        # This in-process fixture exists only inside disposable helper copies;
+        # production gains no origin CLI/config/provider override.
         import shutil
         import tempfile
         with tempfile.TemporaryDirectory() as home:
@@ -1126,18 +1211,138 @@ class AuthorTrailerHarness(unittest.TestCase):
                 shutil.copytree(HOOKS, dest, ignore=shutil.ignore_patterns("__pycache__"))
             msg = Path(home) / "msg.txt"
             base = {"HOME": home, "PATH": "/usr/bin:/bin"}
-            cases = (({"CLAUDECODE": "1"}, "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>", False),
-                     ({"CODEX_THREAD_ID": "t1"}, "Co-Authored-By: GPT-5 Codex <noreply@openai.com>", False),
-                     ({"CLAUDECODE": "1"}, "Co-Authored-By: GPT-5 Codex <noreply@openai.com>", True),
-                     ({"CODEX_THREAD_ID": "t1"}, "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>", True))
-            for marker, trailer, refused in cases:
+            claude = "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+            codex = "Co-Authored-By: GPT-5 Codex <noreply@openai.com>"
+            cases = (("legacy", {"CLAUDECODE": "1"}, claude, False),
+                     ("legacy", {"CODEX_THREAD_ID": "t1"}, codex, False),
+                     ("legacy", {"CLAUDECODE": "1"}, codex, True),
+                     ("legacy", {"CODEX_THREAD_ID": "t1"}, claude, True),
+                     ("native", {"CLAUDECODE": "1"}, codex, False),
+                     ("native", {"CLAUDECODE": "1"}, claude, True),
+                     ("native", {"CODEX_THREAD_ID": "t1"}, codex, False),
+                     ("native", {"CODEX_THREAD_ID": "t1"}, claude, True))
+            for origin, marker, trailer, refused in cases:
                 msg.write_text(self.BODY + trailer + "\n")
+                observation = ("nc.OriginObservation('unknown',False,'no_native_runtime')" if origin == "legacy"
+                               else "nc.OriginObservation('openai',True,'running_code_verified')")
+                fixture = ("import sys; sys.path.insert(0,sys.argv[1]); import commit_policy as cp,native_context as nc; "
+                           "cp.probe_commit_runtime_origin=lambda: " + observation + "; raise SystemExit(cp.main(sys.argv[2:]))")
                 for dest in copies:
-                    with self.subTest(copy=dest.parent.name, marker=marker, trailer=trailer):
-                        out = subprocess.run([sys.executable, "-I", str(dest / "commit_policy.py"), "check-message",
+                    with self.subTest(copy=dest.parent.name, origin=origin, marker=marker, trailer=trailer):
+                        out = subprocess.run([sys.executable, "-I", "-B", "-c", fixture, str(dest), "check-message",
                                               "--file", str(msg)], capture_output=True, text=True, timeout=60,
                                              env=dict(base, **marker))
                         self.assertEqual("this commit is made from the" in out.stdout, refused, out.stdout[-400:])
+                        self.assertEqual(out.returncode, 2 if refused else 0, out.stderr[-400:])
+
+class ClaudeSessionTrailerTests(unittest.TestCase):
+    """goodqa#16106: the Claude Code attribution paragraph is Co-Authored-By plus Claude-Session."""
+
+    BODY = ("fix(hooks): accept the claude session trailer\n\nWhy: the attribution paragraph was refused.\n"
+            "What: recognise the trailer.\nTesting: `python3 -m pytest tests/test_commit_policy.py -q` -> 3 passed\n"
+            "Refs: GoodQA #16106\n\n")
+    COAUTH = "Co-Authored-By: Claude Sonnet <noreply@anthropic.com>"
+    SESSION = "Claude-Session: https://claude.ai/code/session_011PwJaRQM1UYqY3vZNrYjVv"
+
+    def problems(self, trailers, harness="claude"):
+        old = cp.HARNESS_OVERRIDE
+        cp.HARNESS_OVERRIDE = harness
+        try:
+            return cp.validate(self.BODY + trailers + "\n", policy=cp.load_policy())
+        finally:
+            cp.HARNESS_OVERRIDE = old
+
+    def test_ac1_both_trailer_lines_pass(self):
+        self.assertEqual(self.problems(self.COAUTH + "\n" + self.SESSION), [])
+        self.assertEqual(self.problems(self.SESSION + "\n" + self.COAUTH), [])
+
+    def test_neg1_claude_session_needs_the_exact_claude_ai_url(self):
+        for value in ("https://example.com/code/session_abc123", "http://claude.ai/code/session_abc123",
+                      "https://claude.ai/code/abc123", "https://claude.ai/code/session_",
+                      "https://claude.ai.evil.test/code/session_abc123", "https://claude.ai/code/session_abc 123", ""):
+            with self.subTest(value=value):
+                found = self.problems(self.COAUTH + "\nClaude-Session: " + value)
+                self.assertTrue(any(p.startswith("trailers:") for p in found), found)
+
+    def test_ac2_error_names_the_unrecognised_line(self):
+        found = self.problems(self.COAUTH + "\nClaude-Session: https://example.com/code/session_abc123")
+        text = "\n".join(found)
+        self.assertIn("Claude-Session: https://example.com/code/session_abc123", text)
+        self.assertIn("not recognised", text)
+
+    def test_neg2_unknown_key_in_the_final_paragraph_is_still_refused(self):
+        found = self.problems(self.COAUTH + "\nX-Foo: bar")
+        self.assertTrue(any("X-Foo: bar" in p for p in found), found)
+
+    def test_neg3_attribution_still_reads_only_co_authored_by(self):
+        # a valid Claude-Session never stands in for, or changes, the Co-Authored-By check
+        wrong = self.problems("Co-Authored-By: Codex <noreply@openai.com>\n" + self.SESSION)
+        self.assertTrue(any("Co-Authored-By names" in p for p in wrong), wrong)
+        self.assertEqual(self.problems(self.SESSION), [])  # no named harness: nothing to compare
+        _, _, _, _, _, trailers, _, _ = cp.parse_message(cp.normalize(self.BODY + self.COAUTH + "\n" + self.SESSION))
+        self.assertEqual(trailers, [self.COAUTH, self.SESSION])
+        self.assertEqual({cp.trailer_harness(t) for t in trailers if t.lower().startswith("co-authored-by")}, {"claude"})
+
+
+class ClaudeSessionParagraphTests(unittest.TestCase):
+    """goodqa#16106 follow-up: a trailer-only paragraph directly before the final trailer paragraph."""
+
+    # verbatim `git log -1 --format=%B 0ca0731e` of agent-harness PR 234 (already pushed; must not be reworded)
+    PR234 = """fix(ah): keep the read block buildable for a window before the epoch
+
+Why: e7bf3ecf names its window's cutoff in the read block. ah export
+asks status_report for "every row", so the cutoff falls before 1970
+and datetime raised OverflowError on t2-dev; test_ah_export
+FullExport.test_classes_match_ah_status errored in the v10 packet.
+
+What: LostWindow.fields clamps the shown cutoff at the epoch and
+falls back to "" if it is still out of range. The rule's decision
+uses the real cutoff, unchanged. New test covers far-past, negative
+and far-future cutoffs and a status read with a 10^12 s window.
+
+Testing: on the Mac,
+`python3 -W ignore -m unittest tests.test_mission_control_producer_reads.OneSharedRule`
+4 OK; at e7bf3ecf the export test errored on t2-dev (v10 packet).
+Full suites: see the v10 packet at this head.
+
+Refs: GoodQA goodqa#15920
+
+Claude-Session: https://claude.ai/code/session_011PwJaRQM1UYqY3vZNrYjVv
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"""
+    BODY = ("fix(hooks): keep pushed attribution shapes passing\n\nWhy: published commits must still pass.\n"
+            "What: accept the trailer-only paragraph.\nTesting: `python3 -m pytest tests/test_commit_policy.py -q` -> 3 passed\n"
+            "Refs: GoodQA #16106\n\n")
+    COAUTH = "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+    SESSION = next(line for line in PR234.splitlines() if line.startswith("Claude-Session:"))
+
+    def problems(self, message):
+        old = cp.HARNESS_OVERRIDE
+        cp.HARNESS_OVERRIDE = "claude"
+        try:
+            return cp.validate(message + "\n", policy=cp.load_policy())
+        finally:
+            cp.HARNESS_OVERRIDE = old
+
+    def test_the_real_pr234_message_passes(self):
+        self.assertEqual(self.problems(self.PR234), [])
+        self.assertEqual(cp.parse_message(cp.normalize(self.PR234))[5][-1], self.COAUTH)
+
+    def test_the_same_paragraph_shape_still_passes(self):
+        self.assertEqual(self.problems(self.BODY + self.COAUTH + "\n" + self.SESSION), [])
+
+    def test_unknown_key_in_either_paragraph_still_fails(self):
+        self.assertTrue(self.problems(self.BODY + self.SESSION + "\n\n" + self.COAUTH + "\nX-Foo: bar"))
+        found = self.problems(self.BODY + self.SESSION + "\nX-Foo: bar\n\n" + self.COAUTH)
+        self.assertTrue(any(p.startswith("trailers:") for p in found), found)
+
+    def test_a_trailer_in_the_middle_of_the_body_still_fails(self):
+        found = self.problems(self.BODY.replace("Refs: GoodQA #16106\n\n", "")
+                              + self.COAUTH + "\n\nRefs: GoodQA #16106\n\nsome closing prose.\n\n" + self.COAUTH)
+        self.assertTrue(any(p.startswith("trailers:") for p in found), found)
+        found = self.problems(self.BODY + self.COAUTH + "\n\nnormal text after it.\n\n" + self.SESSION)
+        self.assertTrue(any(p.startswith("trailers:") for p in found), found)
+
 
 if __name__ == "__main__":
     unittest.main()

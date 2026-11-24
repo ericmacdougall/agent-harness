@@ -173,6 +173,19 @@ def parse_author(value: str) -> str:
     return identity_key(kind, safe_id(name) if kind == "agent" else name)
 
 
+def declared_owners(spec):
+    """None is legacy; a malformed explicit declaration never selects legacy."""
+    header = spec["header"]
+    if "Owners" not in header:
+        return None
+    values = [item.strip() for item in header["Owners"].split(",")]
+    if ("Owners" in spec.get("duplicate_headers", ()) or not 1 <= len(values) <= 8
+            or any(re.fullmatch("agent:" + UUID.lower(), value) is None or value != value.lower() for value in values)
+            or len(set(values)) != len(values) or parse_author(header.get("Author", "")) not in values):
+        raise SpecError("Owners must list 1..8 unique canonical native agent UUID identities and include the author", EXIT_USAGE)
+    return values
+
+
 # --------------------------------------------------------------------------- spec documents
 
 def normalize_text(text: str) -> str:
@@ -200,7 +213,7 @@ def core_sha(text: str) -> str:
 
 def parse_spec(text: str) -> dict:
     core = spec_core(text)
-    header, sections, current = {}, {}, None
+    header, sections, current, duplicate_headers = {}, {}, None, []
     title = None
     for line in core.split("\n"):
         heading = re.match(r"^## (.+?)\s*$", line)
@@ -211,8 +224,10 @@ def parse_spec(text: str) -> dict:
         if current is None:
             if line.startswith("# ") and title is None:
                 title = line[2:].strip()
-            field = re.match(r"^(Ticket|Author|Click-test|Sign-off|Review-policy):\s*(.*)$", line)
+            field = re.match(r"^(Ticket|Author|Owners|Click-test|Sign-off|Review-policy):\s*(.*)$", line)
             if field:
+                if field.group(1) in header:
+                    duplicate_headers.append(field.group(1))
                 header[field.group(1)] = field.group(2).strip()
         else:
             sections[current].append(line)
@@ -231,7 +246,7 @@ def parse_spec(text: str) -> dict:
         elif line.startswith("- "):
             stray.append(line)
     return {"title": title, "header": header, "sections": sections, "criteria": criteria,
-            "negatives": negatives, "stray": stray, "core": core}
+            "negatives": negatives, "stray": stray, "core": core, "duplicate_headers": duplicate_headers}
 
 
 def standard_review_policy() -> dict:
@@ -311,6 +326,7 @@ def lint(text: str, config: dict | None = None, check_provenance: bool = True, s
             problems.append(str(error))
     try:
         parse_author(header.get("Author", ""))
+        declared_owners(spec)
     except SpecError as error:
         problems.append(str(error))
     click = header.get("Click-test", "")
@@ -473,7 +489,7 @@ def current_reviews(entries: list, core: str) -> dict:
     return latest
 
 
-def review_problems(entries: list, core: str, author_key: str | None, required_roles=ROLES) -> list:
+def review_problems(entries: list, core: str, author_key: str | None, required_roles=ROLES, owners=()) -> list:
     problems = []
     latest = current_reviews(entries, core)
     for role in required_roles:
@@ -491,6 +507,8 @@ def review_problems(entries: list, core: str, author_key: str | None, required_r
     for role, key in keys.items():
         if author_key and key == author_key:
             problems.append(f"the {role} reviewer is the spec author")
+        elif key in (owners or ()):
+            problems.append(f"the {role} reviewer is a declared component owner")
     return problems
 
 
@@ -626,6 +644,10 @@ BASE64_BLOCK = re.compile(r"(?m)^(?:[A-Za-z0-9+/=]{60,76}\n){4,}")
 def prepare_log(path: Path, max_bytes: int):
     """Tail-cut, redact and refuse anything that still looks like key material."""
     data, original = read_regular(path, max_bytes, tail=True)
+    return prepare_log_bytes(path, data, original)
+
+
+def prepare_log_bytes(path: Path, data: bytes, original: int):
     if b"\x00" in data:
         raise SpecError(f"{path} looks binary; attach screenshots with --screenshot and logs as text", EXIT_USAGE)
     text = data.decode("utf-8", "replace")
@@ -668,6 +690,494 @@ def checked_wal(path: Path) -> Path:
     if ".." in raw.parts or path.parent.parent != wal_root().resolve() or path.suffix != ".jsonl":
         raise SpecError("WAL path must be a per-session JSONL under ~/.claude/wals", EXIT_USAGE)
     return path
+
+
+_NATIVE_REVIEW_COLUMNS = ("id", "source", "thread_source", "originator", "agent_path", "agent_role",
+                          "attached_thread_parent_id")
+_NATIVE_REVIEW_QUERY = "SELECT " + ", ".join(
+    f"CASE WHEN {name} IS NULL OR (typeof({name})='text' AND length(CAST({name} AS BLOB))<=512) "
+    f"THEN {name} ELSE X'' END" for name in _NATIVE_REVIEW_COLUMNS
+) + ", CASE WHEN typeof(archived)='integer' THEN archived ELSE X'' END FROM main.threads WHERE id IN (?,?) LIMIT 3"
+
+
+def _native_path(path, uid, *, directory=False, maximum=None, optional=False):
+    try:
+        item = path.lstat()
+    except FileNotFoundError:
+        if optional:
+            return None
+        raise
+    if (path.resolve(strict=True) != path or item.st_uid != uid or item.st_mode & 0o022
+            or (not stat.S_ISDIR(item.st_mode) if directory else not stat.S_ISREG(item.st_mode))
+            or (not directory and (item.st_nlink != 1 or (maximum is not None and item.st_size > maximum)))):
+        raise ValueError("unqualified native metadata path")
+    return item.st_dev, item.st_ino, item.st_uid, item.st_mode
+
+
+def _native_database_binding(home, uid):
+    db = home / ".codex/state_5.sqlite"
+    return (_native_path(home, uid, directory=True),
+            _native_path(db.parent, uid, directory=True),
+            _native_path(db, uid, maximum=256 * 1024 * 1024),
+            _native_path(db.with_name(db.name + "-wal"), uid, maximum=64 * 1024 * 1024, optional=True),
+            _native_path(db.with_name(db.name + "-shm"), uid, maximum=4 * 1024 * 1024, optional=True))
+
+
+def _native_review_rows(home, uid, agent, parent, *, rollout=False):
+    """Historical identity projection, never a current-caller or main-role grant."""
+    import sqlite3
+    db = home / ".codex/state_5.sqlite"
+    deadline = time.monotonic() + 0.20
+    before = _native_database_binding(home, uid)
+    descriptor = os.open(db, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        item = os.fstat(descriptor)
+        if (item.st_dev, item.st_ino, item.st_uid, item.st_mode) != before[2]:
+            raise ValueError("native database changed")
+        header = os.pread(descriptor, 20, 0)
+    finally:
+        os.close(descriptor)
+    if len(header) != 20 or header[:16] != b"SQLite format 3\0":
+        raise ValueError("unsupported native database")
+    if header[18:20] == b"\x02\x02":
+        if before[3] is None or before[4] is None:
+            raise ValueError("native WAL companions unavailable")
+    elif header[18:20] != b"\x01\x01" or before[3] is not None or before[4] is not None:
+        raise ValueError("unsupported native journal state")
+    if _native_path(db.with_name(db.name + "-journal"), uid, maximum=64 * 1024 * 1024, optional=True):
+        raise ValueError("native journal unavailable")
+    connection = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=0.05)
+    try:
+        connection.set_progress_handler(lambda: int(time.monotonic() > deadline), 100)
+        connection.execute("PRAGMA trusted_schema=OFF")
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("BEGIN")
+        tables = connection.execute("PRAGMA main.table_list('threads')").fetchmany(2)
+        if len(tables) != 1 or tables[0][:3] != ("main", "threads", "table"):
+            raise ValueError("native identity table unavailable")
+        columns = (*_NATIVE_REVIEW_COLUMNS, "archived", *(("rollout_path", "model_provider") if rollout else ()))
+        slots = ",".join("?" for _ in columns)
+        count = connection.execute(
+            f"SELECT count(*) FROM pragma_table_xinfo('threads','main') WHERE name IN ({slots}) AND hidden=0",
+            columns).fetchone()
+        if count != (len(columns),):
+            raise ValueError("native identity columns unavailable")
+        query = _NATIVE_REVIEW_QUERY
+        if rollout:
+            query = query.replace(" FROM main.threads", ", CASE WHEN typeof(rollout_path)='text' AND "
+                                  "length(CAST(rollout_path AS BLOB))<=1024 THEN rollout_path END, "
+                                  "CASE WHEN typeof(model_provider)='text' AND length(CAST(model_provider AS BLOB))<=128 "
+                                  "THEN model_provider END FROM main.threads")
+        rows = connection.execute(query, (agent, parent)).fetchmany(3)
+    finally:
+        connection.close()
+    if time.monotonic() > deadline or _native_database_binding(home, uid) != before or len(rows) != 2:
+        raise ValueError("native identity snapshot unavailable")
+    if any(any(value is not None and type(value) is not str for value in row[:7])
+           or type(row[7]) is not int or row[7] not in (0, 1) for row in rows):
+        raise ValueError("native identity fields unavailable")
+    indexed = {row[0]: row for row in rows}
+    if set(indexed) != {agent, parent}:
+        raise ValueError("native identity rows unavailable")
+    return indexed
+
+
+def _native_review_source(path, agent, role):
+    expected = {"adversarial": "harness_red_team", "acceptance": "harness_reviewer"}.get(role)
+    identity = _native_agent_source(path, agent, expected, purpose="review")
+    if identity is None:
+        return None
+    return {"family": "codex", "agent_type": expected, "model": None,
+            "source": "Codex native reviewer metadata; parent bound to native WAL session"}
+
+
+def _native_agent_source(path, agent, expected, *, purpose):
+    """Bind a native child and its main WAL by the account's stored metadata."""
+    click = purpose == "click-test"
+    raw = Path(os.path.expanduser(str(path))).absolute()
+    try:
+        resolved = raw.resolve()
+    except (OSError, RuntimeError):
+        raise SpecError(f"{purpose} WAL path unavailable", EXIT_USAGE) from None
+    # Legacy operation must not acquire a new platform/SQLite prerequisite.
+    def native_shape(value):
+        return any(value.parts[index:index + 2] == (".agent-harness", "codex-wals")
+                   for index in range(len(value.parts) - 1))
+    if not native_shape(raw) and not native_shape(resolved):
+        return None
+    try:
+        import pwd
+        import sqlite3
+    except ImportError:
+        raise SpecError(f"native {purpose} metadata unsupported", EXIT_USAGE) from None
+    uid = os.getuid()
+    try:
+        home = Path(pwd.getpwuid(uid).pw_dir)
+        root = home / ".agent-harness/codex-wals"
+        native = raw.is_relative_to(root) or resolved.is_relative_to(root)
+        if not native:
+            raise ValueError("unqualified native review family")
+        parts = raw.relative_to(root).parts
+        if (raw != resolved or ".." in raw.parts or len(parts) != 2 or parts[1] != "main.jsonl"
+                or re.fullmatch(UUID, parts[0]) is None or re.fullmatch(UUID, agent) is None or agent == parts[0]):
+            raise ValueError("native review WAL shape unavailable")
+        parent = parts[0]
+        directories = (home, home / ".agent-harness", root, raw.parent)
+        before = tuple(_native_path(item, uid, directory=True) for item in directories)
+        wal_binding = _native_path(raw, uid, maximum=64_000_000)
+        if click and (parent != parent.lower() or agent != agent.lower()):
+            raise ValueError("noncanonical child identity")
+        rows = _native_review_rows(home, uid, agent, parent, rollout=True) if click else _native_review_rows(home, uid, agent, parent)
+        parent_row, child = rows[parent], rows[agent]
+        if (parent_row[1:4] != ("vscode", "user", "Codex Desktop") or any(parent_row[i] is not None for i in (4, 5, 6))
+                or (click and parent_row[7] != 0)
+                or child[2:4] != ("subagent", "Codex Desktop") or child[5] != expected or expected is None
+                or child[6] not in (None, parent)):
+            raise ValueError("native reviewer family or role unavailable")
+        safe_input.safe_json_loads(child[1], max_depth=8, max_bytes=512)
+        def unique_pairs(items):
+            value = {}
+            for key, item in items:
+                if key in value:
+                    raise ValueError("duplicate native metadata key")
+                value[key] = item
+            return value
+        source = json.loads(child[1], object_pairs_hook=unique_pairs,
+                            parse_constant=lambda _value: (_ for _ in ()).throw(ValueError("invalid native number")))
+        if (not isinstance(source, dict) or set(source) != {"subagent"}
+                or not isinstance(source["subagent"], dict) or set(source["subagent"]) != {"thread_spawn"}):
+            raise ValueError("native reviewer source unavailable")
+        spawn = source["subagent"]["thread_spawn"]
+        if (not isinstance(spawn, dict) or set(spawn) - {"parent_thread_id", "depth", "agent_path", "agent_role", "agent_nickname"}
+                or spawn.get("parent_thread_id") != parent or type(spawn.get("depth")) is not int or spawn["depth"] != 1
+                or not child[4] or spawn.get("agent_path") != child[4] or spawn.get("agent_role") != expected):
+            raise ValueError("native reviewer parent or role conflicts")
+        if (tuple(_native_path(item, uid, directory=True) for item in directories) != before
+                or _native_path(raw, uid, maximum=64_000_000) != wal_binding):
+            raise ValueError("native review WAL binding changed")
+        identity = {"home": home, "uid": uid, "parent": parent, "agent_path": child[4],
+                "main": raw, "main_binding": wal_binding, "rollout": child[8] if click else None,
+                "archived": bool(child[7]), "child_source": source,
+                "child_provider": child[9] if click else None, "parent_provider": parent_row[9] if click else None}
+        if purpose == "owner":
+            identity["native_binding_sha256"] = sha256_bytes(json.dumps(
+                {"parent": parent_row, "owner": child}, sort_keys=True).encode())
+        return identity
+    except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, RuntimeError):
+        label = "click-tester" if click else "reviewer"
+        raise SpecError(f"native {label} metadata unavailable or conflicting", EXIT_USAGE) from None
+
+
+NATIVE_CLICK_PREFIX = "CLICK_TEST_WITNESS_V1 "
+NATIVE_CLICK_SOURCE = "codex-native-click-witness-v1"
+NATIVE_CLICK_ROLE = "harness_click_tester"
+NATIVE_ROLLOUT_LIMIT = 16_000_000
+NATIVE_CLICK_WAL_LIMIT = 4_000_000
+MAX_NATIVE_CLICK_CANDIDATES = 16
+
+
+def _native_read(path, identity, limit, *, binding=None):
+    """Bound one local file and its ancestors throughout the read."""
+    home, uid = identity["home"], identity["uid"]
+    parents = [home, *(p for p in reversed(path.parents) if p != home and p.is_relative_to(home))]
+    directories = [_native_path(p, uid, directory=True) for p in parents]
+    before = _native_path(path, uid, maximum=limit)
+    if binding is not None and before != binding:
+        raise ValueError("native identity file changed")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        first = os.fstat(fd)
+        if (first.st_dev, first.st_ino, first.st_uid, first.st_mode) != before:
+            raise ValueError("native file changed")
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            raw = stream.read(limit + 1)
+        last = os.fstat(fd)
+        if ((first.st_size, first.st_mtime_ns, first.st_ctime_ns) !=
+                (last.st_size, last.st_mtime_ns, last.st_ctime_ns) or len(raw) != first.st_size or len(raw) > limit
+                or _native_path(path, uid, maximum=limit) != before
+                or [_native_path(p, uid, directory=True) for p in parents] != directories):
+            raise ValueError("native file changed")
+        return raw
+    finally:
+        os.close(fd)
+
+
+def _native_json(raw, limit):
+    safe_input.safe_json_loads(raw, max_depth=40, max_bytes=limit)
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("duplicate native JSON key")
+            result[key] = value
+        return result
+    def constant(_value):
+        raise ValueError("non-finite number")
+    value = json.loads(raw, object_pairs_hook=pairs, parse_constant=constant)
+    if not isinstance(value, dict):
+        raise ValueError("native document is not an object")
+    return value
+
+
+def _native_stamp(value):
+    if not isinstance(value, str) or len(value) > 40:
+        raise ValueError("native timestamp missing")
+    stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if stamp.tzinfo is None:
+        raise ValueError("native timestamp is not timezone aware")
+    return stamp
+
+
+def _check_native_inherited_header(entry, identity, first_at, observed_start):
+    """Accept the one Desktop fork prologue, which belongs to the already-bound parent."""
+    payload = entry.get("payload")
+    parent = identity["parent"]
+    if (entry.get("type") != "session_meta" or not isinstance(payload, dict)
+            or payload.get("id") != parent or payload.get("session_id") != parent
+            or payload.get("source") != "vscode" or payload.get("thread_source") != "user"
+            or payload.get("originator") != "Codex Desktop" or not identity["parent_provider"]
+            or payload.get("model_provider") != identity["parent_provider"]
+            or any(payload.get(key) is not None for key in ("parent_thread_id", "forked_from_id", "agent_path",
+                                                           "agent_role", "agent_nickname", "subagent_history_start_ordinal"))
+            or not first_at <= _native_stamp(entry.get("timestamp")) <= observed_start):
+        raise ValueError("native inherited rollout header mismatched")
+
+
+def _native_click_proof(identity, agent, line, started, ended):
+    """Require the same statement in the child's native final answer and own WAL."""
+    try:
+        raw_rollout = identity["rollout"]
+        if not isinstance(raw_rollout, str):
+            raise ValueError("native rollout unavailable")
+        rollout = Path(raw_rollout)
+        codex = identity["home"] / ".codex"
+        relative = rollout.relative_to(codex)
+        if (not re.fullmatch(rf"rollout-[0-9T-]+-{re.escape(agent)}\.jsonl", rollout.name)
+                or not re.fullmatch(r"sessions/[0-9]{4}/[0-9]{2}/[0-9]{2}|archived_sessions", str(relative.parent))
+                or (relative.parts[0] == "archived_sessions") != identity["archived"]
+                or ".." in relative.parts):
+            raise ValueError("native rollout path unavailable")
+        start, end = _native_stamp(started), _native_stamp(ended)
+        if start > end:
+            raise ValueError("native observed time order invalid")
+        parent = identity["parent"]
+        agent_wal = identity["main"].with_name(f"agent-{agent}.jsonl")
+        main_data = _native_read(identity["main"], identity, NATIVE_CLICK_WAL_LIMIT, binding=identity["main_binding"])
+        main_rows = [_native_json(raw, 4_000_000) for raw in main_data.splitlines()]
+        child_rows = [_native_json(raw, 4_000_000) for raw in _native_read(agent_wal, identity, NATIVE_CLICK_WAL_LIMIT).splitlines()]
+        starts = [e for e in main_rows if e.get("event") == "SubagentStart" and e.get("agent_id") == agent]
+        child_starts = [e for e in child_rows if e.get("event") == "SubagentStart"]
+        notes = [e for e in child_rows if isinstance(e.get("note"), str) and e["note"].startswith(NATIVE_CLICK_PREFIX)]
+        if (len(starts) != 1 or starts != child_starts or starts[0].get("agent_type") != NATIVE_CLICK_ROLE
+                or len(notes) != 1 or notes[0].get("event") != "check" or notes[0].get("note") != line
+                or not _native_stamp(starts[0].get("at")) <= start <= end <= _native_stamp(notes[0].get("at"))):
+            raise ValueError("native WAL witness missing or mismatched")
+        entries = iter(_native_read(rollout, identity, NATIVE_ROLLOUT_LIMIT).splitlines())
+        first = _native_json(next(entries), 4_000_000)
+        meta = first.get("payload")
+        first_at = _native_stamp(first.get("timestamp"))
+        if (first.get("type") != "session_meta" or not isinstance(meta, dict) or meta.get("id") != agent
+                or meta.get("session_id") != parent or meta.get("parent_thread_id") != parent
+                or meta.get("originator") != "Codex Desktop" or meta.get("thread_source") != "subagent"
+                or meta.get("agent_role") != NATIVE_CLICK_ROLE or meta.get("agent_path") != identity["agent_path"]
+                or first_at > start):
+            raise ValueError("native rollout metadata mismatched")
+        cutoff = meta.get("subagent_history_start_ordinal")
+        if cutoff is not None:
+            if (type(cutoff) is not int or cutoff < 2 or not identity["child_provider"]
+                    or meta.get("model_provider") != identity["child_provider"]
+                    or meta.get("source") != identity["child_source"]):
+                raise ValueError("native fork history boundary unavailable")
+        matches = []
+        for ordinal, raw in enumerate(entries, start=1):
+            entry = _native_json(raw, 4_000_000)
+            if cutoff is not None and ordinal == 1:
+                _check_native_inherited_header(entry, identity, first_at, start)
+                continue
+            if entry.get("type") == "session_meta":
+                raise ValueError("unexpected native rollout header")
+            if cutoff is not None and ordinal < cutoff:
+                continue
+            payload = entry.get("payload")
+            settings = (entry.get("type") == "event_msg" and isinstance(payload, dict)
+                        and payload.get("type") == "thread_settings_applied")
+            if ordinal == cutoff and (not settings or _native_stamp(entry.get("timestamp")) > start):
+                raise ValueError("native fork history boundary unavailable")
+            if settings and payload.get("thread_id") != agent:
+                raise ValueError("native rollout settings name another thread")
+            if (entry.get("type") != "response_item" or not isinstance(payload, dict)
+                    or payload.get("type") != "message" or payload.get("role") != "assistant"
+                    or payload.get("phase") != "final_answer" or payload.get("status") != "completed"):
+                continue
+            content = payload.get("content")
+            if not isinstance(content, list):
+                raise ValueError("native rollout message unavailable")
+            for item in content:
+                if not isinstance(item, dict) or item.get("type") != "output_text" or not isinstance(item.get("text"), str):
+                    raise ValueError("native rollout message unavailable")
+                for text in item["text"].splitlines():
+                    if text.startswith(NATIVE_CLICK_PREFIX):
+                        matches.append((text, _native_stamp(entry.get("timestamp"))))
+        if len(matches) != 1 or matches[0][0] != line or matches[0][1] < _native_stamp(notes[0].get("at")):
+            raise ValueError("native assistant witness missing, mismatched or replayed")
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError, StopIteration):
+        raise SpecError("native click-test witness unavailable, conflicting or not authored by this tester", EXIT_USAGE) from None
+
+
+def _native_click_origin(repo):
+    origin = subprocess.run(["git", "-C", str(repo), "config", "--get", "remote.origin.url"],
+                            capture_output=True, text=True, timeout=30)
+    text = origin.stdout.strip()
+    scp = re.fullmatch(r"git@([A-Za-z0-9.-]+):([^\s]+)", text)
+    if scp:
+        host, name = scp.groups()
+    else:
+        try:
+            parsed = urllib.parse.urlsplit(text)
+            if (parsed.scheme not in ("https", "ssh") or parsed.username not in (None, "git") or parsed.password is not None
+                    or parsed.query or parsed.fragment or parsed.port is not None):
+                raise ValueError("unsupported origin")
+            host, name = parsed.hostname, parsed.path.removeprefix("/")
+        except ValueError:
+            raise SpecError("native click-test needs a credential-free canonical Git origin", EXIT_USAGE) from None
+    name = name.removesuffix(".git")
+    if (origin.returncode or not host or not re.fullmatch(r"[A-Za-z0-9.-]+", host)
+            or not re.fullmatch(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)+", name)
+            or any(part in (".", "..") for part in name.split("/"))):
+        raise SpecError("native click-test needs a credential-free canonical Git origin", EXIT_USAGE)
+    return f"{host.lower()}/{name}"
+
+
+def _native_click_line(record, attachments):
+    tester = record["tester"]
+    deployed = record["deployed_commit"]["sha"]
+    report = tester["report_sha256"]
+    core = record["spec_core_sha"]
+    if (not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", deployed)
+            or any(not re.fullmatch(r"[0-9a-f]{64}", s) for s in (report, core))
+            or record["result"] not in ("pass", "fail") or len(record["url"]) > 512):
+        raise ValueError("native witness fields malformed")
+    url = urllib.parse.urlsplit(record["url"])
+    if (url.scheme not in ("http", "https") or not url.hostname or url.username is not None
+            or url.path not in ("", "/") or url.query or url.fragment or url.netloc.endswith(":")
+            or (url.port is not None and not 1 <= url.port <= 65535)
+            or any(not 33 <= ord(ch) <= 126 for ch in record["url"])):
+        raise ValueError("native witness URL is not a credential-free origin")
+    bound = {key: record[key] for key in ("ticket", "url", "result", "spec_core_sha", "covers_commits")}
+    bound.update({key: tester[key] for key in ("identity", "parent", "repo", "report_sha256", "started_at", "ended_at")})
+    bound["deployed_commit"] = deployed
+    bound["attachments_sha256"] = sha256_bytes(json.dumps(attachments, ensure_ascii=True, separators=(",", ":")).encode())
+    line = NATIVE_CLICK_PREFIX + json.dumps(bound, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    if len(line) > 4000:
+        raise ValueError("native witness too large")
+    return line
+
+
+def _native_click_spec_fresh(record, spec):
+    try:
+        return _native_stamp(record["tester"]["started_at"]) >= _native_stamp(spec["_at"])
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _native_click_claim(record):
+    tester = record.get("tester")
+    if not isinstance(tester, dict):
+        tester = {}
+    ident = tester.get("identity")
+    return (record.get("v") == 2 or tester.get("family") == "codex"
+            or tester.get("agent_type") == NATIVE_CLICK_ROLE or record.get("pass_source") == NATIVE_CLICK_SOURCE
+            or (isinstance(ident, str) and re.fullmatch(UUID, ident) is not None))
+
+
+def _native_click_record_line(record, attachments):
+    tester = record["tester"]
+    if (record.get("v") != 2 or tester.get("family") != "codex" or tester.get("kind") != "agent"
+            or tester.get("agent_type") != NATIVE_CLICK_ROLE or record.get("pass_source") != NATIVE_CLICK_SOURCE
+            or not re.fullmatch(UUID, tester["parent"]) or not re.fullmatch(UUID, tester["identity"])
+            or sum(item["role"] == "report" for item in attachments) != 1):
+        raise ValueError("native click-test record shape unavailable")
+    manifest = [[f["role"], f["name"], f["sha256"]] for f in attachments]
+    return _native_click_line(record, manifest)
+
+
+def _native_click_record_proof(record, attachments, cache):
+    import pwd
+
+    line = _native_click_record_line(record, attachments)
+    if cache is not None and line in cache:
+        if not cache[line]:
+            raise ValueError("native click-test witness unavailable")
+        return
+    if cache is not None:
+        cache[line] = False
+    tester = record["tester"]
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    main = home / ".agent-harness/codex-wals" / tester["parent"] / "main.jsonl"
+    identity = _native_agent_source(main, tester["identity"], NATIVE_CLICK_ROLE, purpose="click-test")
+    if identity is None:
+        raise ValueError("native click-test identity unavailable")
+    _native_click_proof(identity, tester["identity"], line, tester["started_at"], tester["ended_at"])
+    if cache is not None:
+        cache[line] = True
+
+
+def _native_owner_proof(main_wal, owner):
+    """Check native assignment and freeze an owner-recorded handoff/result, not process completion."""
+    agent = owner.removeprefix("agent:")
+    native = _native_agent_source(Path(main_wal), agent, "harness_owner", purpose="owner")
+    if native is None:
+        raise SpecError("Explicit Owners require native assigned-owner metadata", EXIT_USAGE)
+    import pwd
+    uid = os.getuid()
+    home = Path(pwd.getpwuid(uid).pw_dir)
+    path = home / ".agent-harness/codex-wals" / native["parent"] / f"agent-{agent}.jsonl"
+    try:
+        before = _native_path(path, uid, maximum=64_000_000)
+        detail = path.stat()
+        data = read_regular(path, 64_000_000)
+        after = path.stat()
+        if (_native_path(path, uid, maximum=64_000_000) != before
+                or (detail.st_size, detail.st_mtime_ns) != (after.st_size, after.st_mtime_ns)
+                or len(data) != detail.st_size or not data.endswith(b"\n")):
+            raise ValueError("owner WAL changed or is incomplete")
+        def unique(items):
+            value = {}
+            for key, item in items:
+                if key in value:
+                    raise ValueError("duplicate owner event key")
+                value[key] = item
+            return value
+        candidate, start = None, None
+        for line in data.splitlines():
+            if not line.strip():
+                continue
+            safe_input.safe_json_loads(line, max_depth=16, max_bytes=65536)
+            item = json.loads(line, object_pairs_hook=unique,
+                              parse_constant=lambda _: (_ for _ in ()).throw(ValueError("invalid owner number")))
+            if not isinstance(item, dict):
+                raise ValueError("invalid owner event")
+            if item.get("event") == "SubagentStart":
+                timestamp = item.get("at")
+                if (start is not None or item.get("agent_id") != agent or item.get("agent_type") != "harness_owner"
+                        or not isinstance(timestamp, str) or len(timestamp) > 64
+                        or datetime.fromisoformat(timestamp).tzinfo is None):
+                    raise ValueError("owner start is unavailable or conflicting")
+                start = {"started_at": timestamp, "start_event_sha256": sha256_bytes(line)}
+            if item.get("event") in {"handoff", "result"} and isinstance(item.get("note"), str) and item["note"].strip():
+                timestamp = item.get("at")
+                if not isinstance(timestamp, str) or len(timestamp) > 64 or datetime.fromisoformat(timestamp).tzinfo is None:
+                    raise ValueError("invalid owner attestation timestamp")
+                if start is None or datetime.fromisoformat(timestamp) < datetime.fromisoformat(start["started_at"]):
+                    raise ValueError("owner attestation predates the matching start")
+                candidate = {"attestation_event": item["event"], "attestation_at": timestamp,
+                             "event_sha256": sha256_bytes(line)}
+        if candidate is None or _native_agent_source(Path(main_wal), agent, "harness_owner", purpose="owner") != native:
+            raise ValueError("owner attestation or stable assignment unavailable")
+        return {"owner": owner, "parent": native["parent"], "family": "codex", "agent_type": "harness_owner", **start,
+                "native_binding_sha256": native["native_binding_sha256"], "wal_sha256": sha256_bytes(data), **candidate}
+    except (OSError, ValueError, TypeError, UnicodeError, RuntimeError):
+        raise SpecError("Owner-recorded handoff/result evidence unavailable or changed", EXIT_USAGE) from None
 
 
 def wal_entries(path: Path):
@@ -757,11 +1267,11 @@ def record_body(summary: str, record: dict) -> str:
 
 _FIELD_TYPES = {"attachments": list, "commits": list, "ac": list, "reviews": list, "tester": dict,
                 "deployed_commit": dict, "covers_commits": list, "click_test": dict, "really_tested": dict,
-                "review_policy": dict}
+                "review_policy": dict, "owners": list, "owner_proofs": list}
 _NESTED_STRINGS = {"id", "role", "sha256", "name", "key", "verdict", "core_sha", "kind", "sha", "identity",
                    "at", "text", "id_hint", "mode", "basis", "reason", "artifact", "reviewed_at"}
 _STRING_FIELDS = ("key", "actor", "author", "spec_core_sha", "spec_file_sha", "by", "signer_kind", "result", "url",
-                  "pass_source", "signoff", "note")
+                  "pass_source", "signoff", "note", "owners_core_sha", "owner_proof_sha256")
 
 
 def record_shape_problem(record: dict):
@@ -773,11 +1283,11 @@ def record_shape_problem(record: dict):
         if name in record and record[name] is not None and not isinstance(record[name], str):
             return f"field {name} is not a string"
     for name, inner in (("attachments", dict), ("commits", dict), ("reviews", dict), ("ac", str),
-                        ("covers_commits", str)):
+                        ("covers_commits", str), ("owners", str), ("owner_proofs", dict)):
         if any(not isinstance(item, inner) for item in record.get(name) or []):
             return f"field {name} holds an entry that is not a {inner.__name__}"
     # Nested objects hold only scalars, and the fields the gate keys on are strings.
-    nested = [(name, item) for name in ("attachments", "commits", "reviews") for item in record.get(name) or []]
+    nested = [(name, item) for name in ("attachments", "commits", "reviews", "owner_proofs") for item in record.get(name) or []]
     nested += [(name, record[name]) for name in ("tester", "deployed_commit", "click_test", "really_tested", "review_policy")
                if isinstance(record.get(name), dict)]
     for name, item in nested:
@@ -787,6 +1297,50 @@ def record_shape_problem(record: dict):
             if field in _NESTED_STRINGS and value is not None and not isinstance(value, str):
                 return f"field {name}.{safe(field, 40)} is not a string"
     return None
+
+
+_OWNERSHIP_FIELDS = {"owners", "owners_core_sha", "owner_proofs", "owner_proof_sha256"}
+
+
+def ownership_payload(record):
+    return json.dumps({"schema": 1, "spec_core_sha": record["owners_core_sha"], "owners": record["owners"],
+                       "proofs": record["owner_proofs"]}, sort_keys=True, separators=(",", ":")).encode()
+
+
+def explicit_record_owners(record):
+    if not _OWNERSHIP_FIELDS.intersection(record) and record.get("v") != 2:
+        return None
+    fields = {"owner", "parent", "family", "agent_type", "attestation_event", "attestation_at",
+              "started_at", "start_event_sha256", "wal_sha256", "event_sha256", "native_binding_sha256"}
+    try:
+        owners, proofs, core = record["owners"], record["owner_proofs"], record["owners_core_sha"]
+        if (record.get("v") != 2 or type(owners) is not list or not 1 <= len(owners) <= 8 or len(set(owners)) != len(owners)
+                or any(type(owner) is not str or re.fullmatch("agent:" + UUID, owner) is None
+                       or owner != owner.lower() for owner in owners)
+                or record.get("author") not in owners or not isinstance(core, str)
+                or re.fullmatch(r"[0-9a-f]{64}", core) is None or core != record.get("spec_core_sha")
+                or type(proofs) is not list or len(proofs) != len(owners)):
+            raise ValueError
+        for owner, proof in zip(owners, proofs):
+            if (type(proof) is not dict or set(proof) != fields or proof["owner"] != owner
+                    or proof["family"] != "codex" or proof["agent_type"] != "harness_owner"
+                    or proof["attestation_event"] not in ("handoff", "result")
+                    or type(proof["parent"]) is not str or re.fullmatch(UUID, proof["parent"]) is None
+                    or proof["parent"] != proof["parent"].lower() or owner == "agent:" + proof["parent"]
+                    or type(proof["attestation_at"]) is not str or len(proof["attestation_at"]) > 64
+                    or datetime.fromisoformat(proof["attestation_at"]).tzinfo is None
+                    or type(proof["started_at"]) is not str or len(proof["started_at"]) > 64
+                    or datetime.fromisoformat(proof["started_at"]).tzinfo is None
+                    or datetime.fromisoformat(proof["attestation_at"]) < datetime.fromisoformat(proof["started_at"])
+                    or any(type(proof[key]) is not str or re.fullmatch(r"[0-9a-f]{64}", proof[key]) is None
+                           for key in ("wal_sha256", "event_sha256", "native_binding_sha256", "start_event_sha256"))):
+                raise ValueError
+        if (len({proof["parent"] for proof in proofs}) != 1
+                or record["owner_proof_sha256"] != sha256_bytes(ownership_payload(record))):
+            raise ValueError
+        return set(owners)
+    except (KeyError, TypeError, ValueError, OverflowError):
+        raise SpecError("Explicit owner declaration or frozen native provenance is malformed or stale") from None
 
 
 def _nesting_depth(text: str) -> int:
@@ -811,9 +1365,21 @@ def _nesting_depth(text: str) -> int:
     return deepest
 
 
+BOOKKEEPING_LABEL = "coordinator bookkeeping (ahc)"   # goodqa#16034 D24 / AC-30: the ahc freshness note
+
+
+def is_bookkeeping(body) -> bool:
+    """True for an ahc D24 bookkeeping note (it starts with the label). It states facts already in git and is never
+    owner evidence, a checkpoint, a spec record or a click-test (AC-30)."""
+    return str(body or "").lstrip().startswith(BOOKKEEPING_LABEL)
+
+
 def ticket_records(comments: list, max_bytes: int):
     records, ignored = [], []
     for comment in comments:
+        if is_bookkeeping(comment.get("body")):
+            ignored.append(f"comment {str(comment.get('id', ''))[:8]}: {BOOKKEEPING_LABEL} note, not a record")
+            continue
         for match in RECORD_BLOCK.finditer(str(comment.get("body") or "")):
             raw = match.group(1)
             if len(raw) > max_bytes:
@@ -826,13 +1392,22 @@ def ticket_records(comments: list, max_bytes: int):
             except (ValueError, RecursionError):
                 ignored.append(f"comment {comment['id'][:8]}: record is not JSON")
                 continue
-            if not isinstance(record, dict) or record.get("v") != 1 or record.get("kind") not in KINDS:
+            if (not isinstance(record, dict) or record.get("kind") not in KINDS
+                    or not (record.get("v") == 1 or (record.get("v") == 2 and record.get("kind") in ("spec", "click_test")))):
                 ignored.append(f"comment {comment['id'][:8]}: unknown record version or kind")
                 continue
             shape = record_shape_problem(record)
             if shape:
-                ignored.append(f"comment {comment['id'][:8]}: malformed {record['kind']} record ({shape})")
-                continue
+                if (record.get("v") == 2 and record["kind"] == "spec"
+                        and shape.startswith(("field owners", "field owner_proofs", "field owner_proof_sha256"))):
+                    record["_ownership_shape_problem"] = shape
+                else:
+                    ignored.append(f"comment {comment['id'][:8]}: malformed {record['kind']} record ({shape})")
+                    if record["kind"] != "click_test" or not _native_click_claim(record):
+                        continue
+                    # Preserve native failure precedence; never uncover an older pass.
+                    record = {"v": 2, "kind": "click_test", "spec_core_sha": record.get("spec_core_sha"),
+                              "attachments": [], "tester": {}}
             record["_comment"] = comment["id"]
             record["_at"] = str(comment.get("createdAt") or "")
             records.append(record)
@@ -862,7 +1437,7 @@ def attachment_problems(record: dict, index: dict) -> list:
     return problems
 
 
-def kind_problems(record: dict) -> list:
+def kind_problems(record: dict, *, native_cache=None) -> list:
     """Shape rules beyond attachment integrity: a record must carry the files its kind is trusted for."""
     attachments = [item for item in record.get("attachments") or [] if isinstance(item, dict)]
     roles = {item.get("role"): item for item in attachments}
@@ -870,6 +1445,12 @@ def kind_problems(record: dict) -> list:
     if any(not re.fullmatch(r"AC-[0-9]{1,3}", str(ac)) for ac in record.get("ac") or []):
         problems.append("criteria ids must look like AC-<n>")
     if record["kind"] == "spec":
+        try:
+            explicit = explicit_record_owners(record)
+            if explicit is not None and (roles.get("owner-provenance") or {}).get("sha256") != record["owner_proof_sha256"]:
+                problems.append("no attached owner provenance matches the frozen owner declaration")
+        except SpecError as error:
+            problems.append(str(error))
         if (roles.get("spec") or {}).get("sha256") != record.get("spec_file_sha") or not record.get("spec_file_sha"):
             problems.append("no attached spec file matches the record's spec_file_sha")
         if "reviews" not in roles:
@@ -882,20 +1463,105 @@ def kind_problems(record: dict) -> list:
     elif record["kind"] == "click_test":
         if not (roles.get("log") or roles.get("report")):
             problems.append("the click-test record has no log or report attached")
+        if _native_click_claim(record):
+            try:
+                _native_click_record_proof(record, attachments, native_cache)
+            except (SpecError, OSError, ValueError, TypeError, KeyError):
+                problems.append("native click-test witness did not verify on this host")
     return problems
 
 
-def verified(records: list, index: dict, kind: str):
+def verified(records: list, index: dict, kind: str, *, native_cache=None):
     good, bad = [], []
     for record in records:
         if record["kind"] != kind:
             continue
         try:
-            problems = attachment_problems(record, index) + kind_problems(record)
+            problems = attachment_problems(record, index)
+            if not problems or kind != "click_test" or not _native_click_claim(record):
+                problems += kind_problems(record, native_cache=native_cache)
         except Exception as exc:  # comments are untrusted: a shape the checks missed is ignored, not fatal
             problems = [f"record could not be checked ({type(exc).__name__})"]
         (bad if problems else good).append((record, problems))
     return [record for record, _ in good], bad
+
+
+def current_artifact_spec(records, index, label=None):
+    """Select from checked server attachment bytes, never mutable comment role/version."""
+    sources, errors = [], []
+    for row in index.values():
+        if not isinstance(row, dict) or row.get("mime") != "text/markdown" or not row.get("commentId"):
+            continue
+        timestamp = row.get("_comment_at")
+        try:
+            order = (_native_stamp(timestamp), row["commentId"])
+        except (ValueError, TypeError, KeyError):
+            raise SpecError("Attached markdown lacks a verified comment timestamp") from None
+        data = row.get("_spec_bytes")
+        if (row.get("completionState") != "completed" or row.get("deletedAt") or row.get("archivedAt")
+                or row.get("_spec_error") or not isinstance(data, bytes)
+                or len(data) > 1_000_000 or sha256_bytes(data) != row.get("sha256")):
+            errors.append(order)
+            continue
+        try:
+            text = data.decode("utf-8")
+            parsed = parse_spec(text)
+            header = parsed["header"]
+            looks_spec = text.lstrip().startswith("# Spec:") or ("Ticket" in header and "Author" in header)
+            if not looks_spec:
+                continue
+            if label and norm_identity(header.get("Ticket")) != norm_identity(label):
+                continue
+            author = parse_author(header.get("Author", ""))
+            owners = declared_owners(parsed)
+            sources.append({"order": order, "comment": row["commentId"], "at": timestamp,
+                            "author": author, "owners": owners, "core": core_sha(text),
+                            "sha": row["sha256"], "id": row["id"], "ticket": header.get("Ticket")})
+        except (UnicodeError, ValueError, SpecError):
+            errors.append(order)
+    if not sources:
+        if errors or any(r["kind"] == "spec" for r in records):
+            raise SpecError("No verified spec: attached specification source bytes cannot be verified")
+        return None
+    newest = max(source["order"] for source in sources)
+    for record in records:
+        if record["kind"] == "spec":
+            try:
+                if (_native_stamp(record["_at"]), record["_comment"]) > newest:
+                    raise SpecError("A newer specification record has no verified attached source; older specs cannot substitute")
+            except (KeyError, TypeError, ValueError):
+                raise SpecError("Specification record timestamp cannot be verified") from None
+    if errors and max(errors) >= newest:
+        raise SpecError("Current attached specification source is unavailable or corrupt; older specs cannot substitute")
+    current = [source for source in sources if source["order"] == newest]
+    bindings = {(r["core"], r["author"], None if r["owners"] is None else tuple(r["owners"])) for r in current}
+    if len(bindings) != 1:
+        raise SpecError("Conflicting specification artifacts are attached to the current comment")
+    matches = [r for r in records if r["kind"] == "spec" and r["_comment"] == current[0]["comment"]]
+    if len(matches) != 1:
+        raise SpecError("Current attached specification has missing or ambiguous record metadata")
+    record = matches[0]
+    source = next((r for r in current if r["sha"] == record.get("spec_file_sha")), None)
+    if (source is None or record.get("author") != source["author"] or record.get("spec_core_sha") != source["core"]
+            or norm_identity(record.get("ticket")) != norm_identity(source["ticket"])):
+        raise SpecError("Specification record author/core differs from the verified attached source")
+    if source["owners"] is not None:
+        if record.get("owners") != source["owners"] or explicit_record_owners(record) != set(source["owners"]):
+            raise SpecError("Explicit ownership metadata differs from the verified attached specification")
+    elif _OWNERSHIP_FIELDS.intersection(record) or record.get("v") == 2:
+        raise SpecError("Ownership metadata is not declared by the attached specification")
+    problems = attachment_problems(record, index) + kind_problems(record)
+    if problems:
+        raise SpecError("Current specification verification failed: " + "; ".join(problems))
+    return record
+
+
+def broken_current_ownership(records, index):
+    try:
+        current_artifact_spec(records, index)
+    except SpecError as error:
+        return str(error)
+    return None
 
 
 def op_id(issue_id: str, key: str) -> str:
@@ -928,22 +1594,37 @@ class Session:
         return records, ignored, index
 
     def latest_spec(self, records, index):
-        good, _ = verified(records, index, "spec")
-        if not good:
+        current = current_artifact_spec(records, index, self.ticket.label)
+        if current is None:
             raise SpecError(f"no verified spec is attached to {self.ticket.label}; run spec_flow.py attach first")
-        return good[-1]
+        return current
 
     def post(self, kind: str, summary: str, record: dict, files, records):
         """files: [(role, name, mime, bytes)]. Idempotent on the record key."""
         index = {row.get("id"): row for row in self.adapter.attachments(self.ticket.id)}
-        trusted = verified(records, index, record["kind"])[0] if record["kind"] != "signoff" else \
-            [item for item in records if item["kind"] == "signoff"]
+        key_records = records
+        if kind == "click_test":
+            native = _native_click_claim(record)
+            key_records = [item for item in records if item["kind"] == kind and item.get("key") == record["key"]
+                           and _native_click_claim(item) == native]
+            if native:
+                if len(key_records) > MAX_NATIVE_CLICK_CANDIDATES:
+                    raise SpecError("too many native click-test replays for this receipt; reconcile duplicate ticket records")
+                manifest = [[role, name, sha256_bytes(data)] for role, name, _mime, data in files]
+                line = _native_click_line(record, manifest)
+                trusted = [item for item in verified(key_records, index, kind, native_cache={})[0]
+                           if _native_click_record_line(item, item["attachments"]) == line]
+            else:
+                trusted = verified(key_records, index, kind)[0]
+        else:
+            trusted = verified(records, index, record["kind"])[0] if record["kind"] != "signoff" else \
+                [item for item in records if item["kind"] == "signoff"]
         if any(item.get("key") == record["key"] for item in trusted):
             print(json.dumps({"status": "ALREADY_RECORDED", "kind": kind, "key": record["key"]}))
             return None
         # A same-key record that failed verification must not be replayed by GoodQA's idempotent comment:
         # fold the rejected comment ids into the operationId so this attempt creates a new comment.
-        rejected = sorted(item["_comment"] for item in records
+        rejected = sorted(item["_comment"] for item in key_records
                           if item.get("key") == record["key"] and item not in trusted)
         op_key = record["key"] + ("|retry:" + ",".join(rejected) if rejected else "")
         if not self.project_id:
@@ -957,15 +1638,17 @@ class Session:
         comment = self.adapter.comment_with_files(self.ticket.id, record_body(summary, record),
                                                   op_id(self.ticket.id, op_key),
                                                   [item["id"] for item in attachments])
-        if comment.get("id") in rejected:
+        comment_id = comment.get("id")
+        if not isinstance(comment_id, str) or not comment_id:
+            raise SpecError("GoodQA did not return a comment identifier", EXIT_TRACKER)
+        if comment_id in rejected:
             raise SpecError("GoodQA replayed an earlier rejected comment instead of recording this one", EXIT_TRACKER)
         bound = {row.get("id"): row for row in self.adapter.attachments(self.ticket.id)}
-        unbound = [item["name"] for item in attachments if (bound.get(item["id"]) or {}).get("commentId") != comment.get("id")]
-        if unbound:
-            raise SpecError(f"GoodQA did not bind {', '.join(unbound)} to the new comment; the record will not "
-                            "verify", EXIT_TRACKER)
+        problems = attachment_problems(dict(record, _comment=comment_id), bound)
+        if problems:
+            raise SpecError("GoodQA attachment verification failed: " + "; ".join(problems), EXIT_TRACKER)
         print(json.dumps({"status": "RECORDED", "kind": kind, "ticket": self.ticket.label,
-                          "comment": comment["id"], "attachments": len(attachments)}))
+                          "comment": comment_id, "attachments": len(attachments)}))
         return comment
 
 
@@ -977,21 +1660,95 @@ def tester_key(tester: dict) -> str:
     return identity_key(kind, safe_id(identity) if kind == "agent" else identity) if kind else ""
 
 
+def independence_roles(spec, records, index):
+    """Posting is transport in explicit mode; legacy owner inference stays conservative."""
+    explicit = explicit_record_owners(spec)
+    author, core = spec.get("author"), spec.get("spec_core_sha")
+    owners = ({author} | explicit) if explicit is not None else (
+        {author} | {r.get("actor") for r in records if r["kind"] in ("spec", "evidence", "click_test")})
+    owners.discard(None)
+    reviewers = {r.get("key") for r in spec.get("reviews") or []
+                 if r.get("core_sha") == core and r.get("role") in required_review_roles(spec.get("review_policy"))}
+    if explicit is None:
+        # Preserve legacy final-gate behavior, including historical tester exclusions.
+        tests = [r for r in records if r["kind"] == "click_test"]
+        click_excluded = {author} | reviewers | {r.get("actor") for r in records if r["kind"] == "evidence"}
+    else:
+        tests, _ = verified(records, index, "click_test")
+        click_excluded = owners | reviewers
+    testers = {tester_key(r.get("tester") or {}) for r in tests} - {""}
+    return owners | reviewers | testers, click_excluded
+
+
+def _latest_click_result(records, index, spec, label, notes):
+    """Select current native results by witnessed run order, and legacy results by receipt order."""
+    core = spec.get("spec_core_sha")
+    click_records = [r for r in records if r["kind"] == "click_test"]
+    native = [r for r in click_records if r.get("spec_core_sha") == core and _native_click_claim(r)]
+    if not native:
+        legacy = [r for r in click_records if not _native_click_claim(r)]
+        good, bad = verified(legacy, index, "click_test")
+        for record, problems in bad:
+            notes.append(f"click-test record {record['_comment'][:8]} ignored: {'; '.join(problems)}")
+        current = [r for r in good if r.get("spec_core_sha") == core]
+        return (current[-1] if current else None), bool(good or any(_native_click_claim(r) for r in click_records)), None
+    if len(native) > MAX_NATIVE_CLICK_CANDIDATES:
+        return None, True, "too many current native records to verify; reconcile duplicate or obsolete ticket records"
+    scoped = [r for r in native if r.get("ticket") == label and _native_click_spec_fresh(r, spec)]
+    good, bad = verified(scoped, index, "click_test", native_cache={})
+    for record, problems in bad:
+        notes.append(f"click-test record {record['_comment'][:8]} ignored: {'; '.join(problems)}")
+    observations = {_native_click_record_line(r, r["attachments"]): r for r in good}
+    unknown = [r for r in native if r not in good]
+    if not observations:
+        return None, True, "the latest native result does not verify for this ticket on this host"
+    last_end = max(_native_stamp(r["tester"]["ended_at"]) for r in observations.values())
+    newest = [r for r in observations.values() if _native_stamp(r["tester"]["ended_at"]) == last_end]
+    if len(newest) != 1:
+        return None, True, "the latest native observations conflict at the same end time; run a new independent click-test"
+    # An unverifiable attempt can only be superseded by a verified run that ends after it was posted.
+    try:
+        inconclusive = any(_native_stamp(r.get("_at")) >= last_end for r in unknown)
+    except ValueError:
+        inconclusive = True
+    if inconclusive:
+        return None, True, "the latest native result does not verify for this ticket on this host"
+    latest = newest[0]
+    if latest["result"] == "pass":
+        legacy_failures = [r for r in click_records if r.get("spec_core_sha") == core and r.get("result") == "fail"
+                           and not _native_click_claim(r)]
+        for record in verified(legacy_failures, index, "click_test")[0]:
+            try:
+                failed_at = _native_stamp((record.get("tester") or {}).get("ended_at"))
+            except ValueError:
+                try:
+                    failed_at = _native_stamp(record.get("_at"))
+                except ValueError:
+                    return None, True, "a legacy failure has no verifiable observation or posting time"
+            if failed_at >= last_end:
+                return None, True, "a newer legacy click-test failed after the native pass"
+    return latest, True, None
+
+
 def evaluate(records: list, index: dict, issue: dict, ignored=()):
     """Return {"ready", "missing", "self_attested", "notes"} for one ticket."""
     missing, attested, notes = [], [], list(ignored)
     label = issue.get("_label") or issue.get("id")
+    try:
+        current = current_artifact_spec(records, index, label)
+    except SpecError as error:
+        return {"ready": False, "missing": [str(error)], "self_attested": [], "notes": notes}
     specs, bad_specs = verified(records, index, "spec")
     for record, problems in bad_specs:
         notes.append(f"spec record {record['_comment'][:8]} ignored: {'; '.join(problems)}")
-    if not specs:
+    if current is None:
         missing.append("No verified spec is attached. Fix: spec_flow.py new --ticket '<ref>' --out spec.md; "
                        "get adversarial + acceptance reviews (spec_flow.py review); spec_flow.py attach spec.md")
         return {"ready": False, "missing": missing, "self_attested": attested, "notes": notes}
-    spec = specs[-1]
+    spec = current
     core = spec.get("spec_core_sha")
-    attested.append("spec core sha, criteria and review verdicts are read from the spec record; the attached spec "
-                    "file is checked by sha256 but the core is not re-derived from it")
+    attested.append("spec author, Owners and core are derived from checksum-verified attachment bytes; criteria and "
+                    "review verdict metadata retain their existing declared-record trust limits")
     author = spec.get("author")
     review_policy = spec.get("review_policy")
     required_roles = required_review_roles(review_policy)
@@ -1016,8 +1773,14 @@ def evaluate(records: list, index: dict, issue: dict, ignored=()):
         missing.append("both spec reviews come from the same reviewer/model")
     if author in review_keys:
         missing.append("a spec reviewer is the spec author")
-    owners = {author} | {r.get("actor") for r in records if r["kind"] in ("spec", "evidence", "click_test")}
-    owners.discard(None)
+    excluded, click_excluded = independence_roles(spec, records, index)
+    explicit = explicit_record_owners(spec)
+    if explicit is not None:
+        if explicit & review_keys:
+            missing.append("a spec reviewer is a declared component owner")
+        attested.append("component owners are declared in the reviewed core; native assigned-owner metadata was "
+                        "checked at attachment, while handoff/result is owner-recorded, not process termination "
+                        "or cryptographic proof of code ownership; transport reporters are not inferred owners")
     # acceptance criteria
     evidence, bad_evidence = verified(records, index, "evidence")
     for record, problems in bad_evidence:
@@ -1044,12 +1807,10 @@ def evaluate(records: list, index: dict, issue: dict, ignored=()):
     # click test
     click = spec.get("click_test") or {}
     if click.get("required", True):
-        all_tests, bad_tests = verified(records, index, "click_test")
-        tests = [r for r in all_tests if r.get("spec_core_sha") == core]
-        for record, problems in bad_tests:
-            notes.append(f"click-test record {record['_comment'][:8]} ignored: {'; '.join(problems)}")
-        latest = tests[-1] if tests else None
-        if latest is None and all_tests:
+        latest, had_results, click_problem = _latest_click_result(records, index, spec, label, notes)
+        if click_problem:
+            missing.append(f"click-test: {click_problem}")
+        elif latest is None and had_results:
             missing.append("click-test: only click-tests of an older spec version exist (stale); record a new "
                            "click-test after deploying the current spec's work")
         elif latest is None:
@@ -1071,8 +1832,7 @@ def evaluate(records: list, index: dict, issue: dict, ignored=()):
                                  - set(latest.get("covers_commits") or [])):
             missing.append(f"click-test: evidence commits {', '.join(s[:12] for s in uncovered)} came after the "
                            "deployed commit that was click-tested; deploy them and record a new click-test")
-        elif tester_key(latest.get("tester") or {}) in (
-                {author} | review_keys | {r.get("actor") for r in evidence if r.get("actor")}):
+        elif tester_key(latest.get("tester") or {}) in click_excluded:
             missing.append("click-test: the tester is the spec author, a spec reviewer or posted the evidence; "
                            "an independent click-tester must run it")
         else:
@@ -1095,8 +1855,6 @@ def evaluate(records: list, index: dict, issue: dict, ignored=()):
     # sign-off
     human_required = spec.get("signoff") == "human" or "human sign-off" in str(issue.get("description") or "").lower()
     signoffs = [r for r in records if r["kind"] == "signoff" and r.get("spec_core_sha") == core]
-    testers = {tester_key(r.get("tester") or {}) for r in records if r["kind"] == "click_test"}
-    excluded = owners | review_keys | (testers - {""})
     valid = [r for r in signoffs if r.get("by") not in excluded
              and (not human_required or r.get("signer_kind") == "human")]
     if not valid:
@@ -1111,7 +1869,7 @@ def evaluate(records: list, index: dict, issue: dict, ignored=()):
     else:
         signer = valid[-1]
         attested.append(f"sign-off by {safe(signer.get('signer_kind'))} {safe(signer.get('by'))!r} (identity is self-declared; independence is checked only "
-                        "against the declared author, reviewer, poster and tester ids)")
+                        "against the declared owner, author, reviewer and tester roles; legacy specs also infer owners from posters)")
     return {"ready": not missing, "missing": missing, "self_attested": attested, "notes": notes,
             "spec_core_sha": core}
 
@@ -1558,18 +2316,22 @@ def cmd_review(args, spec_policy):
         if not args.wal or not args.verdict or not args.report_file:
             raise SpecError("--agent needs --wal <main WAL>, --verdict and --report-file", EXIT_USAGE)
         agent = safe_id(args.agent)
-        types = [e.get("agent_type") for e in wal_entries(checked_wal(Path(args.wal)))
-                 if e.get("event") == "subagent" and e.get("agent_id") == agent]
-        if not types:
-            raise SpecError(f"agent {args.agent} has no subagent record in {args.wal}")
-        if types[0] not in REVIEWER_AGENT_TYPES:
-            raise SpecError(f"agent {args.agent} is a {types[0] or 'typeless'} agent; only "
-                            f"{', '.join(REVIEWER_AGENT_TYPES)} agents may record a review")
-        if args.role == "adversarial" and types[0] != "red-team":
-            raise SpecError("the adversarial review must come from a red-team agent, a helper receipt or a human")
+        native = _native_review_source(Path(args.wal), agent, args.role)
+        if native is None:
+            types = [e.get("agent_type") for e in wal_entries(checked_wal(Path(args.wal)))
+                     if e.get("event") == "subagent" and e.get("agent_id") == agent]
+            if not types:
+                raise SpecError(f"agent {args.agent} has no subagent record in {args.wal}")
+            if types[0] not in REVIEWER_AGENT_TYPES:
+                raise SpecError(f"agent {args.agent} is a {types[0] or 'typeless'} agent; only "
+                                f"{', '.join(REVIEWER_AGENT_TYPES)} agents may record a review")
+            if args.role == "adversarial" and types[0] != "red-team":
+                raise SpecError("the adversarial review must come from a red-team agent, a helper receipt or a human")
+            provenance = {"model": types[0], "source": f"WAL-verified {types[0]} agent", "agent_type": types[0]}
+        else:
+            provenance = native
         data = read_regular(Path(args.report_file), 1_000_000)
-        entry = {"kind": "agent", "identity": agent, "model": types[0], "verdict": args.verdict,
-                 "source": f"WAL-verified {types[0]} agent", "agent_type": types[0],
+        entry = {"kind": "agent", "identity": agent, "verdict": args.verdict, **provenance,
                  "report": {"path": str(Path(args.report_file).absolute()), "sha256": sha256_bytes(data)}}
     elif args.human:
         if not args.verdict or not args.source:
@@ -1583,6 +2345,9 @@ def cmd_review(args, spec_policy):
         raise SpecError("give one review source: --report, --agent or --human", EXIT_USAGE)
     entry.update(role=args.role, core_sha=core, at=now,
                  key=identity_key(entry["kind"], entry["model"] if entry["kind"] == "helper" else entry["identity"]))
+    owners = declared_owners(parse_spec(text))
+    if owners is not None and entry["key"] in owners:
+        raise SpecError("A declared component owner cannot review this specification")
     entries.append(entry)
     write_spec_with_reviews(spec_path, entries)
     print(json.dumps({"status": "RECORDED", "role": args.role, "verdict": entry["verdict"], "key": entry["key"],
@@ -1600,20 +2365,30 @@ def cmd_attach(args, spec_policy):
     problems = lint(text, config)
     core = core_sha(text)
     author = parse_author(spec["header"].get("Author", ""))
+    owners = declared_owners(spec)
     review_policy, _ = review_policy_from_header(spec["header"].get("Review-policy"))
     required_roles = required_review_roles(review_policy)
     domain_warnings, domain_problems = domain_lint(text, getattr(args, "repo", None) or ".", spec_policy)
     problems += domain_problems  # only fails in enforce mode
     for warning in domain_warnings:
         print(f"spec-flow: warning: {warning}", file=sys.stderr)
-    problems += review_problems(entries, core, author, required_roles)
+    problems += review_problems(entries, core, author, required_roles, owners=owners)
     if problems:
         raise SpecError("spec not attached:\n" + "\n".join("  - " + p for p in problems))
+    owner_fields = {}
+    if owners is not None:
+        if not getattr(args, "owners_wal", None):
+            raise SpecError("Explicit Owners attachment requires --owners-wal with the native main WAL", EXIT_USAGE)
+        owner_fields = {"owners": owners, "owners_core_sha": core,
+                        "owner_proofs": [_native_owner_proof(args.owners_wal, owner) for owner in owners]}
+        owner_fields["owner_proof_sha256"] = sha256_bytes(ownership_payload(owner_fields))
     session = Session(spec["header"]["Ticket"], spec_policy)
     records, _, _ = session.records()
     latest = current_reviews(entries, core)
     files = [("spec", spec_path.name, "text/markdown", read_spec_bytes(spec_path)),
              ("reviews", reviews_path(spec_path).name, "text/plain", read_spec_bytes(reviews_path(spec_path)))]
+    if owner_fields:
+        files.append(("owner-provenance", "owner-provenance.json", "text/plain", ownership_payload(owner_fields)))
     for role in required_roles:
         report = latest[role].get("report")
         if report:
@@ -1623,13 +2398,13 @@ def cmd_attach(args, spec_policy):
             files.append((f"review-report:{role}", f"{role}-review-{Path(report['path']).name}", "text/markdown", data))
     click = spec["header"].get("Click-test", "required")
     reason = re.match(r"^not-applicable\s*\((.+)\)$", click)
-    record = {"v": 1, "kind": "spec", "ticket": session.ticket.label, "issue_id": session.ticket.id,
+    record = {"v": 2 if owner_fields else 1, "kind": "spec", "ticket": session.ticket.label, "issue_id": session.ticket.id,
               "actor": parse_author(args.actor), "author": author, "spec_core_sha": core,
               "spec_file_sha": sha256_bytes(read_spec_bytes(spec_path)),
               "ac": [ident for ident, _ in spec["criteria"]], "neg": [ident for ident, _, _ in spec["negatives"]],
               "click_test": {"required": not reason, "reason": reason.group(1) if reason else None},
               "signoff": spec["header"].get("Sign-off", "main"), "review_policy": review_policy,
-              "reviews": [{k: latest[role].get(k) for k in ("role", "kind", "identity", "model", "verdict",
+              **owner_fields, "reviews": [{k: latest[role].get(k) for k in ("role", "kind", "identity", "model", "verdict",
                                                              "core_sha", "key", "source", "artifact", "reviewed_at")}
                           for role in required_roles]}
     record["key"] = content_key("spec", record["spec_file_sha"])
@@ -1684,7 +2459,17 @@ def cmd_evidence(args, spec_policy):
 
 
 def cmd_click_test(args, spec_policy):
-    session, records, _, spec = _actor_and_spec(args, spec_policy)
+    session, records, index, spec = _actor_and_spec(args, spec_policy)
+    native = None
+    if args.agent_id and args.wal_dir:
+        wal_dir = Path(os.path.expanduser(args.wal_dir)).absolute()
+        native = _native_agent_source(wal_dir / "main.jsonl", args.agent_id, NATIVE_CLICK_ROLE, purpose="click-test")
+    if (args.print_native_witness or args.verify_native_witness) and native is None:
+        raise SpecError("native witness modes require a native Codex click-tester", EXIT_USAGE)
+    if native is None and re.fullmatch(UUID, (args.agent_id or args.human or "").strip()):
+        raise SpecError("a native UUID tester must use its native Codex WAL", EXIT_USAGE)
+    if native and not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", args.deployed_commit):
+        raise SpecError("native click-test needs the full deployed commit", EXIT_USAGE)
     max_log = int(spec_policy.get("max_log_bytes", 2_000_000))
     files = [("log", Path(p).name, "text/plain", prepare_log(Path(p), max_log)) for p in args.log or []]
     report_verdict, report_sha = None, None
@@ -1693,12 +2478,12 @@ def cmd_click_test(args, spec_policy):
         report_sha = sha256_bytes(raw)
         first = next((line.strip() for line in raw.decode("utf-8", "replace").splitlines() if line.strip()), "")
         match = re.match(r"^CLICK_TEST_RESULT: (PASS|FAIL)\b", first)
-        if not match:
+        if not match or (native and match.group(0) != first):
             raise SpecError("the click-test report must start with `CLICK_TEST_RESULT: PASS` or `... FAIL`", EXIT_USAGE)
         report_verdict = match.group(1).lower()
         if report_verdict != args.result:
             raise SpecError(f"--result {args.result} contradicts the report ({match.group(0)})")
-        files.append(("report", Path(args.report).name, "text/plain", prepare_log(Path(args.report), max_log)))
+        files.append(("report", Path(args.report).name, "text/plain", prepare_log_bytes(Path(args.report), raw, len(raw))))
     for path in args.screenshot or []:
         data, mime = prepare_media(Path(path), int(spec_policy.get("max_media_bytes", 15_000_000)))
         files.append(("screenshot", Path(path).name, mime, data))
@@ -1707,12 +2492,25 @@ def cmd_click_test(args, spec_policy):
     # "On deploy": bind the click-test to the deployed commit, which must contain every evidence commit so far.
     repo = Path(args.repo or ".")
     deployed = git_commit(repo, args.deployed_commit, None)
-    evidence_shas = sorted({c.get("sha") for r in records if r["kind"] == "evidence"
+    evidence = verified(records, index, "evidence")[0] if native else records
+    evidence_shas = sorted({c.get("sha") for r in evidence if r["kind"] == "evidence"
                             and r.get("spec_core_sha") == spec["spec_core_sha"]
                             for c in r.get("commits") or [] if c.get("sha")})
     for sha in evidence_shas:  # raises "commit X is not reachable from <deployed>"
         git_commit(repo, sha, deployed["sha"])
-    if args.agent_id:
+    if native:
+        if args.human or args.really_tested or not (args.report and args.started and args.ended):
+            raise SpecError("native click-tests require a report and observed --started/--ended, and accept no manual fallback",
+                            EXIT_USAGE)
+        agent = args.agent_id
+        _, excluded = independence_roles(spec, records, index)
+        if identity_key("agent", agent) in excluded:
+            raise SpecError("the native click-tester must be independent of the author, reviewers and evidence posters")
+        tester = {"kind": "agent", "family": "codex", "identity": agent, "agent_type": NATIVE_CLICK_ROLE,
+                  "parent": native["parent"], "repo": _native_click_origin(repo), "report_sha256": report_sha,
+                  "started_at": args.started, "ended_at": args.ended, "last_activity_at": args.ended}
+        pass_source = NATIVE_CLICK_SOURCE
+    elif args.agent_id:
         if not args.wal_dir:
             raise SpecError("--agent-id needs --wal-dir <the session WAL directory>", EXIT_USAGE)
         wal_dir = Path(os.path.expanduser(args.wal_dir)).absolute()
@@ -1749,11 +2547,34 @@ def cmd_click_test(args, spec_policy):
         pass_source = "self-attested" if args.result == "pass" else None
     else:
         raise SpecError("give --agent-id with --wal-dir, or --human", EXIT_USAGE)
-    record = {"v": 1, "kind": "click_test", "ticket": session.ticket.label, "actor": parse_author(args.actor),
+    if explicit_record_owners(spec) is not None:
+        _, click_excluded = independence_roles(spec, records, index)
+        if tester_key(tester) in click_excluded:
+            raise SpecError("A declared owner, author or spec reviewer cannot be the independent click-tester")
+    record = {"v": 2 if native else 1, "kind": "click_test", "ticket": session.ticket.label, "actor": parse_author(args.actor),
               "spec_core_sha": spec["spec_core_sha"], "result": args.result, "url": args.url, "tester": tester,
               "pass_source": pass_source, "deployed_commit": deployed, "covers_commits": evidence_shas}
-    record["key"] = content_key("click_test", [tester, args.result, args.url, deployed["sha"],
-                                               [sha256_bytes(f[3]) for f in files]])
+    manifest = [[role, name, sha256_bytes(data)] for role, name, _mime, data in files]
+    key_parts = [tester, args.result, args.url, deployed["sha"], [f[2] for f in manifest]]
+    if native:
+        if not _native_click_spec_fresh(record, spec):
+            raise SpecError("native click-test must start after the current spec attachment timestamp", EXIT_USAGE)
+        try:
+            line = _native_click_line(record, manifest)
+            if _native_stamp(args.started) > _native_stamp(args.ended):
+                raise ValueError("invalid observed time bounds")
+        except ValueError:
+            raise SpecError("native click-test requires valid witness fields and observed time bounds", EXIT_USAGE) from None
+        if args.print_native_witness:
+            print(line)
+            return EXIT_OK
+        _native_click_proof(native, args.agent_id, line, args.started, args.ended)
+        if args.verify_native_witness:
+            print(json.dumps({"status": "VERIFIED", "kind": "native_click_witness",
+                              "sha256": sha256_bytes(line.encode())}))
+            return EXIT_OK
+        key_parts.append(line)
+    record["key"] = content_key("click_test", key_parts)
     summary = (f"**Click-test {args.result.upper()}** by {tester['kind']} {tester['identity']} on {args.url} "
                f"at deployed commit {deployed['sha'][:12]} "
                f"({tester['started_at']} to {tester.get('ended_at') or 'end not recorded'}), {len(files)} file(s).")
@@ -1762,13 +2583,12 @@ def cmd_click_test(args, spec_policy):
 
 
 def cmd_signoff(args, spec_policy):
-    session, records, _, spec = _actor_and_spec(args, spec_policy)
+    session, records, index, spec = _actor_and_spec(args, spec_policy)
     signer = identity_key(args.kind, safe_id(args.by) if args.kind == "agent" else args.by)
-    excluded = {spec.get("author")} | {r.get("key") for r in spec.get("reviews") or []} | \
-        {r.get("actor") for r in records if r["kind"] in ("spec", "evidence", "click_test")}
+    excluded, _ = independence_roles(spec, records, index)
     if signer in excluded:
-        raise SpecError("the sign-off must come from someone other than the owner, the spec author and both "
-                        "spec reviewers (normally the main agent, or the user)")
+        raise SpecError("the sign-off must come from someone other than the owner, the spec author, both "
+                        "spec reviewers and the verified click-tester (normally the main agent, or the user)")
     record = {"v": 1, "kind": "signoff", "ticket": session.ticket.label, "actor": parse_author(args.actor),
               "spec_core_sha": spec["spec_core_sha"], "by": signer, "signer_kind": args.kind,
               "source": args.source.strip()[:300], "note": (args.note or "").strip()[:2000] or None}
@@ -1953,6 +2773,7 @@ def build_parser() -> argparse.ArgumentParser:
     attach = sub.add_parser("attach", help="attach the reviewed spec to its ticket")
     attach.add_argument("spec")
     attach.add_argument("--repo", default=".", help="repo scanned for blockchain signals (default .)")
+    attach.add_argument("--owners-wal", type=Path, help="native main WAL for explicit Owners assignment and owner-recorded handoff/result proof")
     evidence = sub.add_parser("evidence", help="attach proof for acceptance criteria")
     click = sub.add_parser("click-test", help="attach a click-test record")
     signoff = sub.add_parser("signoff", help="record a sign-off on the current spec")
@@ -1979,6 +2800,9 @@ def build_parser() -> argparse.ArgumentParser:
     click.add_argument("--ended")
     click.add_argument("--really-tested")
     click.add_argument("--report")
+    native_witness = click.add_mutually_exclusive_group()
+    native_witness.add_argument("--print-native-witness", action="store_true", help="print the exact Codex witness line without posting")
+    native_witness.add_argument("--verify-native-witness", action="store_true", help="verify the local Codex witness without posting")
     click.add_argument("--log", action="append")
     click.add_argument("--screenshot", action="append")
     signoff.add_argument("--by", required=True)

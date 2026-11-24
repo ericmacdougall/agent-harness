@@ -51,7 +51,7 @@ RECONCILIATION_KINDS = {'manual_reconciliation', 'automatic_reconciliation'}
 EXECUTIONS = {'NOT_STARTED', 'RUNNING', 'COMPLETED', 'INTERRUPTED', 'UNKNOWN'}
 RESULTS = {'CHECK_OK', 'CHECK_FAILED', 'NO_RESULT'}
 REASONS = {'NONE', 'CODE_FINDINGS', 'QUOTA', 'AUTH', 'TRANSIENT_INFRA', 'LOW_DISK',
-           'TIMEOUT', 'INVALID_OUTPUT', 'INPUT_CHANGED', 'BUDGET_EXHAUSTED', 'ADVISORY', 'UNKNOWN'}
+           'TIMEOUT', 'INVALID_OUTPUT', 'OUTPUT_TOO_LARGE', 'INPUT_CHANGED', 'BUDGET_EXHAUSTED', 'ADVISORY', 'UNKNOWN'}
 STAGES = {'PLAN', 'CODE_INSPECTION', 'PR'}
 ENVIRONMENT_KEYS = {'CI', 'LANG', 'LC_ALL', 'TZ', 'PYTHONHASHSEED', 'NODE_ENV'}
 HEX = re.compile(r'[0-9a-f]{64}\Z')
@@ -65,6 +65,15 @@ class GuardError(Exception):
     def __init__(self, reason, message, reference=None):
         super().__init__(message)
         self.reason, self.message, self.reference = reason, message, reference
+
+
+class PoolUnavailable(GuardError):
+    """acquire_pool refused a provider pool (reserved by an unreleased run, or cooling down). No provider was
+    launched. `holder` is the run id that holds the pool and `kind` is 'active' or 'cooldown'."""
+
+    def __init__(self, reason, message, *, holder=None, kind='active', reference=None):
+        super().__init__(reason, message, reference)
+        self.holder, self.kind = holder, kind
 
 
 def encoded(value):
@@ -313,6 +322,23 @@ def owner_liveness(start, children=()):
             facts.update(state='UNCERTAIN', why='child pid %d %s: %s' % (child['pid'], child_state.lower(), child_why))
             return facts
     return facts
+
+
+def incomplete_reboot_proven(start):
+    """Without terminal launch evidence, only a typed same-host reboot covers unrecorded children."""
+    owner = start.get('owner_process') if isinstance(start, dict) else None
+    if not isinstance(owner, dict) or owner.get('host') != host_identity():
+        return False
+    identities = []
+    for token in (owner.get('boot_id'), boot_identity()):
+        if not isinstance(token, str):
+            return False
+        match = re.fullmatch(r'(procboot|bootsession):([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-'
+                             r'[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})', token)
+        if match is None:
+            return False
+        identities.append((match[1], match[2].lower()))
+    return identities[0][0] == identities[1][0] and identities[0][1] != identities[1][1]
 
 
 class Subject(dict):
@@ -814,7 +840,9 @@ class UsageStore:
                             or record.get('started_at') != started.get('started_at')):
                         raise GuardError('UNKNOWN', 'Completion does not match its referenced START')
                     if record.get('reason') in {'UNKNOWN', 'TIMEOUT'} and not reconciled:
-                        raise GuardError('UNKNOWN', 'Uncertain prior result requires recorded reconciliation', entry['start'])
+                        reconciled = self._auto_reconcile_locked(entry['run_id'])['reconciled']
+                        if not reconciled:
+                            raise GuardError('UNKNOWN', 'Uncertain prior result requires recorded reconciliation', entry['start'])
                     elapsed = record.get('elapsed_seconds')
                     if type(elapsed) not in (int, float) or not math.isfinite(elapsed) or elapsed < 0:
                         raise GuardError('UNKNOWN', 'Elapsed execution budget is invalid')
@@ -928,10 +956,12 @@ class UsageStore:
             if state['active'] is not None and self._auto_reconcile_locked(state['active'])['reconciled']:
                 directory, state = self._pool(provider, pool)
             if state['active'] is not None:
-                raise GuardError('UNKNOWN' if state['reason'] in {'UNKNOWN', 'TIMEOUT'} else 'TRANSIENT_INFRA',
-                                 'Provider pool has an active or unreconciled owner; no provider was launched')
+                raise PoolUnavailable('UNKNOWN' if state['reason'] in {'UNKNOWN', 'TIMEOUT'} else 'TRANSIENT_INFRA',
+                                      'Provider pool has an active or unreconciled owner; no provider was launched',
+                                      holder=state['active'], kind='active')
             if state['cooldown'] and (state['reset_at'] is None or time.time() < state['reset_at']):
-                raise GuardError(state['reason'], 'Provider pool requires availability evidence or its reliable reset')
+                raise PoolUnavailable(state['reason'], 'Provider pool requires availability evidence or its reliable reset',
+                                      kind='cooldown')
             state = {**state, 'active': run_id, 'cooldown': False, 'reason': 'NONE', 'reset_at': None}
             self._pool_event(directory, state, 'RESERVED')
 
@@ -963,13 +993,56 @@ class UsageStore:
     def _publish_reconciliation(self, run_id, *, kind, actor, reason, evidence):
         directory = self._run_directory(run_id)
         affected = self._affected_pools(run_id)
-        self._publish(directory, 'reconciled.json', {'schema': SCHEMA, 'kind': kind,
-                      'run_id': run_id, 'actor': actor, 'reason': reason, 'evidence': evidence,
-                      'at': now_utc().isoformat(), 'execution': 'UNKNOWN', 'result': 'NO_RESULT'})
+        if self._reconciliation(directory, run_id):
+            # A crash can leave the immutable marker ahead of one or more pool heads.
+            # Resume only the remaining exact pointers, retaining the original authority/evidence.
+            prior = read_json(directory / 'reconciled.json')
+            actor, reason, evidence = prior['actor'], prior['reason'], prior['evidence']
+        else:
+            self._publish(directory, 'reconciled.json', {'schema': SCHEMA, 'kind': kind,
+                          'run_id': run_id, 'actor': actor, 'reason': reason, 'evidence': evidence,
+                          'at': now_utc().isoformat(), 'execution': 'UNKNOWN', 'result': 'NO_RESULT'})
         for pool, state in affected:
             self._pool_event(pool, {**state, 'active': None}, 'RECONCILED', actor=actor,
                              reason=reason, evidence=evidence)
         return len(affected)
+
+    def _completion_final(self, directory, run_id, start):
+        """Validate a completion through its indexed START and digest-bound FINAL before using it."""
+        value = read_json(directory / 'completion.json')
+        if (set(value) != {'schema', 'reference'} or type(value.get('schema')) is not int
+                or value['schema'] != SCHEMA or not isinstance(value.get('reference'), dict)
+                or value['reference'].get('run_id') != run_id or value['reference'].get('record') != 'final'):
+            raise GuardError('UNKNOWN', 'Completion is malformed or belongs to another run')
+        final = self.load_ref(value['reference'])
+        if (final['subject'] != start['subject'] or final['invocation'] != start['invocation']
+                or final.get('started_at') != start.get('started_at')):
+            raise GuardError('UNKNOWN', 'Completion FINAL identity does not match its indexed START')
+        return final
+
+    def _completed_children_proven(self, start, final, children):
+        """A completed uncertain run needs complete launch records, or independent reboot proof."""
+        owner = start.get('owner_process') or {}
+        recorded_boot, current_boot = owner.get('boot_id'), boot_identity()
+        if (owner.get('host') == host_identity() and isinstance(recorded_boot, str)
+                and isinstance(current_boot, str) and 0 < len(recorded_boot) <= 256
+                and 0 < len(current_boot) <= 256 and same_scheme(recorded_boot, current_boot)
+                and recorded_boot != current_boot):
+            return True  # all prior-boot children are gone, including any unrecorded spawn
+        usage = final.get('usage')
+        launches = usage.get('provider_launches') if isinstance(usage, dict) else None
+        if type(launches) is not int or not 0 <= launches <= 64 or len(children) != launches:
+            return False
+        if launches == 0:
+            return final['execution'] == 'NOT_STARTED'
+        identities = set()
+        for child in children:
+            if (not isinstance(child, dict) or set(child) != {'pid', 'process_started'}
+                    or not valid_pid(child.get('pid')) or not isinstance(child.get('process_started'), str)
+                    or not 0 < len(child['process_started']) <= 256):
+                return False
+            identities.add((child['pid'], child['process_started']))
+        return len(identities) == launches
 
     def reconcile(self, run_id, *, actor, reason, evidence):
         for value in (actor, reason, evidence): safe_text(value)
@@ -1020,19 +1093,34 @@ class UsageStore:
         repaired = self._repair_interrupted_publish(directory)
         if repaired: report['repaired_stage_files'] = repaired
         start = self._owned_start(run_id)
-        if os.path.lexists(directory / 'completion.json'):
-            report['why'] = 'completed'
-            return report
+        final = (self._completion_final(directory, run_id, start)
+                 if os.path.lexists(directory / 'completion.json') else None)
         if self._reconciliation(directory, run_id):
-            report['why'] = 'already reconciled'
+            count = self._publish_reconciliation(run_id, kind='automatic_reconciliation', actor=AUTO_ACTOR,
+                                                reason='Resume reconciliation', evidence='Existing immutable reconciliation')
+            report.update(reconciled=bool(count), pools=count,
+                          why='resumed reconciliation' if count else 'already reconciled')
             return report
-        liveness = owner_liveness(start, self._children(directory))
+        if final is not None:
+            if (final['result'] != 'NO_RESULT' or final['reason'] not in {'TIMEOUT', 'UNKNOWN'}
+                    or final['execution'] not in {'INTERRUPTED', 'UNKNOWN', 'COMPLETED', 'NOT_STARTED'}
+                    or not self._affected_pools(run_id)):
+                report['why'] = 'completed'
+                return report
+        children = self._children(directory)
+        liveness = owner_liveness(start, children)
         report['liveness'] = liveness
         if liveness['state'] != 'DEAD':
             report['why'] = 'owner ' + liveness['state'].lower() + ': ' + liveness['why']
             return report
         if not liveness['past_deadline']:
             report['why'] = 'dead owner before deadline'
+            return report
+        if final is None and not incomplete_reboot_proven(start):
+            report['why'] = 'incomplete launch/child evidence requires independent same-host reboot proof'
+            return report
+        if final is not None and not self._completed_children_proven(start, final, children):
+            report['why'] = 'completed uncertain launch/child evidence is incomplete'
             return report
         evidence = ('pid %d on host %s: %s; deadline %s; checked %s' % (
             liveness['pid'], liveness['host'], liveness['why'], liveness['deadline'], now_utc().isoformat()))[:500]
@@ -1097,7 +1185,7 @@ class UsageStore:
 
 TICKETED_CATEGORIES = {'correctness', 'reliability', 'performance', 'maintainability', 'testing', 'documentation', 'ux'}
 REVIEW_METADATA_KEYS = {'stage', 'verdict', 'findings', 'report_sha256', 'head', 'repo', 'pr', 'ticketed',
-                        'reviewer', 'reviewer_harness', 'author_harness'}
+                        'reviewer', 'reviewer_harness', 'author_harness', 'snapshot_base'}
 REVIEWER_IDENTITY_KEYS = {'reviewer', 'reviewer_harness', 'author_harness'}
 TICKETED_RECORD_KEYS = {'state', 'finding', 'category', 'ticket', 'head', 'report_sha256'}
 
@@ -1117,6 +1205,14 @@ def validate_review_metadata(review, *, result):
                               or not re.fullmatch(r'[0-9a-f]{64}' if key == 'report_sha256'
                                                   else r'[0-9a-f]{40}|[0-9a-f]{64}', review[key])):
             raise GuardError('INVALID_OUTPUT', 'Review report or head binding is malformed')
+    if 'snapshot_base' in review:
+        # goodqa#16049 v2g: the base the PR reviewer diffed against; only with a bound head, never the head itself
+        if (review['stage'] != 'PR' or not isinstance(review['snapshot_base'], str)
+                or not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', review['snapshot_base'])
+                or not isinstance(review.get('head'), str)
+                or len(review['snapshot_base']) != len(review['head'])
+                or review['snapshot_base'] == review['head']):
+            raise GuardError('INVALID_OUTPUT', 'Review snapshot base binding is malformed')
     if ('repo' in review) != ('pr' in review):
         raise GuardError('INVALID_OUTPUT', 'Review repository and PR must be bound together')
     if 'repo' in review:
@@ -1208,16 +1304,40 @@ class Run:
 
 
 def zero_launch_attempt(final):
-    """True only when the attempt provably launched no provider and was refused by infrastructure.
+    """True only when the attempt did no provider work and was refused by infrastructure.
 
-    Content outcomes (CODE_FINDINGS, INPUT_CHANGED, INVALID_OUTPUT) and uncertain ones (TIMEOUT,
-    UNKNOWN) count as attempts even with zero launches.
+    That is either no launch at all (execution NOT_STARTED), or launches that each ended in the provider's own
+    terminal refusal (quota, auth, model unavailable) before any review work, recorded per provider in
+    usage.provider_attempts (goodqa#16725). Content outcomes (CODE_FINDINGS, INPUT_CHANGED, INVALID_OUTPUT) and
+    uncertain ones (TIMEOUT, UNKNOWN) count as attempts even with zero launches.
     """
     usage = final.get('usage') if isinstance(final.get('usage'), dict) else {}
     launches = usage.get('provider_launches')
-    if type(launches) is not int or launches != 0 or usage.get('reported', []) != []:
+    if type(launches) is not int or launches < 0 or usage.get('reported', []) != []:
         return False
-    return final.get('execution') == 'NOT_STARTED' and final.get('reason') in ZERO_LAUNCH_REASONS
+    if final.get('reason') not in ZERO_LAUNCH_REASONS:
+        return False
+    if launches == 0:
+        return final.get('execution') == 'NOT_STARTED'
+    return final.get('execution') == 'COMPLETED' and refused_before_work(usage.get('provider_attempts'), launches)
+
+
+PROVIDER_ATTEMPT_KEYS = frozenset({'provider', 'launched', 'reason', 'refused_before_work'})
+
+
+def refused_before_work(attempts, launches):
+    """Every launch in the per-provider record was refused by its provider before work, and they add up."""
+    if not isinstance(attempts, list) or not 0 < len(attempts) <= 8:
+        return False
+    total = 0
+    for attempt in attempts:
+        if not isinstance(attempt, dict) or set(attempt) != PROVIDER_ATTEMPT_KEYS:
+            return False
+        launched = attempt['launched']
+        if type(launched) is not int or launched < 0 or (launched and attempt['refused_before_work'] is not True):
+            return False
+        total += launched
+    return total == launches
 
 
 def within_window(started_at, seconds):

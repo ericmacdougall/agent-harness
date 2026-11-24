@@ -1,0 +1,80 @@
+diff --git a/codex-rs/test-binary-support/lib.rs b/codex-rs/test-binary-support/lib.rs
+--- a/codex-rs/test-binary-support/lib.rs
++++ b/codex-rs/test-binary-support/lib.rs
+@@ -44,7 +44,25 @@
+         }
+         TestBinaryDispatchMode::Skip => None,
+         TestBinaryDispatchMode::InstallAliases => {
+-            let codex_home = match tempfile::Builder::new().prefix(codex_home_prefix).tempdir() {
++            let mut builder = tempfile::Builder::new();
++            builder.prefix(codex_home_prefix);
++            let directory = if let Some(base) = std::env::var_os("CODEX_TEST_ARG0_HOME_BASE") {
++                let base = Path::new(&base);
++                let temp = std::env::temp_dir();
++                let physical_temp = temp.canonicalize().expect("test temp root cannot be resolved");
++                assert!(
++                    base.is_absolute()
++                        && base.canonicalize().ok().as_deref() == Some(base)
++                        && base.is_dir()
++                        && !base.starts_with(&temp)
++                        && !base.starts_with(&physical_temp),
++                    "test CODEX_HOME base must be a canonical directory outside the system temp root"
++                );
++                builder.tempdir_in(base)
++            } else {
++                builder.tempdir()
++            };
++            let codex_home = match directory {
+                 Ok(codex_home) => codex_home,
+                 Err(error) => panic!("failed to create test CODEX_HOME: {error}"),
+             };
+diff --git a/codex-rs/app-server/tests/suite/v2/turn_start.rs b/codex-rs/app-server/tests/suite/v2/turn_start.rs
+--- a/codex-rs/app-server/tests/suite/v2/turn_start.rs
++++ b/codex-rs/app-server/tests/suite/v2/turn_start.rs
+@@ -1340,28 +1340,37 @@
+         "amount": expected_amount,
+         "metadata": completed["response"]["usage"],
+     });
+     let body = responses::sse(vec![
+         responses::ev_response_created("resp-1"),
+         responses::ev_assistant_message("msg-1", "Done"),
+         completed,
+     ]);
+     let response_mock = responses::mount_sse_once(&server, body).await;
+-
++
+-    let codex_home = TempDir::new()?;
++    let codex_home = match std::env::var_os("CODEX_TEST_ARG0_HOME_BASE") {
++        Some(base) => TempDir::new_in(base)?,
++        None => TempDir::new()?,
++    };
+     MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+     write_models_cache(codex_home.path()).await?;
+-
++
+-    let mut mcp = TestAppServer::builder()
+-        .with_codex_home(codex_home.path())
+-        .build_initialized()
+-        .await?;
++    let builder = TestAppServer::builder().with_codex_home(codex_home.path());
++    let builder = if cfg!(debug_assertions) {
++        builder
++    } else {
++        // The release server has no debug-only startup switch.
++        builder
++            .with_plugin_startup_tasks()
++            .with_args(&["-c", "features.plugins=false"])
++    };
++    let mut mcp = builder.build_initialized().await?;
+-
++
+     let ThreadStartResponse { thread, .. } = mcp
+         .start_thread(ThreadStartParams {
+             experimental_raw_events: true,
+             ..Default::default()
+         })
+         .await?;
+-
++
+     let TurnStartResponse { turn } = mcp
+         .request(|request_id| ClientRequest::TurnStart {

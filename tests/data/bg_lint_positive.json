@@ -25,5 +25,10 @@
   {"id": "self-match-pgrep-until-quiet", "command": "until ! pgrep -f 'vitest run' >/dev/null; do sleep 30; done", "expect": "self-match-pgrep"},
   {"id": "self-match-pgrep-ssh", "command": "ssh dev2 'while pgrep -f \"tsc --noEmit\" >/dev/null; do sleep 30; done; tail -3 tsc.log'", "expect": "self-match-pgrep"},
   {"id": "self-match-pgrep-flags", "command": "while pgrep -fl 'next build' > /dev/null 2>&1; do sleep 10; done", "expect": "self-match-pgrep"},
-  {"id": "self-match-ps-grep", "command": "while ps aux | grep -q 'vitest run'; do sleep 10; done", "expect": "self-match-pgrep"}
+  {"id": "self-match-ps-grep", "command": "while ps aux | grep -q 'vitest run'; do sleep 10; done", "expect": "self-match-pgrep"},
+  {"id": "file-wait-until-f", "command": "until [ -f /tmp/result.json ]; do sleep 30; done", "expect": "file-wait-unbounded"},
+  {"id": "file-wait-while-not-e", "command": "while [ ! -e out/summary.txt ]; do sleep 5; done; echo ready", "expect": "file-wait-unbounded"},
+  {"id": "file-wait-test-s", "command": "until test -s report.txt; do sleep 10; done", "expect": "file-wait-unbounded"},
+  {"id": "file-wait-remote", "command": "ssh dev2 'until [ -f /srv/x/done.flag ]; do sleep 60; done'", "expect": "file-wait-unbounded"},
+  {"id": "file-wait-12h-incident", "command": "until [[ -f /tmp/b29zgtmq0.out ]]; do sleep 120; done", "expect": "file-wait-unbounded"}
 ]

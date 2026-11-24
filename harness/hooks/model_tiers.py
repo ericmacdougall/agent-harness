@@ -49,6 +49,15 @@ def load_policy(path=None):
     return policy
 
 
+BOOL_CAPS = ('dispatch_exclude_below_rung', 'dispatch_narrow_by_stop_effort')
+
+
+def cap_on(policy, key):
+    """True only when caps[key] is the JSON value true; anything else (missing, "false", 1) is off."""
+    caps = policy.get('caps') if isinstance(policy, dict) else None
+    return isinstance(caps, dict) and caps.get(key) is True
+
+
 def validate(policy):
     if not isinstance(policy, dict) or policy.get('schema') != 1:
         raise TierError('tier table schema must be 1')
@@ -82,6 +91,14 @@ def validate(policy):
             or type(limits.get('max_rung_climbs')) is not int
             or type(limits.get('max_total_review_usd')) not in (int, float)):
         raise TierError('ladder_limits are malformed')
+    # goodqa#15794 r8 A1-1: a switch that changes ladder outcomes must be a real JSON bool. A quoted "false" is
+    # truthy in Python, so it is refused here instead of silently turning the switch on.
+    caps = policy.get('caps', {})
+    if not isinstance(caps, dict):
+        raise TierError('caps must be an object')
+    for key in BOOL_CAPS:
+        if key in caps and type(caps[key]) is not bool:
+            raise TierError('caps.%s must be true or false' % key)
     families = policy.get('families')
     if not isinstance(families, dict) or set(families) != {'claude', 'openai'}:
         raise TierError('families must cover claude and openai')

@@ -134,6 +134,7 @@ class FakeGoodQA:
         self.issues = {ISSUE: {"id": ISSUE, "number": 168, "title": "Spec flow", "status": "in_progress",
                                "projectId": PROJECT, "description": "", "closedAt": None}}
         self.comments, self.attachments, self.calls = {ISSUE: []}, {}, []
+        self.artifact_gets, self.artifact_mode = [], None
         self.delay, self.refuse_done, self.clock = 0, False, 0
         self.forbidden = set()  # issue ids whose reads are refused, as for a revoked key
         self.lost_projects = set()  # project ids the key can no longer read (lost membership answers not_found)
@@ -148,7 +149,10 @@ class FakeGoodQA:
                 self.send_header("content-type", ctype)
                 self.send_header("content-length", str(len(payload)))
                 self.end_headers()
-                self.wfile.write(payload)
+                try:
+                    self.wfile.write(payload)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass  # The bounded-reader negatives intentionally close early.
 
             def do_PUT(self):
                 data = self.rfile.read(int(self.headers["content-length"]))
@@ -157,6 +161,61 @@ class FakeGoodQA:
                     return self._send(403)
                 attachment["bytes"] = data
                 self._send(200)
+
+            def do_GET(self):
+                outer.artifact_gets.append({"path": self.path.split("?", 1)[0],
+                                           "authorization": bool(self.headers.get("Authorization")),
+                                           "cookie": bool(self.headers.get("Cookie"))})
+                parts = self.path.split("?", 1)[0].split("/")
+                if self.path.startswith("/v1/uploads/") and self.path.endswith("/content/read-target"):
+                    if self.headers.get("Authorization") != "Bearer test-key":
+                        return self._send(401)
+                    aid = parts[3]
+                    if aid not in outer.attachments:
+                        return self._send(404)
+                    if outer.artifact_mode == "target-redirect":
+                        self.send_response(302)
+                        self.send_header("Location", outer.base + "/forbidden-sink")
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                    if outer.artifact_mode == "target-oversize":
+                        return self._send(200, b"x" * 65537, "application/json")
+                    target = outer.base + "/download/" + aid
+                    if outer.artifact_mode == "off-origin":
+                        target = "https://forbidden.example.invalid/source"
+                    if outer.artifact_mode == "metadata":
+                        target = "http://169.254.169.254/latest/credentials"
+                    response = {"url": target, "mime": outer.attachments[aid]["mime"], "expiresAt": None}
+                    if outer.artifact_mode == "target-headers":
+                        response["headers"] = {"Authorization": "must-not-forward"}
+                    return self._send(200, json.dumps(response).encode(), "application/json")
+                if self.path.startswith("/download/"):
+                    if self.headers.get("Authorization") or self.headers.get("Cookie"):
+                        return self._send(403)
+                    if outer.artifact_mode == "redirect":
+                        self.send_response(302)
+                        self.send_header("Location", outer.base + "/forbidden-sink")
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                    row = outer.attachments.get(parts[2])
+                    if (row is None or outer.artifact_mode == "missing"
+                            or parts[2] in getattr(outer, "unavailable_artifact_ids", ())):
+                        return self._send(404)
+                    payload = row.get("bytes", b"")
+                    if outer.artifact_mode == "corrupt":
+                        payload += b"changed"
+                    if outer.artifact_mode == "oversize":
+                        payload = b"x" * 1_000_001
+                    if outer.artifact_mode == "stream-oversize":
+                        self.send_response(200)
+                        self.send_header("Content-Type", row["mime"])
+                        self.end_headers()
+                        self.wfile.write(b"x" * 1_000_001)
+                        return
+                    return self._send(200, payload, row["mime"])
+                return self._send(404)
 
             def do_POST(self):
                 request = json.loads(self.rfile.read(int(self.headers["content-length"])))
@@ -669,6 +728,30 @@ class Evidence(SpecFlowCase):
         self.spec_policy["max_log_bytes"] = len(body) + 10
         self.assertEqual(self.ev("--ac", "AC-1", "--log", str(cut))[0], 2)
 
+    def test_post_requires_server_verified_attachment_after_comment_binding(self):
+        handle = self.fake.handle
+        for change, problem in (
+            ({"sha256": "a" * 64}, "sha256 differs"),
+            ({"completionState": "uploading"}, "not a completed upload"),
+            ({"archivedAt": "2026-11-04T06:00:00Z"}, "not a completed upload"),
+        ):
+            with self.subTest(problem=problem, change=change):
+                log = self.tmp / "proof.log"
+                log.write_text(f"verified run {len(self.fake.comments[ISSUE])}\n")
+
+                def mutate_after_comment(name, args):
+                    result, error = handle(name, args)
+                    if name == "comment_on_issue" and error is None:
+                        for aid in args["attachmentIds"]:
+                            self.fake.attachments[aid].update(change)
+                    return result, error
+
+                with mock.patch.object(self.fake, "handle", side_effect=mutate_after_comment):
+                    code, out, err = self.ev("--ac", "AC-1", "--log", str(log))
+                self.assertEqual(code, sf.EXIT_TRACKER)
+                self.assertNotIn("RECORDED", out)
+                self.assertIn(problem, err)
+
     def test_retry_after_a_rejected_record_posts_again(self):
         log = self.tmp / "retry.log"
         log.write_text("Ran 3 tests\nOK\n")
@@ -1015,7 +1098,15 @@ class DoneGate(SpecFlowCase):
         self.assertTrue(any("AC-1" in m and "stale" in m for m in result["missing"]), result["missing"])
 
     def test_click_tester_cannot_sign_off(self):
-        self.complete(signer=("ct1", "agent"))
+        self.complete(signer=None)
+        code, _, error = self.run_cli("signoff", "--ticket", "GoodQA harness#168", "--actor", "agent:main1",
+                                      "--by", "ct1", "--kind", "agent", "--source", "tester tries to sign")
+        self.assertNotEqual(code, 0)
+        self.assertIn("click-tester", error)
+        forged = {"v": 1, "kind": "signoff", "spec_core_sha": sf.core_sha(SPEC), "by": "agent:ct1",
+                  "signer_kind": "agent", "source": "forged", "key": "signoff:tester-forged", "actor": "agent:main1"}
+        adapter = sf.make_adapter(self.config, self.spec_policy, "harness", time.monotonic() + 30)
+        adapter.comment_with_files(ISSUE, sf.record_body("forged tester signoff", forged), str(uuid.uuid4()))
         result = self.evaluate()
         self.assertFalse(result["ready"])
         self.assertTrue(any("click-tester" in m for m in result["missing"]), result["missing"])
@@ -1192,6 +1283,23 @@ class Hook(SpecFlowCase):
         self.assertEqual(self.hook("bulk_update_issues", {"items": ["x"]}, **self.enforce())[0], 2)
         self.assertTrue(sf.TOOL_PATTERN.match("mcp__GoodQA__update_issue"))
         self.assertTrue(re.match(install.GOODQA_STATUS_TOOLS, "mcp__plugin_GoodQA_goodqa__call_api"))
+
+    def test_ahc_bookkeeping_note_is_never_a_record(self):
+        """goodqa#16034 AC-30: an ahc D24 freshness note never counts as evidence, a spec record or a click-test,
+        even when it carries a well-formed record block; an ordinary comment that merely quotes the label later on
+        is still read."""
+        good = sf.record_body("summary", {"v": 1, "kind": "evidence", "ac": ["AC-1"]})
+        plain = {"id": str(uuid.uuid4()), "body": good}
+        self.assertEqual(len(sf.ticket_records([plain], 65536)[0]), 1, "fixture: the same block is a valid record")
+        note = {"id": str(uuid.uuid4()), "body": sf.BOOKKEEPING_LABEL + ": receipt bookkeeping posted by ahc.\n" + good}
+        records, ignored = sf.ticket_records([note], 65536)
+        self.assertEqual(records, [])
+        self.assertIn(sf.BOOKKEEPING_LABEL, ignored[0])
+        import ahc_runner
+        self.assertTrue(sf.is_bookkeeping(ahc_runner.d24_note(
+            {"repo": "o/n", "pr": 7, "head": "a" * 40}, [("a" * 40, "feat(x): y")])),
+            "the daemon's note must carry exactly the label spec_flow skips")
+        self.assertFalse(sf.is_bookkeeping("Owner checkpoint. Not " + sf.BOOKKEEPING_LABEL))
 
     def test_deeply_nested_record_is_ignored(self):
         comment = {"id": str(uuid.uuid4()),

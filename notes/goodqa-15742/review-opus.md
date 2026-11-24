@@ -1,0 +1,7 @@
+# Spec and code review (adversarial) of goodqa#15742 (ah install-files)
+
+Reviewer: native agent a0c568dfa08e7eb86 (Opus). WAL ids: w9763fa270d1 (spec v1, BLOCK: merged code not enforced, a rerun accepts the breakage of an unknown outcome), w6ab35c503d8 (v2, BLOCK: the proof and the bytes came from the caller's object store), the v3 confirmation (ACCEPT with a fresh-repository-per-run medium, adopted), wc3d355240b7 (code review of af9e-install-files at 84c55320, ACCEPT with M1 to M6 and lows L1 to L6), and the confirmation pass of the code fixes at 62f048c6 with the spec at e20101ba (ACCEPT, no new high, two lows: deliberate eval or variable bypass forms to be added to the stated limit, and the quote-aware split of commands, fixed in 8bb1be76).
+
+Closed by testable ACs, NEGs and tests: merged-code proof from a fresh fetched repository with every object re-hashed, two-phase install with the guard last, allow and deny probes with a baseline that must already deny the WAL probe, unfinished-run refusal with resume, rollback only over the run's own new sha, atomic lock with a same-run retake, one quoted remote command, the guard literal-form rule (accident prevention, main only), the downgrade refusal with an audited --allow-older, the remote hooks directory check, unknown outcomes after the first live write, quote removal and bash -c inspection in the guard, and viewer commands and redirects passing.
+
+Verdict: ACCEPT

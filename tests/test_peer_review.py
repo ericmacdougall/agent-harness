@@ -69,7 +69,8 @@ class PeerReviewTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.guard_environment = patch.dict(os.environ, {
-            'AGENT_HARNESS_USAGE_DIR': str(self.root / 'usage-state')})
+            'AGENT_HARNESS_USAGE_DIR': str(self.root / 'usage-state'),
+            'AGENT_HARNESS_ESCALATION_DIR': str(self.root / 'escalation-state')})
         self.guard_environment.start()
         self.addCleanup(self.guard_environment.stop)
         # Never discover a real reviewer CLI from the machine's install locations.
@@ -461,6 +462,7 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
                         raise OSError('synthetic cleanup failure')
                 with contextlib.ExitStack() as stack:
                     stack.enter_context(patch.dict(os.environ, {'AGENT_HARNESS_USAGE_DIR': str(self.root / ('usage-' + failure))}))
+                    stack.enter_context(patch.dict(os.environ, {'PATH': str(self.bin) + os.pathsep + system_path()}))
                     stack.enter_context(patch.object(sys, 'argv', ['review', 'plan', '--repo', str(self.repo),
                                        '--packet', str(self.packet), '--output', str(output)]))
                     stack.enter_context(patch.object(module, 'plan_resource_gate', return_value=(0, '')))
@@ -1047,6 +1049,7 @@ print(json.dumps({{'role': 'assistant', 'content': 'KIMI_ADVISORY: ACCEPT\\nVERD
         errors = io.StringIO()
         with patch.object(sys, 'argv', ['review', 'plan', '--repo', str(self.repo),
                                        '--packet', str(self.packet), '--output', str(self.output)]), \
+             patch.dict(os.environ, {'PATH': str(self.bin) + os.pathsep + system_path()}), \
              patch.object(module, 'plan_resource_gate', return_value=(0, '')), \
              patch.object(module, 'review_snapshot', return_value=('fixture', 'PLAN_RESULT: ACCEPT', '')), \
              patch.object(os, 'fsync', side_effect=fsync_then_mutate), \
@@ -1079,6 +1082,7 @@ print(json.dumps({{'role': 'assistant', 'content': 'KIMI_ADVISORY: ACCEPT\\nVERD
         errors = io.StringIO()
         with patch.object(sys, 'argv', ['review', 'plan', '--repo', str(self.repo),
                                        '--packet', str(self.packet), '--output', str(self.output)]), \
+             patch.dict(os.environ, {'PATH': str(self.bin) + os.pathsep + system_path()}), \
              patch.object(module, 'plan_resource_gate', return_value=(0, '')), \
              patch.object(module, 'review_snapshot', return_value=('fixture', 'PLAN_RESULT: ACCEPT', '')), \
              patch.object(os, 'link', side_effect=link_then_mutate), \
@@ -1245,6 +1249,126 @@ print(json.dumps({{'role': 'assistant', 'content': 'KIMI_ADVISORY: ACCEPT\\nVERD
         self.assertEqual(result.returncode, 2, result.stdout)
         self.assertFalse(capture.exists())
         self.assertTrue(self.output.is_dir())
+
+    # PR 247 F4 (goodqa#16049): agent-harness runs no GitHub CI, so the PR review is the merge gate for the ahc
+    # release list. These run the real `pr` entry point on a fixture repository shaped like agent-harness.
+    RELEASE_HELPERS = ('ah', 'ops_watch', 'peer_review')
+
+    def release_commit(self, message, *, files=None, manifest='current', install_names=('ahc_core.py',),
+                       helpers=None, install_text=None):
+        """HEAD declares its shipped modules in install.py HOOKS and its helpers in ahc_guard.HELPER_SCRIPTS, as
+        agent-harness does; 'current' writes the list ahc_release_hashes.py --write would."""
+        hooks = self.repo / 'harness' / 'hooks'
+        hooks.mkdir(parents=True, exist_ok=True)
+        for name, text in (files or {}).items():
+            (hooks / name).write_text(text)
+        helpers = helpers if helpers is not None else {n: n + '.py' for n in self.RELEASE_HELPERS}
+        (self.repo / 'install.py').write_text(install_text or (
+            'HOOKS = (' + ', '.join('"%s"' % n for n in (*install_names, 'ah.py')) + ',)\n'))
+        (hooks / 'ahc_guard.py').write_text('import re\nHELPER_SCRIPTS = %r\n' % (helpers,))
+        if manifest == 'current':
+            sha = lambda name: hashlib.sha256((hooks / name).read_bytes()).hexdigest()  # noqa: E731
+            manifest = {'files': {n: sha(n) for n in install_names},
+                        'helpers': {n: sha(f) for n, f in helpers.items()}}
+        if manifest is not None:
+            (hooks / 'ahc_release.json').write_text(manifest if isinstance(manifest, str) else json.dumps(manifest))
+        subprocess.run(['git', '-C', str(self.repo), 'add', '-A'], check=True)
+        subprocess.run(['git', '-C', str(self.repo), 'commit', '-qm', message], check=True)
+
+    def release_base(self):
+        self.release_commit('ahc release base', files={'ahc_core.py': 'core = 1\n', 'ah.py': 'ah = 1\n',
+                                                        'ops_watch.py': 'watch = 1\n', 'peer_review.py': 'review = 1\n'})
+
+    def assert_release_refused(self, *fragments):
+        launches = self.root / 'release-launches'
+        result = self.invoke(env={'PROVIDER_LAUNCH_LOG': str(launches)})
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        for fragment in ('Review refused: harness/hooks/ahc_release.json', *fragments):
+            self.assertIn(fragment, result.stderr)
+        self.assertFalse(launches.exists(), 'a stale release list must refuse before any provider launch')
+        self.assertFalse(self.output.exists(), 'a refused review writes no report, so no merge authorization')
+        usage = self.root / 'usage-state'
+        runs = [p for p in usage.rglob('*') if p.is_file() and b'peer-review-pr' in p.read_bytes()] if usage.exists() else []
+        self.assertEqual(runs, [], 'no PR review run (so no PASS evidence) may be recorded')
+        return result
+
+    def test_r247_f4_a_drifted_helper_refuses_the_pr_review_before_any_provider(self):
+        self.release_base()
+        self.release_commit('change a helper without regenerating', files={'ah.py': 'ah = 2\n'}, manifest=None)
+        result = self.assert_release_refused('helpers ah (sha256 differs)', 'scripts/ahc_release_hashes.py --write')
+        self.assertNotIn('ops_watch', result.stderr)
+
+    def test_r247_f4_a_drifted_ahc_module_refuses_the_pr_review(self):
+        self.release_base()
+        self.release_commit('change a module without regenerating', files={'ahc_core.py': 'core = 2\n'}, manifest=None)
+        self.assert_release_refused('files ahc_core.py (sha256 differs)')
+
+    def test_r247_f4_dropping_a_listed_helper_refuses_the_pr_review(self):
+        self.release_base()
+        hooks = self.repo / 'harness' / 'hooks'
+        manifest = json.loads((hooks / 'ahc_release.json').read_text())
+        del manifest['helpers']['ah']
+        self.release_commit('drop a helper from the list', files={'ah.py': 'ah = 2\n'}, manifest=manifest)
+        self.assert_release_refused('helpers ah (declared by ahc_guard.HELPER_SCRIPTS, not listed)')
+
+    def test_r247_f4_a_newly_declared_helper_that_is_not_listed_refuses(self):
+        self.release_base()
+        manifest = json.loads((self.repo / 'harness' / 'hooks' / 'ahc_release.json').read_text())
+        self.release_commit('declare a helper without listing it', files={'extra.py': 'extra = 1\n'}, manifest=manifest,
+                            helpers={**{n: n + '.py' for n in self.RELEASE_HELPERS}, 'extra': 'extra.py'})
+        self.assert_release_refused('helpers extra (declared by ahc_guard.HELPER_SCRIPTS, not listed)')
+
+    def test_r247_f4_a_listed_helper_nothing_declares_refuses(self):
+        self.release_base()
+        manifest = json.loads((self.repo / 'harness' / 'hooks' / 'ahc_release.json').read_text())
+        manifest['helpers']['ghost'] = 'f' * 64
+        self.release_commit('list a helper nothing declares', manifest=manifest)
+        self.assert_release_refused('helpers ghost (listed, but ahc_guard.HELPER_SCRIPTS does not declare it)')
+
+    def test_r247_f4_a_module_no_longer_shipped_leaves_the_list_and_passes(self):
+        # what --check requires: ahc_core.py stays on disk (as ahc_scan.py does) but install.py no longer ships it
+        self.release_base()
+        self.release_commit('stop shipping a module', install_names=())
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_r247_f4_a_listed_name_nothing_declares_refuses(self):
+        self.release_base()
+        manifest = json.loads((self.repo / 'harness' / 'hooks' / 'ahc_release.json').read_text())
+        self.release_commit('stop shipping a module but keep listing it', install_names=(), manifest=manifest)
+        self.assert_release_refused('files ahc_core.py (listed, but install.py does not ship it)')
+
+    def test_r247_f4_a_declaration_that_is_not_a_literal_refuses(self):
+        self.release_base()
+        self.release_commit('compute HOOKS', install_text='NAMES = ["ahc_core.py"]\nHOOKS = tuple(NAMES)\n')
+        self.assert_release_refused('install.py HOOKS is not a literal')
+
+    def test_r247_f4_an_unlisted_shipped_module_refuses_the_pr_review(self):
+        self.release_base()
+        hooks = self.repo / 'harness' / 'hooks'
+        manifest = json.loads((hooks / 'ahc_release.json').read_text())
+        self.release_commit('ship a new module without listing it', files={'ahc_new.py': 'new = 1\n'},
+                            manifest=manifest, install_names=('ahc_core.py', 'ahc_new.py'))
+        self.assert_release_refused('files ahc_new.py (shipped by install.py, not listed)')
+
+    def test_r247_f4_a_malformed_or_deleted_list_refuses_the_pr_review(self):
+        for label, manifest in (('not json', '{'), ('bad digest', {'files': {'ahc_core.py': 'x'}, 'helpers': {}}),
+                                ('deleted', None)):
+            with self.subTest(label):
+                self.release_base()
+                if manifest is None:
+                    (self.repo / 'harness' / 'hooks' / 'ahc_release.json').unlink()
+                self.release_commit('break the list: ' + label, manifest=manifest)
+                self.assert_release_refused()
+
+    def test_r247_f4_a_regenerated_list_passes_and_the_report_names_it(self):
+        self.release_base()
+        self.release_commit('change a helper and regenerate', files={'ah.py': 'ah = 2\n'})
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        listed = (self.repo / 'harness' / 'hooks' / 'ahc_release.json').read_bytes()
+        self.assertIn('ahc release list: current at this HEAD (harness/hooks/ahc_release.json SHA-256 '
+                      + hashlib.sha256(listed).hexdigest() + ')', self.output.read_text())
 
 
 class ProviderEnvelopeTests(unittest.TestCase):
@@ -1477,6 +1601,220 @@ class ProviderEnvelopeTests(unittest.TestCase):
         self.assertIn('fallback', reason)
 
 
+class ReservedPoolFallbackTests(unittest.TestCase):
+    """goodqa#15565: a provider pool that an earlier run never released refuses its lease before any launch. That
+    must not stop the one authorised independent fallback, and the diagnostic must name the holder and the fix."""
+    module = __import__('peer_review')
+    guard = __import__('usage_guard')
+    HOLDER = '98535f2e6b2db3ae1efb0d5c5d07f1f9'
+    VALID = json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'result': 'VERDICT: PASS'})
+
+    class Store:
+        def __init__(self, refusals):
+            self.refusals, self.leases, self.released = refusals, [], []
+
+        def acquire_pool(self, provider, pool, run_id):
+            if provider in self.refusals:
+                raise self.refusals[provider]
+            self.leases.append(provider)
+
+        def release_pool(self, provider, pool, run_id, **kwargs):
+            self.released.append((provider, kwargs.get('reason')))
+
+    def refusal(self, reason='TRANSIENT_INFRA', kind='active'):
+        return self.guard.PoolUnavailable(reason, 'Provider pool has an active or unreconciled owner; no provider was '
+                                          'launched', holder=self.HOLDER, kind=kind)
+
+    def review(self, store, *, options=None, run_result=None):
+        calls = []
+
+        def run(command, prompt, cwd, timeout, **kwargs):
+            calls.append(command[0])
+            return run_result(command) if run_result else (0, self.VALID, '')
+        record = type('Record', (), {'run_id': 'r' * 32, 'timeout': 1440, 'note_child': staticmethod(lambda child: None)})()
+        opts = {'store': store, 'run_record': record, **(options or {})}
+        with tempfile.TemporaryDirectory() as temporary, \
+             patch.object(self.module.diagnostics, 'discover_executable',
+                          side_effect=lambda name, **_: {'name': name, 'path': '/fixture/' + name, 'source': 'PATH', 'rejected': []}), \
+             patch.object(self.module, 'run', side_effect=run):
+            try:
+                source, report, reason = self.module.review_snapshot(Path(temporary), 'a' * 40, 'pr', 'Review', 'Evidence', opts)
+                return calls, source, report, reason, opts, None
+            except self.module.ReviewFailure as error:
+                return calls, None, None, None, opts, error
+
+    def test_a_reserved_primary_pool_uses_the_fallback_and_never_launches_the_primary(self):
+        store = self.Store({'codex': self.refusal()})
+        calls, source, report, reason, options, error = self.review(store)
+        self.assertIsNone(error)
+        self.assertEqual(calls, ['/fixture/claude'])
+        self.assertEqual(report, 'VERDICT: PASS')
+        self.assertIn('Claude', source)
+        self.assertEqual(store.leases, ['claude'])
+        self.assertEqual(store.released, [('claude', 'NONE')])  # the reserved pool is never released or reconciled here
+        self.assertIn(self.HOLDER, reason)
+        self.assertIn('no provider was launched', reason)
+        self.assertEqual(options['launches'], 1)
+
+    def test_the_attempt_diagnostic_names_the_holder_and_the_reconcile_command(self):
+        store = self.Store({'codex': self.refusal()})
+        _, _, _, _, options, _ = self.review(store)
+        first = options['attempts'][0]
+        rendered = self.module.diagnostics.render(first)
+        self.assertEqual(first['provider'], 'codex')
+        self.assertIn(self.HOLDER, rendered)
+        self.assertIn('usage_guard.py reconcile --run ' + self.HOLDER + ' --auto', rendered)
+        self.assertIn('--actor', rendered)
+        self.assertNotIn('Rerun once later', rendered)
+
+    def test_an_unknown_ownership_refusal_also_falls_back(self):
+        store = self.Store({'codex': self.refusal('UNKNOWN')})
+        calls, _, report, _, _, error = self.review(store)
+        self.assertEqual((error, calls, report), (None, ['/fixture/claude'], 'VERDICT: PASS'))
+
+    def test_a_cooldown_refusal_with_quota_still_falls_back(self):
+        store = self.Store({'codex': self.refusal('QUOTA', 'cooldown')})
+        calls, _, report, _, _, error = self.review(store)
+        self.assertEqual((error, calls, report), (None, ['/fixture/claude'], 'VERDICT: PASS'))
+
+    def test_a_reserved_fallback_pool_ends_the_review_after_the_primary_ran(self):
+        quota = json.dumps({'type': 'turn.failed', 'error': {'code': 'insufficient_quota'}})
+        store = self.Store({'claude': self.refusal()})
+        calls, _, _, _, _, error = self.review(store, run_result=lambda command: (1, quota, ''))
+        self.assertEqual(calls, ['/fixture/codex'])
+        self.assertIsNotNone(error)
+
+    def test_a_quota_primary_then_reserved_fallback_is_recorded_as_no_work(self):
+        # goodqa#16725: this run must not use up the repeat budget.
+        quota = json.dumps({'type': 'turn.failed', 'error': {'code': 'insufficient_quota'}})
+        store = self.Store({'claude': self.refusal()})
+        _, _, _, _, options, error = self.review(store, run_result=lambda command: (1, quota, ''))
+        self.assertIsNotNone(error)
+        self.assertEqual(options['attempt_summary'], [
+            {'provider': 'codex', 'launched': 1, 'reason': 'QUOTA', 'refused_before_work': True},
+            {'provider': 'claude', 'launched': 0, 'reason': 'TRANSIENT_INFRA', 'refused_before_work': False}])
+        final = {'execution': 'COMPLETED', 'reason': 'TRANSIENT_INFRA', 'usage': {
+            'provider_launches': options['launches'], 'reported': options['usage'],
+            'provider_attempts': options['attempt_summary']}}
+        self.assertTrue(self.guard.zero_launch_attempt(final))
+
+    def test_a_primary_that_answered_then_reserved_fallback_still_counts(self):
+        store = self.Store({'claude': self.refusal()})
+        unavailable = json.dumps({'type': 'turn.failed', 'error': {'code': 'model_not_found'}})
+        _, _, _, _, options, error = self.review(store, run_result=lambda command: (1, unavailable, ''))
+        self.assertTrue(options['attempt_summary'][0]['refused_before_work'])
+        garbage = lambda command: (1, 'not json', '')
+        _, _, _, _, options, error = self.review(self.Store({}), run_result=garbage)
+        self.assertIsNotNone(error)
+        self.assertFalse(options['attempt_summary'][0]['refused_before_work'])
+        final = {'execution': 'COMPLETED', 'reason': 'INVALID_OUTPUT', 'usage': {
+            'provider_launches': options['launches'], 'reported': options['usage'],
+            'provider_attempts': options['attempt_summary']}}
+        self.assertFalse(self.guard.zero_launch_attempt(final))
+
+    def summary_and_decision(self, options):
+        final = {'execution': 'COMPLETED' if options.get('launches') else 'NOT_STARTED', 'reason': 'TRANSIENT_INFRA',
+                 'usage': {'provider_launches': options.get('launches', 0), 'reported': options['usage'],
+                           'provider_attempts': options['attempt_summary']}}
+        return options['attempt_summary'], self.guard.zero_launch_attempt(final)
+
+    def test_only_a_transcript_with_no_work_is_a_refusal_before_work(self):
+        # PR 318 review F1/F2: the error code alone never proves no work was done.
+        line = lambda *records: '\n'.join(json.dumps(record) for record in records)
+        quota = {'type': 'turn.failed', 'error': {'code': 'insufficient_quota'}}
+        work = [{'type': 'thread.started'}, {'type': 'turn.started'},
+                {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'partial'}}]
+        codex_cases = {
+            'quota-only': (line({'type': 'thread.started'}, {'type': 'turn.started'}, quota), True),
+            'work-then-quota': (line(*work, quota), False),
+            'quota-with-usage': (line({**quota, 'usage': {'input_tokens': 900, 'output_tokens': 40}}), False),
+            'rate-limited': (line({'type': 'turn.failed', 'error': {'code': 'rate_limit_error'}}), False),
+        }
+        for label, (stdout, expected) in codex_cases.items():
+            with self.subTest(label):
+                store = self.Store({'claude': self.refusal()})
+                _, _, _, _, options, error = self.review(store, run_result=lambda command, out=stdout: (1, out, ''))
+                self.assertIsNotNone(error)
+                summary, decision = self.summary_and_decision(options)
+                self.assertEqual(summary[0]['launched'], 1)
+                self.assertIs(summary[0]['refused_before_work'], expected)
+                self.assertIs(decision, expected)
+        claude_cases = {
+            'claude-quota-no-work': ({'type': 'result', 'is_error': True, 'subtype': 'error',
+                                      'error': {'code': 'insufficient_quota'}, 'num_turns': 0}, True),
+            'claude-quota-after-turns': ({'type': 'result', 'is_error': True, 'subtype': 'error',
+                                          'error': {'code': 'insufficient_quota'}, 'num_turns': 7}, False),
+            'claude-quota-with-cost': ({'type': 'result', 'is_error': True, 'subtype': 'error',
+                                        'error': {'code': 'insufficient_quota'}, 'total_cost_usd': 0.42,
+                                        'usage': {'output_tokens': 1200}}, False),
+        }
+        for label, (record, expected) in claude_cases.items():
+            with self.subTest(label):
+                store = self.Store({'codex': self.refusal()})
+                _, _, _, _, options, error = self.review(
+                    store, run_result=lambda command, out=json.dumps(record): (1, out, ''))
+                self.assertIsNotNone(error)
+                summary, _ = self.summary_and_decision(options)
+                self.assertEqual([entry['launched'] for entry in summary], [0, 1])
+                self.assertIs(summary[1]['refused_before_work'], expected)
+                if not expected and 'total_cost_usd' in record:
+                    self.assertTrue(options['usage'], 'the paid failure keeps its reported usage')
+
+    def test_a_guard_quota_refusal_is_never_a_launched_refusal(self):
+        store = self.Store({'codex': self.guard.GuardError('QUOTA', 'account cooldown')})
+        _, _, report, _, options, error = self.review(store)
+        self.assertIsNone(error)
+        self.assertEqual(options['attempt_summary'][0],
+                         {'provider': 'codex', 'launched': 0, 'reason': 'QUOTA', 'refused_before_work': False})
+
+    def test_kimi_quota_marker_is_never_a_refusal_before_work(self):
+        # Workflow verify (spend lens): kimi_attempt drops Kimi's transcript, so its refusals cannot prove no work.
+        outcome = self.module.normalize_provider('kimi', 1, '', 'Error: ACCOUNT_QUOTA_EXCEEDED')
+        self.assertEqual((outcome['reason'], outcome['provider_refused']), ('QUOTA', False))
+
+    def test_unreadable_or_zero_usage_and_last_messages_follow_one_rule(self):
+        refused = lambda provider, record, last='': self.module.normalize_provider(
+            provider, 1, json.dumps(record), '', last).get('provider_refused')
+        quota = {'type': 'turn.failed', 'error': {'code': 'insufficient_quota'}}
+        claude = {'type': 'result', 'is_error': True, 'subtype': 'error', 'error': {'code': 'insufficient_quota'}}
+        self.assertTrue(refused('codex', {**quota, 'usage': {'input_tokens': 0}}))   # zeros: same rule both sides
+        for label, extra in {'float-usage': {'usage': {'output_tokens': 12.0}}, 'string-cost': {'total_cost_usd': '0.4'},
+                             'model-usage': {'modelUsage': {'m': {'outputTokens': 900}}},
+                             'api-time': {'duration_api_ms': 85000}, 'tool-use': {'server_tool_use': {'web': 1}}}.items():
+            with self.subTest(label):
+                self.assertFalse(refused('claude', {**claude, **extra}))
+        self.assertFalse(refused('codex', quota, last='VERDICT: PASS'))
+        warning = {'type': 'item.completed', 'item': {'id': 'w', 'type': 'error', 'message': 'deprecated key'}}
+        stream = '\n'.join(json.dumps(record) for record in ({'type': 'thread.started'}, warning, quota))
+        self.assertTrue(self.module.normalize_provider('codex', 1, stream).get('provider_refused'))
+
+    def test_both_pools_reserved_launches_nothing_and_fails_with_the_holder(self):
+        store = self.Store({'codex': self.refusal(), 'claude': self.refusal()})
+        calls, _, _, _, options, error = self.review(store)
+        self.assertEqual(calls, [])
+        self.assertIsNotNone(error)
+        self.assertEqual(options.get('launches', 0), 0)
+        self.assertIn(self.HOLDER, self.module.diagnostics.render(options['attempts'][-1]))
+
+    def test_a_non_pool_guard_error_never_unlocks_the_fallback(self):
+        store = self.Store({'codex': self.guard.GuardError('TRANSIENT_INFRA', 'run is closed')})
+        calls, _, _, _, _, error = self.review(store)
+        self.assertEqual(calls, [])
+        self.assertIsNotNone(error)
+
+    def test_the_fallback_is_used_once_and_only_after_the_primary(self):
+        store = self.Store({'codex': self.refusal()})
+        calls, _, _, _, _, _ = self.review(store, options={'secondary': 'default'})
+        self.assertEqual(calls, ['/fixture/claude'])
+
+    def test_a_hostile_holder_id_never_reaches_the_command_text(self):
+        hostile = self.guard.PoolUnavailable('TRANSIENT_INFRA', 'reserved', holder='x; rm -rf /', kind='active')
+        _, _, _, _, options, _ = self.review(self.Store({'codex': hostile}))
+        rendered = self.module.diagnostics.render(options['attempts'][0])
+        self.assertNotIn('rm -rf', rendered)
+        self.assertNotIn('--run x', rendered)
+
+
 if __name__ == '__main__':
     unittest.main()
 
@@ -1589,3 +1927,500 @@ else:
         self.assertIn('Reviewer-Rung: R1\n', report)
         argv = json.loads(self.argv_file.read_text())
         self.assertIn('model_reasoning_effort=medium', argv)
+
+
+class ProviderOutputBoundTests(unittest.TestCase):
+    """goodqa#16170: Codex `exec --json` stdout carries each probe's full command output, so a valid review can exceed
+    the 1 MB verdict-bearing bound. Command output must not count against it, while a runaway stream still fails
+    closed with its own reason (OUTPUT_TOO_LARGE) and capture memory stays bounded. Sizes are literal so a failure on
+    the unfixed code is the assertion itself, never a missing constant."""
+    MB = 1_000_000
+
+    def setUp(self):
+        sys.path.insert(0, str(REVIEW.parent))
+        self.addCleanup(sys.path.remove, str(REVIEW.parent))
+        spec = importlib.util.spec_from_file_location('peer_output_bound_test', REVIEW)
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+
+    @staticmethod
+    def stream(command_output, final, *, commands=1, output_field='aggregated_output'):
+        records = [{'type': 'thread.started', 'thread_id': 't'}, {'type': 'turn.started'}]
+        for index in range(commands):
+            item = {'id': 'c%d' % index, 'type': 'command_execution', 'command': 'bash -lc probe', 'status': 'in_progress'}
+            records.append({'type': 'item.started', 'item': {**item, output_field: ''}})
+            records.append({'type': 'item.completed',
+                            'item': {**item, output_field: command_output, 'exit_code': 0, 'status': 'completed'}})
+        records.append({'type': 'item.completed', 'item': {'id': 'm', 'type': 'agent_message', 'text': final}})
+        records.append({'type': 'turn.completed', 'usage': {'input_tokens': 10, 'output_tokens': 5}})
+        return '\n'.join(json.dumps(record) for record in records) + '\n'
+
+    def normalize(self, stdout, last_message, stderr=''):
+        return self.module.normalize_provider('codex', 0, stdout, stderr, last_message, 'pr')
+
+    def test_block_review_with_large_command_output_is_check_failed(self):
+        final = 'VERDICT: BLOCK\n\nF1 (material): the probe reproduced the defect.'
+        stdout = self.stream('x' * (3 * self.MB // 2), final)
+        self.assertGreater(len(stdout), 1_500_000)
+        result = self.normalize(stdout, final)
+        self.assertEqual((result['result'], result['reason']), ('CHECK_FAILED', 'CODE_FINDINGS'))
+        self.assertEqual(result['report'], final)
+
+    def test_pass_review_with_large_command_output_is_check_ok(self):
+        final = 'VERDICT: PASS\n\nNo findings.'
+        result = self.normalize(self.stream('line of probe output\n' * 75_000, final), final)
+        self.assertEqual((result['result'], result['reason']), ('CHECK_OK', 'NONE'))
+
+    def test_many_probes_totalling_several_megabytes_are_exempt(self):
+        final = 'VERDICT: BLOCK\n\nF1: see probe.'
+        result = self.normalize(self.stream('y' * 300_000, final, commands=12), final)
+        self.assertEqual(result['result'], 'CHECK_FAILED')
+
+    def test_stream_above_raw_ceiling_fails_with_output_too_large(self):
+        final = 'VERDICT: PASS\n\nNo findings.'
+        stdout = self.stream('z' * (17 * 2 ** 20), final)  # above the 16 MiB raw ceiling
+        result = self.normalize(stdout, final)
+        self.assertEqual((result['result'], result['reason']), ('NO_RESULT', 'OUTPUT_TOO_LARGE'))
+        self.assertFalse(result['fallback_allowed'])
+
+    def test_oversize_agent_message_stays_bounded(self):
+        final = 'VERDICT: PASS\n\n' + 'padding ' * 200_000  # 1.6 MB of verdict-bearing text
+        result = self.normalize(self.stream('ok', final), final)
+        self.assertEqual((result['result'], result['reason']), ('NO_RESULT', 'OUTPUT_TOO_LARGE'))
+        self.assertEqual(result['report'], '')
+
+    def test_oversize_stderr_or_last_message_still_counts(self):
+        final = 'VERDICT: PASS\n\nNo findings.'
+        stdout = self.stream('ok', final)
+        self.assertEqual(self.normalize(stdout, final, stderr='e' * (self.MB + 1))['reason'], 'OUTPUT_TOO_LARGE')
+
+    def test_only_string_command_execution_output_is_exempt(self):
+        final = 'VERDICT: PASS\n\nNo findings.'
+        # The same bulk under any other field, or a non-string aggregated_output, still counts.
+        for stdout in (self.stream('x' * (3 * self.MB // 2), final, output_field='output'),
+                       self.stream(['x' * (3 * self.MB // 2)], final)):
+            with self.subTest():
+                self.assertEqual(self.normalize(stdout, final)['reason'], 'OUTPUT_TOO_LARGE')
+        bulk = json.dumps({'type': 'item.completed', 'item': {'id': 'r', 'type': 'reasoning',
+                                                               'text': 'r' * (3 * self.MB // 2)}})
+        stdout = self.stream('ok', final).replace('{"type": "turn.completed"', bulk + '\n{"type": "turn.completed"')
+        self.assertEqual(self.normalize(stdout, final)['reason'], 'OUTPUT_TOO_LARGE')
+
+    def test_verdict_inside_command_output_never_counts(self):
+        stdout = self.stream('VERDICT: PASS\n' + 'p' * (3 * self.MB // 2), 'I could not finish the review.')
+        result = self.normalize(stdout, 'I could not finish the review.')
+        self.assertEqual((result['result'], result['reason']), ('NO_RESULT', 'INVALID_OUTPUT'))
+
+    def test_last_message_must_still_equal_final_agent_message(self):
+        stdout = self.stream('x' * (3 * self.MB // 2), 'VERDICT: BLOCK\n\nF1.')
+        result = self.normalize(stdout, 'VERDICT: PASS\n\nNo findings.')
+        self.assertEqual((result['result'], result['reason']), ('NO_RESULT', 'INVALID_OUTPUT'))
+
+    def test_unknown_record_type_still_rejected_with_large_output(self):
+        stdout = self.stream('x' * (3 * self.MB // 2), 'VERDICT: PASS\n\nok').replace(
+            '"type": "turn.started"', '"type": "turn.mystery"')
+        self.assertEqual(self.normalize(stdout, 'VERDICT: PASS\n\nok')['reason'], 'INVALID_OUTPUT')
+
+    def test_claude_result_is_still_bounded(self):
+        record = {'type': 'result', 'subtype': 'success', 'is_error': False,
+                  'result': 'VERDICT: PASS\n\n' + 'q' * (3 * self.MB // 2)}
+        result = self.module.normalize_provider('claude', 0, json.dumps(record), '', '', 'pr')
+        self.assertEqual((result['result'], result['reason']), ('NO_RESULT', 'OUTPUT_TOO_LARGE'))
+
+    def test_runaway_provider_is_killed_at_the_capture_ceiling(self):
+        """A child that writes forever is stopped once capture passes the raw ceiling (patched small here), instead
+        of being buffered until its deadline; the outcome is OUTPUT_TOO_LARGE and the child is reaped."""
+        with tempfile.TemporaryDirectory() as temp:
+            pid_file = Path(temp) / 'pid'
+            child = ('import os, sys\nopen(sys.argv[1], "w").write(str(os.getpid()))\nsys.stdin.read()\n'
+                     'import time\nchunk = b"{" + b"w" * 65535\nwhile True:\n    sys.stdout.buffer.write(chunk)\n'
+                     '    time.sleep(0.002)\n')  # throttled (~32 MB/s) so unbounded capture stays small if broken
+            with patch.object(self.module, 'PROVIDER_RAW_LIMIT', 4 * 2 ** 20, create=True):
+                started = time.monotonic()
+                code, stdout, stderr = self.module.run([sys.executable, '-c', child, str(pid_file)],
+                                                       'prompt ' * 50_000, Path(temp), timeout=8)
+                elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 6, 'the runaway child was not stopped at the capture ceiling')
+            self.assertLessEqual(len(stdout), 4 * 2 ** 20 + 65536)
+            result = self.module.normalize_provider('codex', code, stdout, stderr, '', 'pr')
+            self.assertEqual((result['result'], result['reason']), ('NO_RESULT', 'OUTPUT_TOO_LARGE'))
+            pid = int(pid_file.read_text())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
+    def test_escaped_descendant_holding_stdin_cannot_hang_cleanup(self):
+        """A child floods stdout and never reads its large prompt, while a descendant in its own session keeps the stdin
+        and stdout pipes open. Stopping at the ceiling must still return within the cleanup bound (the stdin feeder
+        must not be blocked forever on a pipe nobody reads)."""
+        import threading
+        with tempfile.TemporaryDirectory() as temp:
+            pid_file = Path(temp) / 'grandchild'
+            child = ('import subprocess, sys, time\n'
+                     'g = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)\n'
+                     'open(sys.argv[1], "w").write(str(g.pid))\n'
+                     'chunk = b"{" + b"w" * 65535\nwhile True:\n    sys.stdout.buffer.write(chunk)\n    time.sleep(0.002)\n')
+            outcome = []
+
+            def call():
+                outcome.append(self.module.run([sys.executable, '-c', child, str(pid_file)], 'prompt ' * 60_000,
+                                               Path(temp), timeout=30))
+
+            def reap_grandchild():
+                try:
+                    os.kill(int(pid_file.read_text()), 9)
+                except (OSError, ValueError):
+                    pass
+            self.addCleanup(reap_grandchild)
+            with patch.object(self.module, 'PROVIDER_RAW_LIMIT', 2 ** 20, create=True):
+                worker = threading.Thread(target=call, daemon=True)
+                started = time.monotonic()
+                worker.start()
+                worker.join(25)
+                hung = worker.is_alive()
+                elapsed = time.monotonic() - started
+                reap_grandchild()
+                worker.join(10)
+            self.assertFalse(hung, 'provider cleanup hung on the stdin pipe held by an escaped descendant')
+            self.assertLess(elapsed, 20)
+            code, stdout, stderr = outcome[0]
+            self.assertEqual((code, stderr), (126, 'HARNESS_PROVIDER_OUTPUT_TOO_LARGE'))
+
+    def test_ordinary_provider_capture_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as temp:
+            child = 'import sys\ndata = sys.stdin.read()\nprint(len(data))\nprint("note", file=sys.stderr)\n'
+            code, stdout, stderr = self.module.run([sys.executable, '-c', child], 'é' * 300_000, Path(temp), timeout=20)
+        self.assertEqual((code, stdout, stderr), (0, '300000\n', 'note\n'))
+
+    def test_new_reason_is_accepted_by_the_usage_store_and_diagnostics(self):
+        import usage_guard
+        self.assertIn('OUTPUT_TOO_LARGE', usage_guard.REASONS)
+        diag = review_diagnostics.provider_attempt('codex', {'path': '/x/codex'}, 0, 'out', '',
+                                                   {'reason': 'OUTPUT_TOO_LARGE'})
+        self.assertEqual(diag['code'], 'PROVIDER_OUTPUT_TOO_LARGE')
+
+
+class ProviderOutputBoundDeltaTests(unittest.TestCase):
+    """Review harness-pr266-v1 (goodqa#16170): F1 a stop that cannot be confirmed is UNKNOWN and keeps the pool,
+    F2 the TERM grace period is kept after the child closes its pipes, F3 parse memory is bounded by record count,
+    record size and JSON node count, not only by raw bytes."""
+
+    def setUp(self):
+        sys.path.insert(0, str(REVIEW.parent))
+        self.addCleanup(sys.path.remove, str(REVIEW.parent))
+        spec = importlib.util.spec_from_file_location('peer_output_bound_delta_test', REVIEW)
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+        import process as process_module
+        self.process = process_module
+
+    FLOOD = ('import sys, time\nchunk = b"{" + b"w" * 65535\nwhile True:\n'
+             '    sys.stdout.buffer.write(chunk)\n    time.sleep(0.002)\n')
+
+    def test_f1_unconfirmed_stop_is_unknown_and_keeps_the_pool(self):
+        import types
+        spawned = []
+        store = types.SimpleNamespace(acquire_pool=unittest.mock.Mock(), release_pool=unittest.mock.Mock())
+        record = types.SimpleNamespace(run_id='a' * 32, timeout=30, note_child=spawned.append)
+        resolution = {'name': 'codex', 'path': sys.executable, 'source': 'fixture', 'rejected': [], 'searched': []}
+        options = {'selection': {'effort': 'medium', 'rung': 'fixture', 'harness': 'claude', 'review_budget_usd': 1},
+                   'codex_model': 'fixture', 'claude_model': 'fixture', 'timeout': 20, 'store': store,
+                   'run_record': record, 'resolutions': {'claude': resolution, 'codex': resolution}}
+        # Survives its pipes closing (EPIPE), like a child stuck in uninterruptible cleanup.
+        flood = ('import sys, time\nchunk = b"{" + b"w" * 65535\nwhile True:\n    try:\n'
+                 '        sys.stdout.buffer.write(chunk)\n        time.sleep(0.002)\n'
+                 '    except (OSError, ValueError):\n        time.sleep(0.05)\n')
+
+        def fixture(_command, **kwargs):
+            return self.process.run([sys.executable, '-c', flood], **kwargs)
+        try:
+            with tempfile.TemporaryDirectory() as temp, \
+                    patch.object(self.module, 'run_process', side_effect=fixture), \
+                    patch.object(self.module, 'PROVIDER_RAW_LIMIT', 2 ** 20, create=True), \
+                    patch.object(self.process, 'signal_group', lambda pid, signum: None), \
+                    patch.object(self.process, 'TERMINATION_GRACE_SECONDS', 0.3), \
+                    patch.object(self.process, 'DISCARD_CLEANUP_SECONDS', 0.3):
+                with self.assertRaises(self.module.ReviewFailure) as caught:
+                    self.module.review_snapshot(Path(temp), 'a' * 40, 'pr', '', 'fixture packet', options)
+            self.assertTrue(spawned and spawned[0].poll() is None, 'positive control: the child is still alive')
+            self.assertEqual(caught.exception.outcome['reason'], 'UNKNOWN')
+            self.assertFalse(store.release_pool.called, 'a child that may be alive must keep its pool reservation')
+        finally:
+            for child in spawned:
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=5)
+                for pipe in (child.stdout, child.stderr, child.stdin):
+                    if pipe is not None and not pipe.closed:
+                        pipe.close()
+
+    def test_f2_term_grace_is_kept_after_the_child_closes_its_pipes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            marker = Path(temp) / 'cleaned-up'
+            child = ('import os, signal, sys, time\n'
+                     'def on_term(signum, frame):\n'
+                     '    os.close(1)\n    os.close(2)\n    time.sleep(0.4)\n'
+                     '    open(sys.argv[1], "w").write("done")\n    os._exit(0)\n'
+                     'signal.signal(signal.SIGTERM, on_term)\n' + self.FLOOD)
+            with self.assertRaises(self.process.OutputLimitExceeded):
+                self.process.run([sys.executable, '-c', child, str(marker)], input='', timeout=20,
+                                 output_limit=2 ** 20)
+            self.assertTrue(marker.exists(), 'the TERM handler was killed before it finished its cleanup')
+
+    def normalize(self, stdout):
+        return self.module.normalize_provider('codex', 0, stdout, '', 'VERDICT: PASS\n\nok', 'pr')
+
+    def test_f3_many_tiny_records_fail_fast_with_bounded_memory(self):
+        import tracemalloc
+        stdout = '{}\n' * 2_000_000  # 6 MB, far below the raw ceiling
+        tracemalloc.start()
+        try:
+            result = self.normalize(stdout)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertEqual((result['result'], result['reason']), ('NO_RESULT', 'OUTPUT_TOO_LARGE'))
+        self.assertLess(peak, 64 * 2 ** 20, 'parsing retained %d bytes for 6 MB of tiny records' % peak)
+
+    def test_f3_many_tiny_objects_in_one_document_fail(self):
+        for stdout in ('[' + ','.join(['{}'] * 1_000_000) + ']',
+                       json.dumps({'type': 'item.completed',
+                                   'item': {'type': 'command_execution', 'aggregated_output': 'x',
+                                            'junk': [{}] * 200_000}}) + '\n'):
+            with self.subTest(size=len(stdout)):
+                self.assertEqual(self.normalize(stdout)['reason'], 'OUTPUT_TOO_LARGE')
+
+    def test_f3_one_huge_record_above_the_record_cap_fails(self):
+        records = [{'type': 'thread.started', 'thread_id': 't'}, {'type': 'turn.started'},
+                   {'type': 'item.completed', 'item': {'id': 'c', 'type': 'command_execution', 'command': 'probe',
+                                                       'aggregated_output': 'h' * (9 * 2 ** 20)}},
+                   {'type': 'item.completed', 'item': {'id': 'm', 'type': 'agent_message', 'text': 'VERDICT: PASS\n\nok'}},
+                   {'type': 'turn.completed'}]
+        stdout = '\n'.join(json.dumps(record) for record in records)  # one 9 MiB line, under the 16 MiB ceiling
+        self.assertEqual(self.normalize(stdout)['reason'], 'OUTPUT_TOO_LARGE')
+
+    def test_f3_verdict_bound_stops_parsing_early(self):
+        """Once the verdict-bearing bound is passed, later records are not parsed."""
+        bulk = json.dumps({'type': 'item.completed', 'item': {'id': 'r', 'type': 'reasoning', 'text': 'r' * 600_000}})
+        stdout = bulk + '\n' + bulk + '\n' + '{"type": "turn.completed"}\n' * 3
+        calls = []
+        real = json.loads
+
+        def counting(text, *args, **kwargs):
+            calls.append(len(text))
+            return real(text, *args, **kwargs)
+        with patch.object(self.module.json, 'loads', side_effect=counting):
+            result = self.normalize(stdout)
+        self.assertEqual(result['reason'], 'OUTPUT_TOO_LARGE')
+        self.assertLessEqual(len([size for size in calls if size < 100]), 0, 'records after the bound were parsed')
+
+
+class ProviderOutputBoundDelta2Tests(unittest.TestCase):
+    """Review harness-pr266-v2 (goodqa#16170): F1 the node count must use constant auxiliary memory and reject an
+    oversized line before decoding it; F2/F3 any cleanup that cannot prove the process group is gone is UNKNOWN, so
+    the provider pool stays reserved."""
+
+    def setUp(self):
+        sys.path.insert(0, str(REVIEW.parent))
+        self.addCleanup(sys.path.remove, str(REVIEW.parent))
+        spec = importlib.util.spec_from_file_location('peer_output_bound_delta2_test', REVIEW)
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+        import process as process_module
+        self.process = process_module
+
+    FINAL = 'VERDICT: PASS\n\nok'
+
+    def stream(self, command):
+        records = [{'type': 'thread.started', 'thread_id': 't'}, {'type': 'turn.started'},
+                   {'type': 'item.completed', 'item': {'id': 'c', 'type': 'command_execution', 'command': 'probe',
+                                                       'aggregated_output': command}},
+                   {'type': 'item.completed', 'item': {'id': 'm', 'type': 'agent_message', 'text': self.FINAL}},
+                   {'type': 'turn.completed'}]
+        return '\n'.join(json.dumps(record) for record in records)
+
+    def test_f1_escape_heavy_output_parses_with_bounded_memory(self):
+        import tracemalloc
+        stdout = self.stream('\\' * 500_000)  # 1 MB of escaped backslashes in one command output
+        self.assertGreater(len(stdout), 1_000_000)
+        tracemalloc.start()
+        try:
+            result = self.module.normalize_provider('codex', 0, stdout, '', self.FINAL, 'pr')
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(result['result'], 'CHECK_OK')
+        self.assertLess(peak, 8 * 2 ** 20, 'node counting allocated %d bytes for 1 MB of escapes' % peak)
+
+    def test_f1_line_over_the_record_cap_is_rejected_before_decoding(self):
+        stdout = self.stream('h' * (9 * 2 ** 20))
+        sizes = []
+        real = json.loads
+
+        def counting(text, *args, **kwargs):
+            sizes.append(len(text))
+            return real(text, *args, **kwargs)
+        with patch.object(self.module.json, 'loads', side_effect=counting):
+            result = self.module.normalize_provider('codex', 0, stdout, '', self.FINAL, 'pr')
+        self.assertEqual(result['reason'], 'OUTPUT_TOO_LARGE')
+        self.assertFalse([size for size in sizes if size > 8 * 2 ** 20], 'an oversized line was decoded')
+
+    def test_f2_failed_child_record_with_unreapable_child_keeps_the_pool(self):
+        import types
+        spawned = []
+
+        def note_child(child):
+            spawned.append(child)
+            raise self.module.GuardError('INVALID_OUTPUT', 'Too many recorded children')
+        store = types.SimpleNamespace(acquire_pool=unittest.mock.Mock(), release_pool=unittest.mock.Mock())
+        record = types.SimpleNamespace(run_id='a' * 32, timeout=30, note_child=note_child)
+        resolution = {'name': 'codex', 'path': sys.executable, 'source': 'fixture', 'rejected': [], 'searched': []}
+        options = {'selection': {'effort': 'medium', 'rung': 'fixture', 'harness': 'claude', 'review_budget_usd': 1},
+                   'codex_model': 'fixture', 'claude_model': 'fixture', 'timeout': 20, 'store': store,
+                   'run_record': record, 'resolutions': {'claude': resolution, 'codex': resolution}}
+
+        def fixture(_command, **kwargs):
+            return self.process.run([sys.executable, '-c', 'import time; time.sleep(30)'], **kwargs)
+        try:
+            with tempfile.TemporaryDirectory() as temp, \
+                    patch.object(self.module, 'run_process', side_effect=fixture), \
+                    patch.object(self.process, 'signal_group', lambda pid, signum: None), \
+                    patch.object(self.process, 'TERMINATION_GRACE_SECONDS', 0.3), \
+                    patch.object(self.process, 'DISCARD_CLEANUP_SECONDS', 0.3):
+                with self.assertRaises(self.module.ReviewFailure) as caught:
+                    self.module.review_snapshot(Path(temp), 'a' * 40, 'pr', '', 'fixture packet', options)
+            self.assertTrue(spawned and spawned[0].poll() is None, 'positive control: the child is still alive')
+            self.assertEqual(caught.exception.outcome['reason'], 'UNKNOWN')
+            self.assertFalse(store.release_pool.called, 'a child that may be alive must keep its pool reservation')
+            self.assertEqual(options['attempts'][-1]['code'], 'REVIEW_LAUNCH_UNCONFIRMED')
+        finally:
+            for child in spawned:
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=5)
+                for pipe in (child.stdout, child.stderr, child.stdin):
+                    if pipe is not None and not pipe.closed:
+                        pipe.close()
+
+    FLOOD = ('import sys, time\nchunk = b"{" + b"w" * 65535\nwhile True:\n'
+             '    sys.stdout.buffer.write(chunk)\n    time.sleep(0.002)\n')
+
+    def run_with_survivor(self, temp, **patches):
+        """A leader that floods stdout and leaves a same-group descendant with its pipes closed."""
+        pid_file = Path(temp) / 'descendant'
+        child = ('import subprocess, sys\n'
+                 'd = subprocess.Popen([sys.executable, "-c", "import os, time\\nos.close(0); os.close(1); os.close(2)'
+                 '\\ntime.sleep(30)"])\n'
+                 'open(sys.argv[1], "w").write(str(d.pid))\n' + self.FLOOD)
+
+        def reap():
+            try:
+                os.kill(int(pid_file.read_text()), 9)
+            except (OSError, ValueError):
+                pass
+        self.addCleanup(reap)
+        with patch.object(self.process, 'TERMINATION_GRACE_SECONDS', 0.3), \
+                patch.object(self.process, 'DISCARD_CLEANUP_SECONDS', 0.3), \
+                patch.object(self.module, 'PROVIDER_RAW_LIMIT', 2 ** 20, create=True):
+            with contextlib_exit_stack(patches) as _:
+                started = time.monotonic()
+                outcome = self.module.run([sys.executable, '-c', child, str(pid_file)], '', Path(temp), timeout=20)
+        return outcome, time.monotonic() - started
+
+    def test_f3_reaped_leader_with_surviving_group_member_is_unknown(self):
+        def leader_only(pid, signum):  # group signalling cannot reach the descendant
+            try:
+                os.kill(pid, signum)
+            except ProcessLookupError:
+                pass
+        with tempfile.TemporaryDirectory() as temp:
+            (code, _stdout, stderr), elapsed = self.run_with_survivor(
+                temp, **{'signal_group': (self.process, leader_only)})
+        self.assertEqual((code, stderr), (125, 'HARNESS_PROVIDER_IO_UNKNOWN'))
+        self.assertEqual(self.module.normalize_provider('codex', code, '', stderr, '', 'pr')['reason'], 'UNKNOWN')
+        self.assertLess(elapsed, 10)
+
+    def test_f3_denied_liveness_signal_is_unknown(self):
+        real = os.killpg
+
+        def denied_probe(pgid, signum):
+            if signum == 0:
+                raise PermissionError('denied')
+            return real(pgid, signum)
+        with tempfile.TemporaryDirectory() as temp:
+            (code, _stdout, stderr), _ = self.run_with_survivor(
+                temp, **{'killpg': (self.process.os, denied_probe)})
+        self.assertEqual((code, stderr), (125, 'HARNESS_PROVIDER_IO_UNKNOWN'))
+
+
+def contextlib_exit_stack(patches):
+    import contextlib
+    stack = contextlib.ExitStack()
+    for name, (target, value) in patches.items():
+        stack.enter_context(patch.object(target, name, value))
+    return stack
+
+
+class ProviderOutputBoundDelta3Tests(unittest.TestCase):
+    """Review harness-pr266-v3 (goodqa#16170): a failed child record of any exception type whose cleanup could not
+    prove the group gone is UNKNOWN (no pool release, no fallback launch); a genuine missing executable still falls
+    back."""
+
+    def setUp(self):
+        sys.path.insert(0, str(REVIEW.parent))
+        self.addCleanup(sys.path.remove, str(REVIEW.parent))
+        spec = importlib.util.spec_from_file_location('peer_output_bound_delta3_test', REVIEW)
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+        import process as process_module
+        self.process = process_module
+
+    def options(self, note_child):
+        import types
+        store = types.SimpleNamespace(acquire_pool=unittest.mock.Mock(), release_pool=unittest.mock.Mock())
+        record = types.SimpleNamespace(run_id='a' * 32, timeout=30, note_child=note_child)
+        resolution = {'name': 'codex', 'path': sys.executable, 'source': 'fixture', 'rejected': [], 'searched': []}
+        return {'selection': {'effort': 'medium', 'rung': 'fixture', 'harness': 'claude', 'review_budget_usd': 1},
+                'codex_model': 'fixture', 'claude_model': 'fixture', 'timeout': 20, 'store': store,
+                'run_record': record, 'resolutions': {'claude': resolution, 'codex': resolution}}
+
+    def test_failed_record_raising_file_not_found_with_unreapable_child_is_unknown(self):
+        spawned = []
+
+        def note_child(child):
+            spawned.append(child)
+            raise FileNotFoundError(2, 'children.json vanished')
+        options = self.options(note_child)
+
+        def fixture(_command, **kwargs):
+            return self.process.run([sys.executable, '-c', 'import time; time.sleep(30)'], **kwargs)
+        try:
+            with tempfile.TemporaryDirectory() as temp, \
+                    patch.object(self.module, 'run_process', side_effect=fixture) as launches, \
+                    patch.object(self.process, 'signal_group', lambda pid, signum: None), \
+                    patch.object(self.process, 'TERMINATION_GRACE_SECONDS', 0.3), \
+                    patch.object(self.process, 'DISCARD_CLEANUP_SECONDS', 0.3):
+                with self.assertRaises(self.module.ReviewFailure) as caught:
+                    self.module.review_snapshot(Path(temp), 'a' * 40, 'pr', '', 'fixture packet', options)
+            self.assertTrue(spawned and spawned[0].poll() is None, 'positive control: the child is still alive')
+            self.assertEqual(caught.exception.outcome['reason'], 'UNKNOWN')
+            self.assertFalse(caught.exception.outcome['fallback_allowed'])
+            self.assertFalse(options['store'].release_pool.called, 'a child that may be alive must keep its pool')
+            self.assertEqual(launches.call_count, 1, 'no fallback provider may launch while the child may be alive')
+        finally:
+            for child in spawned:
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=5)
+                for pipe in (child.stdout, child.stderr, child.stdin):
+                    if pipe is not None and not pipe.closed:
+                        pipe.close()
+
+    def test_control_genuine_missing_executable_still_falls_back(self):
+        options = self.options(lambda child: None)
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(self.module, 'run_process', side_effect=FileNotFoundError(2, 'no such reviewer')) as launches:
+            with self.assertRaises(self.module.ReviewFailure) as caught:
+                self.module.review_snapshot(Path(temp), 'a' * 40, 'pr', '', 'fixture packet', options)
+        self.assertEqual(launches.call_count, 2, 'a missing executable allows the one independent fallback')
+        self.assertEqual(caught.exception.outcome['reason'], 'TRANSIENT_INFRA')
+        self.assertTrue(options['store'].release_pool.called, 'nothing ran, so the pool is released')

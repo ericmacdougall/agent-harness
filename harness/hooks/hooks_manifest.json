@@ -168,6 +168,22 @@
    ]
   },
   {
+   "id": "provenance:answer",
+   "script": "provenance_hooks.py",
+   "arg": "answer",
+   "event": "PostToolUse",
+   "tools": [
+    "AskUserQuestion"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S23"
+   ]
+  },
+  {
    "id": "provenance:stop-lint",
    "script": "provenance_hooks.py",
    "arg": "stop-lint",
@@ -389,6 +405,24 @@
    ]
   },
   {
+   "id": "tier_gate:dispatch",
+   "script": "tier_gate.py",
+   "arg": "dispatch",
+   "event": "PostToolUse",
+   "tools": [
+    "Agent",
+    "Task",
+    "SendMessage"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S25"
+   ]
+  },
+  {
    "id": "work_assignments:guard",
    "script": "work_assignments.py",
    "arg": null,
@@ -441,6 +475,60 @@
    "status": "installed",
    "rules": [
     "S20"
+   ]
+  },
+  {
+   "id": "copy_hygiene:pretool",
+   "script": "copy_hygiene.py",
+   "arg": "pretool",
+   "event": "PreToolUse",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S18"
+   ],
+   "canaries": [
+    {
+     "payload": {
+      "hook_event_name": "PreToolUse",
+      "tool_name": "Bash",
+      "tool_input": {
+       "command": "ls"
+      },
+      "cwd": "/"
+     },
+     "expect": "allow"
+    },
+    {
+     "payload": {
+      "hook_event_name": "PreToolUse",
+      "tool_name": "Bash",
+      "tool_input": {
+       "command": "mkdir -p /dev/shm/doctor-canary"
+      },
+      "cwd": "/"
+     },
+     "expect": "deny"
+    }
+   ]
+  },
+  {
+   "id": "copy_hygiene:session-start",
+   "script": "copy_hygiene.py",
+   "arg": "session-start",
+   "event": "SessionStart",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S18"
    ]
   },
   {
@@ -570,6 +658,122 @@
    ]
   },
   {
+   "id": "mission-gate:stop",
+   "script": "mission_gate.py",
+   "arg": null,
+   "event": "Stop",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "idle-guard:stop",
+   "script": "idle_guard.py",
+   "arg": "stop",
+   "event": "Stop",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "idle-guard:reject-posttoolusefailure",
+   "script": "idle_guard.py",
+   "arg": "reject",
+   "event": "PostToolUseFailure",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "idle-guard:reject-permissiondenied",
+   "script": "idle_guard.py",
+   "arg": "reject",
+   "event": "PermissionDenied",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "idle-guard:reject-userpromptsubmit",
+   "script": "idle_guard.py",
+   "arg": "reject",
+   "event": "UserPromptSubmit",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "mission-gate:pretool",
+   "script": "mission_gate.py",
+   "arg": "pretool",
+   "event": "PreToolUse",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "mission-gate:posttool",
+   "script": "mission_gate.py",
+   "arg": "posttool",
+   "event": "PostToolUse",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "mission-gate:posttool-failure",
+   "script": "mission_gate.py",
+   "arg": "posttool",
+   "event": "PostToolUseFailure",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "mission-gate:permission-denied",
+   "script": "mission_gate.py",
+   "arg": "posttool",
+   "event": "PermissionDenied",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
    "id": "dropped-gate:pretool",
    "script": "dropped_gate.py",
    "arg": "pretool",
@@ -675,6 +879,125 @@
    "rules": [
     "S18"
    ]
+  },
+  {
+   "id": "mc_inbox:stop",
+   "script": "mc_inbox.py",
+   "arg": "hook",
+   "event": "Stop",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "mc_inbox:prompt",
+   "script": "mc_inbox.py",
+   "arg": "hook",
+   "event": "UserPromptSubmit",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "status-truth:prompt",
+   "script": "status_truth.py",
+   "arg": "prompt",
+   "event": "UserPromptSubmit",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "status-truth:session-start",
+   "script": "status_truth.py",
+   "arg": "session-start",
+   "event": "SessionStart",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "status-truth:stop",
+   "script": "status_truth.py",
+   "arg": "stop",
+   "event": "Stop",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "owner_inbox:prompt",
+   "script": "owner_inbox.py",
+   "arg": "hook",
+   "event": "UserPromptSubmit",
+   "tools": [],
+   "flavors": [
+    "claude",
+    "codex"
+   ],
+   "status": "installed",
+   "rules": [],
+   "canaries": [
+    {
+     "payload": {
+      "hook_event_name": "UserPromptSubmit",
+      "session_id": "doctor-canary"
+     },
+     "expect": "allow"
+    }
+   ]
+  },
+  {
+   "id": "owner_inbox:session-start",
+   "script": "owner_inbox.py",
+   "arg": "hook",
+   "event": "SessionStart",
+   "tools": [],
+   "flavors": [
+    "claude",
+    "codex"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "owner_inbox:stop",
+   "script": "owner_inbox.py",
+   "arg": "hook",
+   "event": "Stop",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "owner_inbox:posttool",
+   "script": "owner_inbox.py",
+   "arg": "hook",
+   "event": "PostToolUse",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
   }
  ]
 }

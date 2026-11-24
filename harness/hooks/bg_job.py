@@ -348,6 +348,85 @@ def cmd_wait(args):
         time.sleep(0.1)
 
 
+MAX_FILE_WAIT_S = 24 * 3600
+EXIT_PRODUCER_GONE = 4
+
+
+def _producer_alive(spec, directory):
+    """(alive, label). spec is `job:<name>` (a bg_job record) or `pid:<N>`. A pid answers kill -0 only, so a reused pid
+    reads as alive: prefer job:, which proves the job by its nonce."""
+    kind, _, value = spec.partition(":")
+    if kind == "job" and NAME_RE.match(value):
+        record, why = load_record(directory, value)
+        if record is None:
+            return False, "job %s (%s)" % (value, why)
+        code, swhy = read_status(record)
+        return (code is None and swhy == "missing" and pid_is_job(record["pid"], record["nonce"])), "job %s" % value
+    if kind == "pid" and value.isdigit() and 1 < int(value) < 2 ** 31:
+        try:
+            os.kill(int(value), 0)
+        except ProcessLookupError:
+            return False, "pid %s" % value
+        except PermissionError:
+            pass
+        return True, "pid %s" % value
+    return None, spec
+
+
+def _wait_alert(name, reason, detail):
+    """One high ring alert for a waiter that gave up (best effort: the exit code and the line printed are the proof)."""
+    try:
+        import ops_watch
+        ops_watch.emit({"host": ops_watch.default_host(), "source": "bg-wait", "event": "raise", "severity": "high",
+                        "check": "bg-wait", "key": "bgwait:%s:%s" % (name, reason),
+                        "message": ("background waiter %s gave up: %s" % (name, detail))[:300], "detail": {"reason": reason}})
+    except Exception:  # noqa: BLE001 - an alert failure never changes the waiter's exit status
+        pass
+
+
+def cmd_wait_file(args):
+    """Wait for a file, but only while something that produces it is alive, and never for ever (GoodQA #15565: a waiter
+    sat 12 h on a file nothing produced). Exit 0 FILE_READY; 3 TIMEOUT; 4 PRODUCER_GONE; both raise a high alert."""
+    directory = job_dir(args.dir)
+    if args.timeout is None or not 0 < args.timeout <= MAX_FILE_WAIT_S:
+        print("UNPROVEN reason=--timeout is required, 1 to %d seconds" % MAX_FILE_WAIT_S)
+        return EXIT_USAGE
+    if not math.isfinite(args.poll) or not 0.05 <= args.poll <= 60:
+        print("UNPROVEN reason=--poll must be between 0.05 and 60 seconds")
+        return EXIT_USAGE
+    alive, label = _producer_alive(args.producer, directory)
+    if alive is None:
+        print("UNPROVEN reason=--producer must be job:<bg_job name> or pid:<number>, naming what writes %s" % args.file)
+        return EXIT_USAGE
+    name = os.path.basename(args.file)[:40] or "file"
+    end = time.time() + args.timeout
+    gone_looks = 0
+    while True:
+        try:
+            ready = os.path.isfile(args.file) and os.path.getsize(args.file) >= args.min_bytes  # a directory is not output
+        except OSError:
+            ready = False
+        if ready:
+            print("FILE_READY file=%s" % args.file)
+            return EXIT_OK
+        alive, label = _producer_alive(args.producer, directory)
+        gone_looks = 0 if alive else gone_looks + 1
+        if gone_looks >= 2:  # two looks: one failed `ps` read must not end a live producer's wait
+            try:
+                if os.path.isfile(args.file) and os.path.getsize(args.file) >= args.min_bytes:
+                    continue  # it landed between the checks
+            except OSError:
+                pass
+            print("PRODUCER_GONE file=%s producer=%s: it is not running and the file does not exist" % (args.file, label))
+            _wait_alert(name, "producer-gone", "%s is gone and %s never appeared" % (label, args.file))
+            return EXIT_PRODUCER_GONE
+        if time.time() >= end:
+            print("TIMEOUT file=%s producer=%s still running after %ss" % (args.file, label, args.timeout))
+            _wait_alert(name, "timeout", "%s still not written after %ss (producer %s)" % (args.file, args.timeout, label))
+            return EXIT_TIMEOUT
+        time.sleep(max(0.05, min(args.poll, end - time.time())))  # the timeout stays a hard bound
+
+
 def cmd_status(args):
     record, why = load_record(job_dir(args.dir), args.name)
     if record is None:
@@ -381,6 +460,13 @@ def main(argv=None):
     p.add_argument("--name", required=True)
     p.add_argument("--timeout", type=float)
     p.add_argument("--dir")
+    p = sub.add_parser("wait-file")
+    p.add_argument("--file", required=True)
+    p.add_argument("--producer", required=True, help="what writes the file: job:<bg_job name> or pid:<number>")
+    p.add_argument("--timeout", type=float, help="required: seconds, at most 86400")
+    p.add_argument("--min-bytes", dest="min_bytes", type=int, default=1)
+    p.add_argument("--poll", type=float, default=1.0)
+    p.add_argument("--dir")
     p = sub.add_parser("status")
     p.add_argument("--name", required=True)
     p.add_argument("--dir")
@@ -399,11 +485,11 @@ def main(argv=None):
             print("UNPROVEN reason=--%s must be a finite number >= 0" % opt)
             return EXIT_USAGE
     try:
-        return {"launch": cmd_launch, "wait": cmd_wait, "status": cmd_status}[args.cmd](args)
+        return {"launch": cmd_launch, "wait": cmd_wait, "wait-file": cmd_wait_file, "status": cmd_status}[args.cmd](args)
     except Exception as exc:
         if args.cmd == "launch":
             raise
-        print("UNPROVEN name=%s reason=internal error (%s)" % (args.name, type(exc).__name__))
+        print("UNPROVEN name=%s reason=internal error (%s)" % (getattr(args, "name", args.cmd), type(exc).__name__))
         return EXIT_UNPROVEN
 
 

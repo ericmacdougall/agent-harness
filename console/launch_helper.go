@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"time"
 )
 
@@ -91,12 +93,102 @@ func executeCLILaunch(ticket cliLaunchTicket, binary string, env []string, in io
 		return errors.New("launch working directory changed or was redirected")
 	}
 	command := exec.Command(binary)
+	if wrap, tmuxBin, session := cliTmuxWrap(env, stdinIsTerminal(in) && stdoutIsTerminal(out), exec.LookPath); wrap {
+		command = exec.Command(tmuxBin, tmuxLaunchArgs(session, actualCWD, binary)...)
+	}
 	command.Dir = ticket.CWD
 	command.Env = env
 	command.Stdin = in
 	command.Stdout = out
 	command.Stderr = errOut
 	return command.Run()
+}
+
+func envLookup(env []string, key string) (string, bool) {
+	prefix := key + "="
+	for i := len(env) - 1; i >= 0; i-- {
+		if strings.HasPrefix(env[i], prefix) {
+			return strings.TrimPrefix(env[i], prefix), true
+		}
+	}
+	return "", false
+}
+
+func envOrProcess(env []string, key string) string {
+	if value, ok := envLookup(env, key); ok {
+		return value
+	}
+	return os.Getenv(key)
+}
+
+func stdinIsTerminal(in io.Reader) bool {
+	file, ok := in.(*os.File)
+	if !ok || file == nil {
+		return false
+	}
+	return fdIsTerminal(int(file.Fd()))
+}
+
+func stdoutIsTerminal(out io.Writer) bool {
+	file, ok := out.(*os.File)
+	if !ok || file == nil {
+		return false
+	}
+	return fdIsTerminal(int(file.Fd()))
+}
+
+// cliTmuxWrap reports whether a console CLI launch should run inside tmux, and if so the
+// tmux binary and session name. Default is on when tmux is on PATH, stdin is a terminal,
+// and the launch is not already inside tmux, on Windows, a test fixture, or explicitly disabled
+// with HARNESS_CLI_TMUX=0 or HARNESS_NO_TMUX=1.
+func cliTmuxWrap(env []string, isTerminal bool, lookPath func(string) (string, error)) (bool, string, string) {
+	if runtime.GOOS == "windows" {
+		return false, "", ""
+	}
+	if envOrProcess(env, "HARNESS_CONSOLE_CLI_FIXTURE") != "" {
+		return false, "", ""
+	}
+	if envOrProcess(env, "HARNESS_CLI_TMUX") == "0" || envOrProcess(env, "HARNESS_NO_TMUX") == "1" {
+		return false, "", ""
+	}
+	if envOrProcess(env, "TMUX") != "" {
+		return false, "", ""
+	}
+	if !isTerminal {
+		return false, "", ""
+	}
+	tmuxBin, err := lookPath("tmux")
+	if err != nil || tmuxBin == "" {
+		return false, "", ""
+	}
+	return true, tmuxBin, tmuxSessionName(envOrProcess(env, "HARNESS_CLI_TMUX_SESSION"))
+}
+
+func tmuxSessionName(override string) string {
+	if override != "" && tmuxSessionNameOK(override) {
+		return override
+	}
+	return "ah-cli-" + freshID()[:12]
+}
+
+func tmuxSessionNameOK(name string) bool {
+	if name == "" || len(name) > 64 || strings.ContainsAny(name, ":. \t/") || strings.ContainsRune(name, '\n') {
+		return false
+	}
+	for _, r := range name {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '-' && r != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+func tmuxLaunchArgs(session, cwd, binary string, args ...string) []string {
+	// A private socket (-L) starts a dedicated server that inherits this process's
+	// environment (command.Env), so API keys are not put on a command line with -e,
+	// and the caller's env is not written into the user's default tmux server.
+	out := []string{"-u", "-L", session, "new-session", "-c", cwd, "-s", session, "--", binary}
+	return append(out, args...)
 }
 func loadCLILaunchTicket(path, digest string) (cliLaunchTicket, error) {
 	var ticket cliLaunchTicket
