@@ -87,8 +87,9 @@ def blob_id(data):
 # The files a hook run for a rule executes, reviewed by hand: the launcher, the analyser, the two sibling modules the analyser loads
 # on the paths the table exercises (safe_input via load_policy, redact), and this tool, so a stale self-test cannot pass. Nothing
 # else is pinned: unrelated files (ah.py and the rest) may differ between hosts without making the run unreliable.
-# provenance.py is loaded only by the no-backup override path, which no case in the table reaches.
-PINNED = ("command_guard.py", "command_guard_hook.py", "guard_selftest.py", "redact.py", "safe_input.py")
+# provenance.py is loaded only by the no-backup override path, which no case in the table reaches. wal_paths.py is the
+# analyser's WAL-tree predicate, imported at module level (goodqa#17008).
+PINNED = ("command_guard.py", "command_guard_hook.py", "guard_selftest.py", "redact.py", "safe_input.py", "wal_paths.py")
 
 
 def manifest(hooks_dir, rule="bulk_staging"):

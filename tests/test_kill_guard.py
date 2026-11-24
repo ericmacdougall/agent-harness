@@ -723,7 +723,8 @@ class Failure(unittest.TestCase):
     def staged(self, command_guard_source=None, policy=None):
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, True)
-        for name in ('kill_guard.py', 'kill_guard_policy.json', 'command_guard_policy.json', 'redact.py', 'safe_input.py'):
+        for name in ('kill_guard.py', 'kill_guard_policy.json', 'command_guard_policy.json', 'redact.py', 'safe_input.py',
+                     'wal_paths.py'):
             src = HOOKS / name
             if src.exists():
                 Path(tmp, name).write_bytes(src.read_bytes())
@@ -1099,7 +1100,7 @@ class Install(unittest.TestCase):
         rolled = self.install.merged_settings(settings, claude, command_guard=False)
         self.assertEqual(self.kill_groups(rolled['hooks']['PreToolUse']), [])
         self.assertIn(user, rolled['hooks']['PreToolUse'])
-        for name in ('kill_guard.py', 'kill_guard_policy.json', 'command_guard.py', 'redact.py', 'safe_input.py'):
+        for name in ('kill_guard.py', 'kill_guard_policy.json', 'command_guard.py', 'redact.py', 'safe_input.py', 'wal_paths.py'):
             self.assertIn(name, self.install.HOOKS)
 
     def test_codex_entry_has_no_matcher_and_is_idempotent(self):

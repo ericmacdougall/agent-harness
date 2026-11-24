@@ -594,7 +594,7 @@ class LauncherTests(unittest.TestCase):
             text = text.replace('CHILD_TIMEOUT = 25.0', 'CHILD_TIMEOUT = %r' % child_timeout)
         (d / 'command_guard_hook.py').write_text(text)
         if guard_source is None:
-            for name in ('command_guard.py', 'redact.py', 'safe_input.py'):
+            for name in ('command_guard.py', 'redact.py', 'safe_input.py', 'wal_paths.py'):
                 (d / name).write_text((HOOKS / name).read_text())
         else:
             (d / 'command_guard.py').write_text(guard_source)
@@ -1358,7 +1358,7 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(len(self.guard_groups(again)), 1)  # idempotent
         rolled_back = self.install.merged_settings(settings, claude, command_guard=False)
         self.assertEqual(self.guard_groups(rolled_back), [])
-        for name in ('command_guard.py', 'command_guard_hook.py', 'redact.py', 'safe_input.py'):
+        for name in ('command_guard.py', 'command_guard_hook.py', 'redact.py', 'safe_input.py', 'wal_paths.py'):
             self.assertIn(name, self.install.HOOKS)
 
     def test_codex_registration_has_no_matcher_and_rolls_back(self):
@@ -1372,7 +1372,7 @@ class InstallTests(unittest.TestCase):
                               if g['hooks'][0]['command'] == guard]), 1)
         off = self.install_codex.merge_hooks(hooks, codex, command_guard=False)
         self.assertFalse([g for g in off['hooks']['PreToolUse'] if g['hooks'][0]['command'] == guard])
-        for name in ('command_guard.py', 'command_guard_hook.py', 'redact.py', 'safe_input.py'):
+        for name in ('command_guard.py', 'command_guard_hook.py', 'redact.py', 'safe_input.py', 'wal_paths.py'):
             self.assertIn(name, self.install_codex.DELIVERY_HELPERS)
 
     def test_guard_carries_the_gate_verb_and_replaces_a_verbless_entry(self):
@@ -1433,7 +1433,7 @@ class DoctorTests(unittest.TestCase):
             home = Path(d)
             hooks = home / '.claude' / 'hooks'
             hooks.mkdir(parents=True)
-            for name in ('command_guard.py', 'command_guard_hook.py', 'redact.py', 'safe_input.py'):
+            for name in ('command_guard.py', 'command_guard_hook.py', 'redact.py', 'safe_input.py', 'wal_paths.py'):
                 (hooks / name).write_text('#\n')
             (home / '.claude' / 'settings.json').write_text(json.dumps(install.merged_settings({}, home / '.claude')))
             checks = cg.doctor(home=home, version_runner=lambda: '2.1.300')

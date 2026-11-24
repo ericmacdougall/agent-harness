@@ -179,6 +179,26 @@ def tmp_advisory_output(data: dict) -> tuple:
         return 0, None
 
 
+FILE_TOOLS = {"write", "edit", "multiedit", "notebookedit"}
+
+
+def file_tool_refusal(data: dict):
+    """goodqa#17008: a Write, Edit, MultiEdit or NotebookEdit call into the session WAL tree is refused; only the
+    hooks and wal_note.py write there. The predicate is wal_paths.in_wal_tree, the one command_guard uses for shell
+    writes. If that module cannot be imported, such a call is refused whenever its path names the tree."""
+    if str(data.get("tool_name", "")).casefold() not in FILE_TOOLS:
+        return None
+    tool_input = data.get("tool_input") if isinstance(data.get("tool_input"), dict) else {}
+    try:
+        import wal_paths
+    except Exception:  # fail closed, for these tools and this tree only
+        named = " ".join(str(tool_input.get(k, "")) for k in ("file_path", "notebook_path", "path"))
+        if re.search(r"(?i)[\\/]wals(?:[\\/]|$)", named):
+            return "the session WALs are written only by the harness hooks and wal_note.py (goodqa#17008)"
+        return None
+    return wal_paths.file_tool_refusal(data.get("tool_name"), tool_input, data.get("cwd"))
+
+
 # Types that own or review work and need the full brief; every other type gets a WAL and a short note.
 OWNER_AGENT_TYPES = {"task-owner", "fixer", "red-team", "click-tester", "general-purpose", "claude"}
 
@@ -241,6 +261,13 @@ def main() -> None:
             "tool_use_id": data.get("tool_use_id", ""),
             "target_chars": len(str(target)),
         })
+        refusal = file_tool_refusal(data)
+        if refusal:
+            record["refused"] = "wal-write"  # goodqa#17008; the path stays out of the WAL
+            append(wal, record)
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                                     "permissionDecisionReason": refusal}}))
+            return
         advisories, output = tmp_advisory_output(data)
         if advisories:
             record["tmp_advisory"] = advisories  # a count only: paths stay out of the WAL
