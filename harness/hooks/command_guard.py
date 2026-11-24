@@ -1212,8 +1212,73 @@ def _strip_case_patterns(tokens):
     return out
 
 
+def _plain(word, text):
+    return not word.quoted and word.raw == text
+
+
+def _conditional_end(tokens, i):
+    """Index of the `]]` that closes a `[[` whose first operand token is tokens[i], or None when the shell would
+    reject the text inside (it then runs nothing there) or no `]]` closes it. Inside `[[ ]]` bash and zsh accept
+    operand words, `&&`, `||`, `(`, `)`, line breaks, `<` and `>` as string comparisons, and `|` only within a `=~`
+    pattern. Anything else (`;`, `&`, `|&`, a here-document or another redirection, an fd prefix) is refused here, so
+    the caller keeps the old split reading of the text."""
+    pattern = False  # inside the operand after `=~`, until the next `&&` or `||`
+    for j in range(i, len(tokens)):
+        kind, val = tokens[j]
+        if kind == 'w':
+            if _plain(val, ']]'):
+                return j
+            if _plain(val, '=~'):
+                pattern = True
+        elif kind == 'redir':
+            if val.op not in ('<', '>') or val.fd is not None or val.target is None:
+                return None
+        elif val in ('&&', '||'):
+            pattern = False
+        elif val not in ('(', ')', '\n') and not (val == '|' and pattern):
+            return None
+    return None
+
+
+def _fold_conditionals(tokens):
+    """`[[ a || b ]]`: bash and zsh read everything up to the closing `]]` as one conditional expression whose words are
+    operands, never commands, so the operators inside it do not end a command (goodqa#17044). Each operator inside
+    becomes an operand word of the `[[` command; `<` and `>` keep their right-hand word. A substitution inside an
+    operand stays on its word and is analysed as before. A `[[` that is not a command word (an argument, after an
+    assignment, quoted), or one `_conditional_end` cannot close, leaves the tokens unchanged."""
+    out, i, n = [], 0, len(tokens)
+    while i < n:
+        kind, val = tokens[i]
+        at_start = not out or out[-1][0] == 'op' or (out[-1][0] == 'w' and not out[-1][1].quoted
+                                                       and out[-1][1].text in RESERVED)
+        end = _conditional_end(tokens, i + 1) if kind == 'w' and at_start and _plain(val, '[[') else None
+        if end is None:
+            out.append(tokens[i])
+            i += 1
+            continue
+        out.append(tokens[i])
+        for inner_kind, inner in tokens[i + 1:end]:
+            if inner_kind == 'w':
+                out.append((inner_kind, inner))
+            elif inner_kind == 'redir':
+                out.append(('w', _operator_word(inner.op)))
+                out.append(('w', inner.target))
+            elif inner != '\n':
+                out.append(('w', _operator_word(inner)))
+        out.append(tokens[end])
+        i = end + 1
+    return out
+
+
+def _operator_word(text):
+    word = Word()
+    word.alts = [text]
+    word.raw = text
+    return word
+
+
 def parse(tokens):
-    tokens = _strip_case_patterns(tokens)
+    tokens = _fold_conditionals(_strip_case_patterns(tokens))
     pipelines, pl, cmd = [], Pipeline(), Cmd()
 
     def end_cmd():
