@@ -107,14 +107,17 @@ class Plan(Base):
 
 class Close(Base):
     def test_close_runs_wal_note_with_an_answer_source_no_decision_and_a_tool_mark(self):
-        calls = []
-        sw.close_answered("sess-1", Path("/w/main.jsonl"),
-                          [{"ask": "w00000000001", "turn": "u1-uuid", "answer": 'My "own" product'}], runner=lambda a: calls.append(a) or 0)
-        argv = calls[0]
+        argv = sw.answered_argv("sess-1", Path("/w/main.jsonl"), {"ask": "w00000000001", "turn": "u1-uuid",
+                                                                   "answer": 'My "own" product'})
         self.assertEqual(argv[argv.index("--source") + 1], "answer:sess-1/u1-uuid \"My 'own' product\"")
         self.assertEqual(argv[argv.index("--by") + 1], "ask-sweep")
         self.assertNotIn("--decision", argv)
         self.assertNotIn("--outcome", argv)
+
+    def test_a_refused_close_carries_wal_note_s_message(self):
+        got = sw.run_close("w00000000001", ["x"], runner=lambda a: (2, "", '{"status": "REFUSED", "problem": "nope"}'))
+        self.assertEqual((got["rc"], "nope" in got["refused"]), (2, True))
+        self.assertEqual(sw.run_close("w00000000001", ["x"], runner=lambda a: (0, "{}", "")), {"ask": "w00000000001", "rc": 0})
 
 
 class RealProvenance(Base):
@@ -143,7 +146,7 @@ class Cli(Base):
         self.calls = []
         patches = [mock.patch.dict(os.environ, {"AH_HOME": str(self.home)}),
                    mock.patch.object(sw, "verified", lambda *a: True),
-                   mock.patch.object(sw, "close_answered", lambda s, w, items: [(i["ask"], 0) for i in items])]
+                   mock.patch.object(sw, "_default_runner", lambda argv: self.calls.append(argv) or (0, "{}", ""))]
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
@@ -163,16 +166,20 @@ class Cli(Base):
         self.assertIn("--only", doc["problem"])
 
     def test_apply_closes_exactly_the_named_asks_and_never_a_stale_one(self):
-        code, doc = self.run_main("--apply", "--only", "w00000000002", "w00000000003", "--stale")
-        self.assertEqual(code, 0)
-        self.assertEqual([c["ask"] for c in doc["closed"]], ["w00000000002"])  # the stale ask has no answer: never closed here
+        code, doc = self.run_main()
+        pin = {a["ask"]: a["pin"] for a in doc["answered"]}["w00000000002"]
+        self.assertEqual(pin, "w00000000002=u1")
+        code, doc = self.run_main("--apply", "--only", pin, "w00000000003=x", "--stale")
+        self.assertEqual(code, 1)  # the stale ask has no answer: never closed here, and that is reported
+        self.assertEqual([(c["ask"], c["rc"]) for c in doc["closed"]], [("w00000000002", 0), ("w00000000003", 3)])
+        self.assertEqual([a[a.index("--ref") + 1] for a in self.calls], ["w00000000002"])
         self.assertEqual([s["ask"] for s in doc["stale"]], ["w00000000003"])
 
     def test_a_short_answer_stays_unclosable_even_when_named_with_only(self):
         proj = self.home / ".claude" / "projects" / "p" / f"{SESSION}.jsonl"
         proj.write_text(json.dumps(answer_record("u2", {"[ask:w00000000001] Fable?": "No"})) + "\n")
-        code, doc = self.run_main("--apply", "--only", "w00000000001")
-        self.assertEqual((code, doc["answered"], doc["closed"]), (0, [], []))
+        code, doc = self.run_main("--apply", "--only", "w00000000001=u2")
+        self.assertEqual((code, doc["answered"], [c["rc"] for c in doc["closed"]], self.calls), (1, [], [3], []))
         self.assertEqual([s["ask"] for s in doc["short"]], ["w00000000001"])
 
     def test_a_bad_session_id_is_refused(self):
@@ -262,7 +269,7 @@ class WalEvidence(unittest.TestCase):
         argv = sw.close_argv(item)
         self.assertEqual(argv[argv.index("--wal") + 1], str(self.home / ".claude" / "wals" / S1 / "main.jsonl"))
 
-    def test_terminal_match_needs_a_distinctive_token_after_the_ask_and_is_marked_confirm(self):
+    def test_terminal_match_needs_a_distinctive_token_after_the_ask_and_is_manual_only(self):
         path = "/home/eric/.agent-harness/work/heldout/scoring/__pycache__"
         self.wal(S1, [wrow("ask", "w00000000a05", "2026-11-23T22:47:00+00:00", f"Run on t2-dev: rm -r {path}"),
                       wrow("ask", "w00000000a06", "2026-11-23T22:48:00+00:00", "free space under /home/eric/.agent-harness/work")])
@@ -272,41 +279,56 @@ class WalEvidence(unittest.TestCase):
         items = self.items()
         self.assertNotIn("w00000000a06", items)   # a generic path alone is not evidence
         item = items["w00000000a05"]
-        self.assertEqual((item["kind"], item["confirm"]), ("terminal", True))
+        self.assertEqual((item["kind"], item["manual"]), ("terminal", True))
         self.assertEqual([e["ref"] for e in item["evidence"]], [f"{S1}/u-after"])
-        argv = sw.close_argv(item, "w0000000c0de")
-        self.assertNotIn("--decision", argv)
+        self.assertIsNone(sw.close_argv(item))  # no source exists that wal_note accepts: never closed here
+        self.assertFalse(hasattr(sw, "check_argv"))  # and no observation row is ever written for it
+
+    def test_ranking_with_every_kind_at_once(self):
+        path = "/home/eric/.agent-harness/work/heldout/scoring/__pycache__"
+        ask_row = wrow("ask", "w00000000a20", "2026-11-23T19:00:00+00:00", f"Run on t2-dev: rm -r {path}")
+        superseding = wrow("ask", "w00000000b20", "2026-11-23T19:10:00+00:00", "SUPERSEDES w00000000a20: reworded")
+        answer_user = wrow("decision", "w00000000d21", "2026-11-23T19:20:00+00:00", "Answer to ask w00000000a20: approved",
+                           source=f'user:{S1}/7 "Yes, go ahead now"')
+        answer_card = wrow("decision", "w00000000d22", "2026-11-23T19:30:00+00:00", "Answer to ask w00000000a20: approved",
+                           source=f'answer:{S1}/8 "Yes, go ahead now"')
+        elsewhere = wrow("ask_resolved", "w00000000r20", "2026-11-23T19:40:00+00:00", "closed there", ref="w00000000a20",
+                         source=f'answer:{S2}/9 "Yes"')
+        self.transcript(S1, [bash_input("u-after", "2026-11-23T19:05:00.000Z", f"ssh t2-dev rm -r {path}")])
+        self.wal(S1, [ask_row, superseding])
+        self.assertEqual(self.items()["w00000000a20"]["evidence"][0]["kind"], "superseded")  # superseded beats terminal
+        self.wal(S1, [answer_user])
+        self.assertEqual(self.items()["w00000000a20"]["evidence"][0]["ref"], "w00000000d21")  # an answer beats superseded
+        self.wal(S1, [answer_card])
+        self.assertEqual(self.items()["w00000000a20"]["evidence"][0]["ref"], "w00000000d22")  # answer: beats user:
+        self.wal(S2, [elsewhere])
+        kinds = [e["kind"] for e in self.items([S2])["w00000000a20"]["evidence"]]
+        self.assertEqual(kinds, ["resolved-elsewhere", "answer", "answer", "superseded", "terminal"])
+
+    def test_supersedes_needs_the_exact_id(self):
+        self.wal(S1, [wrow("ask", "w00000000a07", "2026-11-23T18:27:00+00:00", "run h3d.sh"),
+                      wrow("ask", "w00000000a08", "2026-11-23T22:41:00+00:00", "SUPERSEDES w00000000a071 (another ask)")])
+        self.assertEqual(self.items(), {})
+
+    def test_a_symlinked_or_fifo_wal_is_unread_never_followed(self):
+        self.wal(S1, [wrow("ask", "w00000000a30", "2026-11-23T19:00:00+00:00", "q")])
+        self.wal(S2, [wrow("decision", "w00000000d30", "2026-11-23T20:00:00+00:00", "Answer to ask w00000000a30: yes",
+                           source=f'answer:{S2}/1 "Yes, do it"')])
+        folder = self.home / ".claude" / "wals" / S1
+        (folder / "agent-evil.jsonl").symlink_to(self.home / ".claude" / "wals" / S2 / "main.jsonl")
+        os.mkfifo(folder / "agent-fifo.jsonl")
+        found = sw.wal_evidence(self.home, S1)
+        self.assertEqual(found["items"], [])
+        reasons = {Path(u["source"]).name: u["reason"] for u in found["unread"]}
+        self.assertEqual(reasons.get("agent-evil.jsonl"), "file-symlink")
+        self.assertEqual(reasons.get("agent-fifo.jsonl"), "file-not-regular")
+
+    def test_resolved_elsewhere_keeps_the_other_close_s_outcome(self):
+        self.wal(S1, [wrow("ask", "w00000000a40", "2026-11-23T19:00:00+00:00", "q")])
+        self.wal(S2, [wrow("ask_resolved", "w00000000r40", "2026-11-23T20:00:00+00:00", "obsolete there", ref="w00000000a40",
+                           source=f"wal:/x/main.jsonl#w00000000b40", outcome="obsolete")])
+        argv = sw.close_argv(self.items([S2])["w00000000a40"])
         self.assertEqual(argv[argv.index("--outcome") + 1], "obsolete")
-        self.assertTrue(argv[argv.index("--source") + 1].endswith("#w0000000c0de"))
-
-    def test_terminal_close_records_the_observation_first_and_closes_on_it(self):
-        path = "/home/eric/.agent-harness/work/heldout/scoring/__pycache__"
-        self.wal(S1, [wrow("ask", "w00000000a12", "2026-11-23T22:47:00+00:00", f"Run on t2-dev: rm -r {path}")])
-        self.transcript(S1, [bash_input("u-after", "2026-11-24T00:18:00.000Z", f"ssh t2-dev rm -r {path}")])
-        item = self.items()["w00000000a12"]
-        calls = []
-
-        def runner(argv):
-            calls.append(argv)
-            if argv[argv.index("--event") + 1] == "check":
-                return 0, json.dumps({"status": "WROTE", "id": "w0000000c0de"}), ""
-            return 0, "{}", ""
-        self.assertEqual(sw.close_evidence([item], runner), [("w00000000a12", 0, "")])
-        self.assertEqual([a[a.index("--event") + 1] for a in calls], ["check", "ask_resolved"])
-        self.assertIn(f"{S1}/u-after", calls[0][calls[0].index("--note") + 1])
-        self.assertTrue(calls[0][calls[0].index("--source") + 1].startswith("inferred:"))
-        self.assertTrue(calls[1][calls[1].index("--source") + 1].endswith("#w0000000c0de"))
-
-    def test_a_refused_check_row_stops_the_close_and_is_reported(self):
-        path = "/home/eric/.agent-harness/work/heldout/scoring/__pycache__"
-        self.wal(S1, [wrow("ask", "w00000000a13", "2026-11-23T22:47:00+00:00", f"Run on t2-dev: rm -r {path}")])
-        self.transcript(S1, [bash_input("u-after", "2026-11-24T00:18:00.000Z", f"ssh t2-dev rm -r {path}")])
-        item = self.items()["w00000000a13"]
-        calls = []
-        result = sw.close_evidence([item], lambda a: calls.append(a) or (2, "", '{"status": "REFUSED"}'))
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(result[0][:2], ("w00000000a13", 2))
-        self.assertIn("REFUSED", result[0][2])
 
     def test_a_superseded_ask_closes_as_obsolete_on_wal_evidence(self):
         self.wal(S1, [wrow("ask", "w00000000a07", "2026-11-23T18:27:00+00:00", "run h3d.sh"),
@@ -333,20 +355,32 @@ class WalEvidence(unittest.TestCase):
         self.transcript(S1, [])
         calls = []
         with mock.patch.dict(os.environ, {"AH_HOME": str(self.home)}), \
-                mock.patch.object(sw, "close_evidence", lambda items, runner=None: calls.extend(i["ask"] for i in items) or
-                                  [(i["ask"], 0, "") for i in items]), \
+                mock.patch.object(sw, "_default_runner", lambda argv: calls.append(argv) or (0, "{}", "")), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(sw.main(["--session", S1]), 0)
             listed = json.loads(out.getvalue())
         self.assertEqual(sorted(i["ask"] for i in listed["evidence"]), ["w00000000a10", "w00000000a11"])
+        self.assertEqual({i["pin"] for i in listed["evidence"]}, {"w00000000a10=w00000000d10", "w00000000a11=w00000000d10"})
         self.assertNotIn("closed", listed)
         self.assertEqual(calls, [])
         with mock.patch.dict(os.environ, {"AH_HOME": str(self.home)}), \
-                mock.patch.object(sw, "close_evidence", lambda items, runner=None: calls.extend(i["ask"] for i in items) or
-                                  [(i["ask"], 0, "") for i in items]), \
+                mock.patch.object(sw, "_default_runner", lambda argv: calls.append(argv) or (0, "{}", "")), \
                 contextlib.redirect_stdout(io.StringIO()):
-            sw.main(["--session", S1, "--apply", "--only", "w00000000a10"])
-        self.assertEqual(calls, ["w00000000a10"])
+            self.assertEqual(sw.main(["--session", S1, "--apply", "--only", "w00000000a10=w00000000d10"]), 0)
+        self.assertEqual([a[a.index("--ref") + 1] for a in calls], ["w00000000a10"])
+
+
+class OneRule(unittest.TestCase):
+    """Class 2 guard: the SUPERSEDES match and the file reading live in ask_evidence.py only."""
+
+    def test_neither_tool_reimplements_the_shared_rules(self):
+        hooks = Path(sw.__file__).resolve().parent
+        for name in ("ask_sweep.py", "wal_note.py"):
+            text = (hooks / name).read_text()
+            self.assertNotIn("SUPERSEDES\\s", text, name)
+            self.assertIn("ask_evidence", text, name)
+        self.assertNotIn('open(path, "rb")', (hooks / "ask_sweep.py").read_text())
+        self.assertNotIn('open(transcript, "rb")', (hooks / "ask_sweep.py").read_text())
 
 
 if __name__ == "__main__":

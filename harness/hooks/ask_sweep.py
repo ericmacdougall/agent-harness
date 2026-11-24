@@ -6,13 +6,24 @@ user answers through AskUserQuestion, whose structured result maps each question
 selected answer. An open ask (a main-WAL `ask` row with no `ask_resolved`) whose id is a key of a LATER answer record, and
 whose answer provenance verifies as the user's own selection, is ANSWERED.
 
-    ask_sweep.py --session S                    list answered asks (and `short`: answers under 12 characters, which cannot be cited)
-    ask_sweep.py --session S --apply --only A.. close exactly those asks; --apply needs --only: main reads each answer first
-    ask_sweep.py --session S --stale            also list asks older than 7 days with no answer (never closed here)
+    ask_sweep.py --session S [--related S2 ..]           list answered asks, WAL evidence and `short` answers (read only)
+    ask_sweep.py --session S --apply --only A=REF ..     close exactly those asks, each on the evidence REF it was listed with
+    ask_sweep.py --session S --stale                     also list asks older than 7 days with no answer (never closed here)
 
-A close is bookkeeping: it writes `ask_resolved` with the `answer:` source and `closed_by=ask-sweep` and NO decision, so it is
-never an approval for a stop, a grant or a top-rung request (a "No" answer is closed the same way as a "Yes"). The answer text
-is cited as the whole answer only; it is never padded with another question's answer. Stdlib only; Python 3.9+.
+Evidence kinds, best first (GoodQA goodqa#16944): a structured `[ask:<id>]` answer card; `resolved-elsewhere` (an
+ask_resolved row for this ask in a related session); `answer` (a later WAL row that names the ask and cites the user's own
+words); `superseded` (a later ask whose note says `SUPERSEDES <id>`); `terminal` (the user ran the step himself). Terminal
+evidence is listed for MANUAL action only and is never closed here: provenance does not take a `<bash-input>` turn as the
+user's words, so no source exists that wal_note would accept, and no row is ever written for it.
+
+Every listed item carries `pin` (ASK=REF) and `apply`, the exact ask_sweep command that closes it, plus `close`, the exact
+wal_note.py command that command runs. --apply refuses an ask named without its pin, or whose best evidence is no longer the
+one that was listed (a row written after the listing). wal_note.py re-verifies every source; a refused close is reported
+with wal_note's own message and the run exits 1.
+
+A close is bookkeeping: `ask_resolved` with `closed_by=ask-sweep` and NO decision, so it is never an approval for a stop, a
+grant or a top-rung request (a "No" answer is closed the same way as a "Yes"). The answer text is cited as the whole answer
+only. The file reading and the SUPERSEDES and human-turn rules are ask_evidence.py's, shared with wal_note.py. Stdlib only.
 """
 from __future__ import annotations
 
@@ -47,27 +58,22 @@ def parse_ts(value):
         return None
 
 
-def answer_turns(transcript: Path) -> dict:
+def answer_turns(transcript: Path, unread=None) -> dict:
     """{ask id: {"uuid", "ts", "answer"}}: the newest user AskUserQuestion answer record per ask id (structured answers only)."""
     found = {}
-    with open(transcript, "rb") as handle:
-        for raw in handle:
-            if b"[ask:w" not in raw or b"toolUseResult" not in raw:
-                continue
-            try:
-                rec = json.loads(raw)
-            except (ValueError, RecursionError):
-                continue
-            result = rec.get("toolUseResult") if isinstance(rec, dict) else None
-            answers = result.get("answers") if isinstance(result, dict) else None
-            if rec.get("type") != "user" or rec.get("isSidechain") or not isinstance(answers, dict) \
-                    or not isinstance(rec.get("uuid"), str):
-                continue
-            for key, value in answers.items():
-                m = ASK_KEY.match(key) if isinstance(key, str) else None
-                if m and isinstance(value, str) and value.strip():
-                    found[m.group(1)] = {"uuid": rec["uuid"], "ts": parse_ts(rec.get("timestamp")) or 0.0,
-                                         "answer": " ".join(value.split())[:300]}
+    sys.path.insert(0, str(HERE))
+    import ask_evidence  # noqa: PLC0415
+    for rec in ask_evidence.jsonl_records(transcript, unread, needle=b"toolUseResult"):
+        result = rec.get("toolUseResult") if isinstance(rec, dict) else None
+        answers = result.get("answers") if isinstance(result, dict) else None
+        if rec.get("type") != "user" or rec.get("isSidechain") or not isinstance(answers, dict) \
+                or not isinstance(rec.get("uuid"), str):
+            continue
+        for key, value in answers.items():
+            m = ASK_KEY.match(key) if isinstance(key, str) else None
+            if m and isinstance(value, str) and value.strip():
+                found[m.group(1)] = {"uuid": rec["uuid"], "ts": parse_ts(rec.get("timestamp")) or 0.0,
+                                     "answer": " ".join(value.split())[:300]}
     return found
 
 
@@ -91,7 +97,8 @@ def verified(session: str, uuid: str, home: Path) -> bool:
 def plan(main_wal: Path, transcript: Path, now: float | None = None, check=None) -> dict:
     """{"answered": [...], "short": [...], "stale": [...]} for the open asks of one session."""
     now = time.time() if now is None else now
-    turns = answer_turns(transcript)
+    unread = []
+    turns = answer_turns(transcript, unread)
     answered, short, stale = [], [], []
     for ask in open_asks(main_wal):
         opened = float(ask["opened"] or 0)
@@ -102,7 +109,7 @@ def plan(main_wal: Path, transcript: Path, now: float | None = None, check=None)
             (answered if len(turn["answer"]) >= MIN_EXCERPT else short).append(row)
         elif opened and now - opened >= STALE_S:
             stale.append({"ask": ask["id"], "age_days": int((now - opened) // 86400), "question": ask["note"][:120]})
-    return {"answered": answered, "short": short, "stale": stale}
+    return {"answered": answered, "short": short, "stale": stale, "unread": unread}
 
 
 # --------------------------------------------------------------------------- WAL evidence (GoodQA goodqa#16944)
@@ -121,7 +128,8 @@ GENERIC_TOKENS = {"/home/eric", "/Users/eric", "~/.claude/hooks", "~/.agent-harn
                   "/home/eric/.agent-harness/work", "/Users/eric/.agent-harness/work"}
 MAX_LINE = 4 * 1024 * 1024
 MAX_TRANSCRIPT = 512 * 1024 * 1024
-KIND_ORDER = {"resolved-elsewhere": 0, "answer": 1, "terminal": 2, "superseded": 3}
+KIND_ORDER = {"resolved-elsewhere": 0, "answer": 1, "superseded": 2, "terminal": 3}
+CLOSE_OUTCOMES = ("obsolete", "not_user")
 
 
 def _clip(text, limit: int) -> str:
@@ -130,23 +138,9 @@ def _clip(text, limit: int) -> str:
 
 
 def _rows(path: Path, unread: list) -> list:
-    try:
-        handle = open(path, "rb")
-    except OSError as error:
-        unread.append({"source": str(path), "reason": type(error).__name__})
-        return []
-    rows = []
-    with handle:
-        for raw in handle:
-            if len(raw) > MAX_LINE:
-                continue
-            try:
-                rec = json.loads(raw)
-            except (ValueError, RecursionError):
-                continue
-            if isinstance(rec, dict):
-                rows.append(rec)
-    return rows
+    sys.path.insert(0, str(HERE))
+    import ask_evidence  # noqa: PLC0415
+    return ask_evidence.jsonl_records(path, unread)
 
 
 def session_rows(home: Path, session: str, unread: list) -> list:
@@ -171,33 +165,20 @@ def bash_inputs(home: Path, session: str, unread: list) -> list:
     if transcript is None:
         unread.append({"source": f"{session} transcript", "reason": "missing"})
         return []
-    try:
-        if transcript.stat().st_size > MAX_TRANSCRIPT:
-            unread.append({"source": f"{session} transcript", "reason": "too large to scan"})
-            return []
-        handle = open(transcript, "rb")
-    except OSError as error:
-        unread.append({"source": f"{session} transcript", "reason": type(error).__name__})
-        return []
+    sys.path.insert(0, str(HERE))
+    import ask_evidence  # noqa: PLC0415
     found = []
-    with handle:
-        for raw in handle:
-            if b"<bash-input>" not in raw or len(raw) > MAX_LINE:
-                continue
-            try:
-                rec = json.loads(raw)
-            except (ValueError, RecursionError):
-                continue
-            if not isinstance(rec, dict) or rec.get("type") != "user" or rec.get("isSidechain") or rec.get("isMeta"):
-                continue
-            content = (rec.get("message") or {}).get("content")
-            if isinstance(content, list):
-                content = " ".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
-            if not isinstance(content, str) or not content.lstrip().startswith("<bash-input>"):
-                continue
-            m = re.search(r"<bash-input>(.*?)</bash-input>", content, re.S)
-            if m and isinstance(rec.get("uuid"), str):
-                found.append((rec["uuid"], parse_ts(rec.get("timestamp")) or 0.0, m.group(1)))
+    for rec in ask_evidence.jsonl_records(transcript, unread, needle=b"<bash-input>", max_file=MAX_TRANSCRIPT):
+        if not isinstance(rec, dict) or rec.get("type") != "user" or rec.get("isSidechain") or rec.get("isMeta"):
+            continue
+        content = (rec.get("message") or {}).get("content")
+        if isinstance(content, list):
+            content = " ".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
+        if not isinstance(content, str) or not content.lstrip().startswith("<bash-input>"):
+            continue
+        m = re.search(r"<bash-input>(.*?)</bash-input>", content, re.S)
+        if m and isinstance(rec.get("uuid"), str):
+            found.append((rec["uuid"], parse_ts(rec.get("timestamp")) or 0.0, m.group(1)))
     return found
 
 
@@ -226,6 +207,8 @@ def wal_evidence(home: Path, session: str, related=(), unread=None) -> dict:
         rows.extend(session_rows(home, s, unread))
     inputs = {s: bash_inputs(home, s, unread) for s in sessions}
     main_wal = home / ".claude" / "wals" / session / "main.jsonl"
+    sys.path.insert(0, str(HERE))
+    import ask_evidence  # noqa: PLC0415
     resolutions = {}
     for r in rows:
         if r.get("event") == "ask_resolved" and isinstance(r.get("ref"), str):
@@ -238,14 +221,15 @@ def wal_evidence(home: Path, session: str, related=(), unread=None) -> dict:
         if other is not None:
             found.append({"kind": "resolved-elsewhere", "ref": str(other.get("id")), "session": other["_session"],
                           "at": parse_ts(other.get("at")) or 0.0, "summary": str(other.get("note") or ""),
-                          "source": str(other.get("source") or ""), "outcome": None})
+                          "source": str(other.get("source") or ""),
+                          "outcome": other.get("outcome") if other.get("outcome") in CLOSE_OUTCOMES else None})
         for r in rows:
             note = str(r.get("note") or "")
             when = parse_ts(r.get("at")) or 0.0
             if r.get("id") == ident or when <= opened or ident not in note:
                 continue
             source = str(r.get("source") or "")
-            if r.get("event") == "ask" and re.search(r"\bSUPERSEDES\s+" + re.escape(ident), note):
+            if ask_evidence.supersedes(r, ident):
                 found.append({"kind": "superseded", "ref": str(r.get("id")), "session": r["_session"], "at": when,
                               "summary": note, "source": f"wal:{r['_wal']}#{r.get('id')}", "outcome": "obsolete"})
             elif (source.startswith(ANSWER_PREFIXES) and r.get("event") in EVIDENCE_EVENTS
@@ -258,7 +242,7 @@ def wal_evidence(home: Path, session: str, related=(), unread=None) -> dict:
                 hit = sorted(t for t in tokens if t in command) if ts > opened else []
                 if hit:
                     excerpt = _clip(command, 58).replace(chr(34), chr(39))
-                    found.append({"kind": "terminal", "ref": f"{s}/{uuid}", "session": s, "at": ts, "confirm": True,
+                    found.append({"kind": "terminal", "ref": f"{s}/{uuid}", "session": s, "at": ts, "manual": True,
                                   "summary": f"the user ran in a terminal: {_clip(command, 70)} (matched {hit[0]})",
                                   "source": f'user:{s}/{uuid} "{excerpt}"', "outcome": None})
         if not found:
@@ -266,27 +250,18 @@ def wal_evidence(home: Path, session: str, related=(), unread=None) -> dict:
         found.sort(key=lambda e: (KIND_ORDER[e["kind"]], not e["source"].startswith("answer:"),
                                   not ANSWER_WORDS.search(e["summary"]), e["at"]))
         best = found[0]
-        items.append({"ask": ident, "kind": best["kind"], "confirm": bool(best.get("confirm")),
+        items.append({"ask": ident, "kind": best["kind"], "manual": bool(best.get("manual")),
                       "question": ask["note"][:120], "wal": str(main_wal), "evidence": found})
     return {"items": items, "unread": unread}
 
 
-def check_argv(item: dict) -> list:
-    """Terminal evidence: provenance does not take a `<bash-input>` turn as the user's words, so the observation is first
-    recorded as a `check` row that names the transcript turn; the ask then closes as obsolete on that row."""
+def close_argv(item: dict):
+    """The wal_note.py argv that closes one evidence item (bookkeeping, never --decision), or None for terminal evidence,
+    which is listed for manual action only."""
     best = item["evidence"][0]
-    return [sys.executable, str(HERE / "wal_note.py"), "--wal", item["wal"], "--event", "check", "--by", "ask-sweep",
-            "--source", f"inferred: from the transcript turn {best['ref']} -- the user's own terminal command",
-            "--note", f"ask-sweep observed: {_clip(best['summary'], 160)} in transcript turn {best['ref']}; "
-                      f"[ask:{item['ask']}] asked for that step, so it is obsolete"]
-
-
-def close_argv(item: dict, evidence_id: str = "<check row id>") -> list:
-    """The wal_note.py argv that closes one evidence item: bookkeeping, never --decision."""
-    best = item["evidence"][0]
+    if best.get("manual"):
+        return None
     source, outcome = best["source"], best.get("outcome")
-    if best["kind"] == "terminal":
-        source, outcome = f"wal:{item['wal']}#{evidence_id}", "obsolete"
     argv = [sys.executable, str(HERE / "wal_note.py"), "--wal", item["wal"], "--event", "ask_resolved", "--ref", item["ask"],
             "--by", "ask-sweep", "--source", source,
             "--note", f"ask-sweep: {best['kind']} evidence {best['ref']} resolves [ask:{item['ask']}]: "
@@ -301,46 +276,40 @@ def _default_runner(argv):
     return done.returncode, done.stdout, done.stderr
 
 
-def close_evidence(items: list, runner=None) -> list:
-    """[(ask, rc, detail)]: rc 0 closed; otherwise wal_note's refusal text, so a refusal is never silent."""
-    run = runner or _default_runner
-    out = []
-    for item in items:
-        evidence_id = None
-        if item["evidence"][0]["kind"] == "terminal":
-            rc, stdout, stderr = run(check_argv(item))
-            try:
-                evidence_id = json.loads(stdout).get("id") if rc == 0 else None
-            except (ValueError, AttributeError):
-                evidence_id = None
-            if not evidence_id:
-                out.append((item["ask"], rc or 2, _clip(stderr or stdout or "check row not written", 300)))
-                continue
-        rc, stdout, stderr = run(close_argv(item, evidence_id) if evidence_id else close_argv(item))
-        out.append((item["ask"], rc, "" if rc == 0 else _clip(stderr or stdout, 300)))
-    return out
+def answered_argv(session: str, main_wal: Path, item: dict) -> list:
+    quoted = item["answer"].replace(chr(34), chr(39))
+    return [sys.executable, str(HERE / "wal_note.py"), "--wal", str(main_wal), "--event", "ask_resolved", "--ref", item["ask"],
+            "--by", "ask-sweep", "--source", f'answer:{session}/{item["turn"]} "{quoted}"',
+            "--note", f"ask-sweep: the user answered [ask:{item['ask']}] in answer turn {item['turn'][:8]} (bookkeeping, "
+                      "not an approval; read the answer before relying on it)"]
 
 
-def close_answered(session: str, main_wal: Path, items: list, runner=None) -> list:
-    """ask_resolved for each answered ask, through wal_note.py (which re-verifies the answer source). Returns [(ask, rc)].
-    No --decision: the close is not an approval whatever the answer was."""
-    out = []
-    for item in items:
-        quoted = item["answer"].replace(chr(34), chr(39))
-        argv = [sys.executable, str(HERE / "wal_note.py"), "--wal", str(main_wal), "--event", "ask_resolved", "--ref", item["ask"],
-                "--by", "ask-sweep", "--source", f'answer:{session}/{item["turn"]} "{quoted}"',
-                "--note", f"ask-sweep: the user answered [ask:{item['ask']}] in answer turn {item['turn'][:8]} (bookkeeping, "
-                          "not an approval; read the answer before relying on it)"]
-        run = runner or (lambda a: subprocess.run(a, capture_output=True, text=True, timeout=60).returncode)
-        out.append((item["ask"], run(argv)))
-    return out
+def run_close(ask: str, argv, runner=None) -> dict:
+    """{"ask", "rc", "refused"?}: one wal_note.py run. A refusal carries wal_note's own message, never a silent rc."""
+    if argv is None:
+        return {"ask": ask, "rc": 3, "refused": "terminal evidence is listed for manual action only; nothing was written"}
+    rc, stdout, stderr = (runner or _default_runner)(argv)
+    return {"ask": ask, "rc": rc, **({"refused": _clip(stderr or stdout or "refused with no message", 400)} if rc else {})}
+
+
+def pin_of(item: dict) -> str:
+    ref = item.get("turn") or item["evidence"][0]["ref"]
+    return f"{item['ask']}={ref}"
+
+
+def apply_command(session: str, related, pin: str) -> str:
+    argv = [sys.executable, str(HERE / "ask_sweep.py"), "--session", session]
+    for other in related:
+        argv += ["--related", other]
+    return " ".join(shlex.quote(a) for a in argv + ["--apply", "--only", pin])
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="List answered asks, close the ones you pick, list stale ones.")
     parser.add_argument("--session", required=True)
     parser.add_argument("--apply", action="store_true", help="close the asks named by --only")
-    parser.add_argument("--only", nargs="+", metavar="ASK", help="the ask ids to act on")
+    parser.add_argument("--only", nargs="+", metavar="ASK=REF",
+                        help="the asks to act on; with --apply each needs the pin (ASK=REF) it was listed with")
     parser.add_argument("--stale", action="store_true", help="also list open asks older than 7 days with no answer")
     parser.add_argument("--related", action="append", default=[], metavar="SESSION",
                         help="also search this session's WALs and transcript for evidence (a successor or the coordinator)")
@@ -361,21 +330,53 @@ def main(argv=None) -> int:
     structured = {a["ask"] for a in result["answered"] + result["short"]}
     found = wal_evidence(home, args.session, args.related)
     result["evidence"] = [i for i in found["items"] if i["ask"] not in structured]
-    result["unread"] = found["unread"]
+    result["unread"] = result["unread"] + found["unread"]
+    for item in result["answered"]:
+        item["pin"] = pin_of(item)
+        item["close"] = " ".join(shlex.quote(a) for a in answered_argv(args.session, main_wal, item))
+        item["apply"] = apply_command(args.session, args.related, item["pin"])
     for item in result["evidence"]:
-        steps = ([check_argv(item)] if item["evidence"][0]["kind"] == "terminal" else []) + [close_argv(item)]
-        item["close"] = " && ".join(" ".join(shlex.quote(a) for a in step) for step in steps)
+        argv = close_argv(item)
+        item["pin"] = pin_of(item)
+        if argv is None:
+            item["close"] = None
+            item["apply"] = None
+            item["action"] = "manual: the user ran this step himself; main decides how to close the ask"
+        else:
+            item["close"] = " ".join(shlex.quote(a) for a in argv)
+            item["apply"] = apply_command(args.session, args.related, item["pin"])
     if args.only:
-        result["answered"] = [a for a in result["answered"] if a["ask"] in args.only]
-        result["evidence"] = [i for i in result["evidence"] if i["ask"] in args.only]
+        wanted = {}
+        for entry in args.only:
+            ask, _, ref = entry.partition("=")
+            wanted[ask] = ref
+        result["answered"] = [a for a in result["answered"] if a["ask"] in wanted]
+        result["evidence"] = [i for i in result["evidence"] if i["ask"] in wanted]
     if args.apply:
-        closed = [(a, rc, "") for a, rc in close_answered(args.session, main_wal, result["answered"])]
-        closed += close_evidence(result["evidence"])
-        result["closed"] = [{"ask": a, "rc": rc, **({"refused": d} if rc else {})} for a, rc, d in closed]
+        closed = []
+        listed = {i["ask"]: i for i in result["answered"] + result["evidence"]}
+        for ask, ref in wanted.items():
+            item = listed.get(ask)
+            if item is None:
+                closed.append({"ask": ask, "rc": 3, "refused": "no answer or evidence is listed for this ask now"})
+            elif not ref:
+                closed.append({"ask": ask, "rc": 3, "refused": "name the ask with the pin it was listed with: --only " + item["pin"]})
+            elif item["pin"] != f"{ask}={ref}":
+                closed.append({"ask": ask, "rc": 3, "refused": "the best evidence changed since it was listed (now "
+                               + item["pin"] + "); read it again before closing"})
+            elif ask in {a["ask"] for a in result["answered"]}:
+                closed.append(run_close(ask, answered_argv(args.session, main_wal, item)))
+            else:
+                closed.append(run_close(ask, close_argv(item)))
+        result["closed"] = closed
+        if not args.stale:
+            result.pop("stale")
+        print(json.dumps(result, indent=1))
+        return 1 if any(c["rc"] for c in closed) else 0
     if not args.stale:
         result.pop("stale")
     print(json.dumps(result, indent=1))
-    return 2 if result["unread"] and not args.apply else 0
+    return 2 if result["unread"] else 0
 
 
 if __name__ == "__main__":

@@ -100,11 +100,14 @@ def outcome_evidence_problem(source, ref):
             return 'the wal: evidence cannot be read (entry missing, malformed, oversized or beyond the scan budget)'
         if record.get('id') == ref:
             return 'the evidence is the ask itself (by line number)' if parsed['entry'].startswith('L') else 'the evidence is the ask itself'
-        if (record.get('event') == 'ask' and isinstance(record.get('note'), str)
-                and re.search(r'\bSUPERSEDES\s+' + re.escape(ref) + r'\b', record['note'])):
+        import ask_evidence  # noqa: PLC0415 - the one SUPERSEDES and human-turn rule, shared with ask_sweep.py
+        if ask_evidence.supersedes(record, ref):
             # GoodQA goodqa#16944: a later ask that replaces this one is the evidence that it is obsolete. Its own
             # source may be the user's words (the new ask is his), which makes it no answer to the old ask.
             return None
+        if ask_evidence.human_traced(record.get('source')):
+            # #170 F8: a row whose source names a human turn anywhere (also `inferred: from user:...`) is an answer
+            return 'the evidence traces to a human turn: close the ask with that answer (answer:/user:), not as obsolete'
     try:
         import provenance
         result = provenance.resolve(source)

@@ -122,6 +122,16 @@ class OutcomeClose(unittest.TestCase):
         self.assertIn(code, (0, None), err)
         self.assertEqual((self.rows()[-1]["ref"], self.rows()[-1]["outcome"]), ("wask00000001", "obsolete"))
 
+    def test_evidence_whose_own_source_names_a_human_turn_is_refused_even_when_inferred(self):
+        # #170 F8: `inferred: from user:...` resolves with origin None, yet it rests on the user's words: an answer, not obsolete
+        with self.wal.open("a") as fh:
+            fh.write(json.dumps({"event": "decision", "id": "winf00000001", "note": "the user said so",
+                                 "source": "inferred: from user:sess-1/abc \"yes do it\" -- he answered in chat",
+                                 "at": "2026-11-01T00:05:00+00:00"}) + "\n")
+        code, err = self.run_note("--outcome", "obsolete", "--source", "wal:sess-1/main.jsonl#winf00000001")
+        self.assertEqual(code, 2)
+        self.assertIn("human turn", err)
+
     def test_evidence_must_really_resolve_unmocked(self):
         argv = ["wal_note.py", "--wal", str(self.wal), "--event", "ask_resolved", "--ref", "wask00000001", "--note", "closing",
                 "--outcome", "obsolete", "--source", "wal:/nonexistent/main.jsonl#w0123456789a"]
