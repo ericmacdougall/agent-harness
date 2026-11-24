@@ -43,25 +43,29 @@ def claude_dirs(homes=None):
     return out
 
 
-def _forms(path):
-    """The path as written (normalised) and where it really leads: the realpath of its deepest existing ancestor
-    with the rest appended, so a link to the tree, or a new file inside it, is still seen."""
-    norm = posixpath.normpath(path)
-    forms = {norm}
-    head, tail = norm, []
-    for _ in range(64):
+def _real(path):
+    """Where `path` really leads, resolved the way the kernel does: the deepest existing ancestor of the path AS
+    WRITTEN (so `link/..` goes up from the link's target, not from the link), through realpath, with the rest
+    appended; casefolded. None when nothing can be resolved."""
+    parts = path.split('/')
+    for k in range(len(parts), 0, -1):
+        head = '/'.join(parts[:k]) or '/'
         try:
             if os.path.lexists(head):
-                forms.add(posixpath.normpath(posixpath.join(os.path.realpath(head), *reversed(tail))))
-                break
+                return posixpath.normpath(posixpath.join(os.path.realpath(head), *[p for p in parts[k:] if p])).casefold()
         except (OSError, ValueError):
-            break
-        parent, name = posixpath.split(head)
-        if parent == head:
-            break
-        tail.append(name)
-        head = parent
-    return {f.casefold() for f in forms}
+            return None
+    return None
+
+
+def _forms(path):
+    """The path as written (normalised) and where it really leads (_real). A link to the tree, a `..` after a link, or a
+    new file inside the tree is seen."""
+    forms = {posixpath.normpath(path).casefold()}
+    real = _real(path)
+    if real:
+        forms.add(real)
+    return forms
 
 
 def wal_roots(homes=None):
@@ -80,12 +84,30 @@ def in_wal_tree(path, roots=None):
     return any(f == r or f.startswith(r + '/') for f in _forms(path) for r in roots)
 
 
+def below_toward_tree(path, roots=None):
+    """When the absolute `path` is a proper ancestor of a WAL tree root (a recursive copy or an extraction there can
+    create the tree's files), the name of the entry directly below `path` on the way to the root (`.claude` for the
+    home, `wals` for the Claude home); else None."""
+    if not isinstance(path, str) or not path.startswith('/') or '\x00' in path:
+        return None
+    roots = wal_roots() if roots is None else roots
+    for f in _forms(path):
+        base = f.rstrip('/') + '/' if f != '/' else '/'
+        for r in roots:
+            if r.startswith(base) and r != f:
+                return r[len(base):].split('/')[0]
+    return None
+
+
 def wal_owner(path, roots=None):
     """(session, owner) for a WAL file path: owner is 'main' or 'agent-<id>'; None outside the tree or for any other
     name in it."""
-    if not in_wal_tree(path, roots):
+    roots = wal_roots() if roots is None else roots
+    inside = [f for f in _forms(path) if any(f.startswith(r + '/') for r in roots)] if isinstance(path, str) else []
+    if not inside or not path.startswith('/'):
         return None
-    parts = posixpath.normpath(path).split('/')
+    # where it really leads when that differs from the text (a link, or `..` after one)
+    parts = sorted(inside, key=lambda f: f == posixpath.normpath(path).casefold())[0].split('/')
     if len(parts) < 2:
         return None
     session, name = parts[-2], parts[-1]
@@ -104,11 +126,12 @@ def own_wal(session_id, agent_id):
 
 
 def is_own_wal(path, session_id, agent_id):
-    """True when `path` is the caller's own agent WAL both as written and where it leads (a link named like the
-    own WAL that leads to main's is not)."""
+    """True when `path` leads to the caller's own agent WAL, resolved the way the kernel does (a link named like the
+    own WAL that leads to main's is not; `link/../wals/<s>/agent-<id>.jsonl` that leads to the own WAL is)."""
     if not (session_id and agent_id) or not isinstance(path, str) or not path.startswith('/'):
         return False
-    return _forms(path) <= _forms(own_wal(session_id, agent_id))
+    real, own = _real(path), _real(own_wal(session_id, agent_id))
+    return real is not None and real == own
 
 
 FILE_TOOLS = {'write', 'edit', 'multiedit', 'notebookedit'}

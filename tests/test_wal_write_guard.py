@@ -68,6 +68,20 @@ WRITES = [
     "echo {w} | python3 -c \"import sys; open(sys.stdin.read().strip(),'a').write('x')\"",
     "python3 -c \"import runpy, sys; runpy.run_path(sys.argv[1], run_name='__main__')\" ~/.claude/hooks/wal_note.py "
     "--wal {w} --event note --note x",
+    # red-team round 1 (024b13b1): a program given by path is judged by its name; `-` is an operand; target-directory
+    # copies; extraction into a directory above the tree; a directory inside the tree makes relative names count;
+    # code that loads the harness's own writer; readers with an output-file option
+    '/usr/bin/uniq /tmp/x {w}', '/bin/chmod 666 {w}', '/usr/bin/vim -es -c wq {w}', '/usr/bin/gzip {w}',
+    '/usr/bin/patch {w} /tmp/x.diff', 'cat /tmp/x | uniq - {w}', 'cat /tmp/x | xxd -r -p - {w}',
+    'command uniq - {w}', 'cp -t {d} /tmp/x', 'cp --target-directory={d} /tmp/x', 'install -t {d} /tmp/x',
+    'cp -R /tmp/stage/wals {d}/../../', 'tar -xf /tmp/x.tar -C {d}/../..', 'cd {d}/../.. && tar -xf /tmp/x.tar',
+    'unzip /tmp/x.zip -d {d}/../..', "cd {d} && python3 -c \"open('{name}','a').write('x')\"",
+    "cd {d} && perl -e 'open(F, \">>{name}\"); print F 1'",
+    "cd {d} && node -e \"require('fs').appendFileSync('{name}','x')\"",
+    "cd {d} && awk 'BEGIN{{print \"x\" >> \"{name}\"}}'", "cd {d} && sed -n 'w {name}' /tmp/x",
+    'cd {d}; cd /tmp; cd -; echo x >> {name}',
+    "python3 -c \"import sys; sys.path.insert(0, '{d}/../../hooks'); from wal import append; append('{w}', {{}})\"",
+    'cat /tmp/x | less -o {w}', 'tree -o {w} /tmp',
 ]
 READS = [
     'cat {w}', 'tail -n 5 {w}', 'jq . {w}', 'grep -c x {w}', 'wc -l < {w}', 'ls -la {d}',
@@ -166,7 +180,11 @@ class ShellWrites(Case):
             words = [rng.choice(filler) for _ in range(rng.randint(0, 5))]
             words.insert(rng.randint(0, len(words)), form.format(p=path))
             unknown = 'zq' + ''.join(rng.choice('abcdefghij') for _ in range(5))
-            verdict, message = self.decide(' '.join([unknown] + words))
+            # given by name or by a path (a program by path is judged by its name), with a `-` operand or not
+            program = rng.choice(('', '/usr/local/bin/', './', '~/bin/')) + unknown
+            if rng.random() < 0.3:
+                words.insert(rng.randint(0, len(words)), '-')
+            verdict, message = self.decide(' '.join([program] + words))
             if verdict != 'block' or 'wal-forgery' not in message:
                 misses.append(('unknown', unknown, words, verdict))
             if form == '{p}':
@@ -228,7 +246,12 @@ class Actor(Case):
                 # the script after an interpreter option with a value, and the module form
                 'python3 -X dev ~/.claude/hooks/wal_note.py --wal {main} --event result --note x',
                 'python3 -I -X utf8 ~/.claude/hooks/wal_note.py --wal {main} --event result --note x',
-                'cd ~/.claude/hooks && python3 -m wal_note --wal {main} --event result --note x']
+                'cd ~/.claude/hooks && python3 -m wal_note --wal {main} --event result --note x',
+                # every harness tool given --wal writes there (ah note runs wal_note.py as a child), and argparse
+                # takes an abbreviation of --wal
+                'ah note --wal {main} --event decision --note x', 'ah note --wa {main} --event decision --note x',
+                'python3 ~/.claude/hooks/ah.py note --wal={main} --event decision --note x',
+                'python3 ~/.claude/hooks/deliver.py prepare --wal {other}']
         for row in rows:
             command = (row % NOTE if '%s' in row else row).format(main=self.main, other=self.other)
             if command.endswith(' ' + NOTE):
@@ -281,9 +304,56 @@ class WalNoteItself(Case):
 
 class Allowed(Case):
     def test_reads_and_the_wal_as_a_source_are_allowed(self):
-        refused = [(row, v) for row in READS for path in (self.main, self.agent)
-                   for v in [self.decide(self.fill(row, path))[0]] if v != 'allow']
+        callers = (None, {'kind': 'main', 'session': SESSION}, {'kind': 'agent', 'agent': AGENT, 'session': SESSION})
+        refused = [(row, caller and caller['kind'], v) for row in READS for path in (self.main, self.agent)
+                   for caller in callers for v in [self.decide(self.fill(row, path), caller)[0]] if v != 'allow']
         self.assertEqual(refused, [])
+
+
+class Landing(Case):
+    """Copies whose contents land in the tree through a directory above it (red-team C5), with the source on disk."""
+
+    def setUp(self):
+        super().setUp()
+        self.stage = self.home / 'w/stage'
+        (self.stage / 'wals' / SESSION).mkdir(parents=True)
+        (self.stage / 'wals' / SESSION / 'main.jsonl').write_text('{}\n')
+        (self.home / 'w/notes').mkdir()
+        self.claude = self.home / '.claude'
+
+    def test_a_copy_of_a_tree_into_a_directory_above_it_is_refused(self):
+        for command in ('rsync -a {s}/ {c}/', 'ditto {s} {c}', 'rclone copy {s} {c}', 'cp -R {s}/wals {c}/',
+                        'cp -a {s}/. {c}/', 'cd {c} && cp -R {s}/wals .', 'scp -r {s}/wals {c}',
+                        'cp -R {h}/w/s* {c}/'):
+            command = command.format(s=self.stage, c=self.claude, h=self.home)
+            verdict, message = self.decide(command)
+            self.assertEqual(verdict, 'block', command)
+            self.assertIn('wal-forgery', message, command)
+
+    def test_copies_that_cannot_reach_the_tree_are_allowed(self):
+        for command in ('cp -R {h}/w/notes {c}/', 'rsync -a {h}/w/notes/ /tmp/b/', 'rsync -a {c}/wals/ /tmp/b/',
+                        'tar -xf /tmp/x.tar -C /tmp/out', 'cp {h}/w/notes/a {h}/w/b'):
+            command = command.format(c=self.claude, h=self.home)
+            self.assertEqual(self.decide(command)[0], 'allow', command)
+
+
+class EveryWalTool(Case):
+    def test_every_harness_tool_that_takes_wal_is_judged_by_who_runs_it(self):
+        # a contract over the repository: each tool declaring --wal is refused for a sub-agent aiming it at main's WAL,
+        # unless it only reads --wal (cg.WAL_FLAG_READERS); a new --wal tool joins this test without an edit
+        agent = {'kind': 'agent', 'agent': AGENT, 'session': SESSION}
+        tools = sorted(p.name for p in HOOKS.glob('*.py') if '"--wal"' in p.read_text(errors='replace')
+                       or "'--wal'" in p.read_text(errors='replace'))
+        self.assertIn('wal_note.py', tools)
+        self.assertIn('ah.py', tools)
+        wrong = []
+        for tool in tools:
+            command = 'python3 ~/.claude/hooks/%s sub --wal %s --note x' % (tool, self.main)
+            verdict, message = self.decide(command, agent)
+            refused = 'wal-actor' in message
+            if refused == (tool in cg.WAL_FLAG_READERS):
+                wrong.append((tool, verdict))
+        self.assertEqual(wrong, [])
 
 
 class FileTools(Case):
@@ -330,6 +400,23 @@ class SharedPredicate(Case):
             self.assertEqual((inside, shell, tool), (inside, inside, inside), path)
         self.assertTrue(wal_paths.in_wal_tree(str(self.main)))
         self.assertFalse(wal_paths.in_wal_tree(str(self.home / 'w/main.jsonl')))
+
+    def test_dotdot_after_a_link_resolves_as_the_kernel_does(self):
+        # red-team C1: `link/..` goes up from the link's target, so normalising before resolving misses the tree
+        (self.home / '.claude/plugins').mkdir()
+        (self.home / 'w/p').symlink_to(self.home / '.claude/plugins')
+        path = '%s/w/p/../wals/%s/main.jsonl' % (self.home, SESSION)
+        self.assertTrue(wal_paths.in_wal_tree(path))
+        self.assertEqual(wal_paths.wal_owner(path)[1], 'main')
+        self.assertIn('wal-forgery', self.decide('echo x >> %s' % path)[1])
+        self.assertIn('wal-forgery', self.decide('cd %s && echo x >> p/../wals/%s/main.jsonl'
+                                                 % (self.home / 'w', SESSION))[1])
+        self.assertIsNotNone(wal.file_tool_refusal({'tool_name': 'Write', 'tool_input': {'file_path': path},
+                                                    'agent_id': AGENT, 'session_id': SESSION}))
+        agent = {'kind': 'agent', 'agent': AGENT, 'session': SESSION}
+        own_through_link = '%s/w/p/../wals/%s/agent-%s.jsonl' % (self.home, SESSION, AGENT)
+        self.assertEqual(self.decide('%s --wal %s --event x --note y' % (NOTE, own_through_link), agent)[0], 'allow')
+        self.assertIn('wal-actor', self.decide('%s --wal %s --event x --note y' % (NOTE, path), agent)[1])
 
     def test_the_wal_file_names_agree(self):
         for value in ('a1', 'Foo', 'z-x', 'a/b', '', None, 'x' * 200):

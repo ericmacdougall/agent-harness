@@ -860,7 +860,9 @@ OVERWRITE_EXISTING = [
     ('echo x > @TASK@/NEW-report.md', 'allow'),
     ('make &> @TASK@/NEW-build.log', 'allow'),
     ('echo x >> @TASK@/existing.log', 'allow'),
-    ('ls &>> @HOME@/.claude/wals/s/main.jsonl', 'allow'),
+    # goodqa#17008: the session WAL tree takes no shell write at all, append or read-write open included; rows
+    # there are added only through wal_note.py. These rows expected 'allow' before that rule.
+    ('ls &>> @HOME@/.claude/wals/s/main.jsonl', 'block'),
     ('echo x | tee -a @TASK@/existing.log', 'allow'),
     ('echo x > @HOME@/repo/existing.txt', 'allow'),
     ('ls &> /dev/null', 'allow'),
@@ -869,7 +871,7 @@ OVERWRITE_EXISTING = [
     # native review of 84aed24: a digit before `&>` is an argument; kept names; a symlinked work folder;
     # an empty heredoc writes nothing; scratch reruns (disposable) stay allowed
     ('echo x 3&> @HOME@/.claude/wals/s/main.jsonl', 'block'),
-    ('echo x 9&>> @HOME@/.claude/wals/s/main.jsonl', 'allow'),
+    ('echo x 9&>> @HOME@/.claude/wals/s/main.jsonl', 'block'),  # goodqa#17008
     ('echo x > @TASK@/journal.jsonl', 'block'),
     ('echo x > @TASK@/state/run.txt', 'block'),
     ('echo x > @TASK@/hooklink/hook.py', 'block'),
@@ -882,10 +884,10 @@ OVERWRITE_EXISTING = [
     ('echo x >!@HOME@/.claude/projects/p/s.jsonl', 'block'),
     ('echo x &>! @HOME@/.codex/sessions/2026/r.jsonl', 'block'),
     ('echo x >&! @HOME@/.claude/wals/s/main.jsonl', 'block'),
-    ('echo x >>! @HOME@/.claude/wals/s/main.jsonl', 'allow'),
+    ('echo x >>! @HOME@/.claude/wals/s/main.jsonl', 'block'),  # goodqa#17008
     ('echo x 1<> @HOME@/.claude/projects/p/s.jsonl', 'block'),
     ('echo x 2<> @HOME@/.claude/wals/s/main.jsonl', 'block'),
-    ('cat <> @HOME@/.claude/wals/s/main.jsonl', 'allow'),
+    ('cat <> @HOME@/.claude/wals/s/main.jsonl', 'block'),  # goodqa#17008: a read-write open can create the file
     ('echo x > @TASK@/existing.log > @HOME@/.claude/wals/s/main.jsonl', 'block'),
     ('echo x > {@TASK@/NEW-a.txt,@HOME@/.claude/projects/p/s.jsonl}', 'block'),
     ('echo x > {@TASK@/existing.log,@HOME@/.claude/settings.json}', 'block'),
@@ -902,11 +904,11 @@ OVERWRITE_EXISTING = [
     ('echo x <> @HOME@/.claude/wals/s/main.jsonl >&0', 'block'),
     ('echo x 3<> @HOME@/.claude/wals/s/main.jsonl >&3', 'block'),
     ('exec 3<>@HOME@/.claude/wals/s/main.jsonl; echo x >&3', 'block'),
-    ('cat 0<> @HOME@/.claude/wals/s/main.jsonl', 'allow'),
+    ('cat 0<> @HOME@/.claude/wals/s/main.jsonl', 'block'),  # goodqa#17008
     ('echo x > @HOME@/.claude/settings.jso?', 'block'),
     ('echo x > @TASK@/existing.lo?', 'allow'),
     ('echo x > @HOME@/.claude/NEW-*.txt', 'allow'),
-    ('echo x >! @TASK@/existing.log >>! @HOME@/.claude/wals/s/main.jsonl', 'allow'),
+    ('echo x >! @TASK@/existing.log >>! @HOME@/.claude/wals/s/main.jsonl', 'block'),  # goodqa#17008
     # re-review of 94937f5. N1: a redirect glob must not cost the rest of the command its findings, nor walk disk
     # outside the protected roots
     ("echo x > $'/tmp/a\\x00b/*'; rm -rf @HOME@", 'block'),
