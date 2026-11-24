@@ -1985,6 +1985,16 @@ def _linked_status_refusal(path, cfg, step, backups):
             return 'an ignored build directory holds a nested repository'
     return None
 
+AGENT_WORKTREE_NAME = re.compile(r'agent-[A-Za-z0-9]+')
+
+
+def _agent_worktree_shape(path, top):
+    """goodqa#16943 (H16): exactly <top>/.claude/worktrees/agent-<letters and digits>, the layout agent worktrees are
+    created in. Compared as spelled (case included) on real paths: any other nesting keeps the refusal."""
+    parts = path[len(top) + 1:].split(os.sep) if path.startswith(top + os.sep) else []
+    return len(parts) == 3 and parts[:2] == ['.claude', 'worktrees'] and bool(AGENT_WORKTREE_NAME.fullmatch(parts[2]))
+
+
 def linked_worktree_remove_refusal(path, cwd, policy=None, remote_ls=None, *, backups=None):
     """None only for a clean, registered linked worktree whose exact HEAD is live on an allowlisted remote.
 
@@ -2043,6 +2053,11 @@ def linked_worktree_remove_refusal(path, cwd, policy=None, remote_ls=None, *, ba
             return 'the path is not the exact top of its registered linked worktree'
         if os.path.dirname(git_dir) != os.path.join(common, 'worktrees'):
             return 'the .git file points outside the common worktree registry'
+        if os.path.lexists(os.path.join(git_dir, 'locked')):
+            # goodqa#16943: refused up front (the plain removal would fail on it later); a lock is how a running agent
+            # marks its worktree, and breaking one is a separate decision
+            return ('the worktree is locked (git worktree lock): an agent may still be working in it; nothing here '
+                    'unlocks it')
         try:
             current = os.path.realpath(_git_out(cwd, ['rev-parse', '--show-toplevel'], step(2.0)).strip())
         except ValueError:
@@ -2057,7 +2072,10 @@ def linked_worktree_remove_refusal(path, cwd, policy=None, remote_ls=None, *, ba
         for other in trees:
             if other == path:
                 continue
-            if other.startswith(path + os.sep) or path.startswith(other + os.sep):
+            if other.startswith(path + os.sep):
+                # removing the target would delete the worktree inside it
+                return 'nested worktrees are not removable through this exemption (it contains another worktree)'
+            if path.startswith(other + os.sep) and not (other == trees[0] and _agent_worktree_shape(path, other)):
                 return 'nested worktrees are not removable through this exemption'
         for forbidden, why in ((os.path.join(common, 'modules'), 'it has submodules'),
                                (os.path.join(common, 'info', 'grafts'), 'it has grafts'),
@@ -2093,6 +2111,13 @@ def linked_worktree_remove_refusal(path, cwd, policy=None, remote_ls=None, *, ba
         for entry in _git_out(path, ['ls-files', '-v', '-z'], step(3.0)).split('\x00'):
             if entry and entry[0] != 'H':
                 return 'a tracked file is marked assume-unchanged, skip-worktree or otherwise hidden from git status'
+        if path.startswith(trees[0] + os.sep):
+            # goodqa#16943 (H16): an agent worktree inside its primary checkout (the only nesting admitted above). The
+            # primary must not track anything under it, or the removal would also delete files of the primary. Run after
+            # the shared and per-worktree config vetting, so this git call reads only vetted config
+            rel = path[len(trees[0]) + 1:]
+            if _git_out(trees[0], ['ls-files', '-z', '--', ':(literal)' + rel], step(2.0)).strip('\x00'):
+                return 'the containing checkout tracks a path under this worktree'
         reason = _linked_status_refusal(path, cfg, step, backups)
         if reason:
             return reason
