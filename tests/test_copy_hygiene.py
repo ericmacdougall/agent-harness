@@ -1041,6 +1041,77 @@ class Scratch(Base):
         self.assertIn("copy_hygiene.py scratch", err)
 
 
+class BraceCap(Base):
+    """goodqa#17182: brace expansion in the delete check was 2^k in the number of groups and truncated to 256 only
+    after building every result. A replay of real commands found 17 over the 5 s hook budget, and a timed-out
+    PreToolUse hook lets the command run. Past BRACE_CAP the hook now refuses the command as unanalysable."""
+
+    _tempdir_parent = _tempdir_outside_tmp()
+
+    def setUp(self):
+        super().setUp()
+        self.svc = self.home / "svc" / "work"
+        self.svc.mkdir(parents=True)
+        (self.units / "svc.service").write_text("[Service]\nWorkingDirectory=%s\nExecStart=/usr/bin/true\n" % self.svc)
+
+    def run_hook(self, cmd):
+        return tc.pretool({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(self.home)}, self.cfg())
+
+    @staticmethod
+    def groups(k, prefix="/nonexistent-17182/d"):
+        return prefix + "".join("{a%d,b%d}" % (i, i) for i in range(k))
+
+    def test_twenty_groups_are_refused_as_unanalysable_within_a_tenth_of_a_second(self):
+        cmd = "rm -rf " + self.groups(20)
+        best = None
+        for _ in range(3):                      # best of three: one slow scheduler tick is not a regression
+            t0 = time.perf_counter()
+            code, err = self.run_hook(cmd)
+            best = min(best or 9e9, time.perf_counter() - t0)
+        self.assertLess(best, 0.1)
+        self.assertEqual(code, 2, err)
+        self.assertIn("UNANALYSABLE DELETE", err)
+        self.assertIn("Split", err)
+        t0 = time.perf_counter()
+        with self.assertRaises(tc.BraceOverflow):
+            tc._expand_braces(self.groups(20))
+        self.assertLess(time.perf_counter() - t0, 0.1)
+
+    def test_a_protected_path_past_the_cap_is_never_dropped_by_truncation(self):
+        # the protected directory is alternative 301 of one group: the old code judged only the first 256 and allowed it
+        alts = ",".join("x%d" % i for i in range(300))
+        code, err = self.run_hook("rm -rf %s/{%s,%s}" % (self.home, alts, os.path.relpath(self.svc, self.home)))
+        self.assertEqual(code, 2, err)
+        self.assertIn("UNANALYSABLE DELETE", err)
+
+    def test_exactly_the_cap_is_still_analysed_and_one_past_it_is_refused(self):
+        self.assertEqual(len(tc._expand_braces(self.groups(8))), tc.BRACE_CAP)
+        self.assertEqual(self.run_hook("rm -rf " + self.groups(8)), (0, ""))
+        code, err = self.run_hook("rm -rf " + self.groups(9))
+        self.assertEqual(code, 2)
+        self.assertIn("UNANALYSABLE DELETE", err)
+        # at the cap the protected path is still found among the alternatives (judged, not refused unread)
+        prot = "%s/{%s}" % (self.home, ",".join(["svc/work"] + ["y%d" % i for i in range(255)]))
+        self.assertEqual(len(tc._expand_braces(prot)), 256)
+        code, err = self.run_hook("rm -rf " + prot)
+        self.assertEqual(code, 2)
+        self.assertIn("PROTECTED PATH", err)
+
+    def test_ordinary_brace_use_is_unchanged(self):
+        e = tc._expand_braces
+        self.assertEqual(e("a.{txt,log}"), ["a.txt", "a.log"])
+        self.assertEqual(e("x{,.bak}"), ["x", "x.bak"])
+        self.assertEqual(e("{a,b}{c,d}"), ["ac", "ad", "bc", "bd"])
+        self.assertEqual(e("p/{a,{b,c}}/q"), ["p/a/q", "p/b/q", "p/a/q", "p/c/q"])   # innermost group first, as before
+        for literal in ("plain", "{}", "{a}", "${HOME}/x", "find . -exec rm {} +"):
+            self.assertEqual(e(literal), [literal])
+        for cmd in ("rm a.{txt,log}", "cp x{,.bak}", "rm -rf %s/{old,tmp}" % self.home, "mv f{,.orig}"):
+            self.assertEqual(self.run_hook(cmd), (0, ""), cmd)
+        code, err = self.run_hook("rm -rf %s/svc/{work,other}" % self.home)
+        self.assertEqual(code, 2)
+        self.assertIn("PROTECTED PATH", err)
+
+
 class Install(unittest.TestCase):
     def test_installer_ships_and_wires_the_guard(self):
         sys.path.insert(0, str(ROOT))

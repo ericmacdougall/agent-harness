@@ -1201,14 +1201,33 @@ _PUSH, _POP = "\0push", "\0pop"
 _DEFAULT = "\0default:"     # marks a ${X:-default} value so its own variables are expanded too
 
 
-def _expand_braces(s: str) -> "list[str]":
-    m = re.search(r"\{([^{}]*,[^{}]*)\}", s)
-    if not m:
-        return [s]
-    out = []
-    for alt in m.group(1).split(","):
-        out.extend(_expand_braces(s[:m.start()] + alt + s[m.end():]))
-    return out[:256]
+BRACE_CAP = 256     # alternatives one word may expand to before the delete check refuses it as unanalysable
+_BRACE_GROUP = re.compile(r"\{([^{}]*,[^{}]*)\}")
+
+
+class BraceOverflow(ValueError):
+    """A word expands to more than BRACE_CAP alternatives. The delete check cannot list every target, so the hook
+    refuses the command (goodqa#17182) instead of judging a truncated list that could miss a protected path."""
+
+
+def _expand_braces(s: str, cap: int = BRACE_CAP) -> "list[str]":
+    """Every brace alternative of s, innermost comma group first. Generation stops as soon as more than `cap`
+    alternatives exist and raises BraceOverflow: the old recursion built all 2^k results of k groups before it
+    truncated (17 real commands over the 5 s hook budget, and a timed-out PreToolUse hook lets the command run)."""
+    done, todo = [], [s]
+    while todo:
+        w = todo.pop()
+        m = _BRACE_GROUP.search(w)
+        if not m:
+            done.append(w)
+            if len(done) > cap:
+                raise BraceOverflow(s)
+            continue
+        alts = [w[:m.start()] + alt + w[m.end():] for alt in m.group(1).split(",")]
+        todo.extend(reversed(alts))      # depth first, left to right: the old result order
+        if len(done) + len(todo) > cap:  # every pending word yields at least one result, so the total is past cap
+            raise BraceOverflow(s)
+    return done
 
 
 def _var_value(m, env: dict) -> "list[str] | None":
@@ -1857,6 +1876,12 @@ def pretool(event: dict, cfg: "dict | None" = None) -> "tuple[int, str]":
                 alert("test-override-active", {"var": "HARNESS_COPY_HYGIENE_UNIT_DIRS"})
             try:
                 hit = protected_delete(cmd, cwd, cfg)
+            except BraceOverflow:   # fail CLOSED: a partial target list could miss a protected path (goodqa#17182)
+                alert("protected-check-unanalysable", {"reason": "brace-overflow", "cap": BRACE_CAP})
+                return 2, (f"UNANALYSABLE DELETE: a word in this command expands to more than {BRACE_CAP} brace "
+                           "alternatives, too many to check every target against the protected service paths. Split "
+                           "the command into smaller ones (fewer `{a,b}` groups per word), or list the paths "
+                           "explicitly.\n")
             except Exception as e:  # noqa: BLE001 -- documented choice: fail OPEN (a broken check must not block
                 hit = None          # every rm in every session) but leave an alert for the owner
                 alert("protected-check-error", {"error": f"{type(e).__name__}: {str(e)[:160]}"})
