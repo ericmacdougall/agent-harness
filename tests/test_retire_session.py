@@ -6,6 +6,7 @@ live and the owner view is complete. Anything that cannot be read is a refusal. 
 disposition that cites the decision; a retired owner that shows new activity alerts again.
 
 Failing-first: tests/mutants_retire_session.py runs this file against controlled broken variants of ah.py."""
+import datetime as dt
 import json
 import os
 import subprocess
@@ -78,6 +79,15 @@ class Base(unittest.TestCase):
         t = mock.patch.object(ah.time, "time", side_effect=lambda: self.clock)
         t.start()
         self.addCleanup(t.stop)
+
+        class FakeDT(dt.datetime):  # the decision line and the audit are stamped by the same fake clock
+            @classmethod
+            def now(cls, tz=None):
+                return dt.datetime.fromtimestamp(test.clock, tz)
+        test = self
+        d = mock.patch.object(ah.dt, "datetime", FakeDT)
+        d.start()
+        self.addCleanup(d.stop)
         self.table = list(QUIET_TABLE)
         self.alive = set()  # pids the fake kernel says exist
         self.starts = {}  # pid -> the start time ps prints
@@ -489,7 +499,8 @@ class Authority(Base):
 
 class EndedAndPreview(Base):
     def test_ended_needs_an_explicit_offset(self):
-        for bad in ("2026-11-24", "2026-11-24T10:00:00", "2026-11-24 10:00", "yesterday"):
+        naive = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(OLD))  # a valid instant, but no offset: ambiguous
+        for bad in ("2026-11-24", "2026-11-24T10:00:00", "2026-11-24 10:00", "yesterday", naive):
             with self.subTest(bad=bad):
                 self.refused("bad_request", ended=bad)
 
