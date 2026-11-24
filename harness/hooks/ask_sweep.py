@@ -271,21 +271,54 @@ def wal_evidence(home: Path, session: str, related=(), unread=None) -> dict:
     return {"items": items, "unread": unread}
 
 
-def close_argv(item: dict) -> list:
+def check_argv(item: dict) -> list:
+    """Terminal evidence: provenance does not take a `<bash-input>` turn as the user's words, so the observation is first
+    recorded as a `check` row that names the transcript turn; the ask then closes as obsolete on that row."""
+    best = item["evidence"][0]
+    return [sys.executable, str(HERE / "wal_note.py"), "--wal", item["wal"], "--event", "check", "--by", "ask-sweep",
+            "--source", f"inferred: from the transcript turn {best['ref']} -- the user's own terminal command",
+            "--note", f"ask-sweep observed: {_clip(best['summary'], 160)} in transcript turn {best['ref']}; "
+                      f"[ask:{item['ask']}] asked for that step, so it is obsolete"]
+
+
+def close_argv(item: dict, evidence_id: str = "<check row id>") -> list:
     """The wal_note.py argv that closes one evidence item: bookkeeping, never --decision."""
     best = item["evidence"][0]
+    source, outcome = best["source"], best.get("outcome")
+    if best["kind"] == "terminal":
+        source, outcome = f"wal:{item['wal']}#{evidence_id}", "obsolete"
     argv = [sys.executable, str(HERE / "wal_note.py"), "--wal", item["wal"], "--event", "ask_resolved", "--ref", item["ask"],
-            "--by", "ask-sweep", "--source", best["source"],
+            "--by", "ask-sweep", "--source", source,
             "--note", f"ask-sweep: {best['kind']} evidence {best['ref']} resolves [ask:{item['ask']}]: "
                       f"{_clip(best['summary'], 90)} (bookkeeping, not an approval)"]
-    if best.get("outcome"):
-        argv += ["--outcome", best["outcome"]]
+    if outcome:
+        argv += ["--outcome", outcome]
     return argv
 
 
+def _default_runner(argv):
+    done = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+    return done.returncode, done.stdout, done.stderr
+
+
 def close_evidence(items: list, runner=None) -> list:
-    run = runner or (lambda a: subprocess.run(a, capture_output=True, text=True, timeout=60).returncode)
-    return [(item["ask"], run(close_argv(item))) for item in items]
+    """[(ask, rc, detail)]: rc 0 closed; otherwise wal_note's refusal text, so a refusal is never silent."""
+    run = runner or _default_runner
+    out = []
+    for item in items:
+        evidence_id = None
+        if item["evidence"][0]["kind"] == "terminal":
+            rc, stdout, stderr = run(check_argv(item))
+            try:
+                evidence_id = json.loads(stdout).get("id") if rc == 0 else None
+            except (ValueError, AttributeError):
+                evidence_id = None
+            if not evidence_id:
+                out.append((item["ask"], rc or 2, _clip(stderr or stdout or "check row not written", 300)))
+                continue
+        rc, stdout, stderr = run(close_argv(item, evidence_id) if evidence_id else close_argv(item))
+        out.append((item["ask"], rc, "" if rc == 0 else _clip(stderr or stdout, 300)))
+    return out
 
 
 def close_answered(session: str, main_wal: Path, items: list, runner=None) -> list:
@@ -330,13 +363,15 @@ def main(argv=None) -> int:
     result["evidence"] = [i for i in found["items"] if i["ask"] not in structured]
     result["unread"] = found["unread"]
     for item in result["evidence"]:
-        item["close"] = " ".join(shlex.quote(a) for a in close_argv(item))
+        steps = ([check_argv(item)] if item["evidence"][0]["kind"] == "terminal" else []) + [close_argv(item)]
+        item["close"] = " && ".join(" ".join(shlex.quote(a) for a in step) for step in steps)
     if args.only:
         result["answered"] = [a for a in result["answered"] if a["ask"] in args.only]
         result["evidence"] = [i for i in result["evidence"] if i["ask"] in args.only]
     if args.apply:
-        closed = close_answered(args.session, main_wal, result["answered"]) + close_evidence(result["evidence"])
-        result["closed"] = [{"ask": a, "rc": rc} for a, rc in closed]
+        closed = [(a, rc, "") for a, rc in close_answered(args.session, main_wal, result["answered"])]
+        closed += close_evidence(result["evidence"])
+        result["closed"] = [{"ask": a, "rc": rc, **({"refused": d} if rc else {})} for a, rc, d in closed]
     if not args.stale:
         result.pop("stale")
     print(json.dumps(result, indent=1))

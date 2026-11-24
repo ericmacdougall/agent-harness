@@ -94,6 +94,34 @@ class OutcomeClose(unittest.TestCase):
         self.assertIn("human turn", err.getvalue())
         self.assertEqual(len(self.rows()), 2)
 
+    def run_human(self, evidence_id):
+        argv = ["wal_note.py", "--wal", str(self.wal), "--event", "ask_resolved", "--ref", "wask00000001", "--note", "closing",
+                "--outcome", "obsolete", "--source", "wal:sess-1/main.jsonl#" + evidence_id]
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"HOME": str(self.home)}), mock.patch("sys.argv", argv), \
+                mock.patch("provenance.resolve", lambda *a, **k: dict(OK, origin="user")), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            code = wal_note.main()
+        return code, err.getvalue()
+
+    def test_a_later_ask_that_supersedes_this_one_closes_it_even_though_its_source_is_the_user(self):
+        # goodqa#16944: the replacing ask cites the user's words, yet it is no answer to the old ask; it makes it obsolete.
+        rows = [{"event": "ask", "id": "wsup00000001", "note": "SUPERSEDES wask00000001: may main restart service 10?",
+                 "source": USER, "at": "2026-11-01T00:02:00+00:00"},
+                {"event": "ask", "id": "wsup00000002", "note": "SUPERSEDES wask000000019: another ask", "source": USER,
+                 "at": "2026-11-01T00:03:00+00:00"},
+                {"event": "decision", "id": "wsup00000003", "note": "SUPERSEDES wask00000001", "source": USER,
+                 "at": "2026-11-01T00:04:00+00:00"}]
+        with self.wal.open("a") as fh:
+            fh.write("".join(json.dumps(r) + "\n" for r in rows))
+        for wrong in ("wsup00000002", "wsup00000003"):  # another ask's id, or a non-ask row, never opens the exception
+            code, err = self.run_human(wrong)
+            self.assertEqual(code, 2, wrong)
+            self.assertIn("human turn", err)
+        code, err = self.run_human("wsup00000001")
+        self.assertIn(code, (0, None), err)
+        self.assertEqual((self.rows()[-1]["ref"], self.rows()[-1]["outcome"]), ("wask00000001", "obsolete"))
+
     def test_evidence_must_really_resolve_unmocked(self):
         argv = ["wal_note.py", "--wal", str(self.wal), "--event", "ask_resolved", "--ref", "wask00000001", "--note", "closing",
                 "--outcome", "obsolete", "--source", "wal:/nonexistent/main.jsonl#w0123456789a"]

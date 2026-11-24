@@ -100,6 +100,11 @@ def outcome_evidence_problem(source, ref):
             return 'the wal: evidence cannot be read (entry missing, malformed, oversized or beyond the scan budget)'
         if record.get('id') == ref:
             return 'the evidence is the ask itself (by line number)' if parsed['entry'].startswith('L') else 'the evidence is the ask itself'
+        if (record.get('event') == 'ask' and isinstance(record.get('note'), str)
+                and re.search(r'\bSUPERSEDES\s+' + re.escape(ref) + r'\b', record['note'])):
+            # GoodQA goodqa#16944: a later ask that replaces this one is the evidence that it is obsolete. Its own
+            # source may be the user's words (the new ask is his), which makes it no answer to the old ask.
+            return None
     try:
         import provenance
         result = provenance.resolve(source)

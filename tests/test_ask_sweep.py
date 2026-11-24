@@ -274,7 +274,39 @@ class WalEvidence(unittest.TestCase):
         item = items["w00000000a05"]
         self.assertEqual((item["kind"], item["confirm"]), ("terminal", True))
         self.assertEqual([e["ref"] for e in item["evidence"]], [f"{S1}/u-after"])
-        self.assertNotIn("--decision", sw.close_argv(item))
+        argv = sw.close_argv(item, "w0000000c0de")
+        self.assertNotIn("--decision", argv)
+        self.assertEqual(argv[argv.index("--outcome") + 1], "obsolete")
+        self.assertTrue(argv[argv.index("--source") + 1].endswith("#w0000000c0de"))
+
+    def test_terminal_close_records_the_observation_first_and_closes_on_it(self):
+        path = "/home/eric/.agent-harness/work/heldout/scoring/__pycache__"
+        self.wal(S1, [wrow("ask", "w00000000a12", "2026-11-23T22:47:00+00:00", f"Run on t2-dev: rm -r {path}")])
+        self.transcript(S1, [bash_input("u-after", "2026-11-24T00:18:00.000Z", f"ssh t2-dev rm -r {path}")])
+        item = self.items()["w00000000a12"]
+        calls = []
+
+        def runner(argv):
+            calls.append(argv)
+            if argv[argv.index("--event") + 1] == "check":
+                return 0, json.dumps({"status": "WROTE", "id": "w0000000c0de"}), ""
+            return 0, "{}", ""
+        self.assertEqual(sw.close_evidence([item], runner), [("w00000000a12", 0, "")])
+        self.assertEqual([a[a.index("--event") + 1] for a in calls], ["check", "ask_resolved"])
+        self.assertIn(f"{S1}/u-after", calls[0][calls[0].index("--note") + 1])
+        self.assertTrue(calls[0][calls[0].index("--source") + 1].startswith("inferred:"))
+        self.assertTrue(calls[1][calls[1].index("--source") + 1].endswith("#w0000000c0de"))
+
+    def test_a_refused_check_row_stops_the_close_and_is_reported(self):
+        path = "/home/eric/.agent-harness/work/heldout/scoring/__pycache__"
+        self.wal(S1, [wrow("ask", "w00000000a13", "2026-11-23T22:47:00+00:00", f"Run on t2-dev: rm -r {path}")])
+        self.transcript(S1, [bash_input("u-after", "2026-11-24T00:18:00.000Z", f"ssh t2-dev rm -r {path}")])
+        item = self.items()["w00000000a13"]
+        calls = []
+        result = sw.close_evidence([item], lambda a: calls.append(a) or (2, "", '{"status": "REFUSED"}'))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(result[0][:2], ("w00000000a13", 2))
+        self.assertIn("REFUSED", result[0][2])
 
     def test_a_superseded_ask_closes_as_obsolete_on_wal_evidence(self):
         self.wal(S1, [wrow("ask", "w00000000a07", "2026-11-23T18:27:00+00:00", "run h3d.sh"),
@@ -302,7 +334,7 @@ class WalEvidence(unittest.TestCase):
         calls = []
         with mock.patch.dict(os.environ, {"AH_HOME": str(self.home)}), \
                 mock.patch.object(sw, "close_evidence", lambda items, runner=None: calls.extend(i["ask"] for i in items) or
-                                  [(i["ask"], 0) for i in items]), \
+                                  [(i["ask"], 0, "") for i in items]), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertEqual(sw.main(["--session", S1]), 0)
             listed = json.loads(out.getvalue())
@@ -311,7 +343,7 @@ class WalEvidence(unittest.TestCase):
         self.assertEqual(calls, [])
         with mock.patch.dict(os.environ, {"AH_HOME": str(self.home)}), \
                 mock.patch.object(sw, "close_evidence", lambda items, runner=None: calls.extend(i["ask"] for i in items) or
-                                  [(i["ask"], 0) for i in items]), \
+                                  [(i["ask"], 0, "") for i in items]), \
                 contextlib.redirect_stdout(io.StringIO()):
             sw.main(["--session", S1, "--apply", "--only", "w00000000a10"])
         self.assertEqual(calls, ["w00000000a10"])
