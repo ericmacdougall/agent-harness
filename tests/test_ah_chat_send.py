@@ -16,7 +16,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_ah_chat import (AH, CONV, DM_SENTINEL, HOOKS, ME, ORG, OTHER, PEER, USER_SENTINEL, SCHEME, Base, ok,  # noqa: E402
-                          ok_bare, tool_error)
+                          ok_bare, rpc_error, tool_error)
 
 sys.path.insert(0, str(HOOKS))
 import ah_chat_send  # noqa: E402
@@ -385,11 +385,13 @@ class Approval(SendBase):
         self.assertEqual(len({b["body"] for b in bodies}), 1)  # the permit is bound to the exact body: it never changes
         self.assertEqual(self.result(self.send("--approval-id", self.APPROVAL))["code"], "duplicate")
 
-    def test_a_refused_approval_frees_the_text_but_any_other_refusal_does_not(self):
+    def test_a_refused_approval_frees_the_text_but_an_unknown_code_does_not(self):
         for code in ("approval_expired", "approval_denied", "approval_mismatch"):
             self.stub.tools["send_direct_message"] = self.gate(code)
             self.assertEqual(self.result(self.send())["status"], "approval_refused", code)
-        self.stub.tools["send_direct_message"] = self.gate("forbidden")
+        # goodqa#16399: `forbidden` is now a definite refusal (`refused`, Reasons); a code GoodQA's sources do not raise
+        # before storing stays uncertain and holds the text back
+        self.stub.tools["send_direct_message"] = self.gate("internal_error")
         self.assertEqual(self.result(self.send())["status"], "uncertain")
         self.assertEqual(self.result(self.send())["code"], "duplicate")
 
@@ -635,6 +637,92 @@ class Recording(SendBase):
             self.ledger().write_text(json.dumps(row) + "\n")
             self.assertEqual(self.result(self.send())["code"], "ledger_damaged", row)
         self.assertEqual(self.sends(), [])
+
+
+class Reasons(SendBase):
+    """goodqa#16399, the first live send (2026-11-24 07:20Z): GoodQA answered not_found (goodqa#17013) and the send printed
+    `uncertain` with no reason anywhere. Every outcome that is not `sent` now records its failure class, the server's machine
+    code and the HTTP status in the outcome row, the WAL row and the result; a definite refusal before storage is `refused`
+    and frees the text."""
+    ledger = Recording.ledger
+    in_process = Recording.in_process
+
+    def outcome(self):
+        return [json.loads(x) for x in self.ledger().read_text().splitlines()][-1]
+
+    def wal_send(self):
+        return [r for r in self.wal_rows() if r.get("event") == "chat_send"][-1]
+
+    def assert_reason(self, data, status, failure, code=None, http=None):
+        want = {"status": status, "failure": failure, "server_code": code, "http_status": http}
+        for where, row in (("result", data), ("outcome row", self.outcome()), ("WAL row", self.wal_send())):
+            self.assertEqual({k: row.get(k) for k in want}, want, where)
+
+    def test_not_found_is_refused_with_its_reason_everywhere_and_frees_the_text(self):
+        self.stub.tools["send_direct_message"] = lambda a: tool_error("not_found")
+        data = self.result(self.send())
+        self.assertFalse(data["ok"])
+        self.assert_reason(data, "refused", "not_found", "not_found")
+        self.assertIn("goodqa#17013", data["next"])
+        self.stub.tools["send_direct_message"] = lambda a: ok(SENT)
+        self.assertEqual(self.result(self.send())["status"], "sent")  # nothing was stored, so the same text may go
+        self.assertEqual(len(self.sends()), 2)
+
+    def test_each_gate_or_route_refusal_is_refused_with_its_code(self):
+        for code in ("forbidden", "bad_request", "user_token_rate_limited", "user_token_ability_missing", "commander_ceiling"):
+            self.stub.tools["send_direct_message"] = lambda a, code=code: tool_error(code)
+            data = self.result(self.send())
+            self.assert_reason(data, "refused", "tool_error", code)
+            self.assertNotIn("goodqa#17013", data["next"])
+
+    def test_the_mcp_endpoint_refusing_the_request_is_refused_with_its_http_status(self):
+        self.stub.tools["send_direct_message"] = lambda a: (429, {"error": {"code": "user_token_rate_limited"}})
+        self.assert_reason(self.result(self.send()), "refused", "http_error", "user_token_rate_limited", 429)
+        self.stub.tools["send_direct_message"] = lambda a: ok(SENT)
+        self.assertEqual(self.result(self.send())["status"], "sent")
+
+    def test_a_server_error_or_an_unknown_code_stays_uncertain_with_its_reason_and_holds_the_text(self):
+        for n, (answer, failure, code, http) in enumerate((
+                (lambda a: (503, {"error": {"code": "unavailable"}}), "http_error", "unavailable", 503),
+                (lambda a: tool_error("internal_error"), "tool_error", "internal_error", None),
+                (lambda a: tool_error("conflict"), "tool_error", "conflict", None),
+                (lambda a: rpc_error(), "rpc_error", None, None),
+                (lambda a: ok({"message": {"id": "not-a-uuid"}}), "no_message_id", None, None),
+                (lambda a: "drop", "unreachable", None, None))):
+            self.write("message %d" % n)
+            self.stub.tools["send_direct_message"] = answer
+            data = self.result(self.send())
+            self.assert_reason(data, "uncertain", failure, code, http)
+            self.assertIn("Do NOT resend", data["next"])
+            self.stub.tools["send_direct_message"] = lambda a: ok(SENT)
+            self.assertEqual(self.result(self.send())["code"], "duplicate", failure)
+
+    def test_a_code_that_is_not_a_plain_code_is_recorded_as_unrecognized_never_as_given(self):
+        piece = USER_SENTINEL[-16:]  # lower case and code-shaped, but a piece of the user token
+        for n, code in enumerate(("Not Found: " + USER_SENTINEL, piece, "a" * 65, "not_found ")):
+            self.write("message %d" % n)
+            self.stub.tools["send_direct_message"] = lambda a, code=code: tool_error(code)
+            data = self.result(self.send())
+            self.assert_reason(data, "uncertain", "tool_error", "unrecognized")
+        self.assert_no_token()
+        self.assertNotIn(piece, self.ledger().read_text())
+
+    def test_an_exception_records_its_type(self):
+        import http.client
+        real = ah_chat_send.chat.Client.tool
+
+        def tool(client, name, arguments):
+            if name == "send_direct_message":
+                raise http.client.IncompleteRead(b"par")
+            return real(client, name, arguments)
+        data = self.in_process(tool=(ah_chat_send.chat.Client, "tool", tool))
+        self.assert_reason(data, "uncertain", "exception:IncompleteRead")
+
+    def test_a_send_records_no_reason(self):
+        data = self.result(self.send())
+        self.assertEqual(data["status"], "sent")
+        for row in (data, self.outcome(), self.wal_send()):
+            self.assertFalse({"failure", "server_code", "http_status"} & set(row), row)
 
 
 class Limits(unittest.TestCase):

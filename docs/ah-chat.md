@@ -62,6 +62,7 @@ GoodQA's `send_direct_message` (`POST /v1/orgs/:org/dm/:user`) stores each messa
 | --- | --- | --- |
 | `sent` (with `message`) | delivered once | nothing |
 | `uncertain` | the one request failed or its answer was lost; it may have arrived | do NOT resend; read `ah chat history`; if it did not arrive, send it reworded |
+| `refused` (with `failure`, `server_code`) | GoodQA refused the send before storing anything: the DM route's own refusal (`not_found`, `forbidden`, `bad_request`), the user-token gate (`user_token_*`, `commander_ceiling`, `desktop_token_session_scope`, `unauthorized`), or the MCP endpoint itself (HTTP 401, 403, 429); nothing was delivered and the text is not held back | fix the cause, then send again. `not_found` for a listed person who already has a DM with you is goodqa#17013: GoodQA does not let a user token reply in an existing DM; reply in the GoodQA app until it ships |
 | `approval_required`, `approval_pending` | the user token holds the send for the user's approval; nothing stored | tell the user; once he approves it in the web app (Account, User tokens), run the same command with `--approval-id ID` |
 | `approval_refused` | the approval expired, was denied, or was for other text; nothing stored | run it without `--approval-id` to ask again |
 | `duplicate` | the same body went to this person in the last 24 hours, or its outcome is unknown | check history; reword it ("Thanks!" becomes "Thanks, got it.") |
@@ -76,7 +77,8 @@ GoodQA's `send_direct_message` (`POST /v1/orgs/:org/dm/:user`) stores each messa
 ### The rules
 
 - **Ids only.** `--with` is the person's user id. It is never a name, because a member can set any display name. `--conversation` takes a DM id. `--org` is required, because the agent-writable defaults file is not used. `ah chat history --with NAME --org ORG --no-text` shows the id a name resolves to.
-- **One request per run, never an automatic retry.** Any failure of that request is `uncertain` with "Do NOT resend", whatever its kind. Its outcome and WAL rows are still written.
+- **One request per run, never an automatic retry.** A failure of that request is `uncertain` with "Do NOT resend", unless GoodQA answered a definite refusal before storing anything (`refused`, or an approval status). Its outcome and WAL rows are still written.
+- **Every outcome that is not `sent` says why**, in the printed result, the ledger's outcome row and the WAL `chat_send` row: `failure` (the local error class such as `tool_error`, `not_found`, `http_error`, `rpc_error`, `unreachable`, `no_message_id`, or `exception:<type>`), `server_code` (GoodQA's machine code, or `unrecognized` when it is not a short plain code or holds a token piece) and `http_status` when there is one. A server message, the body and the token are never recorded.
 - **The ledger comes first.** `~/.agent-harness/state/ah/store/chat-send.jsonl` gets a complete, fsynced `pending` row before the request, under a lock so two sends never overlap. An `outcome` row follows the request. A malformed, incomplete or unfinished record refuses every send. There is one ledger per home directory per host, so the Mac and t2-dev do not see each other's sends.
 - **The same message to the same person is refused for 24 hours** after any attempt, whatever its outcome. That includes a crash that left only the pending row.
   - "The same message" means the same body: the prefix plus the text, with LF line breaks and no trailing line break.
