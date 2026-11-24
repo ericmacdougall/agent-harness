@@ -46,6 +46,7 @@ import json
 import os
 import random
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -276,12 +277,17 @@ def check_template(t):
 
 
 # ---------------------------------------------------------------------------------------------------- shells phase
+# A shell that rejected the text: bash `syntax error`, dash `Syntax error`, zsh `parse error` (the messages of bash
+# 5.2, dash and zsh 5.9 on the dev host, checked by hand). It does not mean the shell ran nothing: a shell runs the
+# lines before the one it rejects. It means the text as written cannot run to its end in that shell and mode.
+SYNTAX_PATTERN = rb'(?i)syntax error|parse error'
+
 INNER = r'''
 import json, os, re, resource, signal, subprocess, sys
-# a shell that rejected the text as a whole (it ran nothing from it): bash and dash `syntax error`, zsh `parse error`
-SYNTAX = re.compile(rb'syntax error|parse error')
-resource.setrlimit(resource.RLIMIT_CPU, (10, 10))
+SYNTAX = re.compile(@SYNTAX@)
 resource.setrlimit(resource.RLIMIT_FSIZE, (1 << 20, 1 << 20))
+def _shell_limits():  # the CPU limit is for the shells; this script's own time grows with the chunk
+    resource.setrlimit(resource.RLIMIT_CPU, (10, 10))
 LOG = '/rec/log'
 def ran_since(pos):
     try:
@@ -305,7 +311,7 @@ for line in sys.stdin:
                     'eval': ['/usr/bin/' + sh, '-c', 'eval "$(cat /w/t.sh)"'],
                     'file': ['/usr/bin/' + sh, '/w/t.sh']}[mode]
             p = subprocess.Popen(argv, cwd='/w', stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.PIPE, start_new_session=True)
+                                 stderr=subprocess.PIPE, start_new_session=True, preexec_fn=_shell_limits)
             try:
                 err = p.communicate(timeout=2)[1] or b''
             except subprocess.TimeoutExpired:
@@ -326,19 +332,63 @@ import time
 time.sleep(1)
 pos, got = ran_since(pos)
 print(json.dumps({'rows': out, 'tail': sorted(got)}))
-'''
+'''.replace('@SYNTAX@', repr(SYNTAX_PATTERN))
 
 MK = '#!/bin/sh\nprintf "%s\\n" "$2" >> /rec/log\n'
 
 
+class ChunkFailed(Exception):
+    """A sandbox that did not return a complete, trustworthy result for its chunk. None of its rows is recorded: a
+    row of a died sandbox would read as "no shell ran it" and land in the reverse count."""
+
+
+def sandbox_failure(returncode, stderr):
+    """Why a sandbox exited non-zero. Empty stderr with a non-zero code means a signal: a negative code from Python,
+    or 128 + N from bwrap's init."""
+    sig = -returncode if returncode < 0 else returncode - 128 if returncode > 128 else 0
+    name = signal.Signals(sig).name if sig in signal.Signals._value2member_map_ else ''
+    return 'rc=%d%s stderr=%r' % (returncode, ' signal=' + name if name else '', (stderr or '').strip()[-300:])
+
+
+def canary_row(rows):
+    """A bare marker that every shell must run in every mode; the chunk's own control."""
+    ident = 'K' + rows[0]['id'][1:]
+    return {'id': ident, 'text': MARK + ident, 'shells': list(SHELLS), 'modes': ['c', 'eval']}
+
+
+def accept_chunk(sent, res):
+    """The inner script's rows for the rows sent (canary first), with late markers merged; else ChunkFailed. Every
+    row must come back, and the canary must have run in every shell and mode: a full disk or a broken record log
+    would otherwise record every marker of the chunk as not run."""
+    got = {r['id']: r for r in res.get('rows') or ()}
+    missing = [r['id'] for r in sent if r['id'] not in got]
+    if missing or len(got) != len(sent):
+        raise ChunkFailed('%d of %d rows missing from the sandbox result' % (len(missing), len(sent)))
+    late = set(res.get('tail') or ())
+    for r in got.values():
+        late |= set(r.get('late') or ())
+    ran = {k for k, v in got[sent[0]['id']]['ran'].items() if v}
+    want = {'%s.%s' % (sh, m) for sh in sent[0]['shells'] for m in sent[0]['modes']}
+    if ran != want:
+        raise ChunkFailed('canary ran in %s of %s' % (sorted(ran), sorted(want)))
+    out = []
+    for r in sent[1:]:
+        g = dict(got[r['id']])
+        g['late_ran'] = g['id'] in late
+        g.pop('late', None)
+        out.append(g)
+    return out
+
+
 def run_chunk(rows, tmp):
-    """Run one chunk of texts in a fresh sandbox. Returns the inner script's rows, with late markers merged."""
+    """Run one chunk of texts in a fresh sandbox, behind a canary. Returns the rows' results, or ChunkFailed."""
     work, rec, mbin, inner = (tmp / d for d in ('w', 'rec', 'm', 'o'))
     for d in (work, rec, mbin, inner):
         d.mkdir(parents=True, exist_ok=True)
     (mbin / 'mk').write_text(MK)
     (mbin / 'mk').chmod(0o755)
     (inner / 'inner.py').write_text(INNER)
+    rows = [canary_row(rows)] + list(rows)
     argv = ['bwrap', '--ro-bind', '/usr', '/usr', '--symlink', 'usr/bin', '/bin', '--symlink', 'usr/lib', '/lib',
             '--symlink', 'usr/lib64', '/lib64', '--symlink', 'usr/sbin', '/sbin', '--proc', '/proc', '--dev', '/dev',
             '--tmpfs', '/tmp', '--bind', str(work), '/w', '--bind', str(rec), '/rec', '--ro-bind', str(mbin), '/m',
@@ -346,17 +396,54 @@ def run_chunk(rows, tmp):
             '--clearenv', '--setenv', 'PATH', '/m:/usr/bin', '--setenv', 'HOME', '/w', '--setenv', 'LANG', 'C.UTF-8',
             '/usr/bin/python3', '-I', '/o/inner.py']
     payload = ''.join(json.dumps(r) + '\n' for r in rows)
-    done = subprocess.run(argv, input=payload, capture_output=True, text=True, timeout=60 + 30 * len(rows))
+    try:
+        done = subprocess.run(argv, input=payload, capture_output=True, text=True, timeout=60 + 30 * len(rows))
+    except subprocess.TimeoutExpired:
+        raise ChunkFailed('sandbox timed out after %d s' % (60 + 30 * len(rows)))
     if done.returncode != 0:
-        raise RuntimeError('sandbox failed: %s' % done.stderr.strip()[-300:])
-    res = json.loads(done.stdout)
-    late = set(res['tail'])
-    for r in res['rows']:
-        late |= set(r['late'])
-    for r in res['rows']:
-        r['late_ran'] = r['id'] in late
-        del r['late']
-    return res['rows']
+        raise ChunkFailed('sandbox failed: ' + sandbox_failure(done.returncode, done.stderr))
+    try:
+        res = json.loads(done.stdout)
+    except ValueError:
+        raise ChunkFailed('sandbox printed no result (%d bytes)' % len(done.stdout))
+    return accept_chunk(rows, res)
+
+
+def run_all(chunks, runner, jobs, record, log=print):
+    """Run every chunk with runner(chunk, name) and hand each accepted result to record(rows). A chunk that fails is
+    run once more, split in two halves, after the others; a half that fails again stops the run (ChunkFailed), so
+    a flaky host is retried and a text that kills its sandbox is named, never recorded. Returns the retried chunks."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    failed = []
+    with ThreadPoolExecutor(jobs) as pool:
+        futures = {pool.submit(runner, chunk, 'c%05d' % k): k for k, chunk in enumerate(chunks)}
+        for fut in as_completed(futures):
+            k = futures[fut]
+            try:
+                record(fut.result())
+            except ChunkFailed as e:
+                log('chunk %d (%d rows from %s) failed, retried later in halves: %s' % (
+                    k, len(chunks[k]), chunks[k][0]['id'], e))
+                failed.append(k)
+    for k in sorted(failed):
+        half = (len(chunks[k]) + 1) // 2
+        for j, part in enumerate((chunks[k][:half], chunks[k][half:])):
+            if part:
+                try:
+                    record(runner(part, 'c%05d-r%d' % (k, j)))
+                except ChunkFailed as e:
+                    raise ChunkFailed('chunk %d half %d (%d rows from %s) failed twice: %s' % (
+                        k, j, len(part), part[0]['id'], e))
+    return failed
+
+
+def rows_digest(rows):
+    """Names the generated rows a partial result file belongs to, so that --resume never mixes two generators."""
+    import hashlib
+    h = hashlib.sha256()
+    for r in rows:
+        h.update(json.dumps([r['id'], r['text'], r['shells'], r['modes']]).encode() + b'\n')
+    return h.hexdigest()
 
 
 def shells_phase(args):
@@ -372,22 +459,53 @@ def shells_phase(args):
         modes = ['c', 'eval', 'file'] if family == 'S' else ['c', 'eval']
         rows.append({'id': ident, 'text': t.replace('{X}', MARK + ident), 'shells': list(SHELLS), 'modes': modes,
                      'family': family, 'skel': skel, 'template': t})
-    from concurrent.futures import ThreadPoolExecutor
-    size = args.chunk
-    chunks = [rows[i:i + size] for i in range(0, len(rows), size)]
-    base = Path(tempfile.mkdtemp(prefix='oracle-'))
+    floor = getattr(args, 'min_free_gb', 5) * (1 << 30)
+    for where in (Path(args.out).resolve().parent, Path(tempfile.gettempdir())):
+        if shutil.disk_usage(where).free < floor:
+            sys.exit('less than %d GB free under %s: a full disk silently loses markers' % (floor >> 30, where))
+    digest = rows_digest(rows)
+    part = Path(args.out + '.part')
     results = {}
+    if getattr(args, 'resume', False) and part.exists():
+        with open(part) as f:
+            head = json.loads(f.readline() or '{}')
+            if head.get('rows_digest') != digest:
+                sys.exit('%s belongs to other generated rows; move it aside or drop --resume' % part)
+            for line in f:
+                try:
+                    g = json.loads(line)
+                except ValueError:
+                    break  # a line cut by the crash that ended the earlier run
+                results[g['id']] = g
+    else:
+        with open(part, 'w') as f:
+            f.write(json.dumps({'rows_digest': digest}) + '\n')
+    todo = [r for r in rows if r['id'] not in results]
+    size = args.chunk
+    chunks = [[{x: r[x] for x in ('id', 'text', 'shells', 'modes')} for r in todo[i:i + size]]
+              for i in range(0, len(todo), size)]
+    base = Path(tempfile.mkdtemp(prefix='oracle-'))
+    import threading
+    lock = threading.Lock()
+
+    def record(got):
+        with lock, open(part, 'a') as f:
+            for g in got:
+                results[g['id']] = g
+                f.write(json.dumps(g) + '\n')
+
+    def runner(chunk, name):
+        try:
+            return run_chunk(chunk, base / name)
+        finally:
+            shutil.rmtree(base / name, ignore_errors=True)
     try:
-        def one(k):
-            return run_chunk([{x: r[x] for x in ('id', 'text', 'shells', 'modes')} for r in chunks[k]],
-                             base / ('c%05d' % k))
-        with ThreadPoolExecutor(args.jobs) as pool:
-            for k, got in enumerate(pool.map(one, range(len(chunks)))):
-                for g in got:
-                    results[g['id']] = g
-                shutil.rmtree(base / ('c%05d' % k), ignore_errors=True)
+        retried = run_all(chunks, runner, args.jobs, record, log=lambda s: print(s, file=sys.stderr, flush=True))
     finally:
         shutil.rmtree(base, ignore_errors=True)
+    missing = [r['id'] for r in rows if r['id'] not in results]
+    if missing:
+        raise ChunkFailed('%d rows have no result' % len(missing))
     with open(args.out, 'w') as f:
         for r in rows:
             g = results[r['id']]
@@ -396,7 +514,8 @@ def shells_phase(args):
     fam = collections.Counter(r['family'] for r in rows)
     ran = collections.Counter(r['family'] for r in rows
                               if any(results[r['id']]['ran'].values()) or results[r['id']]['late_ran'])
-    print('texts', len(rows), 'by family', dict(fam), 'marker ran in some shell', dict(ran))
+    print('texts', len(rows), 'by family', dict(fam), 'marker ran in some shell', dict(ran), 'resumed',
+          len(rows) - len(todo), 'chunks retried', len(retried), 'rows digest', digest[:16])
 
 
 # ----------------------------------------------------------------------------------------------------- judge phase
@@ -510,9 +629,16 @@ def compare_phase(args):
     shell ran the marker, and the reverse direction (no shell ran it, and a guard now refuses what it allowed)."""
     rows = [json.loads(line) for line in open(args.results)]
     base, head = json.load(open(args.base)), json.load(open(args.head))
+    if len(base) != len(rows) or len(head) != len(rows):
+        sys.exit('verdicts do not match the results: %d rows, base %d, head %d' % (len(rows), len(base), len(head)))
+    if any('syntax' not in r for r in rows):
+        sys.exit('these results carry no syntax field (an older shells phase): the reverse split needs a rerun')
     out = {'findings': collections.defaultdict(collections.Counter),
            'ran_refused_to_allowed': collections.defaultdict(collections.Counter),
-           'not_run_allowed_to_refused': collections.defaultdict(collections.Counter)}
+           'ran_allowed_to_refused': collections.defaultdict(collections.Counter),
+           'not_run_allowed_to_refused': collections.defaultdict(collections.Counter),
+           'not_run_refused_to_allowed': collections.defaultdict(collections.Counter),
+           'reverse_accepted_by': collections.defaultdict(collections.Counter)}
     skels = {k: {g: collections.Counter() for g in TWINS}
              for k in ('head_findings', 'reverse_accepted', 'reverse_rejected_everywhere', 'regressed')}
     for r, b, h in zip(rows, base, head):
@@ -528,12 +654,20 @@ def compare_phase(args):
                 if bv == 'block' and hv != 'block':
                     out['ran_refused_to_allowed'][fam][g] += 1
                     skels['regressed'][g][skel_class(r['skel'])] += 1
+                elif bv != 'block' and hv == 'block':
+                    out['ran_allowed_to_refused'][fam][g] += 1  # a base finding the head closes
             elif bv != 'block' and hv == 'block':
-                # rejected whole by every shell and mode (a syntax error: refusing it costs nothing), or accepted
-                # by some shell that simply never reached the marker (refusing it can cost a real command)
-                kind = 'rejected_everywhere' if set(r.get('syntax') or ()) >= set(r['ran']) else 'accepted'
+                # every shell and mode rejected it (a syntax error: as written it runs in no shell, so refusing it
+                # costs little), or some shell accepted it and ran it without reaching the marker (refusing it can
+                # cost a real command of that shape)
+                accepted = sorted({k.split('.')[0] for k in r['ran'] if k not in set(r['syntax'])})
+                kind = 'accepted' if accepted else 'rejected_everywhere'
                 out['not_run_allowed_to_refused'][fam]['%s %s' % (g, kind)] += 1
                 skels['reverse_' + kind][g][skel_class(r['skel'])] += 1
+                if accepted:
+                    out['reverse_accepted_by'][fam]['%s %s' % (g, '+'.join(accepted))] += 1
+            elif bv == 'block' and hv != 'block':
+                out['not_run_refused_to_allowed'][fam][g] += 1  # an over-refusal at the base the head drops
     print(json.dumps({k: {f: dict(c) for f, c in v.items()} for k, v in out.items()}, indent=1, sort_keys=True))
     for k, by in skels.items():
         for g, c in by.items():
@@ -623,6 +757,8 @@ def main(argv=None):
     s.add_argument('--families', default='ERCSM')
     s.add_argument('--jobs', type=int, default=40)
     s.add_argument('--chunk', type=int, default=200)
+    s.add_argument('--resume', action='store_true', help='keep the rows OUT.part already holds')
+    s.add_argument('--min-free-gb', type=int, default=5)
     j = sub.add_parser('judge')
     j.add_argument('--results', required=True)
     j.add_argument('--hooks', default=str(ROOT / 'harness' / 'hooks'))
