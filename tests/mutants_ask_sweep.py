@@ -227,18 +227,15 @@ MUTANTS = {
     "unknown evidence holds back a traced answer close": ("ask_sweep.py", '        if found[0].get("unknown"):',
                                                           "        if False:", "tests/test_ask_close_contract.py"),
     "a close no user words back is kept beside unknown evidence": (
-        "ask_sweep.py", '            and bool(evidence.get("human")))', "            and True)",
-        "tests/test_ask_close_contract.py"),
+        "ask_sweep.py", ' and bool(evidence.get("human"))', "", "tests/test_ask_close_contract.py"),
     "a traced answer the writer refuses is kept": (
         "ask_sweep.py", "            if keeper is not None and held_back(keeper, ident, home, main_wal) is None:",
         "            if keeper is not None:", "tests/test_ask_close_contract.py"),
     "an outcome close is kept beside unknown evidence": (
-        "ask_sweep.py", 'rank(evidence) <= 1 and evidence.get("outcome") is None and', "rank(evidence) <= 1 and",
+        "ask_sweep.py", 'evidence.get("outcome") is None and not evidence.get("unknown")', 'not evidence.get("unknown")',
         "tests/test_ask_close_contract.py"),
     "another unknown walk is kept beside unknown evidence": (
-        "ask_sweep.py", ' and not evidence.get("unknown")\n', "\n", "tests/test_ask_close_contract.py"),
-    # not listed: traced_answer_close's `rank(evidence) <= 1` clause is equivalent today (only an answer row or a
-    # related-session close carries `human`); it keeps a future kind that does from qualifying
+        "ask_sweep.py", ' and not evidence.get("unknown") and ', " and ", "tests/test_ask_close_contract.py"),
     # not listed: the "tree-too-large" stop in provenance._walk_tree cannot be reached (MAX_RESOLVES caps a tree at
     # far fewer nodes than its bound), and trace's except branch runs only when provenance cannot be imported or
     # resolve() raises, which it never does; both fail closed by construction

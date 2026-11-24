@@ -368,12 +368,11 @@ def held_back(best: dict, ask: str, home: Path, wal: Path):
 
 
 def traced_answer_close(evidence: dict) -> bool:
-    """True when the close of this evidence is an answer close that rests on the user's own words, traced to the end:
-    an answer row, or a related-session close with no outcome (rank 0 or 1: the user's answers), whose walk completed
-    (not `unknown`) and reached a human turn. Only such a close is offered over evidence whose walk stopped (#170 round 7, main's ruling, option a); an
-    obsolete or not-user close never is."""
-    return (rank(evidence) <= 1 and evidence.get("outcome") is None and not evidence.get("unknown")
-            and bool(evidence.get("human")))
+    """True when the close of this evidence is an answer close (no outcome) that rests on the user's own words traced
+    to the end: its walk completed (not `unknown`) and reached a human turn. Only an answer row or a related-session
+    close carries `human`. Only such a close is offered over evidence whose walk stopped (#170 round 7, main's ruling,
+    option a); an obsolete or not-user close never is. Each clause is load-bearing (TracedAnswerClose, mutants)."""
+    return evidence.get("outcome") is None and not evidence.get("unknown") and bool(evidence.get("human"))
 
 
 def wal_evidence(home: Path, session: str, related=(), unread=None) -> dict:
