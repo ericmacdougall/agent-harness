@@ -182,26 +182,22 @@ def remove(host, path, reason, authenticated=False, session="", agent="", home=N
               "skipped_processes": outcome.get("skipped_processes")}
     if "audit_warning" in outcome:
         answer["audit_warning"] = outcome["audit_warning"]
-    step = next_step(host, path, result, authenticated)
+    step = next_step(result)
     if step:
         answer["next"] = step
     return answer
 
 
-def next_step(host, path, result, authenticated=False):
-    """The exact commands that clear a stale-tracking-ref refusal (goodqa#16943): the verifier keeps that rule; the caller
-    gets `git -C <registry repo> fetch --prune --all` on the same host, then this same removal. None otherwise, and None
-    when the verifier's repository is not a plain literal (it is printed for an agent to run). --all and no remote name:
-    the verifier refuses a stale ref under any remote, and a remote name from the repository is never printed (#333
-    review F2, F3)."""
+NEXT_STALE = ("run `git fetch --prune <the remote that holds the deleted branch>` in the registry repository (the checkout "
+              "the worktree was added from) on the same host first; not on a mirror-style remote (fetch refspec "
+              "+refs/*:refs/* or +refs/heads/*:refs/heads/*) or with pruneTags set, where prune deletes local branches or "
+              "tags. Then repeat the same ah worktree-remove call")
+
+
+def next_step(result):
+    """The fixed next step for a stale-tracking-ref refusal (goodqa#16943), or None. The verifier keeps that rule. The
+    text names no path, host or remote: a value read from the repository can be wrong or harmful to run (#333 review
+    rounds 1 and 2), so the caller fills in the remote it knows."""
     if result.get("removable") is not False or "stale or names a moved" not in str(result.get("reason") or ""):
         return None
-    repo = result.get("repo")
-    if not (isinstance(repo, str) and PATH_RE.fullmatch(repo) and ".." not in repo.split("/")):
-        return None
-    fetch = "git -C %s fetch --prune --all" % repo
-    if host != "local":
-        fetch = "ssh %s %s" % (host, shlex.quote(fetch))
-    return ("run `%s` first (the registry repository keeps refs of deleted branches), then repeat: python3 -I "
-            "~/.claude/hooks/ah.py worktree-remove --host %s --path %s --reason \"<why>\"%s" % (
-                fetch, host, path, " --remote-auth" if authenticated else ""))
+    return NEXT_STALE
