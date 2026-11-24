@@ -345,6 +345,30 @@ class Contract(unittest.TestCase):
         self.assertEqual(item["evidence"][0]["source"], self.forms["wal>lost-user"])
         self.assertIn("human turn", item["action"])
 
+    def test_surrounding_whitespace_is_the_same_source_for_the_writer_and_the_listing(self):
+        # wal_note strips the source before it writes it, so " user:..." is the user: spelling: the verdict in every
+        # mode, and the card preference, must be the plain spelling's (a strict reviewer's next spelling case)
+        code = ("import json, sys; sys.path.insert(0, sys.argv[1]); import ask_close; out = {}\n"
+                "for name, src in json.loads(sys.argv[2]).items():\n"
+                "    for mode in ask_close.MODES:\n"
+                "        plain = ask_close.close_verdict(src, mode, 'w0000000beef')['problem']\n"
+                "        padded = ask_close.close_verdict('  ' + src + '\\n', mode, 'w0000000beef')['problem']\n"
+                "        out[name + ' ' + mode] = [plain, padded]\n"
+                "    out[name + ' card'] = [ask_close.is_card(src), ask_close.is_card(' ' + src)]\n"
+                "print(json.dumps(out))")
+        names = ("user", "USER", "user_sp", "answer", "queue", "pasted", "ticket", "file")
+        p = subprocess.run([sys.executable, "-I", "-c", code, str(HOOKS), json.dumps({n: self.direct[n] for n in names})],
+                           env=self.env, capture_output=True, text=True, timeout=120)
+        self.assertEqual(p.returncode, 0, p.stderr[-600:])
+        out = json.loads(p.stdout)
+        self.assertEqual(len(out), len(names) * 4)
+        for cell, (plain, padded) in sorted(out.items()):
+            with self.subTest(cell=cell):
+                self.assertEqual(padded, plain)
+        self.assertIsNone(out["user answer"][0])  # not vacuous: the plain spelling is accepted ...
+        self.assertTrue(out["USER answer"][0])  # ... and a misspelling refused, padded or not
+        self.assertEqual(out["answer card"], [True, True])
+
     def test_provenance_reads_every_word_as_the_table_says(self):
         import ask_close  # noqa: PLC0415
         import provenance  # noqa: PLC0415

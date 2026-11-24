@@ -130,7 +130,7 @@ MUTANTS = {
                                    '"pasted":   {"kind": "pasted", "human": False, "chat": False,', "tests/test_ask_close_contract.py"),
     "any spelling of a word is accepted": (
         "ask_close.py",
-        '    match = re.match(r"^([a-z]+):", source or "")\n    return match.group(1) if match and match.group(1) in TABLE else None',
+        '    match = re.match(r"^([a-z]+):", (source or "").strip())\n    return match.group(1) if match and match.group(1) in TABLE else None',
         '    match = re.match(r"(?i)^\\s*([a-z]+)\\s*:", source or "")\n'
         '    return match.group(1).lower() if match and match.group(1).lower() in TABLE else None',
         "tests/test_ask_close_contract.py"),
@@ -151,8 +151,8 @@ MUTANTS = {
         "                pass", "tests/test_ask_close_outcome.py"),
     "the SUPERSEDES exemption is dropped": ("ask_close.py", "    return None, ask_evidence.supersedes(record, ref)",
                                             "    return None, False", "tests/test_ask_sweep_e2e.py"),
-    "the ask itself is outcome evidence": ("ask_close.py", '    if re.search(r"#" + re.escape(ref) + r"\\s*$", source):',
-                                           "    if False:", "tests/test_ask_close_outcome.py"),
+    # not listed: the `#<ask id>` pre-check in _outcome_problem is equivalent to the entry read after it (the same id is
+    # refused with the same message, and an unreadable path is refused too), like the FIFO case above
 }
 REAL_TESTS = ["tests/test_ask_sweep.py", "tests/test_ask_evidence.py", "tests/test_ask_sweep_quoting.py",
               "tests/test_ask_close_outcome.py", "tests/test_ask_sweep_e2e.py", "tests/test_ask_reminders.py",

@@ -120,6 +120,7 @@ class ResolvedAskAlerts(Base):
         reader = next(c for c in ast.walk(tree) if isinstance(c, ast.Call) and getattr(c.func, "attr", "") == "iter_jsonl_lines")
         self.assertIn("max_total_bytes", {k.arg for k in reader.keywords})
         self.assertIn("max_seconds", {k.arg for k in reader.keywords})
+        self.assertEqual(ast.unparse(reader.args[1]), "RESOLVED_LINE_MAX_BYTES")  # the per-line cap is the named one
 
     def test_an_alert_without_a_session_is_never_hidden(self):
         self.raise_ask("w00000000008", session="")

@@ -73,8 +73,9 @@ def _mode_refusal(word: str, mode: str):
 
 
 def word_of(source: str):
-    """The table row word `source` is written with, or None when it is not spelled exactly as a row."""
-    match = re.match(r"^([a-z]+):", source or "")
+    """The table row word `source` is written with, or None when it is not spelled exactly as a row. Surrounding
+    whitespace is not part of the spelling: wal_note strips it before it writes the source."""
+    match = re.match(r"^([a-z]+):", (source or "").strip())
     return match.group(1) if match and match.group(1) in TABLE else None
 
 
