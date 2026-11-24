@@ -532,6 +532,20 @@
    ]
   },
   {
+   "id": "supervisor_grant:session-start",
+   "script": "supervisor_grant.py",
+   "arg": "session-start",
+   "event": "SessionStart",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S04"
+   ]
+  },
+  {
    "id": "transcript_guard:hook",
    "script": "transcript_guard.py",
    "arg": null,

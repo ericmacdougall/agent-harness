@@ -107,7 +107,7 @@ def managed_scripts(claude: Path) -> set[str]:
                          "command_guard_hook.py", "kill_guard.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py", "log_backup.py", "bg_lint.py",
                          "dropped_gate.py", "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py",
                          "mc_inbox.py", "owner_inbox.py", "mission_gate.py", "status_truth.py", "idle_guard.py", "copy_hygiene.py",
-                         "transcript_guard.py")}
+                         "transcript_guard.py", "supervisor_grant.py")}
 
 
 # Every agent type: a narrower matcher left general-purpose, claude and Explore owners without any

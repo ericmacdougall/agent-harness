@@ -86,6 +86,7 @@ GUARD_REGISTRATIONS = (
     ("UserPromptSubmit", None, "wal.py", ("prompt",)),
     ("PreToolUse", "Bash|PowerShell", "command_guard_hook.py", ("hook",)),
     ("PreToolUse", "Bash|PowerShell", "kill_guard.py", ("hook",)),
+    ("PreToolUse", "Write|Edit|MultiEdit|NotebookEdit", "transcript_guard.py", ()),
     ("PreToolUse", "Agent|Task|Workflow|Bash|PowerShell|Write|Edit|MultiEdit|NotebookEdit", "wal.py", ("pretool",)),
     ("PreToolUse", "Agent|Task|Workflow|Bash|PowerShell|Write|Edit|MultiEdit|NotebookEdit", "merge_gate.py", ("hook",)),
     ("PreToolUse", "Agent|Task|Workflow|Bash", "tier_gate.py", ("hook",)),
