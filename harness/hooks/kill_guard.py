@@ -266,7 +266,7 @@ STOP_COMMANDS = {'grep', 'egrep', 'fgrep', 'rg', 'ag', 'echo', 'printf', 'cat', 
                  'tee', 'diff', 'find', 'curl', 'wget', 'pytest', 'ssh', 'scp', 'rsync', 'tar', 'zip', 'unzip', 'date'}
 NAME_FIRST = {'gosu', 'chroot', 'flock', 'sg', 'su', 'runuser'}  # gosu git bash: the first operand is no command
 OVERRIDDEN = ('apply', 'command', 'dispatch', 'inner_words', 'script', 'ssh', 'container', 'check_tokens', 'resolve',
-              'bind_loop_var', 'names_for')
+              'bind_loop_var', 'names_for', 'unknown_program')
 
 SSH_GLOB_LINE_FIX = True  # goodqa#15365; tests/test_kill_guard_ssh_glob.py flips it in a copy to prove the tests catch a regression
 
@@ -1113,6 +1113,17 @@ def make_analyzer_class(cg):
                 return super().script(text, depth, tail_visible=tail_visible, ps=ps)
             finally:
                 self.xargs = saved
+
+        def unknown_program(self, name, args, depth, pl, idx):
+            # The base reads an unknown program's words as commands for protected-path deletions only, and drops
+            # every other finding of those readings. Kill findings are dropped the same way: a word of such a program
+            # is data far more often than a command (SQL in `wrangler d1 execute --command`), and the kill rules
+            # judge the program's own line as before.
+            mark = len(self.kf)
+            try:
+                return super().unknown_program(name, args, depth, pl, idx)
+            finally:
+                del self.kf[mark:]
 
         def names_kill(self, text):
             # norm_raw deletes a backslash so k\\ill still reads kill; a printf escape in front of a verb must split instead.
