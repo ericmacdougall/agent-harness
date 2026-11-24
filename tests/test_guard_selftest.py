@@ -188,7 +188,8 @@ class Pins(Base):
 
     def test_only_the_files_of_the_hook_run_and_this_tool_are_pinned(self):
         names = [n for n, _b in gs.manifest(self.hooks)]
-        self.assertEqual(names, ["command_guard.py", "command_guard_hook.py", "guard_selftest.py", "redact.py", "safe_input.py"])
+        self.assertEqual(names, ["command_guard.py", "command_guard_hook.py", "guard_selftest.py", "redact.py", "safe_input.py",
+                                 "wal_paths.py"])
         before = self.digest()
         for unrelated in ("ah.py", "model_tiers.json", "ticket_adapters.py"):  # differ between hosts without mattering
             path = self.hooks / unrelated
