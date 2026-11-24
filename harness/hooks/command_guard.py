@@ -1184,15 +1184,16 @@ def _keyword_word(word, name):
 # keyword (case patterns) keep the strict reading. Not after `)` (a subshell or a function's parentheses), a
 # redirection, an assignment or any other word.
 START_OPS = frozenset(('\n', ';', '&', '&&', '||', '|', '|&', '('))
-# reserved words after which a command starts, when they are themselves at a command start
-LEAD_WORDS = ('if', 'then', 'else', 'elif', 'do', 'while', 'until', '{', '!', 'time')
+# reserved words after which a command starts, when they are themselves at a command start. Not `time`: sh and dash
+# have no such keyword, so there `time case ...` runs a program named time and `case` is its argument.
+LEAD_WORDS = ('if', 'then', 'else', 'elif', 'do', 'while', 'until', '{', '!')
 PIPE_OPS = ('|', '|&')
 
 
 class CommandStart:
     """Feed the tokens a pass emits, in order; `next_is_start()` says whether the next one sits where a command
-    starts. `time` and `!` prefix a whole pipeline, so after `|` or `|&` (and any line breaks after it) they are
-    ordinary command names in bash, and no command starts after them there."""
+    starts. `!` prefixes a whole pipeline, so after `|` or `|&` (and any line breaks after it) it is an ordinary
+    command name in bash, and no command starts after it there."""
 
     def __init__(self):
         self.fed = []  # (token, was at a command start)
@@ -1208,7 +1209,7 @@ class CommandStart:
             return val in START_OPS
         if kind != 'w' or not start or not any(_keyword_word(val, w) for w in LEAD_WORDS):
             return False
-        if val.raw in ('time', '!'):
+        if val.raw == '!':
             k = len(self.fed) - 2
             while k >= 0 and self.fed[k][0] == ('op', '\n'):
                 k -= 1
@@ -1231,11 +1232,18 @@ def _aliases_a_keyword(tokens):
         any(_ALIASED_KEYWORD.match(w.text) or _ALIASED_KEYWORD.match(w.raw or '') for w in words)
 
 
-def _strip_case_patterns(tokens):
+def _closes_case(word):
+    """A word that ends pattern mode. Deliberately broader than the keyword (any unquoted word whose text is `esac`):
+    ending early leaves more words as commands, so it can only make the guards stricter (goodqa#17059)."""
+    return not word.quoted and word.text == 'esac'
+
+
+def _strip_case_patterns(tokens, ps=False):
     """`case X in a|b) cmd;; *) cmd;; esac`: drop the pattern lists so `a|b` is not a pipeline and `*` is not a
     command whose name is a glob. The bodies stay as ordinary commands. Only a `case` that is provably the keyword
-    (unquoted source text at a command start, goodqa#17059) starts pattern mode; any other `case` is a word."""
-    if _aliases_a_keyword(tokens):
+    (unquoted source text at a command start, goodqa#17059) starts pattern mode; any other `case` is a word.
+    PowerShell has no case statement, so its text is never stripped."""
+    if ps or _aliases_a_keyword(tokens):
         return list(tokens)
     out, stack, i, n = [], [], 0, len(tokens)
     starts = CommandStart()
@@ -1255,7 +1263,7 @@ def _strip_case_patterns(tokens):
             i += 3
             continue
         if stack and stack[-1] == 'patterns':
-            if kind == 'w' and _keyword_word(val, 'esac'):
+            if kind == 'w' and _closes_case(val):
                 stack.pop()
                 emit(tokens[i])
             elif kind == 'op' and val == ')':
@@ -1276,15 +1284,15 @@ def _strip_case_patterns(tokens):
             emit(('op', ';'))
             i += 2
             continue
-        if stack and kind == 'w' and _keyword_word(val, 'esac') and at_start:
+        if stack and kind == 'w' and _closes_case(val) and at_start:
             stack.pop()
         emit(tokens[i])
         i += 1
     return out
 
 
-def parse(tokens):
-    tokens = _strip_case_patterns(tokens)
+def parse(tokens, ps=False):
+    tokens = _strip_case_patterns(tokens, ps)
     pipelines, pl, cmd = [], Pipeline(), Cmd()
 
     def end_cmd():
@@ -4133,7 +4141,7 @@ class Analyzer:
 
     def _run_tokens(self, tokens, depth):
         self.check_tokens(tokens)
-        pipelines = parse(tokens)
+        pipelines = parse(tokens, self.ctx.ps)
         self._prebind_loop_input(pipelines)
         for pipeline in pipelines:
             self.pipeline(pipeline, depth)
@@ -6448,7 +6456,7 @@ class Analyzer:
         if not text or len(text) > 200000:
             return None
         try:
-            pipelines = parse(Lexer(ctx, ctx.ps).lex(text))
+            pipelines = parse(Lexer(ctx, ctx.ps).lex(text), ctx.ps)
         except (Blocked, ValueError, IndexError, RecursionError):
             return None  # the substitution itself is judged (and refused when unreadable) where it runs
         for pl in pipelines[:64]:

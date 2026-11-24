@@ -53,6 +53,9 @@ NOT_THE_KEYWORD = {
     'after time following a pipe': 'true | time case y in; {X}',
     'after ! following a pipe': 'true | ! case y in; {X}',
     'after time following a pipe and a line break': 'true |\ntime case y in; {X}',
+    'after time (not a keyword in sh or dash)': 'time case y in; {X}',
+    'after ! following a pipe and a line break': 'true |\n! case y in; {X}',
+    'no word between case and in': 'case ; in; {X}',
     'after a lead word that is itself an argument': 'echo if then case y in; {X}',
     # not the keyword's spelling
     'double-quoted': '"case" y in; {X}',
@@ -68,6 +71,20 @@ NOT_THE_KEYWORD = {
     'lead word aliased': "alias then='echo'; if true; then case y in; {X}",
 }
 
+# a real case statement whose closing word is not the keyword `esac` (the shell reports a syntax error); the pass ends
+# pattern mode at any unquoted word whose text is esac, which is stricter, so {X} stays visible
+NOT_THE_CLOSER = {
+    'brace-expanded esac': 'case a in a) true ;; {esac,}; {X}',
+    'esac glued at a carriage return': 'case a in a) true ;; esac\r; {X}',
+}
+
+# PowerShell has no case statement: the word is a command name there, and the command after `;` runs
+POWERSHELL = {
+    'case statement shape': 'case y in; {X}',
+    'case statement shape across lines': 'case y in\n{X}',
+}
+PS_DELETE = 'Remove-Item -Recurse -Force ~/.claude/projects'
+
 # real case statements: both guards allow them before and after (the pattern words are not commands)
 REAL_CASES = {
     'one line': 'case "$1" in a|b) echo ab ;; *) echo other ;; esac',
@@ -75,13 +92,12 @@ REAL_CASES = {
     'inside if': 'if true; then case "$1" in -h|--help) echo usage ;; esac; fi',
     'inside a loop': 'for a in "$@"; do case "$a" in -v) v=1 ;; *) break ;; esac; done',
     'after a pipe': 'printf x | case "$1" in a) cat ;; *) cat ;; esac',
-    'after time': 'time case "$1" in a) true ;; esac',
     'fall-through terminators': 'case "$1" in a) echo a ;& b) echo b ;;& *) echo c ;; esac',
     'parenthesised patterns': 'case "$1" in (a|b) echo ab ;; (*) echo other ;; esac',
 }
 
 
-def _base_strip_case_patterns(tokens):
+def _base_strip_case_patterns(tokens, ps=False):
     """The pass as it was at d56a8cb0, kept verbatim as the reference for the verdict-diff property."""
     out, stack, i, n = [], [], 0, len(tokens)
     while i < n:
@@ -145,17 +161,23 @@ class Guards(tkg.WorldCase):
 class Refused(Guards):
     def test_every_row_that_breaks_one_condition_is_refused_by_both_guards(self):
         wrong = []
-        for label, form in NOT_THE_KEYWORD.items():
+        for label, form in list(NOT_THE_KEYWORD.items()) + list(NOT_THE_CLOSER.items()):
             if self.cg_verdict(form.replace('{X}', DELETE)) != 'block':
                 wrong.append(('command_guard', label))
             if self.kg_verdict(form.replace('{X}', KILL)) != 'block':
                 wrong.append(('kill_guard', label))
         self.assertEqual(wrong, [])
 
+    def test_powershell_text_is_never_read_as_a_case_statement(self):
+        wrong = [label for label, form in POWERSHELL.items()
+                 if self.cg_verdict(form.replace('{X}', PS_DELETE), ps=True) != 'block']
+        self.assertEqual(wrong, [])
+
     def test_the_twin_command_alone_is_refused_so_the_rows_are_not_vacuous(self):
         self.assertEqual(self.cg_verdict('true; ' + DELETE), 'block')
         self.assertEqual(self.kg_verdict('true; ' + KILL), 'block')
         self.assertEqual(self.kg_verdict('echo ' + KILL), 'allow')  # the kill twin needs a real command
+        self.assertEqual(self.cg_verdict('true; ' + PS_DELETE, ps=True), 'block')
 
     def test_a_command_after_a_real_case_statement_is_still_judged(self):
         for form in ('case y in a) true ;; esac; {X}', 'case y in a) {X} ;; esac', 'case y in a|{X}) true ;; esac\n{X}'):
@@ -201,10 +223,13 @@ class Property(Guards):
         self.assertEqual(self._both(lambda r: self.cg_verdict(r[0], ps=r[1]), rows), [])
 
     def test_only_rows_that_break_a_condition_change_and_only_toward_refusal(self):
-        rows = [f.replace('{X}', DELETE) for f in NOT_THE_KEYWORD.values()] + list(REAL_CASES.values())
+        forms = list(NOT_THE_KEYWORD.values()) + list(NOT_THE_CLOSER.values())
+        rows = [f.replace('{X}', DELETE) for f in forms] + list(REAL_CASES.values())
         changed = self._both(self.cg_verdict, rows)
-        rows_k = [f.replace('{X}', KILL) for f in NOT_THE_KEYWORD.values()] + list(REAL_CASES.values())
+        rows_k = [f.replace('{X}', KILL) for f in forms] + list(REAL_CASES.values())
         changed += self._both(self.kg_verdict, rows_k)
+        changed += self._both(lambda r: self.cg_verdict(r, ps=True), [f.replace('{X}', PS_DELETE)
+                                                                       for f in POWERSHELL.values()])
         self.assertTrue(all(before == 'allow' and after == 'block' for _r, before, after in changed), changed)
         self.assertTrue(all('case' in r and r not in REAL_CASES.values() for r, _b, _a in changed), changed)
         self.assertGreater(len(changed), 0)  # the old pass hid them: not vacuous
@@ -236,6 +261,10 @@ class ShellOracle(unittest.TestCase):
 
     def test_time_after_a_pipe_is_a_command_in_bash(self):
         self.assertIn('RAN', self.run_shell(shutil.which('bash'), 'true | time case y in; marker'))
+
+    @unittest.skipUnless(shutil.which('dash'), 'needs dash')
+    def test_time_is_not_a_keyword_in_dash(self):
+        self.assertIn('RAN', self.run_shell(shutil.which('dash'), 'time case y in; marker'))
 
     def test_a_real_case_statement_runs_its_body_not_its_patterns(self):
         for shell in self.shells():

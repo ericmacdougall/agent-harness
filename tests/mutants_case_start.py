@@ -38,8 +38,18 @@ MUTANTS = {
     'a closing parenthesis starts a command': [
         ("START_OPS = frozenset(('\\n', ';', '&', '&&', '||', '|', '|&', '('))",
          "START_OPS = frozenset(('\\n', ';', '&', '&&', '||', '|', '|&', '(', ')'))")],
-    'time or ! after a pipe leads': [
-        ("        if val.raw in ('time', '!'):", "        if False:")],
+    '! after a pipe leads': [
+        ("        if val.raw == '!':", "        if False:")],
+    'time leads (it is no keyword in sh or dash)': [
+        ("LEAD_WORDS = ('if', 'then', 'else', 'elif', 'do', 'while', 'until', '{', '!')",
+         "LEAD_WORDS = ('if', 'then', 'else', 'elif', 'do', 'while', 'until', '{', '!', 'time')")],
+    'pattern mode ends only at the keyword esac': [
+        ("    return not word.quoted and word.text == 'esac'", "    return _keyword_word(word, 'esac')")],
+    'no subject word is needed between case and in': [
+        ("i + 2 < n and tokens[i + 1][0] == 'w' \\\n                and tokens[i + 2][0] == 'w'",
+         "i + 2 < n \\\n                and tokens[i + 2][0] == 'w'")],
+    'PowerShell text is stripped': [
+        ("    if ps or _aliases_a_keyword(tokens):", "    if _aliases_a_keyword(tokens):")],
     'a redirection keeps the command start': [
         ("        if kind == 'op':\n            return val in START_OPS\n",
          "        if kind == 'op':\n            return val in START_OPS\n        if kind == 'redir':\n            return start\n")],
@@ -48,7 +58,7 @@ MUTANTS = {
          "        if kind == 'op':\n            return val in START_OPS\n"
          "        if kind == 'w' and '=' in (val.raw or ''):\n            return start\n")],
     'an alias is ignored': [
-        ("    if _aliases_a_keyword(tokens):\n        return list(tokens)", "    if False:\n        return list(tokens)")],
+        ("    if ps or _aliases_a_keyword(tokens):\n        return list(tokens)", "    if ps:\n        return list(tokens)")],
     'a subscripted alias is read from the expanded text only': [
         ("    return any(w.text == 'alias' or w.text.startswith('aliases[') or (w.raw or '').startswith('aliases[')",
          "    return any(w.text == 'alias' or w.text.startswith('aliases[')")],
