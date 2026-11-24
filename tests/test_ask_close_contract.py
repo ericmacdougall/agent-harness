@@ -116,7 +116,7 @@ EXPECT = {
     "wal>outside": (U, False, False), "wal>cycle": (U, False, False), "wal^9>ticket": (U, False, False),
     "wal>many": (U, False, False), "inf>inf": (U, False, False), "wal>inf>inf": (U, False, False),
     "wal>nonstring": (U, False, False), "wal>unsourced": (U, False, False), "wal>free-text": (U, False, False),
-    "wal>bad-wal": (U, False, False), "wal>warn>no-file": (U, False, False),
+    "wal>bad-wal": (U, False, False), "wal>warn>no-file": (U, False, False), "wal>inf-short": (U, False, False),
     # round 6 controls: outcome evidence that resolves only weakly (refused by the enforce policy alone), and evidence
     # that does not resolve (refused under every policy)
     "wal>file-bare": (N, False, False), "wal>file-wrong": (N, False, False),
@@ -129,7 +129,16 @@ STOP_OF = {
     "wal>outside": "wal-bad-path", "wal>cycle": "cycle", "wal^9>ticket": "too-deep", "wal>many": "too-many-sources",
     "inf>inf": "inferred-no-inputs", "wal>inf>inf": "inferred-no-inputs", "wal>nonstring": "internal",
     "wal>unsourced": "wal-unsourced", "wal>free-text": "bad-syntax", "wal>bad-wal": "bad-syntax",
-    "wal>warn>no-file": "wal-missing",
+    "wal>warn>no-file": "wal-missing", "wal>inf-short": "inferred-no-rationale",
+}
+# the stop codes no cell above reaches: one needs a scan past its time budget, tested in process (StopCoverage); the
+# others cannot be reached, each for the reason given. StopCoverage fails when a stop code is in none of the three.
+IN_PROCESS = {"scan-timeout"}
+UNREACHABLE = {
+    "inferred-nested": "the outer split at the first unquoted ` -- ` leaves none in any input, so an inner inferred: "
+                       "fails as inferred-no-inputs first (cells inf>inf and wal>inf>inf)",
+    "tree-too-large": "MAX_RESOLVES caps a tree at far fewer nodes than the walker's bound of 4 * MAX_RESOLVES",
+    "rejected": "the fallback text of a message when a result has no problem, never a code resolve() records",
 }
 # why a refused cell is refused, for the classes the reason must name (checked in the listing's `action`)
 REASON = {"USER": "lowercase", "user_sp": "lowercase", "pasted": "pasted", "wal>lost-user": "human turn",
@@ -144,7 +153,8 @@ OUTCOME_ONLY_REASON = {"wal>user", "wal>queue", "wal>lost-user", "wal>inf>user+t
 # what the WRITER says for an outcome close of a stop cell whose first hop it can read: the stop, before any policy
 STOPPED = "the source could not be traced to its end"
 WRITER_OUTCOME = {name: STOPPED for name in ("wal>cycle", "wal^9>ticket", "wal>many", "wal>inf>inf", "wal>nonstring",
-                                             "wal>unsourced", "wal>free-text", "wal>bad-wal", "wal>warn>no-file")}
+                                             "wal>unsourced", "wal>free-text", "wal>bad-wal", "wal>warn>no-file",
+                                             "wal>inf-short")}
 WRITER_OUTCOME.update({"wal>mc": "dashboard", "wal>wal>mc": "dashboard", "wal>inf>mc": "dashboard",
                        "wal>wal>inf>mc": "dashboard"})
 
@@ -274,6 +284,7 @@ class Contract(unittest.TestCase):
                  "wal>inf>pasted+ticket": f"inferred: from {direct['pasted']} ; {direct['ticket']} -- both say so",
                  "wal>lost-user": f'user:{S1}/{ULOST} "{T1}"', "wal>many": many, "wal>inf>inf": nested,
                  "wal>nonstring": 12345, "wal>free-text": "the user said so in chat", "wal>bad-wal": "wal:no-entry-named",
+                 "wal>inf-short": "inferred: from ticket:GoodQA goodqa#777 -- short",
                  "wal>file-bare": f"file:notes.txt:1@{sha}", "wal>file-wrong": f'file:notes.txt:1@{sha} "not that line"'}
         for name, source in extra.items():
             ident = new_id()
@@ -677,6 +688,39 @@ class EveryCodeIsClassified(unittest.TestCase):
         self.assertFalse(provenance.stops_walk("ticket-missing", "ticket:GoodQA goodqa#1"))  # an origin that failed
         self.assertTrue(provenance.stops_walk("bad-syntax", "wal:no-entry-named"))  # a pointer: what it names is unknown
         self.assertTrue(provenance.stops_walk("bad-syntax", "the user said so"))  # a source that names no kind
+
+
+class StopCoverage(unittest.TestCase):
+    """Every stop code once (#170 round 6): each is reached by a contract cell (STOP_OF), by a test here (IN_PROCESS),
+    or is named unreachable with its reason (UNREACHABLE)."""
+
+    def test_every_stop_code_has_a_cell_a_test_or_a_reason(self):
+        import provenance  # noqa: PLC0415
+        covered = set(STOP_OF.values())
+        self.assertEqual(provenance.STOP_CODES - covered - IN_PROCESS - set(UNREACHABLE), set())
+        self.assertEqual((IN_PROCESS | set(UNREACHABLE)) & covered, set())
+        self.assertTrue((IN_PROCESS | set(UNREACHABLE)) <= provenance.STOP_CODES)
+
+    def test_a_scan_past_its_time_budget_is_a_stop_under_any_policy(self):
+        import ask_close  # noqa: PLC0415
+        import provenance  # noqa: PLC0415
+        with tempfile.TemporaryDirectory() as tmp:
+            wal = Path(tmp) / "wals" / S2 / "main.jsonl"
+            wal.parent.mkdir(parents=True)
+            wal.write_text(jsonl([row("decision", "w00000000a01", 1, "obsolete there", "ticket:GoodQA goodqa#777")]))
+            source = f"wal:{S2}/main.jsonl#w00000000a01"
+            control = ask_close.trace(source, tmp)
+            self.assertEqual((control["state"], control["stops"]), ("not-human", []))  # the scan completes
+            saved = provenance.SCAN_SECONDS, provenance.load_policy
+            provenance.SCAN_SECONDS = -1.0  # every scan is past its budget before it reads a byte
+            provenance.load_policy = lambda *_a, **_k: {"wal": {"ask": "off"}}
+            try:
+                traced = ask_close.trace(source, tmp)
+                verdict = ask_close.close_verdict(source, "outcome", "w00000000a02", tmp)
+            finally:
+                provenance.SCAN_SECONDS, provenance.load_policy = saved
+        self.assertEqual((traced["state"], traced["maybe_human"], traced["stops"]), ("unknown", True, ["scan-timeout"]))
+        self.assertIn("scan-timeout", verdict["problem"] or "")
 
 
 if __name__ == "__main__":
