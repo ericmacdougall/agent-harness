@@ -18,8 +18,8 @@
   "ahc_w21.py": "04101af2e72ca39ec1d714977d7676d472d17ca4033827734170b856dfdf6b46"
  },
  "helpers": {
-  "ah": "4573cf19aad2f04088a1c7bbf95001d7b8df48d24e95ac878be22cfc1b649c27",
-  "ops_watch": "94d0d1ee5d0f990145e01c70df78ffeef914582073b51ab4a0e87ff0db5f5b6f",
+  "ah": "ad2e968fbff3ea12798d7972edb1299f358c3775c5b0c9018b1e50022aadc49e",
+  "ops_watch": "ff0b4cff4b50c7b29f4a58b22be5b610b6dba2b45e5b03afe7a74278e88d268a",
   "peer_review": "6731fc44d0f91963247432967637cf8764c65b520dc6250eef0d33759bc109e1"
  },
  "note": "v5 entry-point and legacy-helper sha256 list; regenerate with scripts/ahc_release_hashes.py"
