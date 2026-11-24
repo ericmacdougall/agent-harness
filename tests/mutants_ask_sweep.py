@@ -64,6 +64,22 @@ MUTANTS = {
     # round 3 triage (CRITICAL): an elided answer is never closed by the tool
     "an elided answer is closed by the tool": ("ask_sweep.py", "            elif cited[1]:", "            elif False:",
                                                "tests/test_ask_sweep.py"),
+    # round 4 ruling (CRITICAL class): WAL evidence is closed only when it cites the user's whole turn, decided by the
+    # one shared function for both paths
+    "a partial WAL-evidence excerpt is closed": (
+        "ask_sweep.py", '        if best["kind"] in ("answer", "resolved-elsewhere") and whole_citation(best["source"], home) is False:',
+        "        if False:", "tests/test_ask_sweep.py"),
+    "cites_whole accepts any excerpt": ("ask_evidence.py", "    return bool(whole) and provenance.norm(excerpt) == whole",
+                                        "    return True", "tests/test_ask_sweep.py"),
+    "cites_whole compares the raw text": ("ask_evidence.py", "    return bool(whole) and provenance.norm(excerpt) == whole",
+                                          "    return bool(whole) and excerpt == text", "tests/test_ask_sweep_whole_turn.py"),
+    "an inferred chain that quotes the user is offered": (
+        "ask_sweep.py", "        return False if ask_evidence.human_traced(source) else None", "        return None",
+        "tests/test_ask_sweep_whole_turn.py"),
+    "a cite provenance refuses is offered": (
+        "ask_sweep.py", '    return ask_evidence.cites_whole(node.get("excerpt"), node.get("text"))',
+        '    return ask_evidence.cites_whole(node.get("excerpt"), node.get("text")) or not node',
+        "tests/test_ask_sweep_whole_turn.py"),
     # round 2 F4: a failed run never loses the report, and a rerun names closed asks
     "a timeout raises": ("ask_sweep.py", "    except subprocess.TimeoutExpired:", "    except ZeroDivisionError:", "tests/test_ask_sweep.py"),
     "a closed ask is reported as not listed": ("ask_sweep.py", "            if ask in resolved:", "            if False:",
@@ -91,7 +107,8 @@ MUTANTS = {
                                           "    if False:", "tests/test_ask_sweep.py"),
 }
 REAL_TESTS = ["tests/test_ask_sweep.py", "tests/test_ask_evidence.py", "tests/test_ask_sweep_quoting.py",
-              "tests/test_ask_close_outcome.py", "tests/test_ask_sweep_e2e.py", "tests/test_ask_reminders.py"]
+              "tests/test_ask_close_outcome.py", "tests/test_ask_sweep_e2e.py", "tests/test_ask_reminders.py",
+              "tests/test_ask_sweep_whole_turn.py"]
 
 
 def one(job):

@@ -135,13 +135,27 @@ def quote_excerpt(body: str) -> str:
     return '"' + body.replace('"', '\\"') + '"'
 
 
+def cites_whole(excerpt, text) -> bool:
+    """True when `excerpt` quotes ALL of `text`: the two are equal after provenance.norm, and not empty.
+
+    The one test of "is this excerpt the whole answer or turn" (#170 rounds 3 and 4, CRITICAL). ask_sweep offers a close
+    only for a whole citation, both for an answer card (plan, through cite) and for WAL evidence (whole_citation). An
+    excerpt that leaves any words out, with an ellipsis or without, can invert what the user said: "Don't... stop the
+    worker" cited as "...stop the worker", or "Do not stop the worker now" cited as "stop the worker now"."""
+    import provenance  # noqa: PLC0415
+    if not isinstance(excerpt, str) or not isinstance(text, str):
+        return False
+    whole = provenance.norm(text)
+    return bool(whole) and provenance.norm(excerpt) == whole
+
+
 def cite(answer: str, turn_text: str):
     """(quoted excerpt, elided) for the user's `answer`, checked against `turn_text` (the turn as provenance reads it),
     or None when provenance would accept no excerpt of it. provenance reads `...` in an excerpt as an elision and needs
     each piece to be EXCERPT_MIN+ characters, at most EXCERPT_SEGMENTS pieces and EXCERPT_MAX in all; so a literal
     ellipsis (`...` or `…`) is kept as an elision, a piece too short to cite is elided, and an over-long answer is cut
-    with a closing `...`. `elided` says the excerpt is not the whole answer; ask_sweep never closes an elided answer
-    (#170 triage: leaving words out can invert it)."""
+    with a closing `...`. `elided` says the excerpt is not the whole answer (cites_whole); ask_sweep never closes an
+    elided answer (#170 triage: leaving words out can invert it)."""
     import provenance  # noqa: PLC0415
     body = provenance.norm(answer or "")
     pieces = [piece.strip() for piece in body.split("...")]
@@ -177,7 +191,7 @@ def cite(answer: str, turn_text: str):
             return None
     except provenance.Problem:
         return None
-    return quoted, excerpt != body
+    return quoted, not cites_whole(excerpt, answer)
 
 
 def supersedes(record, ref: str) -> bool:

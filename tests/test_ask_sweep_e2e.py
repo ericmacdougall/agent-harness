@@ -2,7 +2,8 @@
 calls the real wal_note.py, which calls the real provenance, all under a temporary HOME that holds synthetic WALs and
 transcripts. For every close kind (answer card, answer row, superseded, resolved-elsewhere) the ask must really be closed in
 the asking WAL with no decision. Terminal evidence must be refused with nothing written. A close wal_note refuses must make
-the run exit 1 with wal_note's own message.
+the run exit 1 with wal_note's own message. A cite of words that are not the user's whole turn is never offered as a close
+(#170 round 4; tests/test_ask_sweep_whole_turn.py has the full table).
 
 Run: python3 -I -m unittest tests.test_ask_sweep_e2e
 """
@@ -19,7 +20,7 @@ S1 = "aaaaaaaa-1111-4111-8111-000000000001"
 S2 = "bbbbbbbb-2222-4222-8222-000000000002"
 ANS, U1, U2, U4, U5 = ("%08d-0000-4000-8000-%012d" % (n, n) for n in (1, 2, 3, 4, 5))
 ASK_USE = "toolu_E2EASK00001"
-CARD, ROW, SUPER, ELSE, TERM, FORGED = ("w%011x" % n for n in (0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6))
+CARD, ROW, SUPER, ELSE, TERM, FORGED, REFUSED = ("w%011x" % n for n in (0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7))
 NEW = "w%011x" % 0xb3
 PYCACHE = "/home/eric/.agent-harness/work/heldout/scoring/__pycache__"
 
@@ -72,6 +73,7 @@ class EndToEnd(unittest.TestCase):
             row("ask", ELSE, 1, "the fourth question"),
             row("ask", TERM, 1, "Run on t2-dev: rm -r %s" % PYCACHE),
             row("ask", FORGED, 1, "q six"),
+            row("ask", REFUSED, 1, "q seven"),
             row("decision", "w%011x" % 0xd2, 20, "Answer to ask %s: the user approved" % ROW,
                 source='user:%s/%s "Yes, restart the worker now"' % (S1, U1)),
             row("ask", NEW, 21, "SUPERSEDES %s: run h3d-v2.sh instead" % SUPER,
@@ -79,8 +81,13 @@ class EndToEnd(unittest.TestCase):
             row("decision", "w%011x" % 0xd6, 22, "Answer to ask %s: the user approved" % FORGED,
                 source='user:%s/%s "words the user never typed here"' % (S1, U1)),
         ]))
-        self.other.write_text(json.dumps(separators=(",", ":"), obj=row("ask_resolved", "w%011x" % 0xe4, 30, "closed in the successor", ref=ELSE,
-                                             source='user:%s/%s "Close the fourth question, it is done"' % (S1, U5))) + "\n")
+        self.other.write_text("".join(json.dumps(r, separators=(",", ":")) + "\n" for r in [
+            row("ask_resolved", "w%011x" % 0xe4, 30, "closed in the successor", ref=ELSE,
+                source='user:%s/%s "Close the fourth question, it is done"' % (S1, U5)),
+            # an outcome close that quotes no user words, so it is offered; its wal: evidence is missing, so wal_note refuses
+            row("ask_resolved", "w%011x" % 0xe7, 31, "obsolete in the successor", ref=REFUSED, outcome="obsolete",
+                source="wal:%s#w%011x" % (self.other, 0xdead)),
+        ]))
 
     def sweep(self, *args):
         env = {"PATH": os.environ.get("PATH", ""), "HOME": str(self.home), "AH_HOME": str(self.home)}
@@ -103,7 +110,7 @@ class EndToEnd(unittest.TestCase):
         items = self.listed()
         kinds = {a: (i.get("kind") or "card") for a, i in items.items()}
         self.assertEqual(kinds, {CARD: "card", ROW: "answer", SUPER: "superseded", ELSE: "resolved-elsewhere",
-                                 TERM: "terminal", FORGED: "answer"})
+                                 TERM: "terminal", FORGED: "answer", REFUSED: "resolved-elsewhere"})
         before_main, before_other = self.rows(self.main), self.other.read_bytes()
         pins = [items[a]["pin"] for a in (CARD, ROW, SUPER, ELSE)]
         code, doc = self.sweep("--apply", "--only", *pins)
@@ -117,7 +124,7 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual({r["ref"]: r.get("outcome") for r in new}[SUPER], "obsolete")
         self.assertEqual(self.other.read_bytes(), before_other)
         left = self.listed()
-        self.assertEqual(sorted(left), sorted([TERM, FORGED]))  # closed asks are no longer listed
+        self.assertEqual(sorted(left), sorted([TERM, FORGED, REFUSED]))  # closed asks are no longer listed
 
     def test_terminal_evidence_is_refused_and_nothing_is_written(self):
         item = self.listed()[TERM]
@@ -130,12 +137,23 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(self.main.read_bytes(), before)
 
     def test_a_close_wal_note_refuses_exits_1_with_its_message_and_writes_nothing(self):
-        item = self.listed()[FORGED]
+        item = self.listed()[REFUSED]
+        self.assertTrue(item["close"])  # offered: it quotes no user words
         before = self.main.read_bytes()
         code, doc = self.sweep("--apply", "--only", item["pin"])
         self.assertEqual(code, 1)
-        self.assertNotEqual(doc["closed"][0]["rc"], 0)
-        self.assertIn("excerpt", doc["closed"][0]["refused"].lower())  # provenance: the cited words are not in that turn
+        self.assertNotIn(doc["closed"][0]["rc"], (0, 3))  # wal_note ran and refused, not the manual refusal
+        self.assertIn("wal: evidence cannot be read", doc["closed"][0]["refused"])  # wal_note's own message
+        self.assertEqual(self.main.read_bytes(), before)
+
+    def test_a_cite_of_words_not_in_the_turn_is_never_offered_and_writes_nothing(self):
+        # #170 round 4: a source that cannot be checked against the whole turn is manual, like a partial one
+        item = self.listed()[FORGED]
+        self.assertEqual((item["manual"], item.get("partial"), item["close"], item["apply"]), (True, True, None, None))
+        before = self.main.read_bytes()
+        code, doc = self.sweep("--apply", "--only", item["pin"])
+        self.assertEqual((code, doc["closed"][0]["rc"]), (1, 3))
+        self.assertIn("part of the user's turn", doc["closed"][0]["refused"])
         self.assertEqual(self.main.read_bytes(), before)
 
     def test_the_printed_close_command_runs_as_printed(self):

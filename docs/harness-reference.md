@@ -67,6 +67,10 @@ These instructions apply to my local Claude Code sessions. Follow repository ins
     - The cited answer is quoted the way provenance reads it back: an inner `"` is written `\"`, and a literal ellipsis (`...` or `…`) is kept as an elision. Each excerpt is checked with provenance's own parser and matcher before it is printed.
     - Only an answer cited whole gets a close. An answer that can be cited only with words left out is listed under `short` with `elided: true` and no close. Examples: a piece too short to cite, more pieces than provenance takes, or an over-long answer. Leaving words out can invert an answer: "Don't... stop the worker" would read as "...stop the worker".
     - An answer provenance would accept in no form is listed under `short` too. Read the whole `answer` and close each `short` item by hand.
+    - WAL evidence follows the same rule. An answer row or a related-session close copies the source another row wrote. A close is offered from it only when that source cites one human turn (`user:`, `uuid:`, `answer:`, `queue:` or `pasted:`) and its excerpt is that whole turn.
+      - Any other citation of a human turn is listed with `manual: true`, `partial: true` and no close, and `--apply` refuses it. This covers an excerpt that leaves words out, with an ellipsis or without: "Do not stop the worker now" cited as "stop the worker now". It also covers an excerpt provenance refuses and an `inferred:` chain that quotes the user.
+      - A source that quotes no human words, such as a `wal:` pointer or an outcome close, is offered as before.
+      - `ask_evidence.cites_whole` is the one test of "is this excerpt the whole turn" for both answer cards and WAL evidence.
     - The listing exits 0 only when every file was read in full. Anything it could not read is listed in `unread`, and the listing exits 2: a refused file (symlink, FIFO, directory, too large), a stop at the time or byte budget, and each skipped over-long or unparseable line.
   - **Applying.** `--apply --only <pin> ...` refuses an ask named without its pin, one whose best evidence changed since it was listed, and every close while anything is unread. An ask that is already closed is reported as resolved, with the row that closed it, and nothing is written. The run exits 1 if any close is refused, times out or cannot start; the JSON report is always printed, with wal_note's own message. After a timeout the ledger is read again, so a close that was written after all is reported as written.
   - **Terminal evidence.** It is listed for manual action only and never closed by the tool, because provenance does not accept a `<bash-input>` turn as the user's words.
@@ -74,7 +78,7 @@ These instructions apply to my local Claude Code sessions. Follow repository ins
   - **Where the rules live.** `ask_evidence.py` holds them once:
     - the bounded reader (`jsonl_records`): regular files only, no symlinks, size, line and time bounds, and every gap listed;
     - the open-ask fold (`read_asks`, which `ask_reminders.open_asks` also uses);
-    - the excerpt quoting (`cite`);
+    - the excerpt quoting (`cite`) and the whole-turn test (`cites_whole`);
     - the SUPERSEDES match and the human-turn rule.
 
     ask_sweep reads every WAL and transcript through that reader, and a guard test fails if it reads a file itself or imports another hook module. `wal_note.py` uses the SUPERSEDES and human-turn rules. It reads the entry that an `--outcome` close cites through provenance's own bounded resolver (`provenance.wal_entry`), which is the read that verifies the entry, not through `jsonl_records`.

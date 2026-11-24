@@ -261,18 +261,45 @@ class WalBase(unittest.TestCase):
     def items(self, related=()):
         return {i["ask"]: i for i in sw.wal_evidence(self.home, S1, related)["items"]}
 
+    def said(self, session, n, text, ts="2026-11-23T19:01:00.000Z"):
+        """A human turn of SESSION that says exactly TEXT, and the user: source that cites it whole. WAL evidence is
+        offered as a close only for a citation of the whole turn (#170 round 4), so a closable fixture needs a real turn."""
+        ident = "%08d-0000-4000-8000-%012d" % (9, n)
+        self.transcript(session, [{"type": "user", "uuid": ident, "timestamp": ts, "sessionId": session,
+                                   "origin": {"kind": "human"}, "message": {"role": "user", "content": text}}])
+        return f'user:{session}/{ident} "{text}"'
+
 
 class WalEvidence(WalBase):
     def test_decision_row_citing_the_users_answer_resolves_without_a_decision(self):
+        source = self.said(S1, 1, "Yes, past the limit too")
         self.wal(S1, [wrow("ask", "w00000000a01", "2026-11-23T19:06:00+00:00", "U6: may reviews attempt Astra?"),
                       wrow("decision", "w00000000d01", "2026-11-23T22:04:00+00:00",
-                           "User answers: U6 (asks w00000000a01) yes", source=f'answer:{S1}/1111 "Yes, past the limit too"')])
+                           "User answers: U6 (asks w00000000a01) yes", source=source)])
         item = self.items()["w00000000a01"]
-        self.assertEqual(item["kind"], "answer")
+        self.assertEqual((item["kind"], item["manual"]), ("answer", False))
         argv = sw.close_argv(item)
         self.assertNotIn("--decision", argv)
-        self.assertEqual(argv[argv.index("--source") + 1], f'answer:{S1}/1111 "Yes, past the limit too"')
+        self.assertEqual(argv[argv.index("--source") + 1], source)
         self.assertEqual(argv[argv.index("--by") + 1], "ask-sweep")
+
+    def test_a_row_citing_part_of_the_turn_is_manual_and_the_whole_turn_is_closed(self):
+        # #170 round 4 (CRITICAL): "Do not stop the worker now" cited as "stop the worker now" says the opposite
+        whole = self.said(S1, 60, "Do not stop the worker now")
+        part = whole.replace('"Do not stop the worker now"', '"stop the worker now"')
+        self.wal(S1, [wrow("ask", "w00000000a60", "2026-11-23T19:00:00+00:00", "may main stop the worker?"),
+                      wrow("ask", "w00000000a61", "2026-11-23T19:00:00+00:00", "may main stop the worker? (again)"),
+                      wrow("decision", "w00000000d60", "2026-11-23T20:00:00+00:00",
+                           "Answer to ask w00000000a60: the user answered", source=part),
+                      wrow("decision", "w00000000d61", "2026-11-23T20:00:00+00:00",
+                           "Answer to ask w00000000a61: the user answered", source=whole)])
+        items = self.items()
+        self.assertEqual((items["w00000000a60"]["kind"], items["w00000000a60"]["manual"], items["w00000000a60"].get("partial")),
+                         ("answer", True, True))
+        self.assertIsNone(sw.close_argv(items["w00000000a60"]))
+        self.assertEqual((items["w00000000a61"]["manual"], items["w00000000a61"].get("partial")), (False, None))
+        argv = sw.close_argv(items["w00000000a61"])
+        self.assertEqual(argv[argv.index("--source") + 1], whole)
 
     def test_earlier_unrelated_agent_and_pending_rows_do_not_resolve(self):
         self.wal(S1, [
@@ -300,7 +327,7 @@ class WalEvidence(WalBase):
     def test_a_close_in_a_related_session_is_found_and_closes_the_asking_wal(self):
         self.wal(S1, [wrow("ask", "w00000000a04", "2026-11-23T19:00:00+00:00", "q")])
         self.wal(S2, [wrow("ask_resolved", "w00000000r04", "2026-11-23T20:00:00+00:00", "closed here",
-                           ref="w00000000a04", source=f'answer:{S2}/4 "Yes"')])
+                           ref="w00000000a04", source=self.said(S2, 4, "Yes"))])
         self.assertEqual(self.items(), {})
         item = self.items([S2])["w00000000a04"]
         self.assertEqual(item["kind"], "resolved-elsewhere")
@@ -389,8 +416,7 @@ class WalEvidence(WalBase):
         self.wal(S1, [wrow("ask", "w00000000a10", "2026-11-23T19:00:00+00:00", "q one"),
                       wrow("ask", "w00000000a11", "2026-11-23T19:00:00+00:00", "q two"),
                       wrow("decision", "w00000000d10", "2026-11-23T20:00:00+00:00", "answered w00000000a10 and w00000000a11",
-                           source=f'answer:{S1}/5 "Yes, both"')])
-        self.transcript(S1, [])
+                           source=self.said(S1, 10, "Yes, both"))])
         calls = []
         with mock.patch.dict(os.environ, {"AH_HOME": str(self.home), "HOME": str(self.home)}), \
                 mock.patch.object(sw, "_default_runner", lambda argv: calls.append(argv) or (0, "{}", "")), \
@@ -527,21 +553,21 @@ class Ranking(WalBase):
     def test_an_answer_row_outranks_an_obsolete_close_elsewhere(self):
         self.wal(S1, [wrow("ask", "w00000000a50", "2026-11-23T19:00:00+00:00", "may main release?"),
                       wrow("decision", "w00000000d50", "2026-11-23T20:00:00+00:00", "Answer to ask w00000000a50: approved",
-                           source=f'answer:{S1}/1 "Yes, release it"')])
+                           source=self.said(S1, 50, "Yes, release it"))])
         self.wal(S2, [wrow("ask_resolved", "w00000000r50", "2026-11-23T21:00:00+00:00", "obsolete there",
                            ref="w00000000a50", source="wal:/x/main.jsonl#w00000000b50", outcome="obsolete")])
         item = self.items([S2])["w00000000a50"]
         self.assertEqual([e["ref"] for e in item["evidence"]], ["w00000000d50", "w00000000r50"])
         argv = sw.close_argv(item)
         self.assertNotIn("--outcome", argv)
-        self.assertEqual(argv[argv.index("--source") + 1], f'answer:{S1}/1 "Yes, release it"')
+        self.assertEqual(argv[argv.index("--source") + 1], f'user:{S1}/%08d-0000-4000-8000-%012d "Yes, release it"' % (9, 50))
 
     def test_a_human_close_is_not_hidden_behind_an_earlier_outcome_close(self):
         self.wal(S1, [wrow("ask", "w00000000a51", "2026-11-23T19:00:00+00:00", "q")])
         self.wal(S2, [wrow("ask_resolved", "w00000000r51", "2026-11-23T20:00:00+00:00", "obsolete there",
                            ref="w00000000a51", source="wal:/x/main.jsonl#w00000000b51", outcome="obsolete")])
         self.wal(S3, [wrow("ask_resolved", "w00000000r52", "2026-11-23T21:00:00+00:00", "answered there",
-                           ref="w00000000a51", source=f'user:{S3}/2 "Close it, it is done"')])
+                           ref="w00000000a51", source=self.said(S3, 52, "Close it, it is done"))])
         item = self.items([S2, S3])["w00000000a51"]
         self.assertEqual([e["ref"] for e in item["evidence"]], ["w00000000r52", "w00000000r51"])
         self.assertNotIn("--outcome", sw.close_argv(item))

@@ -41,6 +41,13 @@ takes, or an over-long answer) is listed under `short` with `elided: true` and n
 out can invert it ("Don't... stop the worker"; #170 triage, CRITICAL). An answer that provenance would accept in no form
 is listed under `short` too. Every `short` item is closed by hand, after reading the whole `answer`.
 
+WAL evidence follows the same rule (#170 round 4). An answer row or a related-session close copies the source another
+row wrote, so a close is offered from it only when that source cites one human turn and its excerpt is the whole turn
+(whole_citation; ask_evidence.cites_whole is the one test for both paths). A source that quotes the turn in part, with an
+ellipsis or without ("Do not stop the worker now" cited as "stop the worker now"), or that cannot be checked against the
+whole turn, is listed with `manual: true`, `partial: true` and no close; --apply refuses it and writes nothing. A source
+that quotes no human words (a wal: pointer, an outcome close) is offered as before.
+
 Listing exits 0 when every file was read in full, and 2 when anything is listed in `unread` (a refused file, a budget
 stop, a skipped over-long or unparseable line). ask_sweep reads every WAL and transcript through
 ask_evidence.jsonl_records. It refuses to run when AH_HOME or CLAUDE_CONFIG_DIR names another home than the one wal_note.py
@@ -282,9 +289,40 @@ def still_waiting(note: str, ident: str) -> bool:
     return bool(starts) and all(WAITING.search(note[max(0, s - 60):s]) for s in starts)
 
 
+PARTIAL_ACTION = ("manual: this evidence quotes only part of the user's turn, or cannot be checked against the whole "
+                  "turn, and leaving words out can change its meaning: read the whole turn and close the ask by hand")
+TERMINAL_ACTION = "manual: the user ran this step himself; main decides how to close the ask"
+
+
+def whole_citation(source: str, home: Path):
+    """Whether a WAL-evidence source quotes the user's WHOLE turn (#170 round 4, main's ruling, CRITICAL class).
+
+    - True: it cites one human turn (user:, uuid:, answer:, queue: or pasted:), provenance resolves it, and its excerpt
+      is that whole turn, as ask_evidence.cites_whole decides (the rule plan() uses through cite).
+    - False: it quotes a human turn in part, or in a form that cannot be checked against the whole turn: an excerpt
+      provenance refuses, an `inferred:` chain that quotes the user, an unparseable source that names a human turn.
+    - None: it quotes no human words at all (a wal: pointer, a ticket, an outcome close), so no words can be left out.
+
+    Only a False source is held back: listed for a manual close, never offered as one."""
+    sys.path.insert(0, str(HERE))
+    import ask_evidence  # noqa: PLC0415
+    import provenance  # noqa: PLC0415
+    try:
+        parsed = provenance.parse_source(source)
+    except provenance.Problem:
+        parsed = {}
+    if parsed.get("kind") not in ("user", "pasted"):
+        return False if ask_evidence.human_traced(source) else None
+    result = provenance.resolve(source, {"home": home / ".claude", "want_text": True})
+    node = result["chain"][0] if result.get("ok") and result.get("chain") else {}
+    return ask_evidence.cites_whole(node.get("excerpt"), node.get("text"))
+
+
 def wal_evidence(home: Path, session: str, related=(), unread=None) -> dict:
     """{"items": [...], "unread": [...]}: open main-WAL asks of SESSION with WAL or terminal evidence from SESSION and
-    the RELATED sessions (its successors or its coordinator). Read-only."""
+    the RELATED sessions (its successors or its coordinator). Read-only. When the best evidence is an answer row or a
+    related-session close that quotes the user only in part (whole_citation is False), the item is `manual` and
+    `partial`: it is listed for main to read and never offered as a close (#170 round 4)."""
     unread = [] if unread is None else unread
     sessions = [session] + [s for s in related if s != session]
     rows = []
@@ -334,14 +372,18 @@ def wal_evidence(home: Path, session: str, related=(), unread=None) -> dict:
         found.sort(key=lambda e: (rank(e), not e["source"].startswith("answer:"),
                                   not ANSWER_WORDS.search(e["summary"]), e["at"]))
         best = found[0]
+        if best["kind"] in ("answer", "resolved-elsewhere") and whole_citation(best["source"], home) is False:
+            best["manual"] = best["partial"] = True
         items.append({"ask": ident, "kind": best["kind"], "manual": bool(best.get("manual")),
+                      **({"partial": True} if best.get("partial") else {}),
                       "question": ask["note"][:120], "wal": str(main_wal), "evidence": found})
     return {"items": items, "unread": unread}
 
 
 def close_argv(item: dict):
-    """The wal_note.py argv that closes one evidence item (bookkeeping, never --decision), or None for terminal evidence,
-    which is listed for manual action only."""
+    """The wal_note.py argv that closes one evidence item (bookkeeping, never --decision), or None for manual evidence:
+    terminal evidence, and a citation of only part of the user's turn (#170 round 4). Both are listed for manual action
+    only."""
     best = item["evidence"][0]
     if best.get("manual"):
         return None
@@ -380,10 +422,12 @@ def answered_argv(session: str, main_wal: Path, item: dict) -> list:
                       "not an approval; read the answer before relying on it)"]
 
 
-def run_close(ask: str, argv, runner=None) -> dict:
-    """{"ask", "rc", "refused"?}: one wal_note.py run. A refusal carries wal_note's own message, never a silent rc."""
+def run_close(ask: str, argv, runner=None, manual=None) -> dict:
+    """{"ask", "rc", "refused"?}: one wal_note.py run. A refusal carries wal_note's own message, never a silent rc. With
+    no argv (manual evidence) nothing runs, and the refusal says why (`manual`, the item's action)."""
     if argv is None:
-        return {"ask": ask, "rc": 3, "refused": "terminal evidence is listed for manual action only; nothing was written"}
+        return {"ask": ask, "rc": 3, "refused": (manual or "this evidence is listed for manual action only")
+                + "; nothing was written"}
     rc, stdout, stderr = (runner or _default_runner)(argv)
     return {"ask": ask, "rc": rc, **({"refused": _clip(stderr or stdout or "refused with no message", 400)} if rc else {})}
 
@@ -448,7 +492,7 @@ def main(argv=None) -> int:
         if argv is None:
             item["close"] = None
             item["apply"] = None
-            item["action"] = "manual: the user ran this step himself; main decides how to close the ask"
+            item["action"] = PARTIAL_ACTION if item.get("partial") else TERMINAL_ACTION
         else:
             item["close"] = " ".join(shlex.quote(a) for a in argv)
             item["apply"] = apply_command(args.session, args.related, item["pin"])
@@ -483,7 +527,7 @@ def main(argv=None) -> int:
             else:
                 argv = (answered_argv(args.session, main_wal, item) if ask in {a["ask"] for a in result["answered"]}
                         else close_argv(item))
-                closed.append(run_close(ask, argv))
+                closed.append(run_close(ask, argv, manual=item.get("action")))
                 if argv is not None:
                     ran.append((closed[-1], argv[argv.index("--source") + 1]))
         failed = [(entry, source) for entry, source in ran if entry["rc"]]
