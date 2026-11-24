@@ -1572,23 +1572,43 @@ def _append_line(path: Path, record: dict) -> None:
         os.close(fd)
 
 
+_LEDGER_MEMO: dict = {}   # (path, include_intents) -> (stat fingerprint, rows, lost lines, skipped); goodqa#17100
+
+
 def _ledger(home: Path, include_intents: bool = False, tally: "ReadTally | None" = None) -> list:
     """Applied rows (rows written before `state` existed count as applied); intents only on request. `tally` (the
     read-only views): an unreadable ledger is an unread source and a torn row a skipped line (PR 234 v8), since the
-    registrations, dispositions and pending stops all come from here."""
+    registrations, dispositions and pending stops all come from here.
+
+    A read-only view (tally given) reuses the parse while the file is unchanged (inode, size, mtime and ctime), so a
+    process that asks for many sessions parses the 20 MB ledger once, not once per session (goodqa#17100: ops-watch
+    spent most of a 30-minute run there). The tally effects are replayed from the memo; the list is a copy. Writers
+    pass no tally and always read the file."""
     path = store_dir(home) / "ledger.jsonl"
-    out = []
+    key = (str(path), bool(include_intents))
+    out, lost, skipped = [], [], 0
     try:
         with open(path, "rb") as handle:
-            mtime = os.fstat(handle.fileno()).st_mtime
+            st = os.fstat(handle.fileno())
+            mtime = st.st_mtime
+            fp = (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+            memo = _LEDGER_MEMO.get(key) if tally is not None else None
+            if memo and memo[0] == fp:
+                for at_tail, lost_mtime in memo[2]:
+                    tally.line_lost(at_tail, lost_mtime)
+                tally.skipped += memo[3]
+                tally.read_ok += 1
+                return list(memo[1])
             for raw in handle:
                 try:
                     row = json.loads(raw)
                 except ValueError:
+                    lost.append((not raw.endswith(b"\n"), mtime))
                     if tally is not None:
-                        tally.line_lost(not raw.endswith(b"\n"), mtime)
+                        tally.line_lost(*lost[-1])
                     continue  # a torn line from a crash is ignored, never fatal
                 if not isinstance(row, dict):
+                    skipped += 1
                     if tally is not None:
                         tally.skipped += 1
                     continue
@@ -1598,6 +1618,10 @@ def _ledger(home: Path, include_intents: bool = False, tally: "ReadTally | None"
                     out.append(row)
         if tally is not None:
             tally.read_ok += 1
+            after = os.stat(path)
+            if fp == (after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                _LEDGER_MEMO[key] = (fp, out, lost, skipped)   # only a parse of a file that did not move meanwhile
+                return list(out)
     except OSError as error:
         if tally is not None:
             tally.missed("ah ledger", error)
