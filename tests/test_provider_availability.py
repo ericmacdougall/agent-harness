@@ -134,6 +134,14 @@ class StoreTests(Established):
         self.assertLessEqual(record['until'], NOW + guard.AVAILABILITY_MAX_SKIP_SECONDS)
         self.assertIsNone(self.records.active('kimi', 'kimi', now=NOW + guard.AVAILABILITY_MAX_SKIP_SECONDS))
 
+    def test_a_near_future_record_is_still_clamped_to_the_cap_from_now(self):
+        # recorded within the clock-skew allowance, so it is valid, but its until is past now + cap
+        value = self.records.record('codex', 'p', now=NOW + 200)
+        self.assertEqual(value['until'], NOW + 200 + guard.AVAILABILITY_REPROBE_SECONDS)
+        path = self.path('codex', 'p'); path.unlink()
+        path.write_text(json.dumps({**value, 'until': NOW + 200 + guard.AVAILABILITY_MAX_SKIP_SECONDS})); path.chmod(0o600)
+        self.assertEqual(self.records.active('codex', 'p', now=NOW)['until'], NOW + guard.AVAILABILITY_MAX_SKIP_SECONDS)
+
     def test_an_uninitialized_root_is_never_created_by_a_record(self):
         empty = Path(self.temp.name) / 'empty'
         empty.mkdir(mode=0o700)
@@ -494,6 +502,19 @@ class BusyPool(LoopFixture):
         self.assertIsNone(error)
         self.assertEqual((sleeps, self.calls), ([5], ['codex']))
 
+    def test_a_limit_recorded_while_waiting_is_not_launched_into(self):
+        store = self.store({'codex': self.held(until_acquire=2)}, self.busy())
+
+        def sleep(seconds):  # the holder records Codex out of quota while this run waits
+            self.records.record('codex', 'codex-harness')
+        options = self.options(store, reviewer='codex-only')
+        with mock.patch.object(pr, '_pool_sleep', side_effect=sleep):
+            result, error, stderr = self.review(options)
+        self.assertIsNone(result)
+        self.assertEqual((error.outcome['reason'], self.calls), ('QUOTA', []))
+        self.assertEqual(store.released, [('codex', {'reason': 'NONE'})])
+        self.assertIn('Provider skipped: codex pool codex-harness', stderr)
+
     def test_the_busy_message_names_the_holder_repo_and_pr(self):
         selections = pr.ladder.state_root() / 'selections'
         selections.mkdir(mode=0o700, exist_ok=True)
@@ -528,6 +549,51 @@ class HolderStatusStore(unittest.TestCase):
         with mock.patch.object(guard, 'owner_liveness', return_value={'state': 'DEAD', 'past_deadline': False,
                                                                      'why': 'fixture', 'deadline': 'x'}):
             self.assertFalse(self.fixture.store.holder_status(run.run_id)['busy'])
+        # Facts without a parseable deadline can never be waited on: the reconcile advice stays.
+        with mock.patch.object(guard, 'owner_liveness', return_value={'state': 'UNCERTAIN', 'past_deadline': False,
+                                                                     'why': 'owner facts missing or malformed'}):
+            self.assertFalse(self.fixture.store.holder_status(run.run_id)['busy'])
+
+    def test_a_finished_holder_is_not_busy(self):
+        run = self.fixture.begin()
+        self.fixture.finish(run)
+        self.assertFalse(self.fixture.store.holder_status(run.run_id)['busy'])
+
+    def test_a_run_that_launched_nothing_spends_no_aggregate_time(self):
+        run = self.fixture.begin(aggregate_timeout=20)
+        with mock.patch.object(guard.time, 'monotonic', return_value=run.began + 15):
+            run.finish(execution='NOT_STARTED', result='NO_RESULT', reason='POOL_BUSY',
+                       usage={'provider_launches': 0, 'reported': []})
+        again = self.fixture.begin(aggregate_timeout=20)
+        self.assertEqual(again.timeout, 10, 'a 15 s pool wait that launched nothing must not shrink the next run')
+
+
+class AhcDaemonClasses(unittest.TestCase):
+    """red-team F1: the ahc daemon must keep retrying on the new codes (quota defers to the reset; busy relaunches)."""
+    INTENTIONALLY_UNKNOWN = {'ISOLATION_FAILED', 'PROVIDER_IO_UNKNOWN', 'PROVIDER_OUTPUT_TOO_LARGE',
+                             'REVIEW_LAUNCH_UNCONFIRMED', 'REVIEW_REPEAT_REQUIRED', 'WORKTREE_SCAN_LIMIT',
+                             'WORKTREE_SPECIAL_ENTRY'}
+
+    def setUp(self):
+        self.runner = __import__('ahc_runner')
+
+    def test_new_codes_have_retry_classes(self):
+        line = ('REVIEW_DIAGNOSTIC code=PROVIDER_SKIPPED reason=QUOTA: every reviewer provider is skipped until the '
+                'earliest resets at 2030-03-17T18:46:40Z, so nothing was launched')
+        self.assertEqual(self.runner.classify_review_failure(line, 2), ('quota', 'PROVIDER_SKIPPED'))
+        # ahc's own parser uses mktime minus time.timezone, an hour off in daylight time on a non-UTC host (a separate
+        # ahc bug, ticketed); only that the reset time is readable is asserted here.
+        self.assertLessEqual(abs(self.runner._reset_time(line) - (NOW + 3600)), 3600)
+        self.assertEqual(self.runner.classify_review_failure('REVIEW_DIAGNOSTIC code=POOL_BUSY reason=POOL_BUSY', 2),
+                         ('contention', 'POOL_BUSY'))
+        record = {'until': NOW + 3600, 'recorded_at': NOW, 'basis': 'provider_reset', 'hint': 'in 1 hour'}
+        self.assertLessEqual(abs(self.runner._reset_time(pr.skip_text('codex', 'p', record)) - (NOW + 3600)), 3600)
+
+    def test_every_diagnostic_code_is_classified_on_purpose(self):
+        unknown = {code for code in rd.CONTRACT if self.runner.classify_review_failure(
+            'REVIEW_DIAGNOSTIC code=%s reason=x' % code, 2)[0] == 'unknown-outcome'}
+        self.assertEqual(unknown, self.INTENTIONALLY_UNKNOWN,
+                         'a new diagnostic code needs an ahc retry class, or a deliberate entry here')
 
 
 class CommandLine(unittest.TestCase):

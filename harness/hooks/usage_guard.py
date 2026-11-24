@@ -895,10 +895,12 @@ class UsageStore:
                     elapsed = record.get('elapsed_seconds')
                     if type(elapsed) not in (int, float) or not math.isfinite(elapsed) or elapsed < 0:
                         raise GuardError('UNKNOWN', 'Elapsed execution budget is invalid')
-                    spent += elapsed
                     if zero_launch_attempt(record):
+                        # goodqa#17108: a run that launched nothing (a refusal, a skip, a bounded pool wait) spends
+                        # no aggregate time; ZERO_LAUNCH_CAP and MAX_ATTEMPTS still bound how often it can happen.
                         zero_launch.append((entry, started.get('started_at')))
                     else:
+                        spent += elapsed
                         counted.append(entry)
                         counted_why.append('run %s ended %s' % (entry['run_id'][:8], record.get('reason')))
             if counted and (repeat_reason is None or len(counted) >= 2):

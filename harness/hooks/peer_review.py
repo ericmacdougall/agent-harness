@@ -1374,7 +1374,7 @@ SKIP_BASIS = {'provider_reset': 'the provider gave this reset time',
 
 
 def skip_text(provider, pool, record):
-    text = '%s pool %s is out of quota (usage limit recorded %s); skipped until %s (%s)' % (
+    text = '%s pool %s is out of quota (usage limit recorded %s); skipped until it resets at %s (%s)' % (
         provider, pool, utc_text(record['recorded_at']), utc_text(record['until']),
         SKIP_BASIS.get(record['basis'], record['basis']))
     if record.get('hint'):
@@ -1409,6 +1409,20 @@ def print_attempt_lines(options, *, always):
         return
     for number, line in enumerate(lines, 1):
         print('Provider attempt %d of %d: %s' % (number, len(lines), line), file=sys.stderr)
+
+
+def skip_attempt(options, provider, pool, skipped):
+    """Book one skipped provider (a line, a PROVIDER_SKIPPED diagnostic, a zero-launch attempt row, a receipt entry)
+    and return its outcome: NO_RESULT, so it can never be a verdict."""
+    text = skip_text(provider, pool, skipped)
+    print('Provider skipped: ' + text + '. Nothing was launched for it.', file=sys.stderr)
+    options.setdefault('provider_skips', []).append({'provider': provider, 'pool': pool,
+                                                     'until': utc_text(skipped['until']), 'basis': skipped['basis']})
+    options.setdefault('attempts', []).append(diagnostics.diagnostic('PROVIDER_SKIPPED', provider=provider, detail=text))
+    options.setdefault('attempt_summary', []).append(
+        {'provider': provider, 'launched': 0, 'reason': 'QUOTA', 'refused_before_work': False})
+    options.setdefault('attempt_lines', []).append('%s pool %s: skipped, not launched (%s)' % (provider, pool, text))
+    return {**provider_failure({}), 'reason': 'QUOTA', 'fallback_allowed': True, 'skipped': True}
 
 
 def record_availability(availability, provider, pool, outcome, launched):
@@ -1493,7 +1507,7 @@ def acquire_lease(store, provider, pool, run_id, *, may_wait, wait_limit):
             if announced:
                 print('Pool free after %d s of waiting: %s/%s reserved; launching %s.' % (waited, provider, pool, provider),
                       file=sys.stderr)
-            return
+            return waited
         except PoolUnavailable as error:
             if error.kind != 'active':
                 raise
@@ -1584,16 +1598,7 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
         skipped = availability_skip(availability, provider, pool)
         if skipped is not None:
             # Recorded out of quota: no lease, no launch, no time. Never a result, so never a PASS or a ladder count.
-            text = skip_text(provider, pool, skipped)
-            print('Provider skipped: ' + text + '. Nothing was launched for it.', file=sys.stderr)
-            options['provider_skips'].append({'provider': provider, 'pool': pool, 'until': utc_text(skipped['until']),
-                                              'basis': skipped['basis']})
-            options.setdefault('attempts', []).append(diagnostics.diagnostic('PROVIDER_SKIPPED', provider=provider,
-                                                                             detail=text))
-            options.setdefault('attempt_summary', []).append(
-                {'provider': provider, 'launched': 0, 'reason': 'QUOTA', 'refused_before_work': False})
-            options['attempt_lines'].append('%s pool %s: skipped, not launched (%s)' % (provider, pool, text))
-            outcome = {**provider_failure({}), 'reason': 'QUOTA', 'fallback_allowed': True, 'skipped': True}
+            outcome = skip_attempt(options, provider, pool, skipped)
             if len(order) == 1 or provider != primary:
                 raise ReviewFailure(outcome, source)
             failure = ('Primary reviewer skipped (%s pool %s out of quota until %s; not launched); used authorized '
@@ -1636,11 +1641,17 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                     # a busy primary with an open fallback falls back at once, as before.
                     later_open = any(availability_skip(availability, name, later_pool) is None
                                      for name, _, later_pool in order[index + 1:])
-                    acquire_lease(store, provider, pool, run_record.run_id,
-                                  may_wait=provider != primary or not later_open,
-                                  # the wait never eats the launch's own deadline: the run budget stays two deadlines
-                                  wait_limit=remaining - per_provider)
+                    waited = acquire_lease(store, provider, pool, run_record.run_id,
+                                           may_wait=provider != primary or not later_open,
+                                           # the wait never eats the launch's own deadline: two deadlines in all
+                                           wait_limit=remaining - per_provider)
                     leased = True
+                    late = availability_skip(availability, provider, pool) if waited else None
+                    if late is not None:
+                        # The holder recorded this provider out of quota while we waited: do not launch into it.
+                        store.release_pool(provider, pool, run_record.run_id, reason='NONE')
+                        leased = False
+                        raise ReviewFailure(skip_attempt(options, provider, pool, late), source)
                 if not resolution['path']:
                     outcome = normalize_provider(provider, 127, '', 'HARNESS_PROVIDER_UNAVAILABLE')
                 else:
@@ -2447,8 +2458,9 @@ def main() -> int:
     skips = [(name, provider_pool(name, options)) for name in options['review_routing']['attempt_order']]
     skips = [(name, pool, availability_skip(options['availability'], name, pool)) for name, pool in skips]
     if all(record is not None for _, _, record in skips):
-        print('REVIEW_DIAGNOSTIC code=PROVIDER_SKIPPED reason=QUOTA: every reviewer provider is skipped, so nothing '
-              'was launched and nothing is counted (NOT_COUNTED, exit 2): ' + '; '.join(
+        print('REVIEW_DIAGNOSTIC code=PROVIDER_SKIPPED reason=QUOTA: every reviewer provider is skipped until the '
+              'earliest resets at %s, so nothing was launched and nothing is counted (NOT_COUNTED, exit 2): '
+              % utc_text(min(record['until'] for _, _, record in skips)) + '; '.join(
                   skip_text(name, pool, record) for name, pool, record in skips)
               + '. Rerun after the earliest time, or clear a wrong record with `python3 ~/.claude/hooks/usage_guard.py '
               'availability --clear --provider <provider> --pool <pool>`.', file=sys.stderr)
@@ -2579,6 +2591,8 @@ def main() -> int:
             run_record.finish(execution='COMPLETED', result='NO_RESULT', reason='ADVISORY', exit_code=4,
                               usage={'provider_launches': options.get('launches', 0), 'reported': options.get('usage', []),
                                      'review_routing': routing_evidence(options),
+                                     'provider_attempts': options.get('attempt_summary', []),
+                                     'provider_skips': options.get('provider_skips', []),
                                      'timing': review_timing(options, run_record)})
         except (OSError, subprocess.TimeoutExpired, GuardError) as error:
             print(f'Advisory publication failed: {diagnostics.sanitize(error)}; nothing published.', file=sys.stderr)

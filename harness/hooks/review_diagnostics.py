@@ -82,7 +82,7 @@ CONTRACT = {
                               'more than 6 hours). List or clear records with `python3 ~/.claude/hooks/usage_guard.py '
                               'availability`.']),
     'PROVIDER_SKIPPED': ('QUOTA', 'The provider and pool are recorded as out of quota, so this run did not launch '
-                         'them (no provider work, not counted).',
+                         'that provider (it did no work). Another provider in the same run may have launched.',
                          ['Read the Detail line: it names the provider, the pool and when the skip ends.',
                           'Rerun after that time, or, if the limit has really reset, clear the record with '
                           '`python3 ~/.claude/hooks/usage_guard.py availability --clear --provider <provider> --pool '
