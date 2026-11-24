@@ -38,7 +38,7 @@ clean and its HEAD commit is on a remote or still in your checkout; otherwise `a
 |---|---|
 | `SessionEnd` hook (`session-end`) | When deletion is on, starts a detached `release --session <id> --apply --budget 600` and returns at once (the probes and per-repo `ls-remote` can take minutes). |
 | `release --session ID / --path DIR [--apply] [--budget S]` | For `~/.agent-harness/work/<id>` or one folder inside `~/.agent-harness/{work,checkouts,test-copies}` (nothing else is accepted): removes each checkout that is verified recoverable. Removes the session folder when no file is left. Dry run without `--apply`. Call it at the end of every runner job. |
-| `sweep --apply` (hourly timer) | `copy_hygiene.py reap`; `release` for every session folder idle (newest mtime or ctime) longer than `max_age_hours` (24) unless its Claude process is alive (session id on a command line, or a WAL newer than the TTL); user-owned `/dev/shm` entries idle longer than `shm_ttl_hours` (6) that nothing holds open or maps (`sem.*`, `PostgreSQL.*`, `libpod*` and browser segments are never touched; the process scan is taken inside the `/dev/shm` step and a failed scan keeps everything); reports the count and size of `~/.agent-harness/mirrors` and removes a mirror idle longer than `mirror_ttl_days` (14) only when it has no `worktrees/<k>` admin entry at all (even for a folder that is missing), a fresh `ls-remote` of its origin succeeds and every commit in it (all refs, so a branch that exists only in the mirror) is on what the origin advertises, nothing uses or references it and deletion is on (report-only otherwise); lists running docker/podman containers with no memory limit. Every removal re-reads idle time under the lock and repeats the process and service probes first. A failed probe keeps everything and exits 0. |
+| `sweep --apply` (hourly timer) | `copy_hygiene.py reap`; `release` for every session folder idle (newest mtime or ctime) longer than `max_age_hours` (24) unless its session is not retired (see "Which sessions are retired" below); user-owned `/dev/shm` entries idle longer than `shm_ttl_hours` (6) that nothing holds open or maps (`sem.*`, `PostgreSQL.*`, `libpod*` and browser segments are never touched; the process scan is taken inside the `/dev/shm` step and a failed scan keeps everything); reports the count and size of `~/.agent-harness/mirrors` and removes a mirror idle longer than `mirror_ttl_days` (14) only when it has no `worktrees/<k>` admin entry at all (even for a folder that is missing), a fresh `ls-remote` of its origin succeeds and every commit in it (all refs, so a branch that exists only in the mirror) is on what the origin advertises, nothing uses or references it and deletion is on (report-only otherwise); lists running docker/podman containers with no memory limit. Every removal re-reads idle time under the lock and repeats the process and service probes first. A failed probe keeps everything and exits 0. |
 | `pretool` hook | Denies `docker\|podman run\|create` and `compose up\|run` without a memory cap, and Elasticsearch/OpenSearch without a heap cap (also via `--env-file`). Handles `sudo/env/timeout/nice/command`, `docker container run`, `$(...)`, pipes and `bash -c`; stops reading flags at the image name. Fails open. |
 
 Testcontainers-style tests start containers through the Docker API and never reach the hook; the sweep lists them as
@@ -63,6 +63,62 @@ an error or timeout keeps everything. Every removal (checkout, session folder, m
 re-reads the service units without the 60-second cache right before deleting; a session folder is removed bottom-up with
 `rmdir` only, so a file written meanwhile survives. With deletion off, `release` and `sweep` report `would_remove` /
 `would_free_bytes` (`mode: report-only`) and never `removed` / `freed`.
+
+## Which sessions are retired (`session_verdict`)
+
+A session folder `~/.agent-harness/work/<id>` is released by `sweep` (and by `release --session` run by hand) only when
+`session_verdict` returns no reason. Each reason keeps the folder and is shown in `session_reasons` and in `report`:
+
+| reason | meaning |
+|---|---|
+| `no_process_list` | the process list could not be read: every session is kept |
+| `session_live` | the id is on a running command line |
+| `no_local_record` | no Claude WAL (`~/.claude/wals/<id>`), Codex WAL (`~/.agent-harness/codex-wals/<id>`), Claude transcript or Codex rollout of the id exists on this host. A Mac session whose agents work on t2-dev, or a folder an agent named itself, is never retired by silence |
+| `recent_activity` / `clock_skew` | the newest of the WAL file times, their last row stamps (`at`, `timestamp`) and the transcripts is younger than the TTL, or in the future |
+| `open_work` | an ask that no `ask_resolved` row closes, an open `ah task` of the session, or a bg job whose nonce is on a running command line |
+| `ambiguous_session` | the id has both a Claude and a Codex WAL |
+| `bad_dir` / `activity_unreadable` / `asks_unreadable` / `tasks_unreadable` | a record exists but cannot be read: kept |
+
+This follows the takeover rules (identity, quiet window, no live process, no open asks or tasks) except one: a declared
+stop or claim is not required, because almost no session writes one and a release only removes checkouts that
+`recoverable` proves are on the remote. `release --session <id>` refuses a session that is not retired unless the
+`SessionEnd` hook of that same session started it (`HARNESS_JANITOR_SESSION_END=<id>`); this prevents accidents and is not a
+security boundary.
+
+## Rebuildable folders of retired sessions
+
+For a retired session, `sweep` also removes, outside any checkout, `node_modules` whose parent holds a regular
+`package.json` and `.venv`/`venv` holding a regular `pyvenv.cfg`. Never a symlink, never a folder holding a repository,
+never anything a process uses or a service names. Other names (`build/`, `dist/`, `out/`, caches) are kept, because outside
+a checkout nothing proves they can be rebuilt (a `build/` holding 5.1 GB of device images is kept). Logs, WALs and the
+session folder itself stay. Same deletion switch; report-only lists them under `would_remove`.
+
+## Report
+
+`python3 harness/hooks/workspace_janitor.py report` is read-only: one row per session folder with its state
+(`retired`/`kept`), reasons, bytes, rebuildable bytes, checkout count, whether it is over `session_budget_gb` (raw key in
+`copy-hygiene.json`, default 15) and the command that would release it; plus `total_gb` and `retired_gb`.
+
+## Proposal: one "published" rule (`hygiene_safety.head_published`, not wired yet)
+
+Today `recoverable` accepts a HEAD that is an ancestor of anything the remote advertises (pull-request refs included),
+while the `remove-worktree` verifier behind `ah worktree-remove` accepts only the exact tip of a live branch or tag, or an
+ancestor of the live default branch. The verifier therefore refuses a worktree whose HEAD is behind its own live branch
+and every detached review head, and those are never removed. `head_published(head, live, allowed_hosts, is_ancestor)` is
+the proposed common rule: HEAD equals, or is an ancestor (local objects only, no fetch) of, a live `refs/heads/*` or
+`refs/tags/*` id on an allowlisted host, as a fresh `ls-remote` reports it.
+
+Security review, to be done before either caller adopts it:
+
+| | |
+|---|---|
+| Newly allowed | a worktree whose HEAD is an ancestor of a live non-default branch or tag (refused today) |
+| Worst case | that branch is deleted or force-pushed after the removal and the host garbage-collects the commit. The exact-tip rule has the same exposure (a branch deleted after a squash merge), so this is no new class; the verifier's stale-tracking-ref and private-ref checks stay |
+| Narrower than `recoverable` | `refs/pull/*`, `refs/changes/*`, notes and other namespaces never count: anyone who can open a pull request can create `refs/pull/*`, and hosts may drop them. Adopting it in `recoverable` would keep review copies whose PR branch is gone |
+| Fails closed | a non-hex HEAD, a host off the allowlist, a failed or timed-out ancestry check, or more than `MAX_ANCESTRY_CHECKS` (200) refs is "not proven" |
+| Must-fail tests | `tests/test_hygiene_safety.py` `HeadPublished`: pull-request refs, off-allowlist hosts, failed ancestry, bad input and the call cap each refuse |
+
+The installed `ah worktree-remove` keeps the exact-tip rule until this review passes and the owner rules.
 
 ## Install the timer (Linux, opt-in)
 

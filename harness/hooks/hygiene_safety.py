@@ -673,6 +673,59 @@ def recoverable(repo: str, deadline: "float | None" = None) -> "tuple[bool, str]
     return ok, why
 
 
+# PROPOSAL (goodqa#16947, not wired into any caller yet): the ONE "is this HEAD published?" rule that the janitor's
+# `recoverable` and command_guard's `remove-worktree` verifier would share. Today they differ: `recoverable` accepts HEAD
+# when it is an ancestor of anything the remote advertises (refs/pull/* included); the guard accepts it only when it is
+# the exact tip of a live branch or tag, or an ancestor of the live default branch. The guard therefore refuses a
+# worktree whose HEAD is behind its own live branch (timbar-legacy-preflight, 24 commits behind) and every detached
+# review head. This function is the proposed common rule; adopting it in the guard needs its own security review and a
+# ruling (docs/workspace-janitor.md, "Proposal: one published rule").
+PUBLISHED_REF_PREFIXES = ("refs/heads/", "refs/tags/")
+MAX_ANCESTRY_CHECKS = 200
+
+
+def head_published(head: str, live: dict, allowed_hosts, is_ancestor) -> "tuple[bool, str]":
+    """(True, "") when HEAD is on a live branch or tag of an allowlisted host, else (False, why). Pure: no git here.
+
+    head          the exact 40- or 64-hex commit id HEAD resolves to.
+    live          {remote host: {ref name: id}} as a FRESH ls-remote reports it (the caller reads it; stale tracking refs
+                  never count). Hosts not in `allowed_hosts` are ignored.
+    is_ancestor   callable(a, b) -> True / False / None; True only when commit a is an ancestor of commit b using LOCAL
+                  objects (no fetch); None for an error, a timeout or a missing object, which never counts as proof.
+    Only refs/heads/* and refs/tags/* count (a peeled `^{}` entry stands for its tag); refs/pull/*, refs/changes/*,
+    notes and every other namespace are NOT publication: anyone who can open a pull request can create refs/pull/*,
+    and the host may drop them. At most MAX_ANCESTRY_CHECKS ancestry calls; past that the answer is "not proven".
+    """
+    if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
+        return False, "HEAD is not an exact commit id"
+    allowed = set(allowed_hosts or ())
+    tips = set()
+    for host, refs in sorted((live or {}).items()):
+        if host not in allowed or not isinstance(refs, dict):
+            continue
+        for name, sha in refs.items():
+            if not isinstance(name, str) or not isinstance(sha, str) or not name.startswith(PUBLISHED_REF_PREFIXES):
+                continue
+            if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha):
+                tips.add(sha)  # an annotated tag's own id never equals HEAD; its peeled `^{}` row carries the commit
+    if not tips:
+        return False, "no live branch or tag on an allowlisted host"
+    if head in tips:
+        return True, ""
+    errors = 0
+    for n, tip in enumerate(sorted(tips)):
+        if n >= MAX_ANCESTRY_CHECKS:
+            return False, "too many live refs to check (not proven)"
+        verdict = is_ancestor(head, tip)
+        if verdict is True:
+            return True, ""
+        if verdict is not False:
+            errors += 1
+    if errors:
+        return False, "an ancestry check failed (not proven)"
+    return False, "HEAD is on no live branch or tag of an allowlisted host"
+
+
 def find_repos(root: str) -> list:
     """Every checkout (a folder with .git) under root, innermost first; does not descend into .git or regenerable folders."""
     out = []

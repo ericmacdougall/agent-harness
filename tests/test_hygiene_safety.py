@@ -524,5 +524,54 @@ class CommandSplitter(unittest.TestCase):
         self.assertIn(["docker", "run", "x"], S.simple_commands("echo $(docker run x)"))
 
 
+class HeadPublished(unittest.TestCase):
+    """The proposed shared "published" rule (goodqa#16947); pure, so the fakes are the whole contract."""
+    H, T1, T2 = "a" * 40, "b" * 40, "c" * 40
+    GH = ("github.com",)
+
+    def pub(self, live, anc=lambda a, b: False, hosts=GH):
+        return S.head_published(self.H, live, hosts, anc)
+
+    def test_exact_tip_of_a_live_branch_or_peeled_tag(self):
+        self.assertEqual(self.pub({"github.com": {"refs/heads/x": self.H}}), (True, ""))
+        self.assertEqual(self.pub({"github.com": {"refs/tags/v1^{}": self.H}}), (True, ""))
+
+    def test_head_behind_its_live_branch_is_published(self):
+        # timbar-legacy-preflight: HEAD 24 commits behind its own live branch, refused by the exact-tip rule
+        self.assertTrue(self.pub({"github.com": {"refs/heads/x": self.T1}}, anc=lambda a, b: b == self.T1)[0])
+
+    def test_pull_request_and_other_namespaces_never_publish(self):
+        for ref in ("refs/pull/7/head", "refs/pull/7/merge", "refs/changes/1/1", "refs/notes/x", "refs/remotes/o/x",
+                    "HEAD", "refs/headsx/y"):
+            ok, why = self.pub({"github.com": {ref: self.H}}, anc=lambda a, b: True)
+            self.assertFalse(ok, ref)
+            self.assertIn("no live branch or tag", why)
+
+    def test_a_host_off_the_allowlist_never_publishes(self):
+        self.assertFalse(self.pub({"evil.example": {"refs/heads/x": self.H}}, anc=lambda a, b: True)[0])
+        self.assertFalse(self.pub({"github.com": {"refs/heads/x": self.H}}, hosts=())[0])
+
+    def test_failed_ancestry_is_not_proof(self):
+        ok, why = self.pub({"github.com": {"refs/heads/x": self.T1}}, anc=lambda a, b: None)
+        self.assertEqual((ok, why), (False, "an ancestry check failed (not proven)"))
+        self.assertTrue(self.pub({"github.com": {"refs/heads/x": self.T1, "refs/heads/y": self.T2}},
+                                 anc=lambda a, b: None if b == self.T1 else True)[0])
+
+    def test_bad_input_is_refused(self):
+        for head in ("", "HEAD", "a" * 39, "A" * 40, None):
+            self.assertFalse(S.head_published(head, {"github.com": {"refs/heads/x": "a" * 40}}, self.GH,
+                                              lambda a, b: True)[0])
+        self.assertFalse(self.pub({"github.com": {"refs/heads/x": "not-a-sha"}}, anc=lambda a, b: True)[0])
+        self.assertFalse(self.pub({"github.com": ["refs/heads/x"]}, anc=lambda a, b: True)[0])
+        self.assertFalse(self.pub({}, anc=lambda a, b: True)[0])
+
+    def test_ancestry_calls_are_capped(self):
+        calls = []
+        live = {"github.com": {"refs/heads/b%d" % i: "%040x" % (i + 1) for i in range(S.MAX_ANCESTRY_CHECKS + 50)}}
+        ok, why = self.pub(live, anc=lambda a, b: calls.append(b) or False)
+        self.assertEqual((ok, why), (False, "too many live refs to check (not proven)"))
+        self.assertEqual(len(calls), S.MAX_ANCESTRY_CHECKS)
+
+
 if __name__ == "__main__":
     unittest.main()
