@@ -46,7 +46,7 @@ DEFAULT_USAGE_ROOT = installed_home() / '.agent-harness' / 'usage'
 PENDING_BATCH = 256
 LOCK_SECONDS = 2.0
 # The fixed classifier table (user requirement, deterministic): what each receipt means for the ladder.
-NOT_COUNTED_REASONS = {'TRANSIENT_INFRA', 'LOW_DISK', 'QUOTA', 'AUTH', 'TIMEOUT', 'UNKNOWN', 'BUDGET_EXHAUSTED'}
+NOT_COUNTED_REASONS = {'TRANSIENT_INFRA', 'LOW_DISK', 'QUOTA', 'AUTH', 'TIMEOUT', 'UNKNOWN', 'BUDGET_EXHAUSTED', 'POOL_BUSY'}
 RESET_CODES = {'missing_task_key', 'state_unreadable', 'state_corrupt', 'lock_timeout', 'unclassifiable_evidence',
                'tier_table_error', 'schema_mismatch'}
 

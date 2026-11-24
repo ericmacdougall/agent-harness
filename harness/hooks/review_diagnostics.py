@@ -77,7 +77,21 @@ CONTRACT = {
     'PROVIDER_USAGE_LIMIT': ('QUOTA', 'The provider reported a usage limit in free text (no structured code).',
                              ['Wait for the limit to reset or use the other authorized provider; the helper '
                               'already tries one independent fallback and will not retry this provider.',
-                              'No account-pool cooldown is written because the text is unstructured.']),
+                              'The helper records the limit for this provider and pool and skips them on later runs '
+                              'until the reset time, or for 30 minutes when the text gives no reliable time (never '
+                              'more than 6 hours). List or clear records with `python3 ~/.claude/hooks/usage_guard.py '
+                              'availability`.']),
+    'PROVIDER_SKIPPED': ('QUOTA', 'The provider and pool are recorded as out of quota, so this run did not launch '
+                         'them (no provider work, not counted).',
+                         ['Read the Detail line: it names the provider, the pool and when the skip ends.',
+                          'Rerun after that time, or, if the limit has really reset, clear the record with '
+                          '`python3 ~/.claude/hooks/usage_guard.py availability --clear --provider <provider> --pool '
+                          '<pool>` and rerun once.']),
+    'POOL_BUSY': ('POOL_BUSY', 'The provider pool is held by another live review run, so this run did not launch '
+                  'that provider. It waits for the pool, within its budget, only when no other provider can be tried; '
+                  'a pool that stays busy ends the run with nothing launched (not counted).',
+                  ['Read the Detail line: it names the holder run, its repository and PR when known, and its deadline.',
+                   'Do not reconcile a live run you do not own. Rerun after the holder finishes or its deadline passes.']),
     'PROVIDER_AUTH': ('AUTH', 'The provider rejected authentication.',
                       ['Sign in again with the provider CLI, then rerun once.']),
     'PROVIDER_UNAVAILABLE': ('TRANSIENT_INFRA', 'The provider was overloaded, rate limited or its model was unavailable.',
@@ -550,7 +564,7 @@ def classify_isolation_error(error):
 
 PROVIDER_REASON_CODES = {'TRANSIENT_INFRA': 'PROVIDER_UNAVAILABLE', 'BUDGET_EXHAUSTED': 'BUDGET_EXHAUSTED', 'QUOTA': 'PROVIDER_USAGE_LIMIT', 'AUTH': 'PROVIDER_AUTH', 'TIMEOUT': 'PROVIDER_TIMEOUT',
                          'UNKNOWN': 'PROVIDER_IO_UNKNOWN', 'INVALID_OUTPUT': 'PROVIDER_INVALID_OUTPUT',
-                         'OUTPUT_TOO_LARGE': 'PROVIDER_OUTPUT_TOO_LARGE'}
+                         'OUTPUT_TOO_LARGE': 'PROVIDER_OUTPUT_TOO_LARGE', 'POOL_BUSY': 'POOL_BUSY'}
 RESET_MARK = '; the provider says its usage limit resets '
 
 
@@ -566,6 +580,8 @@ def provider_attempt(provider, resolution, code, stdout, stderr, outcome, *, lau
     if code is None:
         # Only the caller's trusted pre-launch stage can prove no launch. In particular,
         # Popen may succeed before an on_spawn/child-record failure leaves code unset.
+        if (reason == 'POOL_BUSY' or outcome.get('busy') is True) and launch_state == 'NOT_STARTED':
+            return diagnostic('POOL_BUSY', provider=provider, detail=sanitize(local_detail, 500))
         code_name = 'REVIEW_NOT_STARTED' if launch_state == 'NOT_STARTED' else 'REVIEW_LAUNCH_UNCONFIRMED'
         typed_reason = reason if reason in PROVIDER_REASON_CODES else 'UNKNOWN'
         detail = ('Local outcome: ' + typed_reason + '. ' + sanitize(local_detail, 400)).strip()

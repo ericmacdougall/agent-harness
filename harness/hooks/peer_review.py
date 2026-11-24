@@ -33,7 +33,8 @@ from git_safety import git_environment as safe_git_environment, require_safe_sou
 from report_file import ReportTarget
 import escalation as ladder
 import model_tiers as tiers
-from usage_guard import GuardError, PoolUnavailable, UsageStore, capture_subject, invocation_identity
+from usage_guard import (GuardError, PoolUnavailable, ProviderAvailability, UsageStore, capture_subject,
+                         invocation_identity)
 
 
 PACKET_LIMIT = 150_000
@@ -1327,6 +1328,196 @@ def record_provider_step(options, provider, started_at, deadline):
         {'provider': provider, 'seconds': round(time.monotonic() - started_at, 1), 'deadline': round(deadline, 1)})
 
 
+# ---------------------------------------------------------------- provider availability and busy pools (goodqa#17108)
+
+PROVIDER_LABELS = {'codex': 'Codex', 'claude': 'Claude', 'kimi': 'Kimi'}
+# A pool held by another live review is waited for, with backoff, only when no other provider can be tried, and only
+# while a full per-provider deadline still fits in this run's two-deadline budget. ASSUMPTION (owner decision): at most
+# 600 seconds; polls after 5, 10, 20 and 40 seconds, then every 60.
+POOL_WAIT_SECONDS = 600
+POOL_POLL_SECONDS = (5, 10, 20, 40, 60)
+_pool_sleep = time.sleep
+
+
+class PoolBusy(GuardError):
+    """The pool stayed held by a live run for the whole bounded wait; nothing was launched."""
+    def __init__(self, message):
+        super().__init__('POOL_BUSY', message)
+
+
+def provider_pool(provider, options):
+    """The opaque pool alias each provider runs under: --pool for Codex, --fallback-pool for Claude, Kimi's own."""
+    return {'codex': options.get('pool', 'default'), 'claude': options.get('fallback_pool', 'default'),
+            'kimi': 'kimi'}[provider]
+
+
+def utc_text(epoch):
+    try:
+        return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(epoch))
+    except (OverflowError, OSError, ValueError, TypeError):
+        return 'unknown'
+
+
+def availability_skip(availability, provider, pool):
+    """The live usage-limit record that makes this run skip (provider, pool), or None. Never raises."""
+    if availability is None:
+        return None
+    try:
+        return availability.active(provider, pool)
+    except Exception:  # noqa: BLE001 - availability is advisory; any failure means "launch as before"
+        return None
+
+
+SKIP_BASIS = {'provider_reset': 'the provider gave this reset time',
+              'capped': 'the provider reset is later, so the 6 hour cap applies',
+              'reprobe_interval': 'the provider gave no reliable reset time, so this is the re-probe time'}
+
+
+def skip_text(provider, pool, record):
+    text = '%s pool %s is out of quota (usage limit recorded %s); skipped until %s (%s)' % (
+        provider, pool, utc_text(record['recorded_at']), utc_text(record['until']),
+        SKIP_BASIS.get(record['basis'], record['basis']))
+    if record.get('hint'):
+        text += '; the provider said it resets ' + record['hint']
+    return diagnostics.sanitize(text, 400)
+
+
+def attempt_line(provider, pool, outcome, launched, diag):
+    """One line for one provider attempt (goodqa#17102): provider, pool, reason, whether it was launched, and the
+    provider's reset wording when it gave one."""
+    reason = outcome.get('reason', 'UNKNOWN')
+    if outcome.get('result') not in (None, 'NO_RESULT'):
+        text = 'verdict returned (%s)' % reason
+    else:
+        text = '%s%s, %s' % (reason, ' (%s)' % diag['code'] if diag else '',
+                             'launched' if launched else 'not launched')
+        if outcome.get('provider_refused') is True and outcome.get('usage') is None and launched:
+            text += ', refused before work'
+        if outcome.get('busy'):
+            text += ', pool busy with a live run'
+        elif outcome.get('lease_refused'):
+            text += ', pool lease refused'
+    if diag and diagnostics.RESET_MARK in (diag.get('detail') or ''):
+        text += '; the provider says its usage limit resets ' + diag['detail'].split(diagnostics.RESET_MARK, 1)[1]
+    return diagnostics.sanitize('%s pool %s: %s' % (provider, pool, text), 400)
+
+
+def print_attempt_lines(options, *, always):
+    """Print every provider attempt, not only the last one, before the final diagnostic (goodqa#17102)."""
+    lines = options.get('attempt_lines') or []
+    if not lines or (not always and len(lines) < 2):
+        return
+    for number, line in enumerate(lines, 1):
+        print('Provider attempt %d of %d: %s' % (number, len(lines), line), file=sys.stderr)
+
+
+def record_availability(availability, provider, pool, outcome, launched):
+    """After a launched attempt: a QUOTA refusal records (provider, pool) as unavailable, a verdict clears any record.
+    Returns True when a record was written. Failures only warn: availability never changes a review outcome."""
+    if availability is None or launched <= 0:
+        return False
+    try:
+        if outcome.get('reason') == 'QUOTA':
+            value = availability.record(provider, pool, reset_at=outcome.get('reset_at'),
+                                        reset_hint=outcome.get('reset_hint'))
+            print('Provider availability: %s pool %s recorded out of quota; later runs skip it until %s.'
+                  % (provider, pool, utc_text(value['until'])), file=sys.stderr)
+            return True
+        if outcome.get('result') != 'NO_RESULT':
+            availability.clear(provider, pool)
+    except Exception as error:  # noqa: BLE001
+        print('Provider availability could not be updated (%s); the review result is unchanged.'
+              % type(error).__name__, file=sys.stderr)
+    return False
+
+
+def holder_context(run_id):
+    """What the holder run is reviewing, from its own selection receipt (repo, PR, stage, task), or {}."""
+    try:
+        path = ladder.state_root() / 'selections' / (run_id + '.json')
+        value = json.loads(read_bounded(path, 65536))
+    except Exception:  # noqa: BLE001 - context is display only
+        return {}
+    if not isinstance(value, dict) or value.get('run_id') != run_id:
+        return {}
+    context = {}
+    if isinstance(value.get('github_repo'), str) and re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', value['github_repo']):
+        context['repo'] = value['github_repo']
+    if type(value.get('pr')) is int and value['pr'] > 0:
+        context['pr'] = value['pr']
+    if value.get('stage') in {'plan', 'code-inspection', 'pr'}:
+        context['stage'] = value['stage']
+    if isinstance(value.get('task'), str) and re.fullmatch(r'[A-Za-z0-9_.:#/-]{1,80}', value['task']):
+        context['task'] = value['task']
+    return context
+
+
+def holder_status(store, run_id):
+    """The holder's liveness facts plus its context, or None when they cannot be read (then the old reconcile
+    advice stands). Only a usage store offers holder_status."""
+    probe = getattr(store, 'holder_status', None)
+    if probe is None or not isinstance(run_id, str) or not RUN_ID.fullmatch(run_id):
+        return None
+    try:
+        status = probe(run_id)
+    except Exception:  # noqa: BLE001
+        return None
+    return {**status, **holder_context(run_id)} if isinstance(status, dict) else None
+
+
+def busy_text(provider, pool, status):
+    parts = []
+    if status.get('repo'):
+        parts.append(status['repo'] + (' PR %d' % status['pr'] if status.get('pr') else ''))
+    if status.get('stage'):
+        parts.append('stage ' + status['stage'])
+    if status.get('task'):
+        parts.append('task ' + status['task'])
+    parts.append('started %s' % (status.get('started_at') or 'unknown'))
+    parts.append('deadline %s' % (status.get('deadline') or 'unknown'))
+    if status.get('state') != 'ALIVE':
+        parts.append('liveness %s: %s' % (str(status.get('state')).lower(), status.get('why')))
+    return diagnostics.sanitize('pool busy: %s/%s held by run %s (%s)' % (provider, pool, status['run_id'],
+                                                                         ', '.join(parts)), 500)
+
+
+def acquire_lease(store, provider, pool, run_id, *, may_wait, wait_limit):
+    """Reserve the pool. A pool held by a live run is waited for (backoff, at most `wait_limit` seconds) when
+    `may_wait`; otherwise the refusal carries the holder's status so the caller falls back without reconcile advice.
+    A dead or past-deadline holder is left to acquire_pool's own automatic reconciliation and the reconcile advice."""
+    waited, polls = 0.0, 0
+    announced = False
+    while True:
+        try:
+            store.acquire_pool(provider, pool, run_id)
+            if announced:
+                print('Pool free after %d s of waiting: %s/%s reserved; launching %s.' % (waited, provider, pool, provider),
+                      file=sys.stderr)
+            return
+        except PoolUnavailable as error:
+            if error.kind != 'active':
+                raise
+            status = holder_status(store, error.holder)
+            if status is None or not status.get('busy'):
+                raise
+            error.busy_status = status
+            if not may_wait:
+                raise
+            limit = max(0.0, min(POOL_WAIT_SECONDS, wait_limit))
+            if waited >= limit:
+                raise PoolBusy('%s; waited %d s (the bound is %d s: the %d s cap or what this run budget leaves after one '
+                               'per-provider deadline); nothing was launched' % (busy_text(provider, pool, status),
+                                                                               waited, limit, POOL_WAIT_SECONDS)) from None
+            interval = min(POOL_POLL_SECONDS[min(polls, len(POOL_POLL_SECONDS) - 1)], limit - waited)
+            if not announced:
+                print('%s; waiting up to %d s for the slot (polls after 5, 10, 20 and 40 s, then every 60 s); no '
+                      'reconcile is needed for a live run.' % (busy_text(provider, pool, status), limit), file=sys.stderr)
+                announced = True
+            _pool_sleep(interval)
+            waited += interval
+            polls += 1
+
+
 def verdict_instruction(stage):
     """The reviewer's verdict instruction. Reviewers that wrote a preface before the verdict lost real receipts
     (goodqa#15723), and a PASS after a preface is never accepted (a quoted PASS looks the same), so the prompt asks
@@ -1385,7 +1576,29 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                'kimi': ('kimi', 'Kimi kimi-code/k3.1-pro-highspeed (subscription CLI)', 'kimi')}
     order = tuple(entries[name] for name in options['review_routing']['attempt_order'])
     primary = order[0][0]
-    for provider, source, pool in order:
+    # goodqa#17108: options['availability'] (main() sets it) holds usage-limit records; direct callers have none.
+    availability = options.get('availability')
+    options.setdefault('attempt_lines', [])
+    options.setdefault('provider_skips', [])
+    for index, (provider, source, pool) in enumerate(order):
+        skipped = availability_skip(availability, provider, pool)
+        if skipped is not None:
+            # Recorded out of quota: no lease, no launch, no time. Never a result, so never a PASS or a ladder count.
+            text = skip_text(provider, pool, skipped)
+            print('Provider skipped: ' + text + '. Nothing was launched for it.', file=sys.stderr)
+            options['provider_skips'].append({'provider': provider, 'pool': pool, 'until': utc_text(skipped['until']),
+                                              'basis': skipped['basis']})
+            options.setdefault('attempts', []).append(diagnostics.diagnostic('PROVIDER_SKIPPED', provider=provider,
+                                                                             detail=text))
+            options.setdefault('attempt_summary', []).append(
+                {'provider': provider, 'launched': 0, 'reason': 'QUOTA', 'refused_before_work': False})
+            options['attempt_lines'].append('%s pool %s: skipped, not launched (%s)' % (provider, pool, text))
+            outcome = {**provider_failure({}), 'reason': 'QUOTA', 'fallback_allowed': True, 'skipped': True}
+            if len(order) == 1 or provider != primary:
+                raise ReviewFailure(outcome, source)
+            failure = ('Primary reviewer skipped (%s pool %s out of quota until %s; not launched); used authorized '
+                       'independent fallback.' % (provider, pool, utc_text(skipped['until'])))
+            continue
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise ReviewFailure({**provider_failure({}), 'reason': 'BUDGET_EXHAUSTED'}, source)
@@ -1407,6 +1620,9 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                     record_provider_step(options, provider, launched_at, timeout)
                 options['launches'] += launched  # a refused call never started the CLI, so it is not a launch
                 if code == 0 and KIMI_VERDICT.match(stdout.strip()):
+                    record_availability(availability, provider, pool, {'result': 'ADVISORY'}, launched)
+                    options['attempt_lines'].append(diagnostics.sanitize(
+                        '%s pool %s: advisory opinion returned' % (provider, pool), 400))
                     raise AdvisoryOnly(stdout.strip(), source, failure)
                 outcome = (provider_failure({}) if code == 0 else normalize_provider('kimi', code, stdout, stderr, '', stage))
             else:
@@ -1416,7 +1632,14 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                 resolution = (options.get('resolutions') or {}).get(provider) or diagnostics.discover_executable(
                     provider, policy=review_policy(), roots=roots)
                 if store is not None:
-                    store.acquire_pool(provider, pool, run_record.run_id)
+                    # Wait for a live holder only when no later provider can be tried (goodqa#17108 scope addition);
+                    # a busy primary with an open fallback falls back at once, as before.
+                    later_open = any(availability_skip(availability, name, later_pool) is None
+                                     for name, _, later_pool in order[index + 1:])
+                    acquire_lease(store, provider, pool, run_record.run_id,
+                                  may_wait=provider != primary or not later_open,
+                                  # the wait never eats the launch's own deadline: the run budget stays two deadlines
+                                  wait_limit=remaining - per_provider)
                     leased = True
                 if not resolution['path']:
                     outcome = normalize_provider(provider, 127, '', 'HARNESS_PROVIDER_UNAVAILABLE')
@@ -1457,7 +1680,12 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                 # cannot lose or duplicate work. The reserved pool itself is left exactly as it is.
                 holder = error.holder if isinstance(error.holder, str) and RUN_ID.fullmatch(error.holder) else None
                 outcome.update(lease_refused=True, holder=holder, fallback_allowed=provider == primary)
-                if holder:
+                busy = getattr(error, 'busy_status', None)
+                if busy:
+                    # A live holder: say who holds the pool and give no reconcile advice (goodqa#17108).
+                    outcome['busy'] = True
+                    local_detail = busy_text(provider, pool, busy)
+                elif holder:
                     base = 'python3 ~/.claude/hooks/usage_guard.py reconcile --run ' + holder
                     local_detail = diagnostics.sanitize(
                         '%s pool reserved by run %s. Reconcile: `%s --auto`; if it says completed: `%s --actor <who> '
@@ -1476,10 +1704,17 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
         options.setdefault('attempt_summary', []).append({
             'provider': provider, 'launched': options['launches'] - launches_before, 'reason': outcome['reason'],
             'refused_before_work': outcome.get('provider_refused') is True and outcome.get('usage') is None})
+        launched = options['launches'] - launches_before
+        # goodqa#17108: only a launched attempt is provider evidence; a lease refusal or a missing CLI records nothing.
+        recorded = record_availability(availability, provider, pool, outcome, launched)
+        options['attempt_lines'].append(attempt_line(provider, pool, outcome, launched, options['attempts'][-1]))
         if leased and outcome['reason'] not in {'TIMEOUT', 'UNKNOWN'}:
-            # Unknown/timeout ownership remains reserved until explicit reconciliation.
+            # Unknown/timeout ownership remains reserved until explicit reconciliation. A QUOTA that is now an
+            # availability record is not also a pool cooldown: that one waited for a manual ack with no reset time,
+            # and one owner of the skip keeps it bounded (goodqa#17108).
             store.release_pool(provider, pool, run_record.run_id, reason=outcome['reason'],
-                               account_cooldown=outcome['account_cooldown'], reset_at=outcome['reset_at'])
+                               account_cooldown=outcome['account_cooldown'] and not (recorded and outcome['reason'] == 'QUOTA'),
+                               reset_at=outcome['reset_at'])
         if outcome['result'] != 'NO_RESULT':
             options['outcome'] = outcome
             options['actual_reviewer'] = provider
@@ -1487,7 +1722,10 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
             return source, stage_report(stage, outcome['report']), failure
         if len(order) == 1 or provider != primary or not outcome['fallback_allowed']:
             raise ReviewFailure(outcome, source)
-        if outcome.get('lease_refused'):
+        if outcome.get('busy'):
+            failure = ('Primary reviewer pool is busy with live run %s (no provider was launched); used authorized '
+                       'independent fallback.' % outcome.get('holder'))
+        elif outcome.get('lease_refused'):
             failure = ('Primary reviewer pool is reserved%s (no provider was launched); used authorized independent '
                        'fallback.' % (' by run ' + outcome['holder'] if outcome.get('holder') else ''))
         else:
@@ -1832,7 +2070,10 @@ def write_selection_receipt(run_id, args, head, packet_sha256, author_rung, sele
                            'packet_sha256': packet_sha256, 'author_rung': author_rung, 'author_harness': args.author_harness,
                            'review_routing': review_routing(selection, getattr(args, 'reviewer', 'auto'),
                                                             getattr(args, 'secondary', 'default')),
-                           'selection': selection, 'at': ladder.now()}, sort_keys=True)
+                           'selection': selection, 'at': ladder.now(),
+                           # goodqa#17108: a gate waiting on this run's pool can say what it is reviewing.
+                           'github_repo': getattr(args, 'github_repo', None), 'pr': getattr(args, 'pr', None)},
+                          sort_keys=True)
         path.write_text(body); os.chmod(path, 0o600)
     except OSError as error:
         print(f'Selection receipt could not be written: {type(error).__name__}', file=sys.stderr)
@@ -2200,6 +2441,20 @@ def main() -> int:
                'selection': selection, 'author_rung': author_rung, 'permission': permission,
                'codex_model': policy['rungs'][selection['rung']]['models']['openai'],
                'claude_model': policy['rungs'][selection['rung']]['models']['claude']}
+    # goodqa#17108: a provider recorded out of quota is skipped. When every provider in the attempt order is, the run
+    # stops here, before the snapshot step and the usage-store run: one line, nothing launched, nothing counted.
+    options['availability'] = ProviderAvailability()
+    skips = [(name, provider_pool(name, options)) for name in options['review_routing']['attempt_order']]
+    skips = [(name, pool, availability_skip(options['availability'], name, pool)) for name, pool in skips]
+    if all(record is not None for _, _, record in skips):
+        print('REVIEW_DIAGNOSTIC code=PROVIDER_SKIPPED reason=QUOTA: every reviewer provider is skipped, so nothing '
+              'was launched and nothing is counted (NOT_COUNTED, exit 2): ' + '; '.join(
+                  skip_text(name, pool, record) for name, pool, record in skips)
+              + '. Rerun after the earliest time, or clear a wrong record with `python3 ~/.claude/hooks/usage_guard.py '
+              'availability --clear --provider <provider> --pool <pool>`.', file=sys.stderr)
+        target.close()
+        evidence.close()
+        return 2
     try:
         with tempfile.TemporaryDirectory(prefix='peer-review-') as temp:
             snapshot = Path(temp) / 'repo'
@@ -2253,6 +2508,7 @@ def main() -> int:
             write_selection_receipt(run_record.run_id, args, before[0], evidence.sha256, author_rung, selection)
             source, report, failure = review_snapshot(snapshot, before[0], args.stage,
                                                        stage_rules, evidence.content, options)
+            print_attempt_lines(options, always=False)  # a fallback verdict still shows why the primary did not run
             report = stage_report(args.stage, report)
             ticketed = []
             if 'TICKETED:' in report:
@@ -2277,6 +2533,7 @@ def main() -> int:
         # Cleanup must succeed before any report is published.
     except (OSError, subprocess.TimeoutExpired, GuardError) as error:
         print(f'Review isolation failed: {diagnostics.sanitize(error)}; no signoff published.', file=sys.stderr)
+        print_attempt_lines(options, always=True)
         diagnosis = diagnostics.final_diagnostic(options.get('attempts', []), error)
         if run_record is not None:
             diagnosis = diagnostics.with_timing(diagnosis, review_timing(options, run_record))
@@ -2293,6 +2550,7 @@ def main() -> int:
                                                   'review_routing': routing_evidence(options),
                                                   'provider_attempts': options.get('attempt_summary', []),
                                                   'diagnostic': diagnosis['code'],
+                                                  'provider_skips': options.get('provider_skips', []),
                                                   'timing': review_timing(options, run_record)})
                 record_in_ladder(args, store, failed, before[0], policy)
             except (OSError, GuardError):
@@ -2301,6 +2559,7 @@ def main() -> int:
         evidence.close()
         return 2
     except AdvisoryOnly as advisory:
+        print_attempt_lines(options, always=True)
         # An independent-provider opinion on packet text only: written to the report path with honest headers,
         # recorded in the receipt as ADVISORY, never a pass marker, never exit 0, never a ladder record.
         try:
@@ -2402,6 +2661,7 @@ def main() -> int:
             usage={'provider_launches': options.get('launches', 0), 'reported': options.get('usage', []),
                    'executables': diagnostics.executable_record(options.get('resolutions', {})),
                    'review_routing': routing_evidence(options),
+                   'provider_skips': options.get('provider_skips', []),
                    'timing': review_timing(options, run_record)})
         finalized = True
         final = store.load_ref(reference)
