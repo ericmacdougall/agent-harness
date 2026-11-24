@@ -2826,6 +2826,13 @@ RM_CMDS = {'rm', 'unlink', 'rmdir', 'shred', 'srm', 'trash', 'trash-put', 'remov
 MV_CMDS = {'mv', 'move-item', 'mi', 'move', 'rename-item', 'ren', 'rni'}
 OVERWRITE_CMDS = {'tee', 'set-content', 'out-file', 'sc', 'clear-content', 'clc', 'truncate', 'dd', 'cp', 'copy-item',
                   'cpi', 'copy', 'install', 'ln', 'rsync'}
+# goodqa#17145: a hard link or a move of a live WAL, transcript or session file breaks the WAL integrity rule
+# (wal.py never appends through a link) and the session that owns it. Backups copy; they never link or move.
+LINK_ONLY_CMDS = {'link', 'rename', 'prename', 'rename.ul'}  # not in OVERWRITE_CMDS: dispatched for the link check only
+LINK_REASON = ('Backups copy and never link or move: a hard link or rename of a live log makes a second name for the '
+               'bytes a session is still writing and locks that session out')
+LINK_INSTEAD = ('copy instead: `cp -a SRC DEST`, `rsync -a SRC DEST` (no --link-dest) or `rclone copy`; a copy is '
+                'its own file and never touches the live log')
 KILLERS = {'pkill', 'killall', 'kill', 'taskkill', 'stop-process', 'spps', 'pgrep', 'skill', 'killall5'}
 READ_ONLY_ENV_NAMES = set()
 PS_ALIASES = {'gc': 'cat', 'get-content': 'cat', 'type': 'cat', 'cat': 'cat', 'sls': 'grep', 'select-string': 'grep',
@@ -3706,6 +3713,13 @@ def _build_fallback(c):
                            r'\bopen\b[^\n]{0,200}?\s(?:w|wb|w\+|a\+)(?:\s|$)|\bfs\.(?:rm|rmdir|unlink)\b')
     add((L, 'log-delete-text', ('and', protected, destroyer),
          'removes or rewrites Claude/Codex logs or WALs', 'back them up to Dropbox, run command_guard.py approve-delete, then delete'))
+    # goodqa#17145: interpreter code that makes a hard link next to a protected location (os.link, linkat, hardlink_to,
+    # fs.linkSync, File.link, perl/ruby link()); symlinks stay on their own rule
+    linker = re.compile(r'\bos\s*\.\s*link(?:at)?\b|\.hardlink_to\b|\bfs\s*\.\s*link(?:sync)?\b|\bfile\s*\.\s*link\b|'
+                        r'\bcreatehardlink\b|(?<![\w.])link(?:at)?\s*\(|\bcopy_file_range\b')
+    add((L, 'log-link-text', ('and', protected, linker),
+         'hard-links a Claude/Codex log or WAL, which breaks the WAL integrity rule and locks the session out',
+         'back up by copying (cp -a, rsync -a, rclone copy), never by linking'))
     # the secret word must be part of the variable's own name: `os.environ['API_TOKEN']`, `getenv("DB_PASSWORD")`,
     # `process.env.GH_TOKEN`; quotes and brackets are already spaces here. Not `os.environ['SCRATCH'] ... 'key'`.
     envs = re.compile(r'(?:\benviron(?:\.get)?|\bgetenv|\bprocess\.env\.?|\$env:|\benv\b(?:\.fetch)?)\s*'
@@ -4186,8 +4200,11 @@ class Analyzer:
                 continue
             inner = [norm_name(w.text) for w in words[1:] if not w.text.startswith('-')]
             joined = ' '.join(w.text for w in words[1:])
+            tail = [w for w in words[1:] if not w.text.startswith('-')]
+            linking = bool(tail) and self.makes_hard_link(norm_name(tail[0].text), words[words.index(tail[0]) + 1:],
+                                                          [w.text for w in words[words.index(tail[0]) + 1:]])
             if not (set(inner) & (RM_CMDS | MV_CMDS | {'truncate', 'shred', 'unlink'})
-                    or re.search(r'\b(?:rm|rmdir|unlink|shred|mv|truncate)\b', joined)):
+                    or re.search(r'\b(?:rm|rmdir|unlink|shred|mv|truncate)\b', joined) or linking):
                 continue
             for prev in pl.cmds[:idx]:
                 pw = self._skip_assigns(strip_reserved(prev.words))[1]
@@ -4779,7 +4796,7 @@ class Analyzer:
             self.script(inner, depth + 1, tail_visible=True)
         if name in PRINT_FILE_CMDS or name in GREP_CMDS or name in EXFIL_CMDS or name in ARCHIVE_CMDS or name in ('openssl', 'source'):
             self.read_creds(name, args, pl, idx)
-        if name in RM_CMDS or name in MV_CMDS or name in OVERWRITE_CMDS or name in (
+        if name in RM_CMDS or name in MV_CMDS or name in OVERWRITE_CMDS or name in LINK_ONLY_CMDS or name in (
                 'sed', 'perl', 'ruby', 'awk', 'gawk', 'rsync', 'scp', 'rclone', 'tar', 'zip', 'dd', 'truncate', 'set-content',
                 'out-file', 'curl', 'wget', 'touch', 'mkdir', 'unzip', 'bsdtar', 'gtar'):
             self.destructive(name, args, texts)
@@ -5462,6 +5479,12 @@ class Analyzer:
                     j += 1
                 exec_cmds.append(body)
         destroyers = RM_CMDS | MV_CMDS | {'unlink', 'shred', 'truncate'}
+        links = [b for b in exec_cmds if b and self.makes_hard_link(norm_name(b[0].text), b[1:],
+                                                                     [w.text for w in b[1:]])]
+        if links:
+            for r in roots:
+                self.refuse('find -exec ' + norm_name(links[0][0].text) + ' (makes a hard link)', r,
+                            tiers=('log', 'ancestor', 'unknown'), instead=LINK_INSTEAD, reason=LINK_REASON)
         if '-delete' in texts or any(norm_name(b[0].text) in destroyers for b in exec_cmds if b):
             leading = texts[:k]
             if '-follow' in texts or any(re.fullmatch(r'-[EHLPXdsx]*L[EHLPXdsx]*', t) for t in leading):
@@ -7163,7 +7186,8 @@ class Analyzer:
                     return True
         return False
 
-    def refuse(self, what, word, tiers=('log', 'root', 'ancestor', 'unknown'), need_existing=False, instead=None):
+    def refuse(self, what, word, tiers=('log', 'root', 'ancestor', 'unknown'), need_existing=False, instead=None,
+               reason=None):
         """Add a log_delete finding when `word` resolves into one of `tiers`. Returns True when it did."""
         ctx = self.ctx
         if self._own_temp_file(word):
@@ -7184,8 +7208,8 @@ class Analyzer:
                  'a path the guard cannot resolve that points at protected logs'}[cls]
         name = posixpath.basename(path.rstrip('/')) or path
         ctx.add(LOG_DELETE, 'log-delete',
-                ('%s targets %s (%s). Claude/Codex/harness logs and state are never deleted, moved or truncated '
-                 'without a verified backup' % (what, label, name[:60]))[:300],
+                ('%s targets %s (%s). %s' % (what, label, name[:60], reason or 'Claude/Codex/harness logs and state '
+                                              'are never deleted, moved or truncated without a verified backup'))[:300],
                 instead or 'back up to Dropbox (rclone copy), then `command_guard.py approve-delete --path P --remote '
                 'REMOTE`, then delete the literal path' + ('' if literal else '; spell out the literal path, globs and '
                                                            'variables cannot be approved')
@@ -7458,9 +7482,37 @@ class Analyzer:
                 return True
         return False
 
+    @staticmethod
+    def makes_hard_link(name, args, texts):
+        """The one definition of "this command creates a hard link or renames in place" (goodqa#17145), shared by
+        the plain command, find -exec and xargs."""
+        letters, longs = _flag_letters(args), _longs(args)
+        symbolic = 's' in letters or bool(longs & {'--symbolic', '--symbolic-link'})
+        if name in LINK_ONLY_CMDS:
+            return True
+        if name == 'ln':
+            return not symbolic
+        if name == 'cp':
+            return ('l' in letters or '--link' in longs) and not symbolic
+        if name == 'rsync':
+            return any(t.startswith('--link-dest') for t in texts)
+        return False
+
+    def link_operands(self, name, args, texts):
+        """Refuse every operand (and an rsync --link-dest value) that is, or may be, inside a protected log tree."""
+        words = list(_nondash(args))
+        for k, a in enumerate(args):
+            if a.text.startswith('--link-dest='):
+                words.append(_literal_word(a.text.split('=', 1)[1]))
+        for w in words:
+            self.refuse(name + ' (makes a hard link or renames)', w, tiers=('log', 'ancestor', 'unknown'),
+                        instead=LINK_INSTEAD, reason=LINK_REASON)
+
     def destructive(self, name, args, texts):
         ctx = self.ctx
         nd = _nondash(args)
+        if self.makes_hard_link(name, args, texts):
+            self.link_operands(name, args, texts)
         if name in RM_CMDS:
             if ctx.ps:
                 nd = [a for a in args if not re.match(r'^-[A-Za-z]+$', a.text)]
