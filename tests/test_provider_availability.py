@@ -559,13 +559,22 @@ class HolderStatusStore(unittest.TestCase):
         self.fixture.finish(run)
         self.assertFalse(self.fixture.store.holder_status(run.run_id)['busy'])
 
-    def test_a_run_that_launched_nothing_spends_no_aggregate_time(self):
-        run = self.fixture.begin(aggregate_timeout=20)
-        with mock.patch.object(guard.time, 'monotonic', return_value=run.began + 15):
+    def test_busy_wait_outs_spend_aggregate_time_but_leave_one_full_deadline(self):
+        # A pool wait spends real wall time, so it counts against the aggregate budget (goodqa#14525 pins that for
+        # every zero-launch attempt). The wait is bounded by the run's own budget minus one per-provider deadline,
+        # so repeated wait-outs at medium (720 / 1,440 / 2,880) still leave each later run one full deadline.
+        per_provider, store, fixture = 720, self.fixture.store, self.fixture
+        waits = []
+        for _ in range(5):
+            run = store.begin(fixture.subject, fixture.identity, owner='fixture', label='focused', timeout=1440,
+                              kind='focused', minimum_bytes=0, aggregate_timeout=2880)
+            self.assertGreaterEqual(run.timeout, per_provider - 5, waits)
+            wait = max(0.0, min(pr.POOL_WAIT_SECONDS, run.timeout - per_provider))
+            waits.append(round(wait))
+            run.began -= wait
             run.finish(execution='NOT_STARTED', result='NO_RESULT', reason='POOL_BUSY',
                        usage={'provider_launches': 0, 'reported': []})
-        again = self.fixture.begin(aggregate_timeout=20)
-        self.assertEqual(again.timeout, 10, 'a 15 s pool wait that launched nothing must not shrink the next run')
+        self.assertEqual(waits[:4], [600, 600, 600, 360], 'the waits must spend the aggregate budget')
 
 
 class AhcDaemonClasses(unittest.TestCase):

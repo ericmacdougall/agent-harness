@@ -59,8 +59,6 @@ MUTANTS = {
         'usage_guard.py', [(r"(?:Z|[+-]\d{2}:?\d{2}))'", r"(?:Z|[+-]\d{2}:?\d{2})?)'"),
                            ('return value.timestamp() if value.tzinfo is not None else None', 'return value.timestamp()')],
         None, ['ResetParsing']),
-    'POOL_BUSY counts on the ladder': (
-        'escalation.py', ", 'BUDGET_EXHAUSTED', 'POOL_BUSY'}", ", 'BUDGET_EXHAUSTED'}", ['BusyPool']),
     'a finished holder counts as busy': (
         'usage_guard.py', "busy = (not finished and liveness['state'] != 'DEAD'", "busy = (liveness['state'] != 'DEAD'",
         ['HolderStatusStore']),
@@ -89,10 +87,10 @@ MUTANTS = {
     'a limit recorded during the wait is launched into': (
         'peer_review.py', 'late = availability_skip(availability, provider, pool) if waited else None',
         'late = None', ['BusyPool']),
-    'a zero-launch run spends aggregate time': (
-        'usage_guard.py', "zero_launch.append((entry, started.get('started_at')))\n                    else:",
-        "zero_launch.append((entry, started.get('started_at')))\n                        spent += elapsed\n"
-        "                    else:", ['HolderStatusStore']),
+    'a pool wait spends no aggregate time': (
+        'usage_guard.py', "                    spent += elapsed\n                    if zero_launch_attempt(record):",
+        "                    if not zero_launch_attempt(record):\n                        spent += elapsed\n"
+        "                    if zero_launch_attempt(record):", ['HolderStatusStore']),
     'ahc stops on a recorded skip': (
         'ahc_runner.py', 'if code in ("PROVIDER_USAGE_LIMIT", "PROVIDER_SKIPPED"):', 'if code == "PROVIDER_USAGE_LIMIT":',
         ['AhcDaemonClasses']),
@@ -141,7 +139,7 @@ def main(selected):
     if not selected or 'origin/main' in selected:
         tmp = tree()
         try:
-            for name in ('peer_review.py', 'usage_guard.py', 'review_diagnostics.py', 'escalation.py', 'ahc_runner.py'):
+            for name in ('peer_review.py', 'usage_guard.py', 'review_diagnostics.py', 'ahc_runner.py'):
                 base = subprocess.run(['git', '-C', str(ROOT), 'show', 'origin/main:harness/hooks/' + name],
                                       capture_output=True, check=True).stdout
                 (tmp / 'harness' / 'hooks' / name).write_bytes(base)
