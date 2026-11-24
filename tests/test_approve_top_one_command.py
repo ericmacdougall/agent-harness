@@ -211,8 +211,15 @@ class OneCommand(Fixture):
                                  'message': {'role': 'user', 'content': words}}) + '\n')
 
     def run_ah(self, *argv):
+        """Every refusal of every test here must leave the WAL as it found it: the guard lives in the one runner, so a
+        new refusal test cannot skip it (PR 357 review F1: a refusal path wrote an approved ask pair first)."""
+        before = self.wal.read_text()
         args = self.ah.build_parser().parse_args(list(argv))
-        return self.ah.run(args, self.home)
+        try:
+            return self.ah.run(args, self.home)
+        except BaseException:
+            self.assertEqual(self.wal.read_text(), before, 'a refused approve-top wrote to the WAL')
+            raise
 
     def test_one_command_records_the_task_grant_citing_the_assenting_sentence(self):
         rows = self.run_ah('user-msg', '--session', SESSION, '--recent', '3')['matches']
@@ -293,6 +300,16 @@ class OneCommand(Fixture):
             self.run_ah('approve-top', '--task', 't17164', '--user-msg', ident, '--wal', str(self.wal))
         self.assertEqual(getattr(caught.exception, 'code', ''), 'no_assent')
         self.assertIn('h old; top-rung permission needs words from the last 12 h', str(caught.exception))  # age, not the window
+        self.assertIsNone(self.ledger.status('t17164')['permission'])
+
+    def test_goodqa_17164_a_top_rung_mention_far_after_the_approval_still_refuses(self):
+        ident = self.queued_approval('I approve ' + ASKS, 900)
+        for n in range(30):
+            self.add_turn('00000000-0000-4000-8000-00000000d%03d' % n, 'unrelated later message number %d about the site' % n, age=600 - n)
+        self.add_turn('00000000-0000-4000-8000-00000000dfff', 'actually keep fable off for that one', age=30)
+        with self.assertRaises(self.ah.AhError) as caught:
+            self.run_ah('approve-top', '--task', 't17164', '--user-msg', ident, '--wal', str(self.wal))
+        self.assertIn('mentioned the top rung again later', str(caught.exception))
         self.assertIsNone(self.ledger.status('t17164')['permission'])
 
     def test_non_user_ids_and_unknown_ids_are_refused_with_the_fix(self):

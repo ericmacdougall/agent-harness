@@ -3233,6 +3233,11 @@ def approve_top_cmd(home: Path, args) -> dict:
     if problem:
         raise AhError("no_assent", f"approve-top: the assenting sentence cannot be cited verbatim ({problem}); ask the user to "
                                    "say it in one plain sentence. Nothing was written.", 2)
+    ledger = escalation.Ledger()
+    try:  # the ledger's own judgement (words, excerpt, policy age cap), before ANY write: a refusal writes nothing
+        escalation.Ledger.check_top_source(ledger, source)
+    except escalation.LedgerError as e:
+        raise AhError(e.code, f"approve-top: {e.message} Nothing was written.", 2)
     wal_note = me.parent / "wal_note.py"
     base = [sys.executable, str(wal_note), "--wal", str(wal), "--source", source]
     ask = subprocess.run(base + ["--event", "ask", "--reason", "the model ladder needs the user's recorded permission before the top writing rung is used",
@@ -3243,7 +3248,6 @@ def approve_top_cmd(home: Path, args) -> dict:
                                       "--note", f"[task:{task}] approved for this task only, in the user's own words"],
                               capture_output=True, text=True, timeout=60)
     _wal_note_id(resolved, "ask_resolved")
-    ledger = escalation.Ledger()
     try:
         status = ledger.approve_top(task, ask_id, str(wal))
     except escalation.LedgerError as e:
