@@ -58,7 +58,8 @@
  },
  "harness/hooks/deliver.py": {
   "counts": {
-   "github-fine-grained:prefix": 1
+   "github-fine-grained:prefix": 1,
+   "redact:named-credential:prefix": 2
   },
   "reason": "a redactor, scanner or credential-handling pattern names public token prefixes, credential field names or URL shapes; no value (restrict tier)"
  },
@@ -167,6 +168,23 @@
   },
   "reason": "a redactor, scanner or credential-handling pattern names public token prefixes, credential field names or URL shapes; no value (restrict tier)"
  },
+ "harness/hooks/transcript_redact.py": {
+  "counts": {
+   "anthropic:prefix": 2,
+   "aws-key-id:prefix": 1,
+   "bearer:prefix": 1,
+   "github-classic:prefix": 2,
+   "github-fine-grained:prefix": 3,
+   "github-oauth:prefix": 2,
+   "github-refresh:prefix": 2,
+   "github-server:prefix": 2,
+   "github-user-server:prefix": 2,
+   "gitlab:prefix": 2,
+   "openai:prefix": 2,
+   "redact:named-credential:prefix": 5
+  },
+  "reason": "a redactor, scanner or credential-handling pattern names public token prefixes, credential field names or URL shapes; no value (restrict tier)"
+ },
  "harness/hooks/usage_guard.py": {
   "counts": {
    "anthropic:prefix": 1,
@@ -257,7 +275,7 @@
  "tests/data/ahc_scan_corpus_exempt.json": {
   "counts": {
    "bearer:prefix": 9,
-   "redact:named-credential:prefix": 70
+   "redact:named-credential:prefix": 74
   },
   "reason": "this exemption list names rule kinds (bearer, named-credential) in its own counts and reasons; no value"
  },
@@ -645,6 +663,13 @@
   },
   "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
  },
+ "tests/test_redact_perf.py": {
+  "counts": {
+   "bearer:prefix": 1,
+   "high-entropy": 1
+  },
+  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
+ },
  "tests/test_redact_shapes.py": {
   "counts": {
    "redact:named-credential:prefix": 2
@@ -653,7 +678,9 @@
  },
  "tests/test_redaction.py": {
   "counts": {
+   "bearer:prefix": 1,
    "redact:named-credential:prefix": 8,
+   "redact:oauth-json": 1,
    "redact:url-userinfo:prefix": 4
   },
   "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
@@ -727,6 +754,23 @@
  "tests/test_tier_gate.py": {
   "counts": {
    "redact:named-credential:prefix": 1
+  },
+  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
+ },
+ "tests/test_transcript_redact.py": {
+  "counts": {
+   "bearer:prefix": 7,
+   "github-classic:prefix": 2,
+   "openai:prefix": 5,
+   "redact:named-credential:prefix": 6,
+   "slack:prefix": 1
+  },
+  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
+ },
+ "tests/test_transcripts.py": {
+  "counts": {
+   "github-classic:prefix": 1,
+   "redact:named-credential:prefix": 2
   },
   "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
  },

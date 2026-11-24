@@ -74,6 +74,8 @@ Any installer or kit from another model or vendor is scanned first (`python3 ~/.
 - Scripts, run kits, packets and job state live in the work directory, never in `/tmp` or the scratchpad.
 - Use `ah.py` for harness lookups: `ah owners`, `ah user-msg`, `ah status --since`, `ah ticket get|comments|comment`, `ah disk`, `ah task register|status|done|dispose`, `ah kill --pid N --reason R`. Stop only processes you own; `--foreign`, `--force` and `--all` need my OK. Check `netwatch orphans --json` before a handoff.
 - At start or resume, read the WAL, `git status`, branches and unfinished work before acting. A completion claim links to commits and `REALLY_TESTED` evidence.
+- Transcript archive: run `ah transcripts sync --checkpoint <start|takeover|recovery|pr|deploy>` at project start, on recovery or takeover of a project, at PR submit and at deploy. Hooks do it where installed; run it by hand where they are not (Codex hooks untrusted). A checkpoint is incomplete without a fresh sync receipt (`ah transcripts check`); `deliver.py prepare` refuses without an ok receipt under 24 h unless given an audited `--transcripts-waiver`.
+- Read history with `ah transcripts find`/`cat`/`recover`. Recovery from git is byte-identical to the redacted archive, not the source; exact-source recovery is local or Dropbox. The archive is redacted plaintext with accepted residual risk, so never treat it as secret-free. Never edit or delete source transcripts or WALs.
 
 ## 8. Engineering standards (short form)
 

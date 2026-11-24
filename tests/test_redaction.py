@@ -108,6 +108,12 @@ class HumanWalNoteGuards(unittest.TestCase):
                              list(self.ORDINARY_NOTES))
 
 
+# redact.find() scanned 256 KiB chunks with a 4 KiB overlap until GoodQA #16680's sweep; these tests still
+# straddle that old boundary.
+OLD_CHUNK = 256 * 1024
+OLD_OVERLAP = 4096
+
+
 class SharedSecretRedaction(unittest.TestCase):
     def setUp(self):
         self.redact = load(ROOT / 'harness' / 'hooks' / 'redact.py', 'shared_secret_redaction')
@@ -121,8 +127,8 @@ class SharedSecretRedaction(unittest.TestCase):
     def test_pem_straddling_a_chunk_boundary_is_fully_redacted(self):
         begin = '-----BEG' 'IN RSA PRIVATE KEY-----\n'
         end = '\n-----END RSA PRIVATE KEY-----\n'
-        prefix = 'p' * (self.redact.MAX_CHUNK - 20)
-        body = 'B' * (self.redact.OVERLAP + 128)
+        prefix = 'p' * (OLD_CHUNK - 20)
+        body = 'B' * (OLD_OVERLAP + 128)
         self.assert_redacted(prefix + begin + body + end + 'suffix',
                              prefix + '[REDACTED:pem]\nsuffix')
 
@@ -158,12 +164,32 @@ class SharedSecretRedaction(unittest.TestCase):
             json.loads(self.redact.redact(json.dumps(data)))
 
     def test_secret_shapes_inside_a_pem_body_leave_one_redaction(self):
-        body = 'F' * 40 + '\nghp_' + 'a' * 36 + '\n' + 'G' * (self.redact.MAX_CHUNK + 10)
+        body = 'F' * 40 + '\nghp_' + 'a' * 36 + '\n' + 'G' * (OLD_CHUNK + 10)
         pem = '-----BEG' 'IN EC PRIVATE KEY-----\n' + body + '\n-----END EC PRIVATE KEY-----'
         self.assert_redacted('a ' + pem + ' b', 'a [REDACTED:pem] b')
 
+    def test_long_matches_across_the_old_chunk_boundary_are_whole(self):
+        """Sweep after PR #316's archive gap (same transform-before-scan class): a match longer than the 4 KiB
+        overlap that crossed a 256 KiB boundary lost its tail, and a long JWT whose second dot lay past the overlap
+        was not matched at all. find() now scans the whole text; each value must be redacted whole."""
+        value = 'Zq9X' + 'w2Lm8Rt4' + 'Vb7Np3Kc6'
+        jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJ' + 'u' * 9000 + '.' + value
+        cases = {
+            'long jwt': jwt,
+            'rclone token line': 'token = {"access_token":"' + 'a' * 7900 + value + '"}',
+            'wide whitespace': 'password' + ' ' * 6000 + '= ' + value,
+            'long bearer': 'Bearer ' + 'b' * 6000 + value,
+        }
+        for name, secret in cases.items():
+            for lead in (100, 3000, 4000):
+                with self.subTest(case=name, lead=lead):
+                    text = 'p ' * ((OLD_CHUNK - lead) // 2) + '\n' + secret + '\n tail words'
+                    out = self.redact.redact(text)
+                    self.assertFalse(value in out)
+                    self.assertTrue(out.endswith('\n tail words'))
+
     def test_nonsecret_text_is_byte_for_byte_unchanged(self):
-        ordinary = 'ordinary text, not a credential\n' * (self.redact.MAX_CHUNK // 16)
+        ordinary = 'ordinary text, not a credential\n' * (OLD_CHUNK // 16)
         self.assertTrue(self.redact.redact(ordinary) == ordinary)
 
 

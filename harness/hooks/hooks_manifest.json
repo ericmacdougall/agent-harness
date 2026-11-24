@@ -532,6 +532,18 @@
    ]
   },
   {
+   "id": "transcripts:session-start",
+   "script": "transcripts_hook.py",
+   "arg": "session-start",
+   "event": "SessionStart",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
    "id": "prod_delete_guard:hook",
    "script": "prod_delete_guard.py",
    "arg": null,

@@ -29,7 +29,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "shell_words.py",  # the shell reader merge_gate and copy_hygiene share (goodqa#16811)
          "heavy_job_guard.py", "dropbox_budget.conf", "run_capped.py", "run_probe.py", "resource_budget.py", "agent_gate.py", "ops_watch.py", "resource_limits.json",
          "domain_gates.py", "domain_checklists.json",
-         "command_guard.py", "command_guard_hook.py", "redact.py", "kill_guard.py", "kill_guard_policy.json",
+         "command_guard.py", "command_guard_hook.py", "redact.py", "transcripts.py", "transcript_redact.py", "transcripts_catalog_README.md", "kill_guard.py", "kill_guard_policy.json",
          "doctor.py", "hooks_manifest.json", "rules.json", "ah.py", "ah_kill.py", "ah_worktree.py", "ah_install.py", "guard_selftest.py", "ah_ticket.py", "ah_chat.py", "ah_chat_send.py", "liveness.py",
          "ah_export.py",  # ah export: redacted local HTML of a session (goodqa#15788)
          "remote_delete.py", "remote_delete_agent.py",
@@ -40,6 +40,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "dropped_gate.py", "ask_reminders.py",  # dropped-owner gate and ask reminders (goodqa#14791)
          "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py",  # Hawkeye ports (goodqa#14908)
          "copy_hygiene.py", "lifecycle_cleanup.py",  # reusable copies and scoped completed-task cleanup
+         "transcripts_hook.py",  # SessionStart: detached transcript archive sync (goodqa#16650)
          "backup_watch.py", "kimi_review.py", "installer_scan.py",
          "trivy_gate.py",  # pinned Trivy scan for deliver prepare --scan (goodqa#15295)
          "mc_chat.py", "mc_inbox.py",  # Mission Control chat store and inbox CLI/hook (goodqa#15585)
@@ -103,7 +104,8 @@ def managed_scripts(claude: Path) -> set[str]:
             for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py",
                          "command_guard_hook.py", "kill_guard.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py", "log_backup.py", "bg_lint.py",
                          "dropped_gate.py", "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py",
-                         "mc_inbox.py", "owner_inbox.py", "mission_gate.py", "status_truth.py", "idle_guard.py", "copy_hygiene.py")}
+                         "mc_inbox.py", "owner_inbox.py", "mission_gate.py", "status_truth.py", "idle_guard.py", "copy_hygiene.py",
+                         "transcripts_hook.py")}
 
 
 # Every agent type: a narrower matcher left general-purpose, claude and Explore owners without any
@@ -246,6 +248,11 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
     # report-only reap at most every 6 h. Never deletes; fails open.
     managed["SessionStart"].append({"hooks": [{
         "type": "command", "command": "python3", "args": [str(claude / "hooks" / "copy_hygiene.py"), "session-start"],
+        "timeout": 5}]})
+    # Transcript archive (goodqa#16650, AC-8): startup is a project start, resume/compact/clear a recovery. The hook
+    # spawns a detached `transcripts.py sync --background` and returns at once; it always exits 0, so no onFailure.
+    managed["SessionStart"].append({"hooks": [{
+        "type": "command", "command": "python3", "args": [str(claude / "hooks" / "transcripts_hook.py"), "session-start"],
         "timeout": 5}]})
     if log_backup:
         # Visible alert when the scheduled log backup has not succeeded for an hour; fails open. Only registered
@@ -1149,6 +1156,18 @@ def log_backup_status(home: Path, apply: bool, flag=None) -> str:
         return f"log backup: skipped ({error.__class__.__name__}: {error})"
 
 
+def transcripts_backfill_status(home: Path, apply: bool, flag=None) -> str:
+    """Transcript archive backfill scheduler (goodqa#16650); opt-in, never fails the harness install."""
+    try:
+        import transcripts_install
+        enabled = transcripts_install.choice(home, flag)
+        if apply and flag is not None:
+            transcripts_install.save_choice(home.expanduser().resolve(), flag)
+        return transcripts_install.status(home, apply, enabled=enabled)
+    except Exception as error:  # noqa: BLE001
+        return f"transcripts backfill: skipped ({error.__class__.__name__}: {error})"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true", help="write changes; otherwise only preview paths")
@@ -1189,6 +1208,13 @@ def main() -> None:
     backup.add_argument("--no-log-backup", dest="log_backup", action="store_false",
                         help="remember not to install it; where installed, stop its scheduler job (files and "
                              "remote copies stay; see docs/operations.md, Agent log backup, for rollback)")
+    backfill = parser.add_mutually_exclusive_group()
+    backfill.add_argument("--transcripts-backfill", dest="transcripts_backfill", action="store_true", default=None,
+                          help="install the 30-minute transcript archive backfill job (launchd or systemd) and "
+                               "remember the choice; it uploads redacted transcripts to private GitHub repos")
+    backfill.add_argument("--no-transcripts-backfill", dest="transcripts_backfill", action="store_false",
+                          help="remember not to install it; where installed, stop its scheduler job (files and "
+                               "archived chunks stay)")
     args = parser.parse_args()
     durable_tmp = durable_tmp_choice(args.home, args.durable_tmp)
     if args.apply and args.durable_tmp is not None:
@@ -1222,6 +1248,7 @@ def main() -> None:
     print(f"  {local_profile_status(args.home)}")
     print(f"  {command_guard_status(args.command_guard)}")
     print(f"  {log_backup_status(args.home, args.apply, args.log_backup)}")
+    print(f"  {transcripts_backfill_status(args.home, args.apply, args.transcripts_backfill)}")
     print(f"  {mission_control_status(args.home, args.apply, args.mission_control)}")
     if not args.apply:
         print("Run with --apply to install. Existing files will be backed up.")

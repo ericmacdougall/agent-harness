@@ -14,12 +14,25 @@ from __future__ import annotations
 
 import re
 
-MAX_CHUNK = 256 * 1024  # inputs are processed in chunks of this size (with an overlap) to bound regex work
-OVERLAP = 4096
-
-_KEYS = (r'(?:[a-z0-9]+[_-])*(?:password|passwd|passphrase|secret|token|api[_-]?key|access[_-]?key|'
-         r'private[_-]?key|credentials?|client[_-]?secret|refresh[_-]?token|access[_-]?token|id[_-]?token)'
-         r'(?:[_-]value)?')
+_KEY_WORDS = (r'(?:password|passwd|passphrase|secret|token|api[_-]?key|access[_-]?key|'
+              r'private[_-]?key|credentials?|client[_-]?secret|refresh[_-]?token|access[_-]?token|id[_-]?token)'
+              r'(?:[_-]value)?')
+# For anchored use (ah_export fullmatches whole key names with it): any number of name segments.
+_KEYS = r'(?:[a-z0-9]+[_-])*' + _KEY_WORDS
+# For searching: the same name shape with a bounded prefix (at most 16 segments of at most 128 characters). The
+# unbounded prefix restarted at every word boundary of a hyphenated run and scanned to its end, which is
+# quadratic (GoodQA #16680); bounded, each start does constant work. A match starts at a word boundary, as before.
+# Underscores are word characters, so a name longer than that window has no later \b to start from; two more starts
+# cover it, and each fires only once the window is used up, so short names match exactly as before:
+#   - inside a name, after a letter or digit and _ or -, with exactly 16 full segments to the key word (17+ segments);
+#   - inside a segment, after a letter or digit, with 128 more before its _ or - (a segment over 128 characters).
+# Every value the unbounded form redacted is still redacted; tests/test_redact_perf.py pins this against it, and
+# pins that the repo's own code gains no findings. Past the window the match is a slight superset (the extra starts
+# cannot see whether the whole name began with _), which only over-redacts.
+_KEY_SEG = r'[a-z0-9]{1,128}[_-]'
+_KEYS_SCAN_ANY = (r'(?:\b(?:' + _KEY_SEG + r'){0,16}'
+                  r'|(?<=[a-z0-9][_-])(?:' + _KEY_SEG + r'){16}'
+                  r'|(?<=[a-z0-9])[a-z0-9]{128}[_-](?:' + _KEY_SEG + r'){0,15})' + _KEY_WORDS)
 
 # PEM bodies are unbounded: scan them separately so chunk boundaries and regex body caps cannot expose a tail.
 PEM_BEGIN = re.compile(r'-----BEGIN [A-Z0-9 ]{0,40}(?:PRIVATE KEY|ENCRYPTED PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----')
@@ -27,7 +40,8 @@ PEM_END = re.compile(r'-----END [A-Z0-9 ]{0,40}-----')
 
 # (kind, compiled pattern). Order matters: specific shapes first so the kind label is the most useful one.
 PATTERNS = [
-    ('rclone-token', re.compile(r'(?im)^\s*token\s*=\s*\{[^\n]{0,8192}')),
+    # bounded whitespace: an unbounded `^\s*` rescanned every line start of a newline run (GoodQA #16680)
+    ('rclone-token', re.compile(r'(?im)^[ \t]{0,64}token\s{0,64}=\s{0,64}\{[^\n]{0,8192}')),
     ('oauth-json', re.compile(r'(?is)\{[^{}]{0,2048}?[\x22\x27](?:access_token|refresh_token|id_token)[\x22\x27]'
                               r'\s*:[^{}]{0,4096}\}')),
     ('anthropic', re.compile(r'\bsk-ant-[A-Za-z0-9_-]{8,}')),
@@ -50,23 +64,17 @@ PATTERNS = [
     ('dropbox', re.compile(r'\bsl\.[A-Za-z0-9_-]{40,}')),
     ('slack', re.compile(r'\bxox[abposr]-[A-Za-z0-9-]{6,}')),
     ('npm', re.compile(r'\bnpm_[A-Za-z0-9]{30,}')),
-    ('jwt', re.compile(r'\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{0,512}')),
+    # A start inside a token (after a hyphen, which \b allowed) must reach its first dot within 256 characters: an
+    # unbounded segment rescanned a dotless run to its end once per start (eyJaaaaaaaa- repeated), which is
+    # quadratic. A start at a token boundary is unbounded, and there is one per token.
+    ('jwt', re.compile(r'(?:(?<![A-Za-z0-9_-])|(?<=-)(?=eyJ[A-Za-z0-9_-]{8,253}\.))'
+                       r'eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{0,512}')),
     ('bearer', re.compile(r'(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}')),
     ('url-userinfo', re.compile(r'(?i)\b[a-z][a-z0-9+.-]{0,30}://[^\s/?#@]{1,256}@[^\s/?#]{1,256}')),
-    ('named-credential', re.compile(r'(?i)\b' + _KEYS + r'[\x22\x27]?\s*[:=]\s*[\x22\x27]?[^\s\x22\x27,;}]{3,512}')),
+    ('named-credential', re.compile(r'(?i)' + _KEYS_SCAN_ANY + r'[\x22\x27]?\s*[:=]\s*[\x22\x27]?[^\s\x22\x27,;}]{3,512}')),
     ('named-credential', re.compile(r'\b[a-z][a-z0-9]*(?:Secret|Token|Password|ApiKey|AccessKey|PrivateKey|Credentials?)'
                                     r'[\x22\x27]?\s*[:=]\s*[\x22\x27]?[^\s\x22\x27,;}]{3,512}')),
 ]
-
-
-def _chunks(text):
-    if len(text) <= MAX_CHUNK:
-        yield 0, text
-        return
-    start = 0
-    while start < len(text):
-        yield start, text[start:start + MAX_CHUNK + OVERLAP]
-        start += MAX_CHUNK
 
 
 def _find_pem(text):
@@ -87,16 +95,17 @@ def find(text):
     text = str(text)
     hits = _find_pem(text)
     seen = {(start, end) for _kind, start, end in hits}
-    for base, chunk in _chunks(text):
-        for kind, pattern in PATTERNS:
-            for match in pattern.finditer(chunk):
-                if '[REDACTED:' in match.group(0):
-                    continue
-                span = (base + match.start(), base + match.end())
-                if span in seen:
-                    continue
-                seen.add(span)
-                hits.append((kind, span[0], span[1]))
+    # The whole text is scanned in one pass: every pattern is linear (tests/test_redact_perf.py guards that at
+    # 1-2 MB), and slicing it into chunks cut any match longer than the overlap at a boundary (GoodQA #16680).
+    for kind, pattern in PATTERNS:
+        for match in pattern.finditer(text):
+            if '[REDACTED:' in match.group(0):
+                continue
+            span = match.span()
+            if span in seen:
+                continue
+            seen.add(span)
+            hits.append((kind, span[0], span[1]))
     return sorted(hits, key=lambda hit: (hit[1], hit[2]))
 
 

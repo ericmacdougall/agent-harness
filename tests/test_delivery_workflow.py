@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest import mock
 
 from commit_messages import message
+import transcripts_fake
 
 
 DELIVER = Path(__file__).resolve().parents[1] / 'harness/hooks/deliver.py'
@@ -41,6 +42,10 @@ class DeliveryWorkflow(unittest.TestCase):
             if name.startswith('GIT_') and name not in {'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM'}:
                 self.env.pop(name)
         self.env['PYTHONDONTWRITEBYTECODE'] = '1'
+        # prepare's transcript archive gate (goodqa#16650) reads a fake receipt: fresh and ok, never GitHub.
+        self.env['TRANSCRIPTS_BIN'] = str(transcripts_fake.write_fake(self.root))
+        self.env['FAKE_CHECK_JSON'] = json.dumps({'status': 'ok', 'last_ok_at': transcripts_fake.now_iso(),
+                                                  'age_min': 0, 'reasons': []})
         self.original = self.root / 'original'
         command('git', 'init', '-q', '-b', 'main', str(self.original), env=self.env)
         command('git', 'config', 'user.name', 'Harness Test', cwd=self.original, env=self.env)

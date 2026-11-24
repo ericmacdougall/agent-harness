@@ -1,0 +1,10 @@
+[Unit]
+Description=Resumable backfill of the private agent-transcripts archive (GoodQA #16650)
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+ExecStart=/usr/bin/env python3 %h/.claude/hooks/transcripts.py backfill --budget-seconds 1500
+# A oneshot run that never ends keeps the timer from re-arming (OnUnitActiveSec waits for the unit; goodqa#15218).
+# The run stops itself at its 1500 s budget and defers under load, so 30 min never stops a healthy one.
+TimeoutStartSec=30min

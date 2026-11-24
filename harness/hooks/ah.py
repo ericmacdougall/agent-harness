@@ -3727,6 +3727,9 @@ def build_parser():
         v.add_argument("--all", action="store_true", help="every session with a main WAL")
         v.add_argument("--json", action="store_true", help="accepted for symmetry; output is always JSON")
     sub.add_parser("sessions", help="sessions with a main WAL, newest first")
+    sub.add_parser("transcripts", add_help=False,
+                   help="private transcript archive (goodqa#16650): `ah transcripts sync --checkpoint takeover` on a "
+                        "takeover, `--checkpoint recovery` on a resume; `ah transcripts --help` for the rest")
     ex = sub.add_parser("export", help="write one session's WALs as a redacted, local-only HTML file (goodqa#15788); "
                                        "never uploaded")
     ex.add_argument("--session")
@@ -4044,6 +4047,42 @@ CHAT_PARSE_REFUSED = ("ah chat: the arguments were not accepted. The rejected va
                       "credential. Run `ah chat <subcommand> -h` for the accepted options. Nothing was read or sent.")
 
 
+TRANSCRIPTS_HELP = """ah transcripts: the private agent-transcripts archive (GoodQA #16650). It runs transcripts.py beside
+ah.py with the remaining arguments, so the exit code and output are the tool's own.
+
+  ah transcripts sync --checkpoint {start,recovery,takeover,pr,deploy,manual} [--budget-seconds N] [--background]
+  ah transcripts check [--max-age-min 60] [--json]   0 ok, 1 stale, 2 failed/cap/held/disk-low, 3 never-ok
+  ah transcripts find --session S | --ticket N | --project P | --since T | --host H
+  ah transcripts cat <session> [--local]
+  ah transcripts recover <session> --to DIR [--from git|local]
+  ah transcripts status | verify [--rehash] | reindex [--from-sidecars] | backfill [--budget-seconds N]
+
+Checkpoints: the hooks run start, recovery, pr and deploy where they are installed. Run them by hand where they are
+not (for example while Codex hooks are untrusted), and always for a takeover:
+  ah transcripts sync --checkpoint takeover   when you take over another agent's project or stream
+  ah transcripts sync --checkpoint recovery   when you resume a project after a crash, compaction or restart
+Then read the history with `ah transcripts find` and `cat`, and confirm the receipt with `ah transcripts check`.
+`ah transcripts <command> --help` shows the tool's own help."""
+
+
+def transcripts_passthrough(rest) -> int:
+    """Run transcripts.py (beside this file; TRANSCRIPTS_BIN overrides it for tests) in place of this process."""
+    if not rest or rest[0] in ("-h", "--help", "help"):
+        sys.stdout.write(TRANSCRIPTS_HELP + "\n")
+        return 0
+    override = os.environ.get("TRANSCRIPTS_BIN")
+    script = Path(override) if override else Path(__file__).resolve().with_name("transcripts.py")
+    if not script.is_file():
+        json.dump({"ok": False, "code": "missing", "message": "transcripts.py is not installed beside ah.py; install "
+                                                                 "the current hook files first"}, sys.stdout)
+        sys.stdout.write("\n")
+        return 4
+    argv = ([sys.executable, str(script)] if script.suffix == ".py" else [str(script)]) + list(rest)
+    sys.stdout.flush()
+    os.execv(argv[0], argv)
+    return 4  # not reached
+
+
 def _first_word(tokens):
     """The first token that is not an option. ah's only top-level option (--text) takes no value, so before the subcommand
     this is the subcommand itself."""
@@ -4079,6 +4118,8 @@ def main(argv=None) -> int:
     if given[:1] == ["decision"]:  # goodqa#16651: signed central top-rung decisions (central_decisions.py)
         import central_decisions  # noqa: PLC0415
         return central_decisions.main(given[1:])
+    if given[:1] == ["transcripts"]:  # goodqa#16650: the archive tool's own CLI, exit code passed through
+        return transcripts_passthrough(given[1:])
     if given[:1] == ["guard-selftest"]:  # goodqa#15876: a fixed live test of a guard rule; it takes no command, path or directory
         try:
             import guard_selftest  # noqa: PLC0415
