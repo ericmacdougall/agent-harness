@@ -558,6 +558,44 @@ class MidTurnAttachmentTests(Base):
         self.assertEqual(len(after), 1)
 
 
+    def test_f1_repeated_identical_reminder_prefixed_replies_are_all_indexed(self):
+        a = self.attach(self.blocks(self.REMINDER, "yes go ahead"), ts="2026-11-04T10:20:00.000Z")
+        b = self.attach(self.blocks(self.REMINDER, "yes go ahead"), ts="2026-11-04T11:45:00.000Z")
+        self.transcript([self.human(), a, b])
+        ids = [m["id"] for m in self.matches() if m["kind"] == "queued"]
+        self.assertEqual(len(ids), 2)
+        self.assertEqual(len(set(ids)), 2)
+
+    def test_f1_same_plain_text_enqueued_twice_hours_apart_gives_two_rows(self):
+        def enq(ts):
+            return {"type": "queue-operation", "operation": "enqueue", "timestamp": ts, "content": "yes go ahead"}
+        self.transcript([self.human(), enq("2026-11-04T10:00:00.100Z"), self.attach("yes go ahead", ts="2026-11-04T10:00:00.120Z"),
+                         enq("2026-11-04T13:00:00.100Z"), self.attach("yes go ahead", ts="2026-11-04T13:00:00.130Z")])
+        ids = [m["id"] for m in self.matches() if m["kind"] == "queued"]
+        self.assertEqual(ids, [f"queue:{SESSION}/2026-11-04T10:00:00.100Z#" + hashlib.sha256(b"yes go ahead").hexdigest()[:12],
+                               f"queue:{SESSION}/2026-11-04T13:00:00.100Z#" + hashlib.sha256(b"yes go ahead").hexdigest()[:12]])
+
+    def test_f1_an_attachment_with_no_nearby_enqueue_is_kept_and_an_enqueue_never_wipes_others(self):
+        enq = {"type": "queue-operation", "operation": "enqueue", "timestamp": "2026-11-04T13:00:00.100Z", "content": "yes go ahead"}
+        self.transcript([self.human(), self.attach("yes go ahead", ts="2026-11-04T10:00:00.000Z"), enq])
+        self.assertEqual(len([m for m in self.matches() if m["kind"] == "queued"]), 2)
+
+    def test_f1_pairing_is_one_to_one(self):
+        enq = {"type": "queue-operation", "operation": "enqueue", "timestamp": "2026-11-04T10:00:00.100Z", "content": "yes go ahead"}
+        self.transcript([self.human(), enq, self.attach("yes go ahead", ts="2026-11-04T10:00:00.110Z"),
+                         self.attach("yes go ahead", ts="2026-11-04T10:00:01.000Z")])
+        self.assertEqual(len([m for m in self.matches() if m["kind"] == "queued"]), 2)
+
+    def test_f2_attachment_rows_and_resolution_name_the_human_origin_marker(self):
+        import provenance
+        self.transcript([self.human(), self.attach(self.blocks(self.REMINDER, self.TYPED))])
+        row = [m for m in self.matches() if m["kind"] == "queued"][0]
+        self.assertNotEqual(row["trust"], provenance.QUEUE_TRUST)
+        self.assertIn("origin", row["trust"])
+        self.assertIn("human", row["trust"])
+        res = provenance.resolve(row["source"])
+        self.assertEqual(res["chain"][0]["trust"], row["trust"])
+
     def test_attachment_before_its_enqueue_leaves_one_row_with_the_enqueue_id(self):
         content = "queued mid turn: use the cli for hooks too"
         enq = {"type": "queue-operation", "operation": "enqueue", "timestamp": "2026-11-04T10:07:00.123Z", "content": content}

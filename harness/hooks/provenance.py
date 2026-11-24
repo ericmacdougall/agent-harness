@@ -767,6 +767,8 @@ ANSWER_TRUST = "AskUserQuestion tool result bound to an AskUserQuestion tool_use
 MC_TRUST = ("Mission Control dashboard approval, HMAC-signed by the local server after an authenticated session click "
             "(accidental-damage threat model: a process running as this user could forge it)")
 QUEUE_TRUST = "transcript queue-operation record without an origin marker (accidental-damage threat model)"
+ATTACHMENT_TRUST = ("transcript queued_command attachment whose origin marker says human; reminder and pasted blocks removed "
+                    "(accidental-damage threat model: a process running as this user could forge it)")
 
 
 def queue_user_text(record):
@@ -1013,7 +1015,8 @@ def queue_turn(session: str, ident, home=None) -> dict:
             continue
         attached = queued_attachment_text(record)
         if attached is not None and record.get("timestamp") == stamp and hashlib.sha256(attached[0].encode()).hexdigest()[:12] == sha:
-            return {"text": attached[1], "timestamp": stamp, "uuid": f"{stamp}#{sha}", "session": session}
+            return {"text": attached[1], "timestamp": stamp, "uuid": f"{stamp}#{sha}", "session": session,
+                    "trust": ATTACHMENT_TRUST}
         text = queue_user_text(record)
         if text is not None and record.get("timestamp") == stamp and hashlib.sha256(text.encode()).hexdigest()[:12] == sha:
             # B6 (step-1 red-team): like a human turn, pasted and injected blocks are not the user's words. The id
@@ -1262,7 +1265,7 @@ def _resolve(source, ctx, depth, seen, result):
                 "timestamp": turn["timestamp"], "status": "verified"}
         if variant != "user":
             node["variant"] = variant
-            node["trust"] = ANSWER_TRUST if variant == "answer" else QUEUE_TRUST
+            node["trust"] = ANSWER_TRUST if variant == "answer" else turn.get("trust", QUEUE_TRUST)
         if ctx.get("want_text"):
             node["text"] = turn["text"]
         node["excerpt"] = parsed["excerpt"]

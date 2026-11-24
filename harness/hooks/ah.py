@@ -993,7 +993,7 @@ def _blocks_text(content):
     return ""
 
 
-TRANSCRIPT_RULE = 2  # 2: human queued_command attachments are indexed once per prompt (goodqa#17101)
+TRANSCRIPT_RULE = 2  # 2: human queued_command attachments are stored; pairing with enqueue twins happens on read (goodqa#17101)
 
 
 def index_transcript(home: Path, session: str) -> dict:
@@ -1015,7 +1015,6 @@ def index_transcript(home: Path, session: str) -> dict:
         idx.update(msgs=[], askq=[])
     askq = set(idx["askq"])
     prov = _prov()
-    queued_digests = {m["id"].rsplit("#", 1)[1] for m in idx["msgs"] if m.get("kind") == "queued" and "#" in m["id"]}
     for off, raw in lines:
         if b'"type"' not in raw:
             continue
@@ -1042,22 +1041,19 @@ def index_transcript(home: Path, session: str) -> dict:
             content = prov.queue_user_text(rec)  # provenance.py owns the rule; wrappers are never user text
             if content is not None:
                 digest = hashlib.sha256(content.encode()).hexdigest()[:12]
-                if digest in queued_digests:  # the same prompt was seen first as an attachment: keep the enqueue id
-                    idx["msgs"] = [m for m in idx["msgs"] if not (m.get("via") == "attachment" and m["id"].endswith("#" + digest))]
                 idx["msgs"].append(_msg("queued", f"queue:{session}/{rec.get('timestamp')}#{digest}",
                                         rec.get("timestamp"), prov.strip_blocks(content), prov.QUEUE_TRUST, off))
-                queued_digests.add(digest)
         elif kind == "attachment":
             # goodqa#17101: a human message picked up mid-turn behind injected blocks (origin human only).
+            # Every attachment is stored; _pair_attachments is the only place a duplicate is ever dropped.
             attached = prov.queued_attachment_text(rec)
             if attached is not None:
                 digest = hashlib.sha256(attached[0].encode()).hexdigest()[:12]
-                if digest not in queued_digests:  # a plain prompt already indexed from its enqueue record
-                    queued_digests.add(digest)
-                    row = _msg("queued", f"queue:{session}/{rec.get('timestamp')}#{digest}",
-                               rec.get("timestamp"), attached[1], prov.QUEUE_TRUST, off)
-                    row["via"] = "attachment"
-                    idx["msgs"].append(row)
+                row = _msg("queued", f"queue:{session}/{rec.get('timestamp')}#{digest}",
+                           rec.get("timestamp"), attached[1], prov.ATTACHMENT_TRUST, off)
+                row["via"] = "attachment"
+                row["plain"] = isinstance((rec.get("attachment") or {}).get("prompt"), str)
+                idx["msgs"].append(row)
     idx["askq"] = sorted(askq)
     atomic_json(cache, idx)
     return idx
@@ -1166,9 +1162,49 @@ def _message_source(row):
     return {"source_error": "no automatically verified excerpt; use --full and quote exact user text"}
 
 
+PAIR_WINDOW_SECONDS = 5.0  # a plain prompt's enqueue and its pickup attachment are recorded within a fraction of a second
+
+
+def _stamp(value):
+    try:
+        return dt.datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _pair_attachments(rows: list) -> list:
+    """The only place a duplicate queued row is dropped (goodqa#17101).
+
+    A plain-string prompt is recorded twice: as an enqueue record and, when picked up, as an attachment with the same
+    raw text. Each such attachment is paired one-to-one with the nearest unmatched enqueue of the same digest within
+    PAIR_WINDOW_SECONDS, and the attachment row is dropped so the enqueue id stays. Anything unpaired stays: two
+    identical replies, in any order or spacing, are two messages. Attachments are never compared with each other.
+    """
+    enqueues = {}
+    for i, row in enumerate(rows):
+        if row.get("kind") == "queued" and row.get("via") != "attachment":
+            enqueues.setdefault(row["id"].rsplit("#", 1)[-1], []).append(i)
+    drop, taken = set(), set()
+    for i, row in enumerate(rows):
+        if row.get("via") != "attachment" or not row.get("plain"):
+            continue
+        at = _stamp(row.get("timestamp"))
+        best = None
+        for j in enqueues.get(row["id"].rsplit("#", 1)[-1], []):
+            if j in taken or at is None:
+                continue
+            gap = abs(at - (_stamp(rows[j].get("timestamp")) or 1e18))
+            if gap <= PAIR_WINDOW_SECONDS and (best is None or gap < best[0]):
+                best = (gap, j)
+        if best:
+            taken.add(best[1])
+            drop.add(i)
+    return [row for i, row in enumerate(rows) if i not in drop]
+
+
 def user_msgs(home: Path, session: str, text=None, recent=None, full=False, limit=20) -> dict:
     idx = index_transcript(home, session)
-    msgs = verify_rows(find_transcript(home, session), idx["msgs"])
+    msgs = _pair_attachments(verify_rows(find_transcript(home, session), idx["msgs"]))
     # A queued message that later became a human turn is the same message: point the queue id at the uuid id.
     human = [(m["id"], norm(m["text"])) for m in msgs if m["kind"] == "uuid"]
     seen, out = set(), []
