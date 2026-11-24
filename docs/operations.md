@@ -82,8 +82,9 @@ python3 -I scripts/checkout_inventory.py workdirs ~/.agent-harness/work > workdi
 - `repos` prints one row per worktree (main checkout first, then each linked worktree, deduplicated by git common
   dir): branch, HEAD, whether the folder exists, locked, prunable, dirty count, unpushed count, merged into
   origin/main (ancestry only: a squash merge shows `no`), upstream, last touched, size, and on the main row the origin
-  URL without userinfo, the last fetch time and the stash count. "Unpushed" and "merged" are as of the last fetch: the
-  tool never fetches.
+  URL without userinfo, the last fetch time, the stash count and `local_unpushed` (commits on any local branch or tag
+  and on no remote-tracking ref: what removing the whole clone would lose; the row's own unpushed count covers HEAD
+  only). "Unpushed" and "merged" are as of the last fetch: the tool never fetches.
 - `workdirs` prints one row per child folder: size, newest write, and counts of `.git`, `node_modules`, venv, build
   folders and log files.
 - The checkouts it reads are agent-writable, so git runs with fsmonitor, hooks and the untracked cache off, no

@@ -20,7 +20,9 @@ Usage:
 repos columns:
   repo kind path branch head exists locked prunable dirty unpushed merged_main upstream
   last_touched_utc size_mb note
-  note       on the main row also: origin=<url without userinfo>; fetched=<FETCH_HEAD time or never>;
+  note       on the main row also: local_unpushed=N (commits on any local branch or tag and on no
+             remote-tracking ref: what removing the whole clone would lose); origin=<url without userinfo>;
+             fetched=<FETCH_HEAD time or never>;
              stashes=N when the repository has stashes (shared by all its worktrees)
   dirty      lines of `git status --porcelain` (tracked changes and untracked files, not ignored)
   unpushed   commits reachable from HEAD and from no remote-tracking ref, as last fetched
@@ -165,6 +167,9 @@ def repo_rows(main):
             if rc == 0 and out.strip() and kind == "main":
                 note.append("stashes=%d (shared by all worktrees)" % len(out.splitlines()))
         if kind == "main":
+            # Removing a whole clone deletes every local branch and tag, not only HEAD's.
+            rc, out, _ = git(main, "rev-list", "--count", "--branches", "--tags", "--not", "--remotes")
+            note.append("local_unpushed=" + (out.strip() if rc == 0 else "?"))
             rc, out, _ = git(main, "remote", "get-url", "origin")
             note.append("origin=" + (redact_url(out.strip()) if rc == 0 else "none"))
             gd = os.path.join(main, ".git")

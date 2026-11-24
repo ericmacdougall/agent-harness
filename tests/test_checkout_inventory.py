@@ -82,6 +82,19 @@ class Rows(Base):
         linked = [r for r in self.rows(self.repo) if r["kind"] == "linked"][0]
         self.assertEqual((linked["exists"], linked["prunable"], linked["size_mb"]), ("no", "yes", "0"))
 
+    def test_unpushed_commits_on_other_local_branches_are_counted_on_the_main_row(self):
+        # Removing a whole clone deletes every local branch and tag, not only the one checked out.
+        self.assertIn("local_unpushed=0", self.rows(self.repo)[0]["note"], "positive control: all pushed")
+        sh(self.repo, "checkout", "-q", "-b", "side")
+        (self.repo / "s.txt").write_text("s\n")
+        sh(self.repo, "add", "s.txt")
+        sh(self.repo, "commit", "-qm", "side only")
+        sh(self.repo, "checkout", "-q", "main")
+        sh(self.repo, "tag", "-a", "-m", "t", "local-tag", "side")
+        main = self.rows(self.repo)[0]
+        self.assertEqual(main["unpushed"], "0", "HEAD itself is pushed")
+        self.assertIn("local_unpushed=1", main["note"])
+
     def test_stashes_are_counted_on_the_main_row(self):
         (self.repo / "a.txt").write_text("changed\n")
         sh(self.repo, "stash", "-q")
