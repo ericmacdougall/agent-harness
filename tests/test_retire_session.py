@@ -26,6 +26,7 @@ import idle_guard  # noqa: E402
 import liveness  # noqa: E402
 import ops_watch  # noqa: E402
 
+REAL_PS = ah._retire_ps_rows
 NOW = 1_800_000_000.0
 OLD = NOW - 10 * 3600  # an ended session: quiet for 10 h
 SESSION = "11111111-aaaa-4bbb-8ccc-222222222222"
@@ -287,17 +288,9 @@ class Refused(Base):
                 self.refused("retire_unreadable")
 
     def setUp_real_ps(self):
-        mock.patch.stopall()
-        c = mock.patch.object(ah, "server_now", side_effect=lambda: iso(self.clock))
-        c.start()
-        self.addCleanup(c.stop)
-        t = mock.patch.object(ah.time, "time", side_effect=lambda: self.clock)
-        t.start()
-        self.addCleanup(t.stop)
-        import provenance
-        p = mock.patch.object(provenance, "resolve", return_value={"ok": True, "problems": []})
-        p.start()
-        self.addCleanup(p.stop)
+        m = mock.patch.object(ah, "_retire_ps_rows", REAL_PS)  # the real parser, the rest of the fixture unchanged
+        m.start()
+        self.addCleanup(m.stop)
 
     def test_the_real_parser_reads_a_negative_uid_and_an_empty_command(self):
         self.setUp_real_ps()
