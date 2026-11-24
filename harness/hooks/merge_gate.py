@@ -1963,7 +1963,8 @@ def decide(payload, runner, state_dir, now=None, notes=None):
     # A quoted `;` before the binding flags hides them from PEER_REVIEW_AUTH; the segment-wise mention still sees
     # them, and a line shell_words cannot verify is read as one text (goodqa#16811).
     bound_review = _launches_bound_review(command)
-    if subagent and (PEER_REVIEW_AUTH.search(plain) or bound_review or _mentions_bound_review(command)):
+    if subagent and (PEER_REVIEW_AUTH.search(plain) or bound_review or _mentions_bound_review(command)
+                     or _hidden_bound_review(command)):
         return 2, ("merge-gate: a subagent cannot run the PR review that mints a merge authorization (--github-repo/"
                    "--pr); run it without the GitHub binding, or ask the main agent.")
     # goodqa#15684: a missing agent_id is not proof of main (Codex hook payloads never carry one), so the waiver path
@@ -2357,6 +2358,26 @@ def _mentions_bound_review(command):
         return bool(PEER_REVIEW_MENTION.search(re.sub(r"[\"'\\$]", "", command)))
     return any(PEER_REVIEW_MENTION.search(" ".join(segment.argv + [target.value for _, _, target in segment.redirects]))
                for segment in scan.segments)
+
+
+_BUILT_WORD = frozenset("*?[]{}")  # unquoted glob or brace characters: the shell, not the text, picks the word
+_NAMES_PEER = re.compile(r"peer", re.I)
+_NAMES_BINDING = re.compile(r"(?<![\w-])--(?:github-repo|pr)\b")
+
+
+def _hidden_bound_review(command):
+    """The subagent rule for words the text does not spell out (goodqa#16811): a line that is not fully literal
+    (shell_words cannot verify it, or a word holds an expansion or an unquoted glob or brace character) and whose
+    text names `peer` and a binding flag anywhere, in any order. That covers `P=peer_review.py; python3 .../$P
+    --pr 5`, `G=--github-repo; ... peer_review.py $G o/r` and `.../peer_r*.py --pr 5`. A launch built wholly at run
+    time (`$(cat f)`, a wrapper script file) cannot be seen in the text at all; for those the review-auth stamp is
+    the authority control (minted only for proven main, taken by the run at launch, honoured for 120 s)."""
+    scan = shell_words.scan(command)
+    if scan.verified and not any(word.expansions or any(char in _BUILT_WORD for _, char in word.unquoted)
+                                 for segment in scan.segments for word in segment.words):
+        return False
+    plain = re.sub(r"[\"'\\$]", "", command)
+    return bool(_NAMES_PEER.search(plain) and _NAMES_BINDING.search(plain))
 
 
 def _deadline_seconds():

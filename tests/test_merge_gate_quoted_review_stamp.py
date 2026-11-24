@@ -225,6 +225,12 @@ class SubagentCannotHideABoundReview(MainHome):
         "bash -c 'cd /w; python3 ~/.claude/hooks/peer_review.py --repeat-reason \"a;b\" --github-repo o/r --pr 5 pr'",
         PY + " # it's the retry",
         PY.replace("'a;b'", "’a;b’"),
+        # Words the shell builds at run time: an expansion or a glob names the script or a flag.
+        "P=peer_review.py; python3 ~/.claude/hooks/$P pr --github-repo o/r --pr 5",
+        "G=--github-repo; N=--pr; python3 ~/.claude/hooks/peer_review.py pr $G o/r $N 5",
+        "python3 ~/.claude/hooks/peer_r*.py pr --github-repo o/r --pr 5",
+        "python3 ~/.claude/hooks/peer_{review,x}.py pr --github-repo o/r --pr 5",
+        'python3 "$HOME/.claude/hooks/peer_review.py" pr --github-repo o/r --pr 5',
     ]
 
     def subagent(self, command):
@@ -242,7 +248,9 @@ class SubagentCannotHideABoundReview(MainHome):
         # Control: the subagent rule needs peer_review and a binding flag inside one command.
         for command in ("python3 -X utf8 ~/.claude/hooks/peer_review.py --repeat-reason 'a;b' pr --packet /p",
                         "bash -c 'python3 ~/.claude/hooks/peer_review.py pr --packet /p --expected-head x'",
-                        "grep -n peer_review notes.md && echo --pr 5"):
+                        "grep -n peer_review notes.md && echo --pr 5",
+                        "ls ~/.claude/hooks/*.py && git log --oneline -3",
+                        "python3 ~/.claude/hooks/peer_review.py pr --packet $PACKET --expected-head x"):
             with self.subTest(command=command):
                 code, text = self.subagent(command)
                 self.assertEqual(code, 0, text)
