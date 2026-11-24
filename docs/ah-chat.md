@@ -61,7 +61,7 @@ GoodQA's `send_direct_message` (`POST /v1/orgs/:org/dm/:user`) stores each messa
 | `status` / `code` | Meaning | What to do |
 | --- | --- | --- |
 | `sent` (with `message`) | delivered once | nothing |
-| `uncertain` | the one request failed or its answer was lost; it may have arrived | do NOT resend; read `ah chat history`; if it did not arrive, send it reworded |
+| `uncertain` (with `failure`, `server_code`, `http_status`) | the one request failed, was refused with a server code, or its answer was lost; it may have arrived. A server code is a reason, not proof that nothing was stored | do NOT resend; read `ah chat history`; if it did not arrive, send it reworded. `not_found` for a listed person who already has a DM with you is likely goodqa#17013: GoodQA does not let a user token reply in an existing DM; reply in the GoodQA app until it ships |
 | `approval_required`, `approval_pending` | the user token holds the send for the user's approval; nothing stored | tell the user; once he approves it in the web app (Account, User tokens), run the same command with `--approval-id ID` |
 | `approval_refused` | the approval expired, was denied, or was for other text; nothing stored | run it without `--approval-id` to ask again |
 | `duplicate` | the same body went to this person in the last 24 hours, or its outcome is unknown | check history; reword it ("Thanks!" becomes "Thanks, got it.") |
@@ -76,12 +76,13 @@ GoodQA's `send_direct_message` (`POST /v1/orgs/:org/dm/:user`) stores each messa
 ### The rules
 
 - **Ids only.** `--with` is the person's user id. It is never a name, because a member can set any display name. `--conversation` takes a DM id. `--org` is required, because the agent-writable defaults file is not used. `ah chat history --with NAME --org ORG --no-text` shows the id a name resolves to.
-- **One request per run, never an automatic retry.** Any failure of that request is `uncertain` with "Do NOT resend", whatever its kind. Its outcome and WAL rows are still written.
+- **One request per run, never an automatic retry.** A failure of that request is `uncertain` with "Do NOT resend", unless the user-token approval gate answered in the tool's own error (an approval status). A server code such as `not_found` is recorded as the reason but never frees the text: the client cannot verify at run time what the deployed server stored. Its outcome and WAL rows are still written.
+- **Every outcome that is not `sent` says why**, in the printed result, the ledger's outcome row and the WAL `chat_send` row: `failure` (the local error class such as `tool_error`, `not_found`, `http_error`, `rpc_error`, `unreachable`, `no_message_id`, or `exception:<type>`), `server_code` (GoodQA's machine code, or `unrecognized` when it is not a short plain code or fails the one third-party screen, `ah_chat._credential_like`: a token piece or any secret shape) and `http_status` when there is one. A server message, the body and the token are never recorded.
 - **The ledger comes first.** `~/.agent-harness/state/ah/store/chat-send.jsonl` gets a complete, fsynced `pending` row before the request, under a lock so two sends never overlap. An `outcome` row follows the request. A malformed, incomplete or unfinished record refuses every send. There is one ledger per home directory per host, so the Mac and t2-dev do not see each other's sends.
 - **The same message to the same person is refused for 24 hours** after any attempt, whatever its outcome. That includes a crash that left only the pending row.
   - "The same message" means the same body: the prefix plus the text, with LF line breaks and no trailing line break.
   - "The same person" means the same id in any letter case, whether named by `--with` or `--conversation`.
-  - The exception is an attempt that the user-token approval gate refused (`human_approval_required`, `human_approval_pending`, `approval_expired`, `approval_denied`, `approval_mismatch`). That gate runs before the route stores anything.
+  - The only exception is an attempt that the user-token approval gate refused in the tool's own error (`human_approval_required`, `human_approval_pending`, `approval_expired`, `approval_denied`, `approval_mismatch`). That gate runs before the route stores anything. The same code in an HTTP-level error does not free the text, and no other code does, `not_found` included.
 - **Rate limits.** At most 6 attempts per person and 20 to everyone per hour. Every attempt counts.
 - **Main agent only.**
   - mission_gate's PreToolUse hook writes a one-shot stamp, and only for a payload that `caller_identity.is_main` accepts.
@@ -208,7 +209,7 @@ Rows for `ah chat send` (tests in `tests/test_ah_chat_send.py`). The send also h
 | hook | the mission_gate stamp | gates every sink | bound to the tool call, target, org, approval id, real path and the file's SHA-256; single use | `MainOnly`; `OneRead`; `FileTiming` |
 | file | `chat-send.jsonl` | gates N | every row complete (`_row_complete`), last line terminated; key `_identity` (lower-case id, SHA-256 of the exact body) | `NoRetry`; `Recording`; `CanonicalKey` |
 | server | `whoami`, DM list participants | N (`userId`) | exactly the caller and one other person, no `isBot` persona, ids compared in lower case | `Participants` |
-| server | send result, error code, `details.approvalId` | L, W, O | message id UUID; code only for the five approval-gate codes; approval id UUID | `Approval`; `NoRetry` |
+| server | send result, error code, HTTP status, `details.approvalId` | L, W, O | message id UUID; error code only when it is a short plain code that passes `ah_chat._credential_like`, else `unrecognized`; HTTP status an integer; approval id UUID, printed only for an approval status | `Approval`; `NoRetry`; `Reasons`; `ApprovalOnly` |
 
 ## Tests
 
