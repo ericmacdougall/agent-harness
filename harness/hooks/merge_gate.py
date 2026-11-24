@@ -1526,9 +1526,6 @@ def evaluate_merge(merge, client, state_dir, now, command_hash):
             # needs positive evidence instead: an exact-head waiver, or the one a bound PR review authorization writes
             soft.append("GitHub CI is switched off for this repository, so no check ran on this head; the merge needs "
                         "an exact-head waiver or a PR review authorization (peer_review.py pr --github-repo --pr)")
-            note = review_refusal_note(state_dir, info["repo"], info["pr"], info["head"])
-            if note:
-                soft.append("the latest PR review of this head did not authorize the merge: " + note)
         if merge.kind != "check":
             if merge.head_unknown or not merge.head_vals:
                 hard.append(f"the merge must carry the verified head: add {merge.binding.replace('<full head sha>', details['head'])}")
@@ -1545,6 +1542,10 @@ def evaluate_merge(merge, client, state_dir, now, command_hash):
         if wid:
             info["waiver"] = wid
             return True, "", info
+    if info["head"] and not hard:
+        note = review_refusal_note(state_dir, info["repo"], info["pr"], info["head"])
+        if note:  # goodqa#17129: say why the review of this exact head did not stand in for the waiver
+            soft.append("the latest PR review of this head did not authorize the merge: " + note)
     reasons = [clean(r, 300) for r in (hard + soft)][:MAX_REASONS]
     where = f" of {clean(info['repo'])}#{info['pr']} (head {info['head'][:12]})" if info["head"] else ""
     text = f"merge-gate: BLOCKED merge{where}.\n" + "\n".join("  - " + r for r in reasons)

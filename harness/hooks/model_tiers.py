@@ -278,7 +278,8 @@ def review_independence(review, routing, run_id, *, allow_same_harness=True):
         return 'same harness as author and the run did not fall back from Codex to Claude'
     author_rung, reviewer_rung = _rung_number(review.get('author_rung')), _rung_number(review.get('reviewer_rung'))
     if author_rung is None:
-        return 'same harness as author and the author rung is unknown'
+        return ('same harness as author and the author rung is unknown (give --task or --author-rung, or commit with a '
+                'Co-Authored-By: Claude Sonnet trailer)')
     if reviewer_rung is None or reviewer_rung <= author_rung:
         return 'same harness as author and the reviewer rung is not above the author rung'
     return None

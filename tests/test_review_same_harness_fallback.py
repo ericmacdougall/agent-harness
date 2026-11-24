@@ -270,7 +270,7 @@ class EndToEnd(unittest.TestCase):
 
     fake = base.EndToEndTests.fake
 
-    def review(self, *extra, no_codex_anywhere=False):
+    def review(self, *extra, no_codex_anywhere=False, output="probe-review.md"):
         base.main_call_stamp(self.root)
         policy = ROOT / "harness" / "hooks" / "review_policy.json"
         if no_codex_anywhere:  # a machine-installed Codex must not be discovered by this hermetic run
@@ -282,7 +282,7 @@ class EndToEnd(unittest.TestCase):
                    AGENT_HARNESS_USAGE_DIR=str(self.root / "usage"), AGENT_HARNESS_REVIEW_POLICY=str(policy))
         return subprocess.run([
             sys.executable, str(HOOKS / "peer_review.py"), "pr", "--repo", str(self.repo),
-            "--packet", str(self.packet), "--output", str(self.root / "probe-review.md"),
+            "--packet", str(self.packet), "--output", str(self.root / output),
             "--expected-head", self.head, "--github-repo", "o/r", "--pr", "5", "--author-harness", "claude", *extra],
             text=True, capture_output=True, env=env, timeout=60)
 
@@ -308,7 +308,8 @@ class EndToEnd(unittest.TestCase):
         self.assertNotIn("Merge authorization:", result.stdout)
         self.assertIn("PASS not merge-eligible: same harness as author and the author rung is unknown", result.stderr)
         note = mg.review_refusal_note(self.state, "o/r", 5, self.head)
-        self.assertEqual(note, "PASS not merge-eligible: same harness as author and the author rung is unknown")
+        self.assertTrue(note.startswith("PASS not merge-eligible: same harness as author and the author rung is unknown"))
+        self.assertIn("--author-rung", note)
         self.assertIsNone(mg.review_refusal_note(self.state, "o/r", 5, "0" * 40), "a note binds to the exact head")
         self.assertIsNone(mg.review_refusal_note(self.state, "o/r", 6, self.head))
         # the gate's refusal on a CI-off repository carries the reason
@@ -321,6 +322,46 @@ class EndToEnd(unittest.TestCase):
         finally:
             fixture.HEAD = original
         self.assertEqual(code, 2, text)
+
+    def amend_trailer(self, trailer):
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-q", "--amend", "-m",
+                        "feat: change\n\nRefs: none (fixture)\n\nCo-Authored-By: " + trailer], check=True)
+        self.head = subprocess.check_output(["git", "-C", str(self.repo), "rev-parse", "HEAD"], text=True).strip()
+        self.packet.write_text("Scope and evidence.\nReviewed HEAD " + self.head +
+                               "\n$ python3 -m unittest discover tests\nRan 1 test in 0.1s\nOK\nexit 0\n")
+        value = {"number": 5, "url": "https://github.com/o/r/pull/5", "headRefOid": self.head, "state": "OPEN"}
+        self.fake("gh", "import json\nprint(json.dumps(" + repr(value) + "))\n")
+
+    def test_sonnet_commits_prove_r0_so_a_bare_fallback_review_authorizes(self):
+        """private-lessons-host PR 33: no --author-rung and no --task, a Claude fallback at R1."""
+        self.amend_trailer("Claude Sonnet 5.5 <noreply@anthropic.com>")
+        self.codex_out(1, "ERROR: ACCOUNT_QUOTA_EXCEEDED")
+        result = self.review()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Merge authorization:", result.stdout)
+        final = json.loads(next((self.root / "usage" / "runs").glob("*/final.json")).read_text())
+        self.assertEqual((final["review"]["author_rung"], final["review"]["reviewer_rung"]), ("R0", "R1"))
+
+    def test_opus_commits_prove_no_rung(self):
+        self.codex_out(1, "ERROR: ACCOUNT_QUOTA_EXCEEDED")  # setUp's commit is co-authored by Claude Opus
+        result = self.review()
+        self.assertNotIn("Merge authorization:", result.stdout)
+        self.assertIn("author rung is unknown", result.stderr)
+
+    def test_a_second_run_during_the_codex_cooldown_still_records_the_outage(self):
+        """After a trusted QUOTA the pool is cooling down and Codex is never launched again: that is the steady state
+        of "Codex is out", and it must authorize too."""
+        self.codex_out(1, "ERROR: ACCOUNT_QUOTA_EXCEEDED")
+        first = self.review("--author-rung", "R1")
+        self.assertIn("Merge authorization:", first.stdout, first.stdout + first.stderr)
+        self.fake("codex", "import sys\nsys.exit(99)\n")  # must never be launched: the pool refuses its lease
+        second = self.review("--author-rung", "R1", "--repeat-reason", "second run during the cooldown", output="second.md")
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertIn("Merge authorization:", second.stdout, second.stdout + second.stderr)
+        finals = [json.loads(p.read_text()) for p in (self.root / "usage" / "runs").glob("*/final.json")]
+        later = [f for f in finals if f["review"].get("primary_unavailable", {}).get("reason") == "QUOTA"
+                 and f["usage"].get("provider_launches") == 1]
+        self.assertTrue(later, "the cooled-down run launched only Claude and still recorded the outage")
 
     def test_same_rung_claim_cannot_use_a_higher_author_rung_it_does_not_have(self):
         self.codex_out()
@@ -357,6 +398,29 @@ class EndToEnd(unittest.TestCase):
         final = json.loads(next((self.root / "usage" / "runs").glob("*/final.json")).read_text())
         self.assertNotIn("primary_unavailable", final["review"])
         self.assertEqual(final["review"]["reviewer_harness"], "openai")
+
+
+class MergeGateSaysWhy(unittest.TestCase):
+    """The gate's refusal carries the reason recorded for that exact head, on a CI-off repository."""
+
+    def refuse(self, state, head=None):
+        scenario = {"checks": [], "protection": "none", "workflow_files": []}
+        return mg.decide(fixture.bash("gh pr merge 5 --match-head-commit " + (head or fixture.HEAD)),
+                         fixture.FakeGh(scenario), state)
+
+    def test_ci_off_refusal_repeats_the_reason_and_binds_to_the_head(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state = Path(temp)
+            code, text = self.refuse(state)
+            self.assertEqual(code, 2, text)
+            self.assertNotIn("not merge-eligible", text, "control: no note, no reason line")
+            mg.note_review_refusal(state, "o/r", 5, "9" * 40, "same harness as author and no recorded fallback")
+            self.assertNotIn("not merge-eligible", self.refuse(state)[1], "a note for another head is not shown")
+            mg.note_review_refusal(state, "O/R", 5, fixture.HEAD, "same harness as author and no recorded fallback")
+            code, text = self.refuse(state)
+            self.assertEqual(code, 2, text)
+            self.assertIn("PASS not merge-eligible: same harness as author and no recorded fallback", text)
+            self.assertFalse((state / mg.WAIVER_FILE).exists(), "a note is never an authorization")
 
 
 if __name__ == "__main__":

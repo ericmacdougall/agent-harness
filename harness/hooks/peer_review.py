@@ -1456,7 +1456,8 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                 # The pool refused its lease before any call: nothing ran, so the one authorised independent fallback
                 # cannot lose or duplicate work. The reserved pool itself is left exactly as it is.
                 holder = error.holder if isinstance(error.holder, str) and RUN_ID.fullmatch(error.holder) else None
-                outcome.update(lease_refused=True, holder=holder, fallback_allowed=provider == primary)
+                outcome.update(lease_refused=True, holder=holder, fallback_allowed=provider == primary,
+                               lease_kind=getattr(error, 'kind', 'active'))
                 if holder:
                     base = 'python3 ~/.claude/hooks/usage_guard.py reconcile --run ' + holder
                     local_detail = diagnostics.sanitize(
@@ -1487,14 +1488,15 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
             return source, stage_report(stage, outcome['report']), failure
         if len(order) == 1 or provider != primary or not outcome['fallback_allowed']:
             raise ReviewFailure(outcome, source)
-        if provider == 'codex' and not outcome.get('lease_refused') and outcome['reason'] in tiers.PRIMARY_OUTAGE_REASONS:
+        if (provider == 'codex' and outcome['reason'] in tiers.PRIMARY_OUTAGE_REASONS
+                and (not outcome.get('lease_refused') or outcome.get('lease_kind') == 'cooldown')):
             # goodqa#17129: the only writer of the outage record. It comes from this run's own provider outcome, never
             # from an argument or the packet; a reserved pool is not an outage. `basis` says whether the provider
             # sent a structured refusal (cooldown placed, or the harness's own unavailable marker) or only prose.
             options['primary_unavailable'] = {
                 'run_id': getattr(run_record, 'run_id', None), 'provider': 'codex', 'reason': outcome['reason'],
-                'basis': 'structured' if outcome['reason'] == 'TRANSIENT_INFRA' or outcome['account_cooldown']
-                         else 'prose'}
+                'basis': 'structured' if (outcome['reason'] == 'TRANSIENT_INFRA' or outcome['account_cooldown']
+                                          or outcome.get('lease_kind') == 'cooldown') else 'prose'}
         if outcome.get('lease_refused'):
             failure = ('Primary reviewer pool is reserved%s (no provider was launched); used authorized independent '
                        'fallback.' % (' by run ' + outcome['holder'] if outcome.get('holder') else ''))
@@ -1607,6 +1609,27 @@ def commit_author_harness(repo, base):
             return 'unknown'
         found |= names
     return found.pop() if len(found) == 1 else 'unknown'
+
+
+MODEL_TRAILER = re.compile(r'\bclaude[ -](sonnet|opus|haiku|fable)\b', re.I)
+
+
+def commit_author_rung(repo, base):
+    """'R0' when every commit in base..HEAD carries a Co-Authored-By trailer naming a Claude Sonnet model, else None.
+    Only Sonnet maps to one rung whatever its effort; Opus spans R1 to R4 by effort and the trailer does not say which,
+    so it proves no rung. Like the author harness, this is the author's own trailer: evidence, not proof."""
+    try:
+        text = git(repo, 'log', '--max-count=500', '--format=%B%x00', (base + '..HEAD') if base else 'HEAD')
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    commits = [body for body in text.split('\0') if body.strip()]
+    if not commits:
+        return None
+    for body in commits:
+        names = {m.lower() for t in AUTHOR_TRAILER.findall(body) for m in MODEL_TRAILER.findall(t)}
+        if names != {'sonnet'}:
+            return None
+    return 'R0'
 
 
 def pr_base(repo, base):
@@ -2128,6 +2151,7 @@ def main() -> int:
             print('Note: the reviewed commits do not prove the author harness (%s); this review cannot authorize '
                   'a merge.' % evidenced, file=sys.stderr)
         args.author_harness = evidenced
+        args.evidenced_rung = commit_author_rung(repo, pr_base(repo, args.base))
     stage_rules = (
         "Planning gate: judge the proposed design, acceptance criteria, edge cases, test strategy, "
         "and rollout/rollback plan. You may read repository context. Do not BLOCK solely for an "
@@ -2155,6 +2179,10 @@ def main() -> int:
             author_rung = ladder.Ledger(policy=policy).status(args.task)['rung']
         except (ladder.LedgerError, tiers.TierError):
             author_rung = None
+    if author_rung is None:
+        # goodqa#17129: neither a flag nor a ledger task named the rung (PR 33 of private-lessons-host ran this way),
+        # so use the only rung the commits prove: every commit co-authored by a Sonnet model is R0.
+        author_rung = getattr(args, 'evidenced_rung', None)
     # Availability uses the launch's own trust-checked discovery, so a CLI found only at a policy location counts
     # and a binary inside the reviewed repo does not.
     providers = ('codex',) if args.reviewer == 'codex-only' else diagnostics.PROVIDERS
