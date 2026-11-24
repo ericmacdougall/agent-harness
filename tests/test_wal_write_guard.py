@@ -110,6 +110,7 @@ WRITES = [
     '/usr/bin/time -a -o {w} true', 'parallel --joblog {w} true ::: 1', 'screen -L -Logfile {w} -dm true',
     'docker run -v {d}:/w alpine true', 'podman run --mount type=bind,src={d},dst=/w alpine true',
     'cd {d} && script -q -c true', 'cd {d} && nohup true',
+    'cd {d} && script',  # no word at all: only the working directory says it writes ./typescript in the tree
 ]
 READS = [
     'cat {w}', 'tail -n 5 {w}', 'jq . {w}', 'grep -c x {w}', 'wc -l < {w}', 'ls -la {d}',
