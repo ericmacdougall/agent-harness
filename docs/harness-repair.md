@@ -47,4 +47,25 @@ The tool repairs installation drift. Codex hook review uses the native `/hooks` 
 
 For a release that updates the remote hook-file deployment guard itself, use this normal repair flow with the reviewed merged commit. After the refreshed guard is active, the installed `ah.py install-files` command accepts a proven Claude Code main or Codex Desktop root. It checks the existing command form and applies the same remote host, merged source, allowlist, backup, and audit requirements. A Desktop root qualifies through the actual signed runtime and supported GUI ancestry plus the current root metadata. Children and standalone CLI sessions do not inherit that authority.
 
+Guard files have one more gate (goodqa#16944, PR 326a). `harness/hooks/guard_files.py` decides which hook files are
+guard files: the registered PreToolUse and Stop hooks, everything they import or name, the files they read, and the
+install routes themselves. Today that is 115 of the 123 installed names. When `ah.py install-files` names a guard file, it
+runs only in one of two ways:
+
+- **From your own terminal.** `human_proof.py` checks for a terminal on stdin, no agent variables, no agent process as an
+  ancestor, and a login session or terminal emulator as an ancestor. stdout may be piped.
+- **As Claude Code main,** for a new install that is not a downgrade, under four conditions:
+  - mission_gate stamped that exact command in main's own Bash call;
+  - `release_receipt.py` proves the `--from-ref` is the merge commit of one PR into canonical main;
+  - that PR's head has a `settled-review` or `hook` row in the merge-gate waiver log;
+  - the fresh fetch proves the ref is on main.
+
+`--allow-older`, `--resume` and `--rollback` of a guard file are always yours. A sub-agent, a script and a Codex
+Desktop root get no stamp, so they are refused.
+
+Limits:
+- The waiver log and the stamps are same-user files. A deliberate agent could forge them (goodqa#17019).
+- The route covers t2-dev and ah-mac-mini only. A Mac target is goodqa#17031, and refusing agent `--apply` runs of the
+  installers and repair is goodqa#17032.
+
 Git versions below 2.54 cannot activate the installer's global commit-msg backstop. The host's installer reports that limitation. Review it alongside the other install results.

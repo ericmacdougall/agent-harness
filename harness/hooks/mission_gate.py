@@ -203,6 +203,33 @@ def chat_allow_stamps(cmd: str) -> list:
     return out
 
 
+def install_files_stamps(cmd: str) -> list:
+    """[stamp parts] for each `ah install-files --host H --from-ref R --file F ... --ticket T` new install this Bash line
+    runs at command position (goodqa#16944, PR 326a): main's reviewed-release branch for guard files needs it. A dry run,
+    --allow-older, --resume, --rollback, a computed word and an unparsable line get none."""
+    import contextlib  # noqa: PLC0415
+    import io  # noqa: PLC0415
+    try:
+        import ah  # noqa: PLC0415
+        import guard_files  # noqa: PLC0415
+    except ImportError:
+        return []
+    out = []
+    for words in simple_commands(cmd):
+        argv = mission_argv(words, "ah.py") or mission_argv(words, "ah")
+        if not argv or str(argv[0]) != "install-files" or any(getattr(w, "computed", False) for w in argv):
+            continue
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                args = ah.build_parser().parse_args([str(w) for w in argv])
+        except (SystemExit, Exception):  # noqa: BLE001 - a refusal or --help mints nothing
+            continue
+        if args.dry_run or args.allow_older or args.resume or args.rollback or not args.from_ref or not args.files:
+            continue
+        out.append(guard_files.install_stamp_parts(args.host, args.from_ref, args.files, args.ticket))
+    return out
+
+
 def stamps_for(cmd: str) -> list:
     """[(subcommand, argv key)] for each main-only mission_coverage.py command this Bash line runs. The key is
     mission_coverage.argv_key of the exact argument list, so the stamp covers that command and nothing else."""
@@ -233,7 +260,7 @@ def cmd_pretool(payload: dict) -> dict:
         return {}
     tool_input = payload.get("tool_input")
     cmd = str((tool_input if isinstance(tool_input, dict) else {}).get("command") or "")
-    if "mission_coverage" not in cmd and "ahc" not in cmd and "chat" not in cmd:
+    if "mission_coverage" not in cmd and "ahc" not in cmd and "chat" not in cmd and "install-files" not in cmd:
         return {}
     import caller_identity  # noqa: PLC0415
     if not caller_identity.is_main(payload):
@@ -254,6 +281,11 @@ def cmd_pretool(payload: dict) -> dict:
         import ah_chat_send  # noqa: PLC0415
         for parts in chat_allow_stamps(cmd)[:1]:
             caller_identity.put_stamp(ah_chat_send.ALLOW_STAMP, parts, session=session, home=home_dir(),
+                                      tool_use_id=tool_use_id, transcript=str(payload.get("transcript_path") or ""))
+    if "install-files" in cmd:
+        import guard_files  # noqa: PLC0415
+        for parts in install_files_stamps(cmd)[:3]:
+            caller_identity.put_stamp(guard_files.INSTALL_STAMP, parts, session=session, home=home_dir(),
                                       tool_use_id=tool_use_id, transcript=str(payload.get("transcript_path") or ""))
     if "ahc" in cmd:
         try:

@@ -38,6 +38,22 @@ def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
+class PersonEnv:
+    """human_proof's process view for a person in Terminal (login -> zsh -> python3)."""
+
+    def stdin_is_tty(self):
+        return True
+
+    def environ(self):
+        return {}
+
+    def process_table(self):
+        return {3: (2, "python3 ah.py"), 2: (1, "-zsh"), 1: (0, "login -pf user")}
+
+    def pid(self):
+        return 3
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ah-inst-")
@@ -67,7 +83,9 @@ class Base(unittest.TestCase):
         git(self.tmp, "clone", "-q", "--bare", str(self.work), str(self.origin))
         for n in NAMES:  # the host holds the c0 bytes
             (self.hooks / n).write_bytes(self.base_bytes(n))
-        self.patches = [mock.patch.object(ai, "CANONICAL_URL", "file://" + str(self.origin)), mock.patch.object(ai, "ALLOW_FILE", True)]
+        # the guard-file gate (PR 326a) is tested in test_guard_install_gate.py; here the user runs every command
+        self.patches = [mock.patch.object(ai, "CANONICAL_URL", "file://" + str(self.origin)), mock.patch.object(ai, "ALLOW_FILE", True),
+                        mock.patch.object(ai, "PROOF_ENV", PersonEnv())]
         for p in self.patches:
             p.start()
             self.addCleanup(p.stop)
