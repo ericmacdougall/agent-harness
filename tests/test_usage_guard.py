@@ -625,7 +625,8 @@ class OwnerLiveness(StoreFixture):
         run = self.begin()
         start = self.store.load_ref(run.start_ref)
         owner = start['owner_process']
-        self.assertEqual(set(owner), {'pid', 'host', 'boot_id', 'process_started', 'deadline'})
+        self.assertEqual(set(owner), {'pid', 'host', 'boot_id', 'process_started', 'pid_ns', 'deadline'})
+        self.assertEqual(owner['pid_ns'], guard.pid_namespace())
         self.assertEqual((owner['pid'], owner['host']), (os.getpid(), guard.host_identity()))
         self.assertTrue(owner['process_started'].startswith(('ps:', 'proc:')))
         self.assertIsInstance(owner['boot_id'], (str, type(None)))
@@ -1051,9 +1052,12 @@ class CompletedUncertainPools(OwnerLiveness):
     """Completed timeout history cannot orphan a pool or excuse missing child evidence."""
 
     def uncertain(self, *, label='focused', launches=1, children=1, execution='INTERRUPTED', reason='TIMEOUT',
-                  pools=('fixture-pool',)):
+                  pools=('fixture-pool',), facts=None, drop=()):
         owner = self.child()
-        run = self.begin_owned(self.facts_for(owner), label=label)
+        owner_facts = self.facts_for(owner, **(facts or {}))
+        for key in drop:
+            owner_facts.pop(key, None)
+        run = self.begin_owned(owner_facts, label=label)
         for pool in pools:
             self.store.acquire_pool('claude', pool, run.run_id)
         recorded = [self.child() for _ in range(children)]
@@ -1126,7 +1130,8 @@ class CompletedUncertainPools(OwnerLiveness):
         self.assertEqual(self.pool()[1]['active'], retry.run_id)
 
     def test_completed_run_still_waits_for_child_and_deadline(self):
-        run, owner, children, _ = self.uncertain()
+        # A legacy START (no pid namespace recorded) cannot prove same-instance death: it keeps the deadline rule.
+        run, owner, children, _ = self.uncertain(drop=('pid_ns',))
         self.stop_owned(owner)
         with self.future():
             self.assertFalse(self.store.auto_reconcile(run.run_id)['reconciled'])
@@ -1134,6 +1139,105 @@ class CompletedUncertainPools(OwnerLiveness):
         self.stop_owned(*children)
         self.assertFalse(self.store.auto_reconcile(run.run_id)['reconciled'])
         self.assertFalse(self.reconciled_path(run).exists())
+
+    # goodqa#16811: a completed run whose owner and children are probed dead on this host, boot and pid namespace
+    # releases its pool at once; every weaker proof keeps the deadline (or stays uncertain).
+
+    def test_probed_dead_completed_run_releases_before_deadline(self):
+        run, owner, children, _ = self.uncertain()
+        self.stop_owned(owner, *children)
+        report = self.store.auto_reconcile(run.run_id)  # no future(): the deadline has not passed
+        self.assertTrue(report['reconciled'], report)
+        self.assertEqual(report['why'], 'owner probed dead before deadline')
+        self.assertFalse(report['liveness']['past_deadline'])
+        self.assertTrue(report['liveness']['same_instance'])
+        self.assertIsNone(self.pool()[1]['active'])
+        record = json.loads(self.reconciled_path(run).read_text())
+        self.assertEqual((record['kind'], record['actor'], record['execution'], record['result']),
+                         ('automatic_reconciliation', 'usage_guard.auto', 'UNKNOWN', 'NO_RESULT'))
+        self.assertIn('before the deadline', record['reason'])
+        self.assertIn('same host, boot and pid namespace', record['evidence'])
+
+    def test_acquire_pool_takes_the_lane_at_once_after_probed_death(self):
+        run, owner, children, _ = self.uncertain()
+        self.stop_owned(owner, *children)
+        retry = self.begin_owned(self.facts_for(self.child()), label='independent-invocation')
+        self.store.acquire_pool('claude', 'fixture-pool', retry.run_id)  # no future()
+        self.assertTrue(self.reconciled_path(run).exists())
+        self.assertEqual(self.pool()[1]['active'], retry.run_id)
+
+    def test_reused_pid_completed_run_releases_before_deadline(self):
+        live = self.child()
+        token = guard.process_start_token(live.pid)
+        if token is None: self.skipTest('no process start token on this platform')
+        run, owner, children, _ = self.uncertain(facts={'pid': live.pid, 'process_started': token + 'x'})
+        self.stop_owned(owner, *children)
+        report = self.store.auto_reconcile(run.run_id)
+        self.assertTrue(report['reconciled'], report)
+        self.assertEqual(report['liveness']['why'], 'pid reused: start time differs')
+
+    def test_weaker_death_proofs_keep_the_deadline(self):
+        current = guard.boot_identity()
+        if current is None: self.skipTest('this host exposes no boot identifier')
+        scheme = current.split(':', 1)[0]
+        other_boot = scheme + ':22222222-2222-4222-8222-222222222222'
+        cases = {
+            'legacy-no-namespace': ({}, ('pid_ns',)),
+            'namespace-none': ({'pid_ns': None}, ()),
+            'other-namespace': ({'pid_ns': 'linuxns:1'}, ()),
+            'namespace-malformed': ({'pid_ns': 'x' * 65}, ()),
+            'other-boot': ({'boot_id': other_boot}, ()),  # a reboot, or another machine with the same name
+            'boot-case-variant': ({'boot_id': current.swapcase().replace(scheme.swapcase(), scheme, 1)}, ()),
+            'no-boot': ({'boot_id': None}, ()),
+        }
+        for label, (facts, drop) in cases.items():
+            with self.subTest(label=label):
+                if facts.get('boot_id') == current: self.skipTest('boot id has no letters to vary')
+                run, owner, children, _ = self.uncertain(label=label, facts=facts, drop=drop, pools=(label,))
+                self.stop_owned(owner, *children)
+                report = self.store.auto_reconcile(run.run_id)
+                self.assertFalse(report['reconciled'], report)
+                self.assertFalse(report['liveness']['same_instance'])
+                self.assertFalse(self.reconciled_path(run).exists())
+                self.assertEqual(self.pool(label)[1]['active'], run.run_id)
+
+    def test_other_host_and_live_child_stay_held_before_and_after_deadline(self):
+        run, owner, children, _ = self.uncertain(label='other-host', facts={'host': 'other.fixture'},
+                                                 pools=('host-pool',))
+        self.stop_owned(owner, *children)
+        for patch in (mock.patch.object(guard, 'now_utc', wraps=guard.now_utc), self.future()):
+            with patch:
+                report = self.store.auto_reconcile(run.run_id)
+            self.assertFalse(report['reconciled'])
+            self.assertEqual(report['liveness']['state'], 'UNCERTAIN')
+        live_run, live_owner, live_children, _ = self.uncertain(label='live-child', pools=('child-pool',))
+        self.stop_owned(live_owner)
+        report = self.store.auto_reconcile(live_run.run_id)
+        self.assertFalse(report['reconciled'])
+        self.assertIn('child', report['why'])
+        self.assertIsNone(live_children[0].poll())
+
+    def test_incomplete_same_instance_run_is_never_released_early(self):
+        owner = self.child()
+        run = self.begin_owned(self.facts_for(owner), label='incomplete-early')
+        self.store.acquire_pool('claude', 'incomplete-pool', run.run_id)
+        self.stop_owned(owner)
+        report = self.store.auto_reconcile(run.run_id)
+        self.assertFalse(report['reconciled'])
+        self.assertEqual(report['why'], 'dead owner before deadline')
+        self.assertTrue(report['liveness']['same_instance'])
+        self.assertEqual(self.pool('incomplete-pool')[1]['active'], run.run_id)
+
+    def test_pid_namespace_names_this_process(self):
+        value = guard.pid_namespace()
+        if os.path.exists('/proc/self/ns/pid'):
+            inode = os.readlink('/proc/self/ns/pid')
+            self.assertEqual(value, 'linuxns:' + inode[len('pid:['):-1])
+            self.assertEqual(guard.pid_namespace(os.getpid()), value)
+        elif sys.platform == 'darwin':
+            self.assertEqual(value, 'darwin:single')
+        else:
+            self.assertIsNone(value)
 
     def test_corrupt_pool_history_blocks_completed_reconciliation(self):
         run, owner, children, _ = self.uncertain()

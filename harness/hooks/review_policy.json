@@ -24,6 +24,10 @@
     "usage limit reached",
     "reached your usage limit",
     "exceeded your usage limit",
-    "you've hit your limit"
+    "you've hit your limit",
+    "hit your weekly limit",
+    "weekly limit reached",
+    "hit your session limit",
+    "session limit reached"
   ]
 }

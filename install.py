@@ -26,6 +26,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "spec_flow.py", "spec_policy.json", "spec_template.md", "provenance.py", "provenance_policy.json", "provenance_hooks.py", "safe_input.py", "caller_identity.py", "review_map.py",
          "native_context.py", "native_user_source.py", "native_admission.py", "native_main.py", "t2scan_consent.py",
          "review_diagnostics.py", "review_policy.json", "merge_gate.py",
+         "shell_words.py",  # the shell reader merge_gate and copy_hygiene share (goodqa#16811)
          "heavy_job_guard.py", "dropbox_budget.conf", "run_capped.py", "run_probe.py", "resource_budget.py", "agent_gate.py", "ops_watch.py", "resource_limits.json",
          "domain_gates.py", "domain_checklists.json",
          "command_guard.py", "command_guard_hook.py", "redact.py", "kill_guard.py", "kill_guard_policy.json",

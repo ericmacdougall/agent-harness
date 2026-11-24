@@ -5,6 +5,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -24,6 +25,28 @@ HEAD = "a" * 40
 OTHER = "b" * 40
 REPORT_SHA = "c" * 64
 FINAL_SHA = "d" * 64
+MAIN_SID = "11111111-2222-4333-8444-555555555555"
+MAIN_CALL = "toolu_01MAINREVIEWCALL0000000001"
+
+
+def main_transcript(root):
+    """Main's transcript under a temporary HOME: a real top-level Claude transcript, so is_main proves main."""
+    transcript = Path(root) / ".claude" / "projects" / "-x" / (MAIN_SID + ".jsonl")
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    if not transcript.exists():
+        transcript.write_text("{}\n")
+    return transcript
+
+
+def main_call_stamp(root, repo="o/r", pr=5, age=0, tool_use_id=MAIN_CALL, background=False):
+    """What merge_gate's hook writes for main's peer_review call (goodqa#16811 round 2): a stamp bound to that call.
+    No record of the call is in the transcript yet, so the call is still running when the review takes it."""
+    import caller_identity
+    transcript = main_transcript(root)
+    flags = {"background": True} if background else {}  # passed only when set, so the fixture runs on older bases
+    caller_identity.put_stamp("review-auth", [repo, pr], session=MAIN_SID, home=root, now=time.time() - age,
+                              tool_use_id=tool_use_id, transcript=str(transcript), **flags)
+    return transcript
 
 
 class FakePr:
@@ -518,8 +541,7 @@ class EndToEndTests(unittest.TestCase):
         path.chmod(0o700)
 
     def test_review_pass_then_merge_without_separate_waive(self):
-        import caller_identity
-        caller_identity.put_stamp("review-auth", ["o/r", 5], home=self.root)  # what main's hook writes
+        main_call_stamp(self.root)  # what main's hook writes
         output = self.root / "review.md"
         env = dict(os.environ, HOME=str(self.root), PATH=str(self.bin) + os.pathsep + "/usr/bin:/bin",
                    AGENT_HARNESS_USAGE_DIR=str(self.root / "usage"),
@@ -561,7 +583,7 @@ class EndToEndTests(unittest.TestCase):
     def test_no_main_stamp_leaves_mains_stamp_and_mints_nothing(self):
         # goodqa#16049: the ahc daemon's bound run on a host where main has a stamp for this exact repo and PR
         import caller_identity
-        caller_identity.put_stamp("review-auth", ["o/r", 5], home=self.root)
+        main_call_stamp(self.root)
         folder = caller_identity.stamp_dir(self.root)
         before = sorted(p.name for p in folder.iterdir())
         output = self.root / "daemon.md"
@@ -736,7 +758,8 @@ class EndToEndTests(unittest.TestCase):
 
 class NativeReviewReceiptScope(unittest.TestCase):
     COMMAND = "python3 ~/.claude/hooks/peer_review.py pr --repo /w --github-repo o/r --pr 5 --packet /p"
-    PAYLOAD = {"session_id": "11111111-2222-4333-8444-555555555555", "agent_id": None}
+    PAYLOAD = {"session_id": MAIN_SID, "agent_id": None, "tool_use_id": MAIN_CALL, "transcript_path": "/t.jsonl",
+               "tool_input": {"command": COMMAND}}
 
     def check_path(self, command, native, claude=False):
         import caller_identity
@@ -752,7 +775,9 @@ class NativeReviewReceiptScope(unittest.TestCase):
         native = mock.Mock(return_value=True)
         stamp = self.check_path(self.COMMAND, native)
         native.assert_called_once_with(self.PAYLOAD)
-        stamp.assert_called_once_with("review-auth", ["o/r", 5], session=self.PAYLOAD["session_id"], now=123)
+        stamp.assert_called_once_with("review-auth", ["o/r", 5], session=self.PAYLOAD["session_id"], now=123,
+                                      tool_use_id=MAIN_CALL, transcript="/t.jsonl", background=False,
+                                      require_bound=True)
 
     def test_nonplain_commands_do_not_reach_native_admission(self):
         for command in ("echo " + self.COMMAND, self.COMMAND + " | tee output", "true; " + self.COMMAND):
@@ -804,7 +829,7 @@ class SubagentAuthorization(unittest.TestCase):
             with mock.patch.dict(os.environ, {"HOME": home}):
                 mg.decide(fixture.bash(cmd), fixture.FakeGh(fixture.SCENARIOS["green"]), Path(home) / "s")
                 self.assertIsNone(caller_identity.take_stamp("review-auth", ["o/r", 5], home=home))  # no proof
-                main = dict(fixture.bash(cmd), session_id=sid, transcript_path=str(transcript))
+                main = dict(fixture.bash(cmd), session_id=sid, transcript_path=str(transcript), tool_use_id=MAIN_CALL)
                 mg.decide(main, fixture.FakeGh(fixture.SCENARIOS["green"]), Path(home) / "s")
                 self.assertIsNotNone(caller_identity.take_stamp("review-auth", ["o/r", 5], home=home))
 
@@ -822,12 +847,12 @@ class SubagentAuthorization(unittest.TestCase):
                         "python3 ~/.claude/hooks/peer_review.py pr --github-repo o/r --pr 5 | tee /tmp/x",
                         "git log # peer_review --github-repo o/r --pr 5"):
                 with self.subTest(cmd=cmd), mock.patch.dict(os.environ, {"HOME": home}):
-                    main = dict(fixture.bash(cmd), session_id=sid, transcript_path=str(transcript))
+                    main = dict(fixture.bash(cmd), session_id=sid, transcript_path=str(transcript), tool_use_id=MAIN_CALL)
                     mg.decide(main, fixture.FakeGh(fixture.SCENARIOS["green"]), Path(home) / "s")
                     self.assertIsNone(caller_identity.take_stamp("review-auth", ["o/r", 5], home=home))
             cmd = "python3 -I /x/.claude/hooks/peer_review.py pr --repo /w --github-repo o/r --pr 5 --packet /p"
             with mock.patch.dict(os.environ, {"HOME": home}):
-                main = dict(fixture.bash(cmd), session_id=sid, transcript_path=str(transcript))
+                main = dict(fixture.bash(cmd), session_id=sid, transcript_path=str(transcript), tool_use_id=MAIN_CALL)
                 mg.decide(main, fixture.FakeGh(fixture.SCENARIOS["green"]), Path(home) / "s")
                 self.assertIsNotNone(caller_identity.take_stamp("review-auth", ["o/r", 5], home=home))
 
