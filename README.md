@@ -105,7 +105,7 @@ Untracked repos may reference local ledger tickets. `harness tickets` keeps tick
 
 When `peer_review.py` cannot produce a reviewed result it prints a stable reason code, an exact next step and a reminder that native evidence is not a helper receipt; it also finds the reviewer CLIs in documented install locations and lints review packets for run evidence and the exact HEAD. See [review helper reliability](docs/operations.md#review-helper-reliability).
 
-A command guard (`command_guard.py`, behind the fail-closed launcher `command_guard_hook.py`) blocks shell commands that delete, move or empty Claude, Codex and harness logs and state, or that print secrets and configuration (for example `rclone config show`), in both editions; deletes of logs need a verified Dropbox backup and a single-use `approve-delete`. See [command guard](docs/operations.md#command-guard).
+A command guard (`command_guard.py`, behind the fail-closed launcher `command_guard_hook.py`) blocks shell commands that delete, move or empty Claude, Codex and harness logs and state, or that print secrets and configuration (for example `rclone config show`), in both editions; deletes of logs need a verified copy on Dropbox or on the b2 remote named exactly `b2-archive`, and a single-use `approve-delete`. See [command guard](docs/operations.md#command-guard).
 
 A kill guard (`kill_guard.py`, GoodQA #14506) blocks `pkill`, `killall`, `pgrep`-fed kills and kills of processes the caller cannot prove it owns (cwd or program inside its own worktree, or a `kill_guard.py spawn` ledger entry), including inside `ssh`, except `netwatch orphans --kill --pid N`; see [kill guard](docs/operations.md#kill-guard).
 
