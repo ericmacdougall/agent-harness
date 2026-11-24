@@ -2062,5 +2062,83 @@ class BulkFilters(BulkResume):
         self.assertEqual(set(kept) - remote, set(), "pgdata, t2-course and other .lanes copies stay in the backup")
 
 
+class BulkBackoff(Case):
+    """goodqa#17119: the bulk lane kept starting into the Dropbox throttle (267 h stale on the Mac). A throttled bulk
+    run now records a bounded, doubling wait, and no bulk run starts before it; tier 1 is never held back."""
+
+    THROTTLE = dict(FAKE_RCLONE_LOG_TEXT="ERROR : upload failed: too_many_write_operations",
+                    FAKE_NOTE_MATCH="archived_sessions", FAKE_EXIT_AFTER_NOTE="1", LOG_BACKUP_RETRIES="0",
+                    LOG_BACKUP_BULK_EVERY_SECONDS="0")
+
+    def backoff(self):
+        p = self.logs / "log-backup.bulk-backoff"
+        return p.read_text().split() if p.exists() else None
+
+    def bulk_sent(self):
+        return [c for c in self.copies() if any(".agent-harness/work" in a or "archived_sessions" in a for a in c)]
+
+    def test_a_throttled_bulk_run_backs_off_and_the_next_run_skips_bulk_but_not_tier_1(self):
+        t0 = int(time.time())
+        done = self.run_script(**self.THROTTLE)
+        self.assertNotEqual(done.returncode, 0)
+        n, nxt, iso = self.backoff()
+        self.assertEqual(n, "1")
+        self.assertTrue(t0 + 1800 - 5 <= int(nxt) <= int(time.time()) + 1800 + 5, (t0, nxt))
+        self.assertRegex(iso, r"^20\d\d-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.assertIn("next try at " + iso, (self.logs / "log-backup.log").read_text())
+        open(self.calls, "w").close()
+        again = self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="0")
+        self.assertEqual(self.bulk_sent(), [], "no bulk copy before the backoff time")
+        sent = [c[-1].split("/testhost/", 1)[1] for c in self.copies()]
+        self.assertIn(".claude/projects", sent, "tier 1 still runs")
+        self.assertIn("bulk tier throttled (attempt 1); next try at " + iso, (self.logs / "log-backup.log").read_text())
+        self.assertEqual(self.backoff()[0], "1", "a skipped bulk tier is not another attempt")
+        self.assertIn("bulk=0", (self.logs / "log-backup.last-run").read_text())
+        del again
+
+    def test_the_wait_doubles_then_is_capped(self):
+        self.logs.mkdir(parents=True, exist_ok=True)
+        for prev, want in (("1", 3600), ("2", 7200), ("5", 57600), ("6", 86400), ("40", 86400)):
+            (self.logs / "log-backup.bulk-backoff").write_text("%s 1 1970-01-01T00:00:01Z\n" % prev)
+            open(self.calls, "w").close()
+            t0 = int(time.time())
+            self.run_script(**self.THROTTLE)
+            n, nxt, _ = self.backoff()
+            self.assertEqual(int(n), int(prev) + 1)
+            self.assertTrue(t0 + want - 5 <= int(nxt) <= int(time.time()) + want + 5, (prev, want, int(nxt) - t0))
+
+    def test_a_clean_bulk_run_clears_the_backoff_and_garbage_never_blocks(self):
+        self.logs.mkdir(parents=True, exist_ok=True)
+        (self.logs / "log-backup.bulk-backoff").write_text("3 1 1970-01-01T00:00:01Z\n")
+        done = self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="0")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue(self.bulk_sent())
+        self.assertIsNone(self.backoff())
+        (self.logs / "log-backup.bulk-backoff").write_text("garbage\n")
+        self.put(".agent-harness/work/t1/later.md", b"later\n")  # new bulk data, so the pass copies again
+        open(self.calls, "w").close()
+        done = self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="0")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue(self.bulk_sent(), "an unreadable backoff file never blocks the backup")
+        self.assertNotIn("bulk tier throttled", (self.logs / "log-backup.log").read_text())
+
+    def test_a_lane_is_not_started_during_the_backoff(self):
+        self.logs.mkdir(parents=True, exist_ok=True)
+        future = int(time.time()) + 3600
+        (self.logs / "log-backup.bulk-backoff").write_text("2 %d 2099-01-01T00:00:00Z\n" % future)
+        done = self.run_script(LOG_BACKUP_BULK_LANE="1", LOG_BACKUP_TPSLIMIT="2", LOG_BACKUP_BULK_EVERY_SECONDS="0")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        log = (self.logs / "log-backup.log").read_text()
+        self.assertNotIn("bulk lane started", log)
+        self.assertIn("bulk tier throttled (attempt 2); next try at 2099-01-01T00:00:00Z", log)
+        self.assertEqual(self.bulk_sent(), [])
+
+    def test_bad_backoff_settings_are_refused(self):
+        for k in ("LOG_BACKUP_BULK_BACKOFF_SECONDS", "LOG_BACKUP_BULK_BACKOFF_MAX_SECONDS", "LOG_BACKUP_BULK_BACKOFF_ATTEMPTS"):
+            done = self.run_script(**{k: "x1"})
+            self.assertNotEqual(done.returncode, 0, k)
+            self.assertEqual(self.copies(), [], k)
+
+
 if __name__ == "__main__":
     unittest.main()

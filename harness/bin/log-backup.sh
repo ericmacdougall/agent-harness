@@ -69,6 +69,9 @@ PERIOD=${LOG_BACKUP_PERIOD_SECONDS:-900}  # the schedule interval: a run, start 
 LANE=${LOG_BACKUP_BULK_LANE:-0}          # 1: the bulk tier runs as its own detached run beside tier 1 (goodqa#15062)
 BULK_TPS=${LOG_BACKUP_BULK_TPS:-$TPSLIMIT}   # the lane's rate; it never copies beside tier 1, so no split
 LANE_POLL=${LOG_BACKUP_LANE_POLL_SECONDS:-2}
+BULK_BACKOFF_BASE=${LOG_BACKUP_BULK_BACKOFF_SECONDS:-1800}     # first wait after a throttled bulk run (goodqa#17119)
+BULK_BACKOFF_MAX=${LOG_BACKUP_BULK_BACKOFF_MAX_SECONDS:-86400}  # the longest wait
+BULK_BACKOFF_ATTEMPTS=${LOG_BACKUP_BULK_BACKOFF_ATTEMPTS:-6}    # doublings before the wait is always the cap
 LANE_BUDGET=${LOG_BACKUP_LANE_BUDGET_SECONDS:-10800}
 TIER=${LOG_BACKUP_TIER:-all}             # all: both tiers in this run; live: tier 1 only; bulk: the lane run
 for rate in TPSLIMIT TRANSFERS BULK_TPS; do
@@ -97,7 +100,7 @@ if [ -n "$budget_share" ]; then
 fi
 BULK_CHUNK=${LOG_BACKUP_BULK_CHUNK:-}
 [ -z "$BULK_CHUNK" ] || printf '%s' "$BULK_CHUNK" | grep -Eq '^[1-9][0-9]{0,4}$' || { echo "log-backup: LOG_BACKUP_BULK_CHUNK must be 1-99999" >&2; exit 2; }
-for numeric in BUDGET_SECONDS LOG_BACKUP_RETRIES LOG_BACKUP_RETRY_SLEEP BULK_EVERY JITTER DEADLINE_GRACE SLICE_RESERVE KILL_GRACE PERIOD LANE_BUDGET LANE_POLL; do
+for numeric in BUDGET_SECONDS LOG_BACKUP_RETRIES LOG_BACKUP_RETRY_SLEEP BULK_EVERY JITTER DEADLINE_GRACE SLICE_RESERVE KILL_GRACE PERIOD LANE_BUDGET LANE_POLL BULK_BACKOFF_BASE BULK_BACKOFF_MAX BULK_BACKOFF_ATTEMPTS; do
   # No leading zeros: bash would read 08 as octal and abort the arithmetic.
   if ! printf '%s' "${!numeric:-0}" | grep -Eq '^(0|[1-9][0-9]{0,4})$'; then
     echo "log-backup: $numeric must be a whole number of at most 5 digits without leading zeros" >&2; exit 2
@@ -661,6 +664,38 @@ bulk_due() { # the hourly gap has passed (or a pass stopped on the budget cleare
   a=$(raw_age "$bulk_try")
   [ -z "$a" ] || [ "$a" -lt 0 ] || [ "$a" -ge "$BULK_EVERY" ]
 }
+# Bounded retries on the Dropbox throttle for the bulk tier (goodqa#17119; the lane looped into the throttle for days).
+# A bulk run (the lane, or the bulk tier of a lane-off run) that ends throttled records
+#   log-backup.bulk-backoff: "<attempts> <next-try epoch> <next-try ISO>"
+# and no bulk run starts before that time. The wait doubles from BULK_BACKOFF_BASE per consecutive throttled run and
+# is capped at BULK_BACKOFF_MAX; after BULK_BACKOFF_ATTEMPTS throttled runs in a row the wait is the cap every time.
+# A bulk run that ends without the throttle clears it. Tier 1 (the transcripts) is never held back by it.
+BULK_BACKOFF="$LOGDIR/log-backup.bulk-backoff"
+bulk_backoff_ok() { # 0: no bulk backoff in force; 1: a throttled bulk run asked to wait (it says when)
+  local line n next iso now
+  line=$(head -c 200 "$BULK_BACKOFF" 2>/dev/null) || return 0
+  read -r n next iso <<< "$line"
+  printf '%s' "$next" | grep -Eq '^[0-9]{1,12}$' || return 0   # unreadable: never block the backup on it
+  now=$(date +%s)
+  [ "$now" -lt "$next" ] || return 0
+  say "bulk tier throttled (attempt ${n:-?}); next try at ${iso:-$next}"
+  return 1
+}
+bulk_backoff_record() { # after a bulk run: throttled -> wait longer before the next; clean -> clear
+  local n=0 line next delay i
+  if [ "$throttled" != 1 ]; then rm -f "$BULK_BACKOFF"; return 0; fi
+  line=$(head -c 200 "$BULK_BACKOFF" 2>/dev/null) && read -r n _ <<< "$line"
+  printf '%s' "$n" | grep -Eq '^[0-9]{1,4}$' || n=0
+  n=$((n + 1)); delay=$BULK_BACKOFF_BASE; i=1
+  while [ $i -lt $n ] && [ $i -lt "$BULK_BACKOFF_ATTEMPTS" ] && [ $delay -lt "$BULK_BACKOFF_MAX" ]; do
+    delay=$((delay * 2)); i=$((i + 1))
+  done
+  if [ $delay -gt "$BULK_BACKOFF_MAX" ] || [ $n -gt "$BULK_BACKOFF_ATTEMPTS" ]; then delay=$BULK_BACKOFF_MAX; fi
+  next=$(( $(date +%s) + delay ))
+  echo "$n $next $(date -u -r "$next" +%FT%TZ 2>/dev/null || date -u -d "@$next" +%FT%TZ)" > "$BULK_BACKOFF.tmp.$$" \
+    && mv "$BULK_BACKOFF.tmp.$$" "$BULK_BACKOFF"
+  say "bulk tier throttled (attempt $n; capped at ${BULK_BACKOFF_MAX}s after $BULK_BACKOFF_ATTEMPTS); next try at $(cut -d' ' -f3 "$BULK_BACKOFF")"
+}
 lane_yields() { # the live lane run $1 is one that yields to tier 1 (it keeps a state file under its pid)
   case "$(cat "$LANE_STATE" 2>/dev/null)" in "copying $1"|"idle $1") return 0 ;; esac
   return 1
@@ -695,7 +730,7 @@ if [ "$TIER" != bulk ] && [ -n "$lane_pid" ] && holder_alive "$lane_pid"; then
   else
     say "WARNING: a bulk lane run that does not yield is going and LOG_BACKUP_TPSLIMIT is 1; this host runs over its budget until it ends"
   fi
-elif [ "$TIER" = live ] && bulk_due; then
+elif [ "$TIER" = live ] && bulk_due && bulk_backoff_ok; then
   rm -f "$LOGDIR/log-backup.lane.started"
   LOG_BACKUP_TIER=bulk /bin/bash "$SELF_DIR/$(basename "$0")" </dev/null >/dev/null 2>&1 &
   lane_pid=$! waited=0
@@ -761,6 +796,9 @@ if [ $bulk_ran -eq 1 ] && [ -e "$bulk_try" ]; then
     bulk_ran=0 sources_bulk=()
     say "bulk tier skipped: last attempt ${bulk_age}s ago (every ${BULK_EVERY}s)"
   fi
+fi
+if [ $bulk_ran -eq 1 ] && ! bulk_backoff_ok; then
+  bulk_ran=0 sources_bulk=()   # a throttled bulk run asked to wait: not an attempt; the backoff file says when
 fi
 # Mac 2026-11-07: tier 1 used the whole budget, so every hourly bulk attempt copied nothing, failed the run and still
 # spent the hour. With no time left the tier is deferred instead: not an attempt, no failure, the next run tries it.
@@ -835,6 +873,7 @@ if [ "$throttled" = 1 ]; then
     && mv "$LOGDIR/log-backup${TAG}.throttled.tmp.$$" "$LOGDIR/log-backup${TAG}.throttled"
   say "run stopped early on the Dropbox write rate limit (log-backup${TAG}.throttled); the next scheduled run continues"
 fi
+[ $bulk_ran -eq 1 ] && bulk_backoff_record
 # How many files the remote refused by name in this run (goodqa#16123): not failures, and not backed up.
 echo "$STARTED refused=$REFUSED_N" > "$LOGDIR/log-backup${TAG}.refused.tmp.$$" \
   && mv "$LOGDIR/log-backup${TAG}.refused.tmp.$$" "$LOGDIR/log-backup${TAG}.refused"
