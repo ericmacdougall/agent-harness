@@ -2186,6 +2186,7 @@ def decide(command, cwd=None, ps=False, ownership=None, policy=None, compiled=No
             return ('block' if policy['mode'] == 'enforce' else 'warn'), rule, block_message(rule, reason), ()
     if not findings:
         return 'allow', '', '', ()
+    findings = list(dict.fromkeys(findings))  # a launcher judged under several readings finds the same kill each time
     rule, reason, pids = findings[0]
     message = block_message(rule, reason)
     if len(findings) > 1:  # name every finding, so the blocked command can be fixed in one pass

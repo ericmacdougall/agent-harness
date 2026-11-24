@@ -5382,8 +5382,7 @@ class Analyzer:
         starts, texts = readings
         # with no row (an option word as the command) any word may be where the command starts
         end = len(args) if spec is OPTION_HEAD or not starts else min(max(starts), len(args))
-        skipped = [k for k in range(end) if k not in starts and not _unsettled(args[k])
-                   and norm_name(args[k].text) in COMMAND_VERBS]
+        skipped = [k for k in range(end) if k not in starts and _names_skipped_command(args[k])]
         places = sorted(set(starts) | set(skipped))
         cwds = [None] + self._launch_cwds(spec, args, end)
         count = (len(places) * (2 if spec.joined else 1) + len(texts)) * len(cwds)
@@ -5393,15 +5392,27 @@ class Analyzer:
         if not self._spend_readings(name, count):
             return
         visible = True if name in ('flock', 'unshare', 'script') else None
-        for cwd in cwds:
-            for text in texts:
-                self._reading(spec.same_shell, lambda text=text: self.script(text, depth + 1, tail_visible=visible), cwd)
-            for k in places:
-                self._reading(spec.same_shell,
-                              lambda k=k: self.inner_words(args[k:], depth, pl, idx, via_xargs=via_xargs), cwd)
-                if spec.joined:
-                    self._reading(spec.same_shell, lambda k=k: self.script(' '.join(a.text for a in args[k:]),
-                                                                            depth + 1, tail_visible=True), cwd)
+        before = len(self.ctx.findings)
+        try:
+            for cwd in cwds:
+                for text in texts:
+                    self._reading(spec.same_shell,
+                                  lambda text=text: self.script(text, depth + 1, tail_visible=visible), cwd)
+                for k in places:
+                    self._reading(spec.same_shell,
+                                  lambda k=k: self.inner_words(args[k:], depth, pl, idx, via_xargs=via_xargs), cwd)
+                    if spec.joined:
+                        self._reading(spec.same_shell, lambda k=k: self.script(' '.join(a.text for a in args[k:]),
+                                                                                depth + 1, tail_visible=True), cwd)
+        finally:
+            # several readings often find the same thing; the refusal names it once
+            seen, kept = set(), []
+            for f in self.ctx.findings[before:]:
+                key = (f.category, f.rule, f.reason, f.alternative)
+                if key not in seen:
+                    seen.add(key)
+                    kept.append(f)
+            self.ctx.findings[before:] = kept
 
     def unknown_program(self, name, args, depth, pl, idx):
         """A program the guard has no model of may run its words as a command (`systemd-run`, `uv run`, a project's own
@@ -8218,6 +8229,15 @@ COMMAND_VERBS = frozenset(RM_CMDS | MV_CMDS | OVERWRITE_CMDS | SHELLS | PS_SHELL
                                                               'rclone', 'busybox', 'parallel', 'tmux', 'screen', 'at',
                                                               'batch', 'flock', 'unshare', 'script'})
 UNKNOWN_PROGRAM_VERBS = COMMAND_VERBS - KILLERS  # kill rules have their own analysis; a word `kill` is often data
+
+
+def _names_skipped_command(word):
+    """A launcher word the row skipped that is read as a command too. An upper-case kill word is a signal name given
+    as an option value (`timeout -s KILL 5 CMD`), not the kill command."""
+    if _unsettled(word):
+        return False
+    name = norm_name(word.text)
+    return name in COMMAND_VERBS and not (name in KILLERS and word.text.isupper())
 # Programs whose words are data, or that the analyser models itself: the unknown-program reading does not apply to
 # them. tmux, screen, parallel, at and batch run commands and are left out on purpose.
 READ_ONLY_PROGRAMS = {'man', 'which', 'whatis', 'apropos', 'info', 'tldr', 'type', 'whence', 'where', 'help', 'wc',

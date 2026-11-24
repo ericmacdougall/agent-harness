@@ -229,6 +229,18 @@ class FalsePositives(GuardCase):
         refused = [row for row in self.ROWS if self.verdict(row) != 'allow']
         self.assertEqual(refused, [])
 
+    def test_a_refusal_names_what_several_readings_found_once(self):
+        for command in ("sg g -c '%s'" % DELETE, 'sudo -D /tmp %s' % DELETE, 'sg g %s' % DELETE):
+            verdict, message = self.decide(command)
+            self.assertEqual(verdict, 'block', command)
+            self.assertNotIn('more finding', message, command)
+
+    def test_a_signal_name_given_to_a_launcher_is_not_a_kill(self):
+        # kill_guard reuses this analysis; an upper-case signal value is not read as the kill command
+        import kill_guard as kg
+        for command in ('timeout -s KILL 5 sleep 9', 'timeout --signal KILL 5 make'):
+            self.assertEqual(kg.decide(command)[0], 'allow', command)
+
     def test_a_launched_cd_does_not_move_the_rest_of_the_line(self):
         # the launched command is its own process; a shell builtin (`command cd`) does move this shell
         self.assertEqual(self.verdict('flock /tmp/l cd ~/.claude; rm -rf projects'), 'allow')
