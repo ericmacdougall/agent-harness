@@ -27,8 +27,9 @@ HEX_PEER = "abcdef01-2345-4abc-8def-0123456789ab"  # ids with letters, so a lett
 HEX_ME = "fedcba98-7654-4fed-8cba-9876543210fe"
 HEX_CONV = "c0ffee00-1234-4abc-8def-c0ffee001234"
 USER_UUID = "9a9a9a9a-1111-4222-8333-444455556666"
-WORDS = "pat peer runs the staging checks.. communicate with pat via goodqa"
+WORDS = "pat peer runs the staging checks with sam.. communicate with pat via goodqa"
 GOOD_SOURCE = 'user:%s/%s "communicate with pat via goodqa"' % (SESSION, USER_UUID)
+SAM_SOURCE = 'user:%s/%s "staging checks with sam"' % (SESSION, USER_UUID)
 PREFIX = "Claude (Eric's bot). "
 SENT = {"message": {"id": "77777777-7777-4777-8777-777777777777", "senderId": ME, "recipientId": PEER},
         "conversationId": CONV, "seq": 9}
@@ -55,10 +56,12 @@ class SendBase(Base):
                                   "timestamp": "2026-11-23T00:00:00Z",
                                   "message": {"role": "user", "content": WORDS}}) + "\n")
         self.stub.tools["list_org_members"] = lambda a: ok({"members": [
-            {"userId": PEER, "name": "Pat Peer"}, {"userId": OTHER, "name": "Sam Other"}]})
+            {"userId": PEER, "name": "Pat Peer"}, {"userId": OTHER, "name": "Sam Other"},
+            {"userId": HEX_PEER, "name": "Pat Hex"}]})
         self.allow_file = self.home / ".config" / "goodqa" / "chat-send-recipients"
         self.rows = 0
-        self.allow_list("# people main may message\n" + "".join(self.entry(i) for i in (PEER, OTHER, HEX_PEER)))
+        self.allow_list("# people main may message\n" + self.entry(PEER) + self.entry(OTHER, name="Sam", source=SAM_SOURCE)
+                        + self.entry(HEX_PEER))
 
     def allow_list(self, content, mode=0o600):
         self.allow_file.write_text(content)
@@ -672,9 +675,25 @@ class AllowList(SendBase):
         self.assertFalse(self.ledger().exists() and self.ledger().read_text().strip())
         return data
 
-    def test_a_person_not_listed_is_refused_by_id(self):
-        self.allow_list(self.entry(OTHER, name="Sam", source='user:%s/%s "staging checks"' % (SESSION, USER_UUID)))
-        self.assertIn("ah chat allow", self.refused("not_allowed")["message"])
+    def test_a_person_not_listed_is_refused_by_id_with_a_hint_that_works(self):
+        self.allow_list(self.entry(OTHER, name="Sam", source=SAM_SOURCE))
+        self.assertIn("ah chat allow --with USER_ID --org ORG --name NAME --source", self.refused("not_allowed")["message"])
+
+    def test_words_naming_one_person_with_another_persons_id_prove_nobody(self):
+        """NEG-20 (adversarial round 3, 1): a hand-written row and line pair real words naming Pat with Sam's id. The row
+        passes every WAL and source check; only the send-time member-name check refuses it."""
+        self.allow_list(self.entry(OTHER, name="Pat"))  # Sam's member name is "Sam Other"
+        self.refused("entry_unproved", target=("--with", OTHER))
+        self.allow_list(self.entry(OTHER, name="Sam", source=SAM_SOURCE))  # positive control: words naming Sam, Sam's id
+        self.assertEqual(self.result(self.send(target=("--with", OTHER)))["status"], "sent")
+
+    def test_a_member_name_that_cannot_be_read_fails_closed(self):
+        for answer in (lambda a: tool_error("forbidden"),
+                       lambda a: ok({"members": [{"userId": PEER, "name": "Pat Peer"}], "hasMore": True,
+                                     "nextCursor": "c1"}),
+                       lambda a: ok({"members": [{"userId": OTHER, "name": "Sam Other"}]})):
+            self.stub.tools["list_org_members"] = answer
+            self.refused("member_unverified")
 
     def test_a_person_not_listed_is_refused_through_a_conversation(self):
         self.allow_list(self.entry(OTHER))
@@ -704,7 +723,7 @@ class AllowList(SendBase):
         ]
         for line in cases:
             self.allow_list(line)
-            self.refused("not_allowed")
+            self.refused("entry_unproved")
 
     def test_a_damaged_list_refuses_every_send(self):
         good = self.entry(PEER)
@@ -862,7 +881,25 @@ class AllowCommand(SendBase):
     def words(self, resolution):
         import provenance
         with mock.patch.object(provenance, "resolve", lambda source, ctx=None: resolution):
-            return ah_chat_send._users_words("user:x", "Pat")
+            return ah_chat_send._users_words("user:x", "Pat", self.home)
+
+    def test_home_or_claude_config_dir_cannot_move_the_users_words(self):
+        """PR 337 round 3: the words are looked up under ah's home only. A fake HOME or CLAUDE_CONFIG_DIR holding a
+        transcript with words naming Pat proves nothing; the real transcript under ah's home still does."""
+        fake_uuid = "8b8b8b8b-1111-4222-8333-444455556666"
+        fake = self.home / "fake"
+        proj = fake / ".claude" / "projects" / "p"
+        proj.mkdir(parents=True)
+        (proj / (SESSION + ".jsonl")).write_text(json.dumps({
+            "type": "user", "uuid": fake_uuid, "origin": {"kind": "human"}, "timestamp": "2026-11-23T00:00:00Z",
+            "message": {"role": "user", "content": "message pat about everything"}}) + "\n")
+        forged = 'user:%s/%s "message pat about everything"' % (SESSION, fake_uuid)
+        for env in ({"HOME": str(fake)}, {"CLAUDE_CONFIG_DIR": str(fake / ".claude")}):
+            with mock.patch.dict(os.environ, env):
+                with self.assertRaises(ah_chat_send.ChatError, msg=env) as caught:
+                    ah_chat_send._users_words(forged, "Pat", self.home)
+                self.assertEqual(caught.exception.code, "source_refused")
+                self.assertEqual(ah_chat_send._users_words(GOOD_SOURCE, "Pat", self.home), "user")  # positive control
 
 
 def shlex_join(words):

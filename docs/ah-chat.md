@@ -29,11 +29,19 @@ GoodQA's `send_direct_message` (`POST /v1/orgs/:org/dm/:user`) stores each messa
   - The source must resolve (provenance.py) to the user's own typed words, a queued message of his or his answer to a question, with a verbatim quoted excerpt. A pasted text, an inference, a ticket, a WAL row or an agent message is refused (`source_refused`).
   - The quoted excerpt must name the person: NAME as a whole word, in any letter case. GoodQA's member name for that id in that org must contain NAME too. Words about one person never add another.
   - The command writes a `decision` row (person, org, name, source and its kind) to main's WAL first, then appends `<id> wal:<session>/<row id>  # added <time>` to the file (mode 0600).
-  - **A line proves nothing by itself.** At every send, the line's decision row must still be in that main session's WAL, add exactly that person in the send's org, and its source must still resolve to the user's words naming them. A line appended by hand, or one naming someone else's row, allows nobody (`not_allowed`).
+  - **A line proves nothing by itself.** At every send, three checks run:
+    - the line's decision row must still be in that main session's WAL, add exactly that person in the send's org, and cite a source that still resolves to the user's words naming them;
+    - the person's GoodQA member name in that org, read again with the user token, must contain the name the row uses;
+    - if the member name cannot be read (not a member, more than one page of members, or the request failed), the send fails closed (`member_unverified`).
+  - A line appended by hand, a row naming someone else, or words about one person paired with another person's id allow nobody (`entry_unproved`).
+  - The user's words are looked up only under ah's home (`<home>/.claude`); HOME and CLAUDE_CONFIG_DIR do not move them.
   - A missing file allows nobody. A file that is a symlink, not this user's, writable by group or others, or holds a line that is not blank, a `#` comment or an entry refuses every send (`allow_list_damaged`). Removing a line by hand only narrows the list; there is no other revoke command yet.
   - `ah chat allow --list` prints the listed ids and changes nothing.
   - The file lives under ah's home (`AH_HOME`, else the home directory), the same root as the stamp, the ledger and the WAL. The proof reads main's WAL and the user's transcript, so an entry holds only on the host where main runs (the Mac).
-- **Limit of the protection.** No command_guard rule covers this file. An agent's file tool can append a line, but that line allows nobody. Forging an entry needs a decision row in main's WAL that cites real words of the user naming that person.
+- **Limit of the protection.**
+  - No command_guard rule covers this file. An agent's file tool can append a line, but that line allows nobody.
+  - **Main's WAL is not write-protected either** (GoodQA goodqa#17008, CRITICAL). On 2026-11-24 command_guard allowed `>>`, `tee -a` and a Python one-liner appending to `~/.claude/wals/<session>/main.jsonl`, and no hook refuses a Write or Edit there (only Claude Code's worktree isolation stops an isolated agent).
+  - So an agent that forges both a decision row and a line can still message a person, but only someone the user named in his own words whose GoodQA member name contains that name. A member who sets a matching display name also passes.
 
 ### Adding Tisha and replying to her, step by step
 
@@ -58,7 +66,9 @@ GoodQA's `send_direct_message` (`POST /v1/orgs/:org/dm/:user`) stores each messa
 | `approval_refused` | the approval expired, was denied, or was for other text; nothing stored | run it without `--approval-id` to ask again |
 | `duplicate` | the same body went to this person in the last 24 hours, or its outcome is unknown | check history; reword it ("Thanks!" becomes "Thanks, got it.") |
 | `rate_limited` | 6 attempts to this person, or 20 to everyone, in the last hour; every attempt counts, refusals too | wait |
-| `not_allowed` | the person is not on the allow-list | main adds them with `ah chat allow` and the user's words, or does not send |
+| `not_allowed` | the person is not on the allow-list | main adds them with `ah chat allow --with ID --org ORG --name NAME --source '...'` and the user's words, or does not send |
+| `entry_unproved` | the line is there, but no decision row proves it, or the member name is not the person the words name | re-add with `ah chat allow`; never edit the file or the WAL by hand |
+| `member_unverified` | the person's member name could not be read, so the entry could not be checked | check the id and org; nothing was sent |
 | `main_only` | no stamp: see step 4, or a sub-agent, or the hook is not installed | fix the cause; never script around it |
 | `bad_request`, `too_long`, `secret_refused` | the arguments or the text were refused; nothing read or sent | fix the text (split a long answer into separate messages) |
 | `ledger_damaged` | the ledger has a damaged record | a person checks whether that message went out before anything else is sent |
