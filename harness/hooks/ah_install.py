@@ -753,6 +753,33 @@ def _ops_module():
     return module
 
 
+def _guard_files():
+    """guard_files from this file's own directory, never by sys.path name."""
+    import importlib.util  # noqa: PLC0415
+    import sys  # noqa: PLC0415
+    path = Path(__file__).resolve().parent / "guard_files.py"
+    loaded = sys.modules.get("guard_files")
+    if loaded is not None and getattr(loaded, "__file__", None) and os.path.realpath(loaded.__file__) == os.path.realpath(path):
+        return loaded
+    if not path.is_file() or path.is_symlink():
+        refuse("guard_files.py is not installed beside ah_install.py, so a manifest install cannot tell guard files apart; nothing "
+               "was changed", "guard_files")
+    spec = importlib.util.spec_from_file_location("guard_files_for_install", str(path))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def refuse_guard_files(host, ref, names, home):
+    """A manifest install (the agent route, under install_files_manifest) never changes a guard file (goodqa#16944 ruling). Checked on the
+    files this run would write, before the start row and before anything remote changes, against this Mac's installed guard hooks and
+    their import closure; the refusal names the user's own line."""
+    module = _guard_files()
+    guards = module.guard_subset(names, Path(home) / ".claude" / "hooks")
+    if guards:
+        refuse(module.refusal(host, ref, guards), "guard_files")
+
+
 def require_manifest_grant(host, ref, home, resume_of=None):
     """Manifest installs need the signed self-serve grant `install_files_manifest`; no grant means a refusal that names the user
     step. The one gate for the capability: install_files and resume both pass through here. The grant evidence names the repository, host
@@ -790,7 +817,7 @@ def resume(run_id, ticket, home=None, session="", agent="", runner=subprocess.ru
     if row.get("manifest"):
         require_manifest_grant(row["host"], row["ref"], home, resume_of=run_id)
     return _run(row["host"], row["ref"], sorted(row["files"], key=lambda n: n), ticket, False, home, session, agent, runner, poster, run_id,
-                row.get("baseline"), "resume")
+                row.get("baseline"), "resume", manifest=bool(row.get("manifest")))
 
 
 def _plan_for(names, sources, state, run):
@@ -842,6 +869,8 @@ def _run(host, ref, files, ticket, dry_run, home, session, agent, runner, poster
             plan[name] = dict(prior, resumed_already_applied=True)
     applied = [n for n in names if plan[n]["action"] in ("new", "replaced")]
     todo = [n for n in applied if not plan[n].get("resumed_already_applied")]
+    if manifest:
+        refuse_guard_files(host, ref, todo, home)
     start = {"event": "start", "kind": kind_, "run": run, "host": host, "url": CANONICAL_URL, "main": main, "ref": ref, "files": plan,
              "baseline": before, "script_sha256": SCRIPT_SHA256, "session": session or None, "agent": agent or None, "ticket": ticket,
              "allow_older": bool(allow_older), "manifest": bool(manifest)}

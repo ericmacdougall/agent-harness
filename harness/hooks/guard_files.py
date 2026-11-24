@@ -5,9 +5,16 @@ the self-serve enabler). Both agent install routes read this module and refuse a
 `ah ops repair` (harness_repair and the central-decisions recipe) and `ah install-files --manifest`
 (install_files_manifest). Everything else stays agent-installable under the signed grant.
 
-A file is a guard file when its name is listed, starts with a listed prefix, or is a policy JSON (`*_policy.json`).
-tests/test_guard_files.py fails when a hook registered for PreToolUse or Stop, or a harness module such a hook imports,
-is missing here, so a new guard cannot be left out by accident. Stdlib only; Python 3.9+; no side effects on import.
+A file is a guard file when any of these holds:
+  * its name is listed;
+  * its name starts with a listed prefix;
+  * it is a policy JSON (`*_policy.json`);
+  * the routes pass the installed hooks directory, and it is a harness module that a registered PreToolUse or Stop hook
+    imports there, directly or through other modules (guard_closure). Changing shellwords.py changes how mission_gate
+    reads a command, so it is guard code too.
+An unreadable hooks_manifest.json counts every name as a guard file (fail closed).
+tests/test_guard_files.py fails when a registered PreToolUse or Stop hook is missing from the static list. Stdlib only,
+Python 3.9+, and importing this module has no side effects.
 """
 from __future__ import annotations
 
@@ -42,13 +49,33 @@ def is_guard_file(name: str) -> bool:
     return base in GUARD_NAMES or base.startswith(GUARD_PREFIXES) or bool(POLICY_JSON.match(base))
 
 
-def guard_subset(names) -> list:
-    return sorted({Path(str(n)).name for n in names if is_guard_file(n)})
+def guard_closure(hooks_dir) -> set | None:
+    """The registered PreToolUse/Stop hooks in HOOKS_DIR and every harness module they import there; None when the manifest
+    cannot be read (the caller then treats every name as a guard file)."""
+    try:
+        hooks_dir = Path(hooks_dir)
+        roots = registered_guard_hooks(hooks_dir / "hooks_manifest.json")
+        return set(roots) | set(local_import_closure(hooks_dir, roots))
+    except Exception:  # noqa: BLE001 - unreadable or malformed: fail closed
+        return None
+
+
+def guard_subset(names, hooks_dir=None) -> list:
+    """The guard files among NAMES. With HOOKS_DIR (the installed hooks), the import closure of the registered guard hooks
+    there counts too, and an unreadable manifest makes every name a guard file."""
+    bases = {Path(str(n)).name for n in names}
+    if hooks_dir is None:
+        return sorted(b for b in bases if is_guard_file(b))
+    closure = guard_closure(hooks_dir)
+    if closure is None:
+        return sorted(bases)
+    return sorted(b for b in bases if is_guard_file(b) or b in closure)
 
 
 def refusal(host: str, ref: str, names) -> str:
-    """The refusal text both routes print: which guard files differ, and the one line the user runs instead."""
-    files = guard_subset(names)
+    """The refusal text both routes print: which guard files differ, and the one line the user runs instead. NAMES are the
+    guard files already chosen by guard_subset."""
+    files = sorted({Path(str(n)).name for n in names})
     return ("ref %s would change guard file(s) %s on %s. Agents install only non-guard tooling under the self-serve "
             "grant; a guard install stays yours. Run: %s" % (ref[:12], ", ".join(files), host,
                                                               USER_INSTALL.format(host=host, ref=ref, files=" --file ".join(files))))

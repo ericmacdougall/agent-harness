@@ -81,9 +81,9 @@ CAPABILITIES = ("same_harness_fallback_review", "merge_reviewed_pr", "harness_re
 CAPABILITY_TEXT = {
     "same_harness_fallback_review": "accept a settled same-harness exact-HEAD PASS when the other harness is out of quota (receipt, rung, fresh worktree, label and follow-up limits; every changed path unless you pass --fallback-denylist)",
     "merge_reviewed_pr": "merge one reviewed PR through `ah ops merge`",
-    "harness_repair": "run the journaled `ah ops repair` recipe on both hosts",
+    "harness_repair": "run the journaled `ah ops repair` recipe on both hosts for a ref that changes no guard file (it can never install a guard file: that stays your `ah install-files` line)",
     "pool_cleanup": "reap this session's own dead pool reservations",
-    "install_files_manifest": "run `ah install-files` in manifest mode",
+    "install_files_manifest": "run `ah install-files` in manifest mode for files that are not guard files (it can never install a guard file: that stays your `ah install-files` line)",
     "central_decisions_agent_steps": "run the merge, repair, enable and adapter steps of the central-decisions recipe (never approve, keygen, pin or publish)",
 }
 TTL_SECONDS = {"same_harness_fallback_review": 900, "merge_reviewed_pr": 900, "harness_repair": 3600,

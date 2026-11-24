@@ -457,12 +457,9 @@ def blob_id(data):
     return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
 
 
-def verify_installed(ctx, ref, host, wanted):
-    """Compare the installed hook bytes on this Mac and on HOST with the git blobs at ref (the hooks the installer lists)."""
-    proof = prove_on_canonical_main(ctx, ref)
-    names = [n for n in wanted if n in proof["listed"]]
-    if not names:
-        return {"compared": 0, "note": "none of the verify hooks are in the installer list at that ref"}
+def installed_vs_ref(ctx, ref, host, names, code="verify_failed"):
+    """(expected, mac, remote): the git blob ids at ref and the installed blob ids on this Mac and on HOST, for NAMES. The one
+    read-back both the post-install verify and the pre-install guard-file check use."""
     sources, _, _ = _fetch(ctx, ref, names)
     expected = {n: sources[n][1] for n in names}
     mac = {}
@@ -470,11 +467,48 @@ def verify_installed(ctx, ref, host, wanted):
         p = ctx.home / ".claude" / "hooks" / n
         mac[n] = blob_id(p.read_bytes()) if p.is_file() and not p.is_symlink() else None
     done = _ok(ctx.ssh(host, "python3 -I -c %s %s" % (shlex.quote(REMOTE_BLOBS), shlex.quote(json.dumps(names))), what="remote hash read-back"),
-               "remote hash read-back", "verify_failed")
+               "remote hash read-back", code)
     try:
         remote = json.loads(done.stdout)
     except ValueError:
         uncertain("the read-back from %s was not readable." % host)
+    if not isinstance(remote, dict):
+        uncertain("the read-back from %s was not readable." % host)
+    return expected, mac, remote
+
+
+def guard_files_module():
+    try:
+        return load_sibling("guard_files")
+    except ImportError:
+        refuse("guard_files.py is not installed beside ah_ops.py, so a repair cannot tell guard files apart; nothing was changed",
+               "guard_files")
+
+
+def refuse_guard_changes(ctx, ref, host):
+    """Agents install only non-guard tooling (goodqa#16944 ruling: guard installs stay a user-run command pinned to a merged commit).
+    Refuses, before anything is installed, when REF would change any guard file the installer lists, on this Mac or on HOST, and
+    names the one line the user runs instead. Returns the number of guard files compared (all equal)."""
+    guards = guard_files_module()
+    proof = prove_on_canonical_main(ctx, ref)
+    names = guards.guard_subset(proof["listed"], ctx.home / ".claude" / "hooks")
+    if not names:
+        return 0
+    expected, mac, remote = installed_vs_ref(ctx, ref, host, names, "guard_files")
+    changed = sorted(n for n in names if mac[n] != expected[n] or remote.get(n) != expected[n])
+    if changed:
+        where = "this Mac and %s" % host
+        refuse(guards.refusal(where, ref, changed), "guard_files")
+    return len(names)
+
+
+def verify_installed(ctx, ref, host, wanted):
+    """Compare the installed hook bytes on this Mac and on HOST with the git blobs at ref (the hooks the installer lists)."""
+    proof = prove_on_canonical_main(ctx, ref)
+    names = [n for n in wanted if n in proof["listed"]]
+    if not names:
+        return {"compared": 0, "note": "none of the verify hooks are in the installer list at that ref"}
+    expected, mac, remote = installed_vs_ref(ctx, ref, host, names)
     wrong = sorted(n for n in names if mac[n] != expected[n] or remote.get(n) != expected[n])
     if wrong:
         refuse("installed hook bytes differ from the merged commit for: %s (mac %s, %s %s)" % (
@@ -490,6 +524,10 @@ def repair_harness_path(ctx):
 
 
 def run_repair(ctx, ref, host, apply):
+    """repair-harness at ref. An apply is refused first when ref would change a guard file (refuse_guard_changes): every agent
+    repair route (the repair recipe and the central-decisions recipe) runs through here."""
+    if apply:
+        refuse_guard_changes(ctx, ref, host)
     argv = [repair_harness_path(ctx), "--ref", ref, "--host", host, "--apply" if apply else "--check"]
     done = ctx.cmd(argv, timeout=1500 if apply else 600, what="repair-harness " + ("apply" if apply else "preview"))
     if done.returncode != 0:
