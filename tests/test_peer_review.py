@@ -1594,7 +1594,7 @@ class ProviderEnvelopeTests(unittest.TestCase):
              patch.object(self.module.diagnostics, 'discover_executable',
                           side_effect=lambda name, **_: {'name': name, 'path': '/fixture/' + name, 'source': 'PATH', 'rejected': []}), \
              patch.object(self.module, 'run', side_effect=run), \
-             patch.object(self.module.time, 'monotonic', side_effect=[0, 0, 0, 721, 721]):
+             patch.object(self.module.time, 'monotonic', side_effect=[0, 0, 0, 3, 721, 721, 722]):  # goodqa#16947: one read after each launch times the provider step
             source, report, reason = self.module.review_snapshot(Path(temporary), 'a' * 40, 'pr', 'Review', 'Evidence')
         self.assertEqual(calls, [('/fixture/codex', 720), ('/fixture/claude', 719)])
         self.assertEqual(report, 'VERDICT: PASS')
