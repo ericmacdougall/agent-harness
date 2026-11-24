@@ -1,0 +1,8 @@
+SYNOPSIS
+     time [-al] [-h | -p] [-o file] utility [argument ...]
+
+     -a      If the -o flag is used, append to the specified file rather than
+     -h      Print times in a human friendly format.  Times are printed in
+     -l      The contents of the rusage structure are printed as well.
+     -o file
+     -p      Makes time output POSIX.2 compliant (each time is printed on its

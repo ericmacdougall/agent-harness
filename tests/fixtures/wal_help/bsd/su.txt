@@ -1,0 +1,7 @@
+SYNOPSIS
+     su [-] [-flm] [login [args]]
+
+     -f      If the invoked shell is csh(1), this option prevents it from
+     -l      Simulate a full login.  The environment is discarded except for
+     -	     (no letter) The same as -l.
+     -m      Leave the environment unmodified.	The invoked shell is your

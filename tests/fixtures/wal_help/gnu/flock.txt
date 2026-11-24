@@ -1,0 +1,24 @@
+
+Usage:
+ flock [options] <file>|<directory> <command> [<argument>...]
+ flock [options] <file>|<directory> -c <command>
+ flock [options] <file descriptor number>
+
+Manage file locks from shell scripts.
+
+Options:
+ -s, --shared             get a shared lock
+ -x, --exclusive          get an exclusive lock (default)
+ -u, --unlock             remove a lock
+ -n, --nonblock           fail rather than wait
+ -w, --timeout <secs>     wait for a limited amount of time
+ -E, --conflict-exit-code <number>  exit code after conflict or timeout
+ -o, --close              close file descriptor before running command
+ -c, --command <command>  run a single command string through the shell
+ -F, --no-fork            execute command without forking
+     --verbose            increase verbosity
+
+ -h, --help               display this help
+ -V, --version            display version
+
+For more details see flock(1).

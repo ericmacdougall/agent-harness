@@ -1,0 +1,80 @@
+SYNOPSIS
+     find [-H | -L | -P] [-EXdsx] [-f path] path ... [expression]
+     find [-H | -L | -P] [-EXdsx] -f path [path ...] [expression]
+
+     -E      Interpret regular expressions following the -regex and -iregex
+     -H      Cause the file information and file type (see stat(2)) returned
+     -L      Cause the file information and file type (see stat(2)) returned
+     -P      Cause the file information and file type (see stat(2)) returned
+     -X      Permit find to be safely used in conjunction with xargs(1).  If a
+     -d      Cause find to perform a depth-first traversal.
+     -f path
+     -s      Cause find to traverse the file hierarchies in lexicographical
+     -x      Prevent find from descending into directories that have a device
+     -Bmin n
+     -Bnewer file
+     -Btime n[smhdw]
+     -acl    May be used in conjunction with other primaries to locate files
+     -amin [-|+]n
+     -anewer file
+     -atime n[smhdw]
+     -cmin [-|+]n
+     -cnewer file
+     -ctime n[smhdw]
+     -d      Non-portable, BSD-specific version of depth.  GNU find implements
+     -delete
+     -depth  Always true; same as the non-portable -d option.  Cause find to
+     -depth n
+     -empty  True if the current file or directory is empty.
+     -exec utility [argument ...] ;
+     -exec utility [argument ...] {} +
+     -execdir utility [argument ...] ;
+     -execdir utility [argument ...] {} +
+     -flags [-|+]flags,notflags
+     -fstype type
+     -gid gname
+     -group gname
+     -ignore_readdir_race
+     -ilname pattern
+     -iname pattern
+     -inum n
+     -ipath pattern
+     -iregex pattern
+     -iwholename pattern
+     -links n
+     -lname pattern
+     -ls     This primary always evaluates to true.  The following information
+     -maxdepth n
+     -mindepth n
+     -mmin [-|+]n
+     -mnewer file
+     -mount  The same thing as -xdev, for GNU find compatibility.
+     -mtime n[smhdw]
+     -name pattern
+     -newer file
+     -newerXY file
+     -nogroup
+     -noignore_readdir_race
+     -noleaf
+     -nouser
+     -ok utility [argument ...] ;
+     -okdir utility [argument ...] ;
+     -path pattern
+     -perm [-|+]mode
+     -print  This primary always evaluates to true.  It prints the pathname of
+     -print0
+     -prune  This primary always evaluates to true.  It causes find to not
+     -quit   Causes find to terminate immediately.
+     -regex pattern
+     -samefile name
+     -size n[ckMGTP]
+     -sparse
+     -type t
+     -uid uname
+     -user uname
+     -wholename pattern
+     -xattr  True if the file has any extended attributes.
+     -xattrname name
+     -not expression
+     -false  Always false.
+     -true   Always true.

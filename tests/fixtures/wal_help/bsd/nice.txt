@@ -1,0 +1,2 @@
+SYNOPSIS
+     nice [-n increment] utility [argument ...]
