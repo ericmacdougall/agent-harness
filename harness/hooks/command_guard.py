@@ -162,7 +162,12 @@ DEFAULT_POLICY = {
                            'ignored_top_ok': ['.venv', 'venv', 'dist', 'build', 'target', '.next', '.gradle']},
     'marker': {'default_ttl_seconds': 900, 'max_ttl_seconds': 86400, 'max_walk_entries': 200000,
                'max_walk_seconds': 2.0, 'max_hash_bytes': 21474836480, 'recent_change_seconds': 600,
-               'approve_remote_types': ['dropbox'], 'no_backup_remote_hosts': ['github.com', 't2-dev']},
+               'approve_remote_types': ['dropbox'],
+               # a backend type that is approved only for remotes with these exact names (supervisor standing
+               # authority, rule 4: "verified copy on b2-archive or Dropbox"). b2-archive2 is a b2 remote that is
+               # NOT approved. Built in: a policy file never widens it (it is not in ADDITIVE_LISTS).
+               'approve_remote_names': {'b2': ['b2-archive']},
+               'no_backup_remote_hosts': ['github.com', 't2-dev']},
 }
 
 SECRET_DUMP, LOG_DELETE, BROAD_KILL = 'secret_dump', 'log_delete', 'broad_kill'
@@ -8896,8 +8901,11 @@ def _check_remote(remote, policy, verifier):
     kind = (found or {}).get(name)
     if kind is None:
         raise ValueError('remote %r is not configured in rclone' % name[:40])
-    if kind.casefold() not in allowed:
-        raise ValueError('remote %r has backend type %r; approvals need one of %s' % (name[:40], kind[:20], allowed))
+    pinned = policy['marker'].get('approve_remote_names', {})
+    named = name in (pinned.get(kind.casefold()) or [])  # exact name; a type alone never approves a pinned type
+    if kind.casefold() not in allowed and not named:
+        raise ValueError('remote %r has backend type %r; approvals need one of %s or a pinned remote name %s'
+                         % (name[:40], kind[:20], allowed, sorted(n for names in pinned.values() for n in names)))
 
 
 def _first_symlink(path):
