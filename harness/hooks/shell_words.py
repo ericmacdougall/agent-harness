@@ -50,6 +50,10 @@ class Word:
     quoted: bool          # any part was quoted
     unquoted: tuple       # (offset, char) for every unquoted character
     expansions: tuple     # (offset, inside_double_quotes, name)
+    # Where value[0] comes from: "quoted" (literal text in quotes), "unquoted" (a literal character the shell may still
+    # glob, tilde- or brace-expand), "expansion" (a parameter expansion: the shell decides it) or "" (empty value).
+    # Judged on the value, not on offsets: in `''"$X"` the first character still comes from $X.
+    lead: str = ""
 
     @property
     def assignment(self):
@@ -150,13 +154,20 @@ class _Scanner:
         if self.word is None:
             if self.closed:
                 self.fail("syntax", "a word right after a closing parenthesis")
-            self.word = {"start": self.index, "value": [], "quoted": False, "unquoted": [], "expansions": []}
+            self.word = {"start": self.index, "value": [], "quoted": False, "unquoted": [], "expansions": [],
+                         "lead": ""}
+
+    def add(self, text, lead):
+        """Append `text` to the word's value; the first non-empty piece decides Word.lead."""
+        if text and not self.word["lead"]:
+            self.word["lead"] = lead
+        self.word["value"].append(text)
 
     def end_word(self):
         if self.word is None:
             return
         built = Word("".join(self.word["value"]), self.word["start"], self.index, self.word["quoted"],
-                     tuple(self.word["unquoted"]), tuple(self.word["expansions"]))
+                     tuple(self.word["unquoted"]), tuple(self.word["expansions"]), self.word["lead"])
         self.word = None
         if self.pending is not None:
             operator, offset = self.pending
@@ -335,7 +346,7 @@ class _Scanner:
                 if odd:
                     self.fail(odd, "a control character %r" % inner if odd == "control" else
                               "the non-ASCII quote, space or format character U+%04X" % ord(inner), offset)
-            word["value"].append(body)
+            self.add(body, "quoted")
             self.index = close + 1
             return
         if char == '"':
@@ -361,7 +372,7 @@ class _Scanner:
                 if inner == "$":
                     self.expansion(dq=True)
                     continue
-                word["value"].append(inner)
+                self.add(inner, "quoted")
                 self.index += 1
         if char == "\\":
             self.fail("backslash", "a backslash escape")
@@ -375,7 +386,7 @@ class _Scanner:
             self.expansion(dq=False)
             return
         word["unquoted"].append((self.index, char))
-        word["value"].append(char)
+        self.add(char, "unquoted")
         self.index += 1
 
     def expansion(self, dq):
@@ -406,5 +417,5 @@ class _Scanner:
             self.fail("expansion_suffix", "%r right after an expansion (zsh may read a subscript, modifier or a "
                       "longer name)" % after, end, dq=dq)
         self.word["expansions"].append((start, dq, name))
-        self.word["value"].append(self.text[start:end])
+        self.add(self.text[start:end], "expansion")
         self.index = end

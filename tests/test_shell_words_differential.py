@@ -62,7 +62,8 @@ ADVERSARIAL = [
     "cd /w && cmd x", "T=/srv; cmd $T && other", "cmd $'a' b", "cmd $'x;y' z", 'cmd $"a" b', "cmd a$'b'",
 ]
 CORPUS = REVIEWER_EXAMPLES + STAMP_LINES + ADVERSARIAL + copy_cases.REMOTE + copy_cases.LOCAL + \
-    copy_cases.BASE_REFUSED + copy_cases.WRAPPED
+    copy_cases.BASE_REFUSED + copy_cases.WRAPPED + copy_cases.ROUND2_LOCAL + copy_cases.ROUND2_STILL_LOCAL + \
+    copy_cases.ROUND2_REMOTE
 
 # Each record is one append-mode write, so the two sides of a pipeline cannot interleave their records.
 BASH_PRELUDE = r"""exec 3>>"$SW_RECORD"
@@ -155,6 +156,19 @@ class ScannerVerdicts(unittest.TestCase):
                 scan = shell_words.scan(line)
                 self.assertTrue(scan.verified, scan.message)
                 self.assertEqual([segment.argv for segment in scan.segments], argv)
+
+    def test_a_word_says_where_its_first_character_comes_from(self):
+        # Round 2: copy_hygiene's ssh rule judges a word by its value's first character. Empty quotes in front of
+        # an expansion do not make the expansion literal text, and a quoted `-` is still a `-`.
+        cases = {"''\"$X\"": "expansion", '""$X': "expansion", "$X": "expansion", "${X}.x": "expansion",
+                 "\"x$X\"": "quoted", "\"''$X\"": "quoted", "'-o'$X": "quoted", "\"-$X\"": "quoted",
+                 "x$X": "unquoted", "-o\"$X\"": "unquoted", '""*': "unquoted", "~/k": "unquoted",
+                 "''": "", '""': ""}
+        for text, lead in cases.items():
+            with self.subTest(word=text):
+                scan = shell_words.scan("cmd " + text)
+                self.assertTrue(scan.verified, scan.message)
+                self.assertEqual(scan.segments[0].words[1].lead, lead)
 
     def test_scan_never_raises(self):
         for line in CORPUS + ["", " ", "\x00", "(" * 50, "$", "${", "'" * 3, '"', "a" * (shell_words.MAX_TEXT + 1)]:
