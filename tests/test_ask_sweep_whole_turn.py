@@ -173,6 +173,17 @@ class WalEvidenceWholeTurn(unittest.TestCase):
                     self.assertTrue(item["manual"])
                     self.assertEqual((item["close"], item["apply"]), (None, None))
                     self.assertIn("by hand", item["action"])
+                    if source.startswith("user:"):
+                        # the whole-turn gate itself holds a direct cite back, not only the writer's rule after it
+                        # (round 5: close_verdict also refuses a cite provenance rejects, so the reason is what differs)
+                        self.assertEqual((item.get("partial"), item["action"]), (True, "manual: this evidence quotes only "
+                                         "part of the user's turn, or cannot be checked against the whole turn, and "
+                                         "leaving words out can change its meaning: read the whole turn and close the "
+                                         "ask by hand"))
+                    else:
+                        # an inferred: chain backs no answer close: the writer's own reason
+                        self.assertNotIn("partial", item)
+                        self.assertIn("wal_note would refuse this close", item["action"])
         # every pin at once: each partial excerpt is refused, each whole turn is closed, in one run
         code, doc = self.sweep("--apply", "--only", *[listed[a]["pin"] for a in self.cases])
         self.assertEqual(code, 1)   # refusals are reported
