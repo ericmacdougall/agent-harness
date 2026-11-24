@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import sys
 import tempfile
 import time
@@ -37,6 +38,7 @@ AID = "a1b2c3d4e5f6a7b8"
 NOW = float(int(time.time()))  # the enabler reads the real clock
 REPO = "ericmacdougall/agent-harness"
 OPUS, SONNET = "claude-opus-5-5", "claude-sonnet-5"
+ARGV = ["--project", REPO + ":mac,t2-dev", "--power", "merge", "--power", "delete", "--reason", "clean up"]
 MODELS_OK = ("claude-opus-5-5", "claude-fable-1", "gpt-6.1-sol", "gpt-6.1-astra")
 MODELS_BAD = {"claude-sonnet-5": "model_unqualified", "gpt-6.1-terra": "model_unqualified",
               "claude-haiku-4-5": "model_unknown", "gpt-6.1-luna": "model_unknown", "mystery-model": "model_unknown",
@@ -87,7 +89,7 @@ class Env(unittest.TestCase):
         """Append the client's assistant record of one tool call; return its tool_use id."""
         self.counter += 1
         tid = "toolu_%016d" % self.counter
-        rec = record or {"type": "assistant", "uuid": "u-%d" % self.counter,
+        rec = record or {"type": "assistant", "uuid": "u-%d" % self.counter, "timestamp": ss.iso(NOW),
                          "message": {"role": "assistant", "model": model,
                                      "content": [{"type": "tool_use", "id": tid, "name": "Bash",
                                                   "input": {"command": command}}]}}
@@ -103,13 +105,15 @@ class Env(unittest.TestCase):
         return out
 
     # ----- request and grant
-    def stamp(self, model=OPUS, transcript=None, session=SID, command=None):
-        tid = self.call(model, transcript, command or "ah supervisor request --project %s:mac" % REPO)
+    def stamp(self, model=OPUS, transcript=None, session=SID, command=None, argv=None):
+        """The client's record of main running `ah supervisor request ARGV` (exactly that command), and the stamp."""
+        command = command or "ah supervisor request " + " ".join(shlex.quote(a) for a in (argv or ARGV))
+        tid = self.call(model, transcript, command)
         return {"session": session, "tool_use_id": tid, "transcript": str(transcript or self.transcript)}
 
     def request(self, argv=None, **kw):
-        argv = argv or ["--project", REPO + ":mac,t2-dev", "--power", "merge", "--power", "delete", "--reason", "clean up"]
-        req = sg.build_request(argv, self.stamp(**kw), now=NOW)
+        argv = argv or ARGV
+        req = sg.build_request(argv, self.stamp(argv=argv, **kw), now=NOW)
         sg.write_request(req)
         return req
 
@@ -208,8 +212,9 @@ class Request(Env):
         self.assertEqual(req["powers"], ["merge"])
 
     def test_unknown_power_is_refused_by_the_parser(self):
-        with self.assertRaises(SystemExit):
+        with self.assertRaises(sg.Refusal) as caught:
             self.request(["--project", REPO + ":mac", "--power", "admin", "--reason", "x"])
+        self.assertEqual(caught.exception.code, "bad_input")
 
     def test_hand_written_request_file_is_refused_by_the_enabler_loader(self):
         req = self.request()
@@ -373,11 +378,16 @@ class Check(Env):
         self.assertTrue(sg.revoke(grant["gid"]))
         self.assertEqual(self.code(self.check(self.call(), now=NOW + 400 * 86400)), "revoked")
 
-    def test_revoked_stays_revoked_when_the_file_is_removed(self):
+    def test_revoked_stays_revoked_whatever_happens_to_the_audit_file(self):
+        """F2: the audit is information only. Making it unreadable, oversized or a symlink revives nothing."""
         grant = self.grant()
         self.assertTrue(sg.revoke(grant["gid"]))
         self.assertEqual(self.code(self.check(self.call())), "revoked")
-        os.unlink(sg.revoked_dir(self.home) / grant["gid"])
+        audit = sg.audit_path(self.home)
+        os.chmod(audit, 0o644)
+        self.assertEqual(self.code(self.check(self.call())), "revoked")
+        audit.unlink()
+        os.symlink(self.transcript, audit)
         self.assertEqual(self.code(self.check(self.call())), "revoked")
 
     def test_revoke_all_and_kill_switch(self):
@@ -686,7 +696,8 @@ class Enabler(Env):
                 self.write(path, json.dumps(forged).encode())
                 rc, _fake, text = self.run_enabler(["", "", "<code>"])
                 self.assertEqual(rc, 3, text)
-                self.assertRegex(text, "does not match the session's own record|not a session transcript")
+                self.assertRegex(text, "changed after it was made|does not match the session's own record|"
+                                       "does not name the call")
                 self.assertEqual(self.grants(), [])
         self.assertEqual(self.grants(), [])
 

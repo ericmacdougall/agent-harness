@@ -129,7 +129,12 @@ Source: the user, relayed by main on 2026-11-24 (goodqa#16944): "make a way for 
   `ah supervisor request --project owner/repo:host[,host] --power merge|delete --reason TEXT [--include-subagents] [--user-source SRC]`
 
   - Main's hook stamps that exact command. A sub-agent's call gets no stamp, so it cannot request.
-  - The session and the model come from the transcript record of that one call.
+  - The session and the model come from the transcript record of that one call. That record's command must be exactly
+    one plain `ah supervisor request ...` simple command (no list, pipe, wrapper or computed word).
+  - The request file is only a pointer to that call. At grant time every field the user sees and signs (projects,
+    powers, sub-agents, reason, user source, model) is computed again from the recorded command; any edited field is
+    refused. The evidence and reason checks run again, the age comes from the record's own time, and one call can be
+    granted once.
   - Projects are named one by one; a wildcard is refused. Each project must appear in the session's own WAL or brief.
   - A request grants nothing.
 - **Grant.** The user runs `ah_enable_self_serve.py --grant-supervisor <rid>` in his own terminal.
@@ -141,10 +146,25 @@ Source: the user, relayed by main on 2026-11-24 (goodqa#16944): "make a way for 
 - **Check at every use.** Consuming guards call `supervisor_grant.check(payload, power, project, host=, target=)` with their own hook payload. It re-verifies:
   - the signature, the session, the sub-agent rule, the project, the host and the power;
   - the expiry, revocation and the kill switch;
-  - the model of the call being checked, read from its own transcript record. Only Sol, Opus, Fable and Astra qualify. An unknown model, or a duplicated record, is refused.
+  - the model of the call being checked, read from its own transcript record. The whole transcript is searched, so
+    padding cannot push the record out of view. Only Sol, Opus, Fable and Astra qualify. An unknown model, or a
+    duplicated record, is refused.
+  - Only the client writes transcripts: the command guard's `transcript-forgery` rule refuses shell writes, and
+    `transcript_guard.py` (PreToolUse on Write, Edit, MultiEdit and NotebookEdit) refuses file-tool writes under
+    `~/.claude/projects` and `~/.claude/transcripts`, except notes under `projects/<dir>/memory/`. A script that
+    computes the path at run time is outside both guards, the same-user limit self_serve states.
 
-  Delete targets under logs, WALs, policy, private keys, hooks or `~/.codex`, guard files, the default, release and tag refs, and yates, apex_app_pos and OptinRouter are never covered.
-- **Revoke and status.** `ah supervisor revoke <gid>|all` works for anyone; nothing deletes a revocation. `ah supervisor status` shows every grant, and the session-start line says when a grant is live.
+  Delete targets are never covered when they reach a log, WAL, transcript, session, state, policy or guard location.
+  The list is the delete guard's own (`command_guard.load_policy()`: its Tier A roots, guard files and WAL rules) plus
+  `~/.agent-harness/logs`, `policy`, `private`, `state`, `bin`, `~/.claude/hooks`, the settings files and `~/.codex`.
+  Inside a harness tree only the guard's scratch subtrees and `~/.agent-harness/work/<session>/<task>/...` can be
+  deleted, and an existing local folder is read first and refused when it holds any of those. The default, release
+  and tag refs, and yates, apex_app_pos and OptinRouter, are never covered either.
+- **Revoke and status.** `ah supervisor revoke <gid>|all` works for anyone. It appends a row to
+  `~/.agent-harness/policy/supervisor/revocations.jsonl`, which nothing rewrites. `revoke all` revokes every grant
+  issued up to that moment, so a later grant works. If that log exists but cannot be read safely (not a private
+  regular file, oversized, a malformed or torn row), every grant counts as revoked, and `ah supervisor status` says
+  why. `ah supervisor status` shows every grant, and the session-start line says when a grant is live.
 - **What it never touches.** Rules 1 to 4, permission prompts and modes, guard installs, and the separate Fable and Astra per-task approval are unaffected.
 
 ## Completion

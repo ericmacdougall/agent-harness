@@ -532,6 +532,52 @@
    ]
   },
   {
+   "id": "transcript_guard:hook",
+   "script": "transcript_guard.py",
+   "arg": null,
+   "event": "PreToolUse",
+   "tools": [
+    "Write",
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S04"
+   ],
+   "canaries": [
+    {
+     "payload": {
+      "hook_event_name": "PreToolUse",
+      "tool_name": "Write",
+      "tool_input": {
+       "file_path": "/tmp/transcript-guard-canary.txt",
+       "content": ""
+      },
+      "cwd": "/"
+     },
+     "expect": "allow"
+    },
+    {
+     "payload": {
+      "hook_event_name": "PreToolUse",
+      "tool_name": "Edit",
+      "tool_input": {
+       "file_path": "~/.claude/projects/doctor-canary/doctor-canary.jsonl",
+       "old_string": "a",
+       "new_string": "b"
+      },
+      "cwd": "/"
+     },
+     "expect": "deny"
+    }
+   ]
+  },
+  {
    "id": "prod_delete_guard:hook",
    "script": "prod_delete_guard.py",
    "arg": null,

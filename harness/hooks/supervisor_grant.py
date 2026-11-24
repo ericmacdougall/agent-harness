@@ -17,10 +17,14 @@ The flow:
   grant    `python3 scripts/enable-agent-ops.py --grant-supervisor <rid>` (installed as
            ~/.agent-harness/bin/ah_enable_self_serve.py), run by the user. It runs the enabler's human checks, shows
            the text in terminal_text(), and signs a grant with the self-serve key under this module's own domain.
+           The request file is only a pointer to the call: load_request computes every field the user sees again
+           from the recorded command (derive_request) and refuses a file whose fields differ. One call, one grant.
   check    check(payload, power, project, ...) from a consuming guard (merge_gate for merge, the sanctioned delete
            routes for delete). It re-verifies the signature, the session, the project, the host, the power, the expiry,
            revocation and the kill switch, and it re-reads the model of the very call being checked.
-  revoke   `ah supervisor revoke <gid>|all`. Anyone may revoke, an agent included: it only takes power away.
+  revoke   `ah supervisor revoke <gid>|all`. Anyone may revoke, an agent included: it only takes power away. Rows go
+           to their own append-only log (revocation_state reads it); a log that cannot be read safely revokes every
+           grant, and `all` revokes the grants issued up to its time.
 
 Why an agent cannot grant itself the power (each has a test in tests/test_supervisor_grant.py):
   * The grant is an Ed25519 signature by the self-serve key under DOMAIN. Without the private key a grant cannot be
@@ -29,8 +33,11 @@ Why an agent cannot grant itself the power (each has a test in tests/test_superv
     in the native dialog.
   * The model is read from the transcript record of the call being checked, found by payload.tool_use_id. The API
     assigns that id when the call is made, so no earlier line can carry it. A line the agent appends while the call runs
-    makes two records with that id, and check() then refuses. The command guard's `transcript-forgery` rule (class
-    LOG_DELETE) blocks shell writes under ~/.claude/projects in the first place.
+    makes two records with that id, and check() then refuses; the whole file is searched, so padding cannot hide the
+    real record. An in-place edit leaves one record, so the control is that no agent route writes the transcript: the
+    command guard's `transcript-forgery` rule (class LOG_DELETE) refuses shell writes under ~/.claude/projects, and
+    transcript_guard.py refuses Write, Edit, MultiEdit and NotebookEdit there. A script that computes the path at run
+    time is outside both, the same-user limit stated below.
   * home=, now= and the proof root are clamped by self_serve (_resolve_home, _clock, _claude_dir).
 
 What a grant never covers, whatever it says (NEVER_COVERED, also copied into every grant): rules 1 to 4, permission
@@ -44,8 +51,10 @@ Python 3.9+, stdlib plus `cryptography` (for signatures). Importing this module 
 """
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
+import mmap
 import os
 import re
 import secrets
@@ -75,7 +84,10 @@ UNTIL_REVOKED = "until revoked"  # never a default: the user must type these wor
 REQUEST_MAX_AGE = 24 * 3600
 MAX_PROJECTS = 20
 MAX_REASON = 1000
-TAIL_BYTES = 16 << 20  # transcript tail searched for the record of the call being checked
+TRANSCRIPT_MAX = 4 << 30  # the whole transcript is scanned (mmap) for the call's id; a larger file is refused
+NEEDLE_LINES_MAX = 64  # lines naming one tool_use id (its call, its result, progress rows); more is refused
+REVOCATIONS_MAX = 4 << 20  # only `revoke` appends to the revocation log, so it stays small; larger is all-revoked
+WALK_MAX = 500_000  # entries read inside a local delete target before it is refused as too large to check
 EVIDENCE_MAX_FILE = 256 << 20
 EVIDENCE_MAX_TOTAL = 1 << 30
 STAMP_SUB = "supervisor"
@@ -101,6 +113,14 @@ NEVER_COVERED = (
     "production data, yates, OptinRouter, and anything outside the projects above",
 )
 
+# What a supervisor delete must never touch on top of the delete guard's own Tier A list (read from command_guard, see
+# never_covered_roots): the harness logs, policy, private keys, state and installed tools, the installed hooks and the
+# settings. Logs are never deleted without a verified backup (the user's rule), so ~/.agent-harness/logs is here.
+SUPERVISOR_EXTRA_ROOTS = ("{home}/.agent-harness/logs", "{home}/.agent-harness/policy", "{home}/.agent-harness/private",
+                          "{home}/.agent-harness/state", "{home}/.agent-harness/bin", "{home}/.agent-harness/codex-wals",
+                          "{home}/.claude/hooks", "{home}/.claude/settings.json", "{home}/.claude/settings.local.json",
+                          "{home}/.claude/CLAUDE.md", "{home}/.claude/projects", "{home}/.claude/wals",
+                          "{home}/.claude/sessions", "{home}/.claude/transcripts", "{home}/.codex")
 REPO = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}$")
 HOST_NAME = re.compile(r"^[a-z0-9][a-z0-9.-]{0,62}$")
 HEX16, HEX32 = re.compile(r"^[0-9a-f]{16}$"), re.compile(r"^[0-9a-f]{32}$")
@@ -132,8 +152,8 @@ def grants_dir(home=None) -> Path:
     return ss.policy_dir(home) / "supervisor"
 
 
-def revoked_dir(home=None) -> Path:
-    return grants_dir(home) / "revoked"
+def revocations_path(home=None) -> Path:
+    return grants_dir(home) / "revocations.jsonl"
 
 
 def requests_dir(home=None) -> Path:
@@ -268,7 +288,10 @@ def resolve_transcripts(payload) -> tuple:
     return session, agent or None, main, own
 
 
-def _tail_lines(path: Path) -> list:
+def _lines_with(path: Path, needle: bytes) -> list:
+    """Every line of the WHOLE transcript that contains `needle` (a tool_use id). The file is scanned end to end
+    through mmap, so padding appended after a forged copy cannot push the real record out of view (no tail window).
+    More than NEEDLE_LINES_MAX matches, a file over TRANSCRIPT_MAX, or anything but a regular file is a refusal."""
     try:
         fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
     except OSError:
@@ -277,30 +300,36 @@ def _tail_lines(path: Path) -> list:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             raise Refusal("model_unknown", "the transcript is not a regular file")
-        start = max(0, info.st_size - TAIL_BYTES)
-        os.lseek(fd, start, os.SEEK_SET)
-        chunks, left = [], info.st_size - start
-        while left > 0:
-            chunk = os.read(fd, min(left, 1 << 20))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            left -= len(chunk)
+        if info.st_size > TRANSCRIPT_MAX:
+            raise Refusal("model_unknown", "the transcript is larger than %d bytes; refusing" % TRANSCRIPT_MAX)
+        if info.st_size == 0:
+            return []
+        with mmap.mmap(fd, info.st_size, access=mmap.ACCESS_READ) as view:
+            lines, pos = [], view.find(needle)
+            while pos != -1:
+                if len(lines) >= NEEDLE_LINES_MAX:
+                    raise Refusal("model_unknown", "the tool call's id appears more than %d times; refusing" % NEEDLE_LINES_MAX)
+                start = view.rfind(b"\n", 0, pos) + 1
+                end = view.find(b"\n", pos)
+                end = info.st_size if end == -1 else end
+                lines.append(view[start:end])
+                pos = view.find(needle, end)
+            return lines
+    except (OSError, ValueError):
+        raise Refusal("model_unknown", "the transcript cannot be read") from None
     finally:
         os.close(fd)
-    lines = b"".join(chunks).split(b"\n")
-    return lines[1:] if start else lines
 
 
 def call_record(transcript: Path, tool_use_id) -> dict:
     """The one assistant record whose content holds the tool_use with this id. Only the client's own record shape
     counts: type and message.role 'assistant', a message.model string, a uuid, not an API error message. None found,
-    or two of them (a forged copy appended while the call runs), is a refusal."""
+    or two of them (a forged copy appended while the call runs, anywhere in the file), is a refusal."""
     if not isinstance(tool_use_id, str) or not TOOL_USE_ID.match(tool_use_id):
         raise Refusal("model_unknown", "the hook payload names no tool call, so the model cannot be read")
     needle = tool_use_id.encode()
     found = []
-    for raw in _tail_lines(transcript):
+    for raw in _lines_with(transcript, needle):
         if needle not in raw:
             continue
         try:
@@ -324,7 +353,7 @@ def call_record(transcript: Path, tool_use_id) -> dict:
             or not isinstance(record.get("uuid"), str) or not isinstance(message.get("model"), str):
         raise Refusal("model_unknown", "the record of this tool call is not an assistant record written by the client")
     return {"model": message["model"], "uuid": record["uuid"], "input": uses[0].get("input"),
-            "name": uses[0].get("name")}
+            "name": uses[0].get("name"), "timestamp": record.get("timestamp")}
 
 
 def observed_model(payload) -> tuple:
@@ -447,42 +476,61 @@ def _verify_user_source(source: str) -> str:
     return match.group(1) if match else ""
 
 
+class _ArgError(Exception):
+    pass
+
+
 def _parse_request_argv(argv) -> dict:
     import argparse  # noqa: PLC0415
-    parser = argparse.ArgumentParser(prog="ah supervisor request", allow_abbrev=False)
+
+    class Parser(argparse.ArgumentParser):
+        def error(self, message):  # never exit or print: a bad argument list is a refusal
+            raise _ArgError(message)
+
+    parser = Parser(prog="ah supervisor request", allow_abbrev=False, add_help=False)
     parser.add_argument("--project", action="append", required=True, help="owner/repo:host[,host] (repeat per project)")
     parser.add_argument("--power", action="append", choices=POWERS, required=True)
     parser.add_argument("--include-subagents", action="store_true", help="ask for this session's sub-agents too")
     parser.add_argument("--reason", required=True, help="why, shown to the user as data (at most %d chars)" % MAX_REASON)
     parser.add_argument("--user-source", help="optional user:/uuid:/answer: citation of the user's words")
-    return vars(parser.parse_args(argv))
+    try:
+        return vars(parser.parse_args([str(a) for a in argv]))
+    except _ArgError as error:
+        raise Refusal("bad_input", "ah supervisor request: %s" % str(error)[:200]) from None
 
 
-def build_request(argv, stamp: dict, *, home=None, now=None) -> dict:
-    """The request record for `ah supervisor request ARGV`, proven by `stamp` (the bound stamp main's hook wrote for this
-    exact argument list). Raises Refusal. Writes nothing."""
-    now = ss._clock(now)
-    home = _home(home)
-    policy = load_policy()
-    if not isinstance(stamp, dict) or not isinstance(stamp.get("session"), str) or not stamp.get("tool_use_id"):
-        raise Refusal("not_main", "only the main agent requests supervisor power: run ONE plain foreground "
-                      "`ah supervisor request ...` command (no wrapper, no $(...)) so main's hook can stamp it. A "
-                      "sub-agent's call gets no stamp. If main ran it, the stamping hook is not installed yet: the user "
-                      "installs the merged hook files with his pinned install line")
-    options = _parse_request_argv(argv)
-    payload = {"session_id": stamp["session"], "transcript_path": stamp.get("transcript"),
-               "tool_use_id": stamp["tool_use_id"]}
-    session, agent, _main, own = resolve_transcripts(payload)
-    if agent:
-        raise Refusal("not_main", "only the main agent requests supervisor power")
-    record = call_record(own, stamp["tool_use_id"])
-    command = str((record.get("input") or {}).get("command") or "") if isinstance(record.get("input"), dict) else ""
-    if "supervisor" not in command or "request" not in command:
-        raise Refusal("not_main", "the stamped tool call is not this `ah supervisor request` command")
+def recorded_argv(command) -> list:
+    """The argument list after `ah supervisor request` in the recorded Bash command, read with the same parser main's
+    stamping hook uses (ah_ops.stamped_argvs). The command must be exactly ONE plain simple command that runs
+    `ah supervisor request ...`: `echo supervisor request`, a pipe, a list, a wrapper or a word only the shell can
+    compute is refused."""
+    if not isinstance(command, str) or not command.strip() or "\x00" in command:
+        raise Refusal("not_main", "the recorded tool call has no command")
+    import ah_ops  # noqa: PLC0415
+    shellwords = ah_ops.load_sibling("shellwords")
+    simple = list(shellwords.simple_commands(command))
+    argvs = ah_ops.stamped_argvs(command)
+    if len(simple) != 1 or len(argvs) != 1 or argvs[0][:2] != [STAMP_SUB, "request"]:
+        raise Refusal("not_main", "the recorded tool call is not one plain `ah supervisor request ...` command")
+    return argvs[0][2:]
+
+
+def request_id(session: str, tool_use_id: str) -> str:
+    """One call gives one request id: a second request file, or a second grant, for the same call is refused."""
+    return hashlib.sha256(("%s\0%s" % (session, tool_use_id)).encode()).hexdigest()[:16]
+
+
+def derive_request(record: dict, session: str, home: str, policy: dict) -> dict:
+    """Every field the user is shown and signs, computed from the client's own record of the call: its model and its
+    exact command (re-parsed), plus the session's own WAL and brief for evidence and provenance for --user-source. The
+    request file never supplies any of these. Raises Refusal."""
     ok, family = qualify(record["model"], policy)
     if not ok:
         raise Refusal(family, "this session runs %s, which is not qualified for supervisor power; only %s are"
                       % (str(record["model"])[:60], ", ".join(qualified_names(policy))))
+    tool_input = record.get("input") if isinstance(record.get("input"), dict) else {}
+    argv = recorded_argv(tool_input.get("command"))
+    options = _parse_request_argv(argv)
     projects = parse_projects(options["project"], policy)
     evidence = supervised_evidence(session, [p["repo"] for p in projects], home)
     missing = [p["repo"] for p in projects if p["repo"] not in evidence]
@@ -497,12 +545,42 @@ def build_request(argv, stamp: dict, *, home=None, now=None) -> dict:
     user_source, excerpt = options.get("user_source"), ""
     if user_source:
         excerpt = _verify_user_source(user_source)
-    return {"schema": REQUEST_SCHEMA, "rid": secrets.token_hex(8), "at": ss.iso(now), "session": session,
-            "transcript": str(own), "tool_use_id": stamp["tool_use_id"], "record_uuid": record["uuid"],
-            "model": record["model"], "model_family": family, "projects": projects,
+    return {"argv": argv, "model": record["model"], "model_family": family, "projects": projects,
             "powers": sorted(set(options["power"])), "include_subagents": bool(options["include_subagents"]),
             "reason": reason, "user_source": user_source or None, "user_excerpt": excerpt or None,
             "evidence": evidence}
+
+
+# The request file is a pointer to one call. These fields must equal what derive_request computes again from that call;
+# any difference means the file was edited, and the request is refused.
+REQUEST_DERIVED = ("model", "model_family", "projects", "powers", "include_subagents", "reason", "user_source",
+                   "user_excerpt")
+REQUEST_KEYS = {"schema", "rid", "at", "session", "transcript", "tool_use_id", "record_uuid", "evidence"} | set(REQUEST_DERIVED)
+
+
+def build_request(argv, stamp: dict, *, home=None, now=None) -> dict:
+    """The request record for `ah supervisor request ARGV`, proven by `stamp` (the bound stamp main's hook wrote for this
+    exact argument list). Raises Refusal. Writes nothing."""
+    now = ss._clock(now)
+    home = _home(home)
+    policy = load_policy()
+    if not isinstance(stamp, dict) or not isinstance(stamp.get("session"), str) or not stamp.get("tool_use_id"):
+        raise Refusal("not_main", "only the main agent requests supervisor power: run ONE plain foreground "
+                      "`ah supervisor request ...` command (no wrapper, no $(...)) so main's hook can stamp it. A "
+                      "sub-agent's call gets no stamp. If main ran it, the stamping hook is not installed yet: the user "
+                      "installs the merged hook files with his pinned install line")
+    _parse_request_argv(argv)  # a malformed argument list is refused before anything is read
+    payload = {"session_id": stamp["session"], "transcript_path": stamp.get("transcript"),
+               "tool_use_id": stamp["tool_use_id"]}
+    session, agent, _main, own = resolve_transcripts(payload)
+    if agent:
+        raise Refusal("not_main", "only the main agent requests supervisor power")
+    record = call_record(own, stamp["tool_use_id"])
+    derived = derive_request(record, session, home, policy)
+    if derived.pop("argv") != [str(a) for a in argv]:
+        raise Refusal("not_main", "the stamped tool call is not this `ah supervisor request` command")
+    return dict(derived, schema=REQUEST_SCHEMA, rid=request_id(session, stamp["tool_use_id"]), at=ss.iso(now),
+                session=session, transcript=str(own), tool_use_id=stamp["tool_use_id"], record_uuid=record["uuid"])
 
 
 def write_request(request: dict, home=None) -> Path:
@@ -518,38 +596,46 @@ def write_request(request: dict, home=None) -> Path:
 
 
 def load_request(rid: str, *, home=None, now=None) -> dict:
-    """A request record, re-proven: its age, its shape, and that the session's own transcript still holds the
-    assistant record of that `ah supervisor request` call with a qualified model. A request file an agent wrote by
-    hand names no such record and is refused."""
+    """The request the user is shown, rebuilt from the call it points at. The file supplies only the pointer (session,
+    transcript, tool_use_id, record uuid). Everything shown and signed is computed again by derive_request from the
+    client's own record of that call, and every derived field the file holds must equal it exactly. The age comes from
+    the record's own timestamp. A hand-written or edited request file is refused."""
     if not isinstance(rid, str) or not HEX16.match(rid):
         raise Refusal("bad_input", "a request id is 16 hex characters")
     now = ss._clock(now)
     home = _home(home)
-    request = ss._strict_json(_read_regular(requests_dir(home) / (rid + ".json"), 65536, private=True))
-    if not isinstance(request, dict) or request.get("schema") != REQUEST_SCHEMA or request.get("rid") != rid:
+    stored = ss._strict_json(_read_regular(requests_dir(home) / (rid + ".json"), 65536, private=True))
+    if not isinstance(stored, dict) or set(stored) != REQUEST_KEYS or stored.get("schema") != REQUEST_SCHEMA \
+            or stored.get("rid") != rid:
         raise Refusal("bad_input", "request %s is malformed" % rid)
-    age = now - ss.parse_time(request.get("at"))
+    if not isinstance(stored.get("session"), str) or not isinstance(stored.get("tool_use_id"), str) \
+            or request_id(stored["session"], stored["tool_use_id"]) != rid:
+        raise Refusal("bad_input", "request %s does not name the call it was made from" % rid)
+    if already_granted(rid, home):
+        raise Refusal("bad_input", "request %s was already granted once; the agent asks again for a new grant" % rid)
+    payload ={"session_id": stored["session"], "transcript_path": stored.get("transcript"),
+               "tool_use_id": stored["tool_use_id"]}
+    session, agent, _main, own = resolve_transcripts(payload)
+    if agent or str(own) != stored.get("transcript"):
+        raise Refusal("bad_input", "request %s does not point at the main session's own transcript" % rid)
+    record = call_record(own, stored["tool_use_id"])
+    if record["uuid"] != stored.get("record_uuid"):
+        raise Refusal("bad_input", "request %s does not match the session's own record of that call" % rid)
+    try:
+        asked = ss.parse_time(record.get("timestamp"))
+    except ss._Deny:
+        raise Refusal("bad_input", "the record of request %s has no time, so its age is unknown" % rid) from None
+    age = now - asked
     if age < -ss.CLOCK_SKEW_SECONDS or age > REQUEST_MAX_AGE:
         raise Refusal("expired", "request %s is older than 24 hours; ask again" % rid)
-    payload = {"session_id": request.get("session"), "transcript_path": request.get("transcript"),
-               "tool_use_id": request.get("tool_use_id")}
-    _session, agent, _main, own = resolve_transcripts(payload)
-    record = call_record(own, request.get("tool_use_id"))
-    command = str((record.get("input") or {}).get("command") or "") if isinstance(record.get("input"), dict) else ""
-    if agent or record["uuid"] != request.get("record_uuid") or record["model"] != request.get("model") \
-            or "supervisor" not in command or "request" not in command:
-        raise Refusal("bad_input", "request %s does not match the session's own record of that call" % rid)
-    policy = load_policy()
-    ok, family = qualify(record["model"], policy)
-    if not ok:
-        raise Refusal(family, "request %s came from an unqualified model" % rid)
-    projects = parse_projects(["%s:%s" % (p.get("repo"), ",".join(p.get("hosts") or [])) for p in request.get("projects") or []
-                               if isinstance(p, dict)], policy)
-    powers = request.get("powers")
-    if not isinstance(powers, list) or not powers or any(p not in POWERS for p in powers):
-        raise Refusal("bad_input", "request %s names an unknown power" % rid)
-    request["projects"] = projects
-    return request
+    derived = derive_request(record, session, home, load_policy())
+    derived.pop("argv")
+    changed = [field for field in REQUEST_DERIVED if stored.get(field) != derived[field]]
+    if changed:
+        raise Refusal("bad_input", "request %s was changed after it was made (%s differ from the recorded command); "
+                      "refused" % (rid, ", ".join(changed)))
+    return dict(derived, schema=REQUEST_SCHEMA, rid=rid, at=ss.iso(asked), session=session, transcript=str(own),
+                tool_use_id=stored["tool_use_id"], record_uuid=record["uuid"])
 
 
 # ------------------------------------------------------------------ grant (body built here, signed by the enabler)
@@ -622,7 +708,15 @@ def terminal_text(request: dict, body: dict) -> str:
     return "\n".join(lines)
 
 
+def already_granted(rid, home=None) -> bool:
+    """Whether a verified grant (live, expired or revoked) was already made from this request: one call, one grant."""
+    return any(g is not None and g.get("rid") == rid for g, _problem, _path in load_grants(_home(home)))
+
+
 def write_grant(signed: dict, home=None) -> Path:
+    if already_granted(signed.get("rid"), home):
+        raise Refusal("bad_input", "request %s was already granted once; the agent asks again for a new grant"
+                      % str(signed.get("rid"))[:16])
     folder = grants_dir(_home(home))
     for directory in (ss.policy_dir(_home(home)), folder):
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -651,29 +745,50 @@ def _audit(home, row: dict):
         os.close(fd)
 
 
-def _audit_revoked(home) -> set:
+def revocation_state(home) -> dict:
+    """The one reader of revocations: {"all": bool, "problem": str|None, "gids": set, "all_at": [times]}.
+
+    Revocations live in their own append-only log, policy/supervisor/revocations.jsonl, which only `revoke` writes
+    (checks never grow it) and which sits in the guarded policy tree. A missing log means nothing is revoked. A log
+    that exists but cannot be read safely (not a regular private file of this user's, larger than REVOCATIONS_MAX, a
+    malformed or torn row) means EVERY grant is revoked: a safety read never fails open. A revoke-all row carries its
+    time and revokes only grants issued at or before it."""
+    state = {"all": False, "problem": None, "gids": set(), "all_at": []}
+    path = revocations_path(home)
     try:
-        raw = _read_regular(audit_path(home), 64 << 20, private=True)
-    except Refusal:
-        return set()
-    out = set()
-    for line in raw.splitlines():
-        if b'"revoked"' not in line:
-            continue
-        try:
-            row = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(row, dict) and row.get("event") == "revoked" and isinstance(row.get("gid"), str):
-            out.add(row["gid"])
-    return out
+        if ss._absent(path):
+            return state
+        raw = _read_regular(path, REVOCATIONS_MAX, private=True)
+        if raw and not raw.endswith(b"\n"):
+            raise Refusal("bad_input", "the revocation log ends in a torn row")
+        for line in raw.split(b"\n")[:-1] if raw else []:
+            row = json.loads(line.decode("utf-8"))
+            if not isinstance(row, dict) or set(row) != {"target", "at"}:
+                raise Refusal("bad_input", "the revocation log has a row of the wrong shape")
+            at = ss.parse_time(row["at"])
+            if row["target"] == "all":
+                state["all_at"].append(at)
+            elif isinstance(row["target"], str) and HEX32.match(row["target"]):
+                state["gids"].add(row["target"])
+            else:
+                raise Refusal("bad_input", "the revocation log names an unknown target")
+    except Refusal as refusal:
+        state.update({"all": True, "problem": refusal.message})
+    except (OSError, ValueError, UnicodeDecodeError, ss._Deny) as error:
+        state.update({"all": True, "problem": "the revocation log cannot be read (%s)" % type(error).__name__})
+    return state
 
 
-def _is_revoked(home, gid, audited) -> bool:
-    directory = revoked_dir(home)
-    if not ss._absent(directory) and (not directory.is_dir() or directory.is_symlink()):
+def _is_revoked(grant, revoked) -> bool:
+    if revoked["all"] or grant["gid"] in revoked["gids"]:
         return True
-    return gid in audited or "all" in audited or not ss._absent(directory / gid) or not ss._absent(directory / "all")
+    if not revoked["all_at"]:
+        return False
+    try:
+        issued = ss.parse_time(grant["issued_at"])
+    except ss._Deny:
+        return True
+    return any(issued <= at for at in revoked["all_at"])
 
 
 def _verify(grant, pins) -> None:
@@ -718,8 +833,8 @@ def load_grants(home) -> list:
     return out
 
 
-def _grant_state(grant, home, now, audited) -> str | None:
-    if _is_revoked(home, grant["gid"], audited):
+def _grant_state(grant, now, revoked) -> str | None:
+    if _is_revoked(grant, revoked):
         return "revoked"
     try:
         issued = ss.parse_time(grant["issued_at"])
@@ -739,12 +854,175 @@ def _norm_target_path(value, home) -> str:
     return os.path.realpath(text)
 
 
-def _protected_roots(home) -> list:
-    h = Path(home)
-    return [str(h / ".claude" / name) for name in ("projects", "wals", "sessions", "hooks", "settings.json", "CLAUDE.md",
-                                                   "history.jsonl", "transcripts")] + \
-        [str(h / ".codex"), str(h / ".agent-harness" / "policy"), str(h / ".agent-harness" / "private"),
-         str(h / ".agent-harness" / "state"), str(h / ".agent-harness" / "bin")]
+GLOB = re.compile(r"[*?\[]")
+
+
+def delete_guard_policy() -> dict:
+    """The delete guard's own policy (command_guard.load_policy: built-in defaults plus the installed additive file).
+    Supervisor deletes read the same lists the guard enforces, so the two cannot drift. Raises Refusal when it
+    cannot be loaded."""
+    try:
+        import command_guard  # noqa: PLC0415
+        policy = command_guard.load_policy()
+    except Exception as error:  # noqa: BLE001
+        raise Refusal("never_covered", "the delete guard's protected list cannot be read (%s); refused"
+                      % type(error).__name__) from None
+    for key in ("protected_log_roots", "guard_files", "protected_roots", "generic_homes", "protected_segment_names",
+                "protected_file_names", "protected_file_suffixes", "keep_names", "keep_suffixes", "keep_segments"):
+        if not isinstance(policy.get(key), list):
+            raise Refusal("never_covered", "the delete guard's policy has no %s list; refused" % key)
+    if not isinstance(policy.get("protected_work_wal_regex"), str):
+        raise Refusal("never_covered", "the delete guard's policy has no WAL pattern; refused")
+    return policy
+
+
+def never_covered_roots(guard_policy) -> list:
+    """Templates ({home}) of everything a supervisor delete never touches. These are the delete guard's Tier A log
+    roots and its guard files, plus SUPERVISOR_EXTRA_ROOTS."""
+    out = []
+    for template in list(guard_policy["protected_log_roots"]) + list(guard_policy["guard_files"]) + list(SUPERVISOR_EXTRA_ROOTS):
+        if isinstance(template, str) and template and template not in out:
+            out.append(template)
+    return out
+
+
+def _homes_for(real: str, home: str, generic) -> list:
+    """This user's home, plus the home a path names on another machine (/home/x, /Users/x, /root), so a target on
+    t2-dev is checked against that host's harness roots too."""
+    homes = [os.path.realpath(home)]
+    parts = real.split("/")
+    for pattern in generic:
+        if not isinstance(pattern, str) or not pattern.startswith("/"):
+            continue
+        depth = len(pattern.strip("/").split("/"))
+        if len(parts) > depth:
+            prefix = "/".join(parts[:depth + 1])
+            if fnmatch.fnmatchcase(prefix.lower(), pattern.lower()) and prefix not in homes:
+                homes.append(prefix)
+    return homes
+
+
+def _covers(real: str, pattern: str) -> bool:
+    """Whether deleting `real` would delete `pattern` or anything below it, or delete something inside it. Compared
+    without case (macOS file systems), which can only refuse more."""
+    real = real.lower()
+    if not GLOB.search(pattern):
+        for root in {os.path.normpath(pattern).lower(), os.path.realpath(pattern).lower()}:
+            if _within(real, root) or _within(root, real):
+                return True
+        return False
+    head, base = os.path.split(os.path.normpath(pattern))
+    if GLOB.search(head):
+        return True  # a glob above the last segment: refuse rather than guess
+    for folder in {head.lower(), os.path.realpath(head).lower()}:
+        if _within(folder, real):
+            return True  # the target is the folder that holds the matches, or above it
+        if _within(real, folder) and real != folder \
+                and fnmatch.fnmatchcase(os.path.relpath(real, folder).split("/")[0], base.lower()):
+            return True
+    return False
+
+
+def _lower_list(values) -> list:
+    return [v.lower() for v in values if isinstance(v, str) and v]
+
+
+def _wal_name(name: str, policy) -> bool:
+    name = name.lower()
+    return name in _lower_list(policy["protected_segment_names"]) or name in _lower_list(policy["protected_file_names"]) \
+        or any(name.endswith(s) for s in _lower_list(policy["protected_file_suffixes"]))
+
+
+def _kept_name(name: str, policy) -> bool:
+    """A name the delete guard never lets go anywhere under a harness root: state, run kits, JSONL logs."""
+    name = name.lower()
+    return name in _lower_list(policy["keep_segments"]) or name in _lower_list(policy["keep_names"]) \
+        or any(name.endswith(s) for s in _lower_list(policy["keep_suffixes"]))
+
+
+def _harness_deletable(path: str, home_dir: str, policy) -> bool:
+    """Inside a harness tree (the guard's Tier B roots) only two places are ever deletable: the guard's own scratch
+    subtrees (allow_subtrees) and one task folder or deeper under ~/.agent-harness/work/<session>/<task>/..."""
+    for template in policy.get("allow_subtrees") or []:
+        if not isinstance(template, str):
+            continue
+        pattern = os.path.normpath(template.replace("{home}", home_dir)).lower()
+        depth = len(pattern.strip("/").split("/"))
+        parts = path.strip("/").split("/")
+        if len(parts) >= depth and fnmatch.fnmatchcase("/" + "/".join(parts[:depth]), pattern):
+            return True
+    work = os.path.join(home_dir, ".agent-harness", "work").lower()
+    return _within(path, work) and len(os.path.relpath(path, work).split("/")) >= 2
+
+
+def _path_reason(form: str, home: str, policy) -> str | None:
+    """Path rules for one spelling of the target (as written, or resolved)."""
+    lowered = [s.lower() for s in form.split("/") if s]
+    if any(_wal_name(s, policy) for s in lowered):
+        return "%s is or is inside a WAL" % form
+    for home_dir in _homes_for(form, home, policy["generic_homes"]):
+        for template in never_covered_roots(policy):
+            if _covers(form, template.replace("{home}", home_dir)):
+                return "%s is or holds a protected log, WAL, transcript, session, policy or guard location" % form
+        try:
+            wal = re.compile(policy["protected_work_wal_regex"].replace("{home}", re.escape(home_dir)), re.I)
+        except re.error:
+            return "the delete guard's WAL pattern does not compile; refused"
+        if wal.match(form):
+            return "%s is or is inside a WAL in a work folder" % form
+        for template in policy["protected_roots"]:
+            root = os.path.normpath(str(template).replace("{home}", home_dir)).lower()
+            low = form.lower()
+            if _within(root, low):
+                return "%s is or holds the harness tree %s" % (form, root)
+            if not _within(low, root):
+                continue
+            below = os.path.relpath(low, root).split("/")
+            if any(_kept_name(s, policy) for s in below):
+                return "%s is state, a run kit or a JSONL log under a harness root" % form
+            if not _harness_deletable(low, home_dir.lower(), policy):
+                return "%s is inside the harness tree %s, where only scratch and work task folders are deletable" % (form, root)
+            if os.path.realpath(home_dir) != os.path.realpath(home):
+                return "%s is in another host's harness tree, whose contents cannot be checked from here" % form
+    return None
+
+
+def _contents_reason(real: str, home: str, policy) -> str | None:
+    """For a local folder that exists: refuse when anything inside it is a WAL, or (under a harness root) state, a
+    run kit or a JSONL log. A folder too large to read within WALK_MAX entries is refused."""
+    if os.path.islink(real) or not os.path.isdir(real):
+        return None
+    local = os.path.realpath(home)
+    harness = any(_within(real.lower(), os.path.normpath(str(t).replace("{home}", local)).lower())
+                  for t in policy["protected_roots"])
+    try:
+        work_wal = re.compile(policy["protected_work_wal_regex"].replace("{home}", re.escape(local)), re.I)
+    except re.error:
+        return "the delete guard's WAL pattern does not compile; refused"
+    seen = 0
+    for folder, dirs, files in os.walk(real, followlinks=False):
+        for name in dirs + files:
+            seen += 1
+            if seen > WALK_MAX:
+                return "%s holds more than %d entries, too many to check; refused" % (real, WALK_MAX)
+            full = os.path.join(folder, name)
+            if _wal_name(name, policy) or (harness and _kept_name(name, policy)) or work_wal.match(full):
+                return "%s holds %s, which is never deleted" % (real, full)
+    return None
+
+
+def protected_reason(target: str, home: str, guard_policy=None) -> str | None:
+    """Why deleting `target` (absolute) would reach a log, WAL, transcript, session, state, policy or guard location,
+    or None. The lists come from the delete guard's own policy. The path is checked both as written and resolved
+    (macOS resolves /home, so a t2-dev path is only recognisable as written), and an existing local folder is read."""
+    policy = guard_policy or delete_guard_policy()
+    written = os.path.normpath(os.path.expanduser(target))
+    real = os.path.realpath(written)
+    for form in dict.fromkeys((written, real)):
+        why = _path_reason(form, home, policy)
+        if why:
+            return why
+    return _contents_reason(real, home, policy)
 
 
 def never_covered_target(target, session, home, policy) -> str | None:
@@ -779,10 +1057,12 @@ def never_covered_target(target, session, home, policy) -> str | None:
     real = _norm_target_path(path, home)
     if real in ("/", os.path.realpath(home)) or real.count("/") < 3:
         return "%s is too broad to delete" % real
-    for root in _protected_roots(home):
-        root = os.path.realpath(root)
-        if _within(real, root) or _within(root, real):
-            return "%s is or holds a protected log, WAL, policy or guard location" % real
+    try:
+        why = protected_reason(path, home)
+    except Refusal as refusal:
+        return refusal.message
+    if why:
+        return why
     try:
         import guard_files  # noqa: PLC0415
         if kind in ("build", "scratch") and guard_files.is_guard_file(os.path.basename(real)):
@@ -832,7 +1112,7 @@ def _check(payload, power, project, host, target, now) -> dict:
     host = host if host is not None else local_host(policy)
     if host is None or host not in policy["hosts"]:
         raise Refusal("wrong_host", "this host is not one supervisor power knows")
-    audited = _audit_revoked(home)
+    revoked = revocation_state(home)
     grants = load_grants(home)
     mine = [g for g, problem, _p in grants if g is not None and g["session"] == session]
     if not mine:
@@ -841,7 +1121,7 @@ def _check(payload, power, project, host, target, now) -> dict:
         if any(g is not None for g, _problem, _p in grants):
             raise Refusal("wrong_session", "supervisor power is granted to another session, not this one")
         raise Refusal("no_grant", "no supervisor grant; ask with `ah supervisor request` and the user grants it")
-    states = [(g, _grant_state(g, home, now, audited)) for g in mine]
+    states = [(g, _grant_state(g, now, revoked)) for g in mine]
     live = [g for g, state in states if state is None]
     if not live:
         raise Refusal("revoked" if any(s == "revoked" for _g, s in states) else "expired",
@@ -884,14 +1164,16 @@ def status(session=None, *, home=None, now=None) -> dict:
     try:
         home, now = _home(home), ss._clock(now)
         out["kill_switch"] = ss.kill_switch_active(home)
-        audited = _audit_revoked(home)
+        revoked = revocation_state(home)
+        if revoked["problem"]:
+            out["revocation_log"] = "unreadable, so every grant counts as revoked: %s" % revoked["problem"]
         for grant, problem, path in load_grants(home):
             if grant is None:
                 out["unreadable"] += 1
                 continue
             if session and grant["session"] != session:
                 continue
-            state = "disabled" if out["kill_switch"] else (_grant_state(grant, home, now, audited) or "live")
+            state = "disabled" if out["kill_switch"] else (_grant_state(grant, now, revoked) or "live")
             out["grants"].append({"gid": grant["gid"], "session": grant["session"], "state": state,
                                   "powers": grant["powers"], "include_subagents": grant["include_subagents"],
                                   "projects": ["%s on %s" % (p.get("repo"), ",".join(p.get("hosts") or []))
@@ -902,21 +1184,21 @@ def status(session=None, *, home=None, now=None) -> dict:
     return out
 
 
-def revoke(target: str, *, home=None) -> bool:
-    """Revoke one grant (32-hex gid) or 'all'. Writes the revocation file and an audit row; nothing deletes either."""
+def revoke(target: str, *, home=None, now=None) -> bool:
+    """Revoke one grant (32-hex gid) or 'all' grants issued up to now. Appends one row to the revocation log (and an
+    audit row for information); nothing removes a row. Anyone may revoke: it only takes power away."""
     if not (target == "all" or (isinstance(target, str) and HEX32.match(target))):
         return False
     try:
         home = _home(home)
-        folder = revoked_dir(home)
-        for directory in (ss.policy_dir(home), grants_dir(home), folder):
+        now = ss._clock(now)
+        for directory in (ss.policy_dir(home), grants_dir(home)):
             directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(str(revocations_path(home)), os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
         try:
-            fd = os.open(str(folder / target), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-            os.write(fd, ss.canonical({"revoked_at": ss.iso(time.time())}) + b"\n")
+            os.write(fd, ss.canonical({"target": target, "at": ss.iso(now)}) + b"\n")
+        finally:
             os.close(fd)
-        except FileExistsError:
-            pass
         _audit(home, {"event": "revoked", "gid": target})
         return True
     except Exception:  # noqa: BLE001

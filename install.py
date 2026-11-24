@@ -53,6 +53,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "ahc_observe.py", "ahc_w21.py", "ahc_review.py",
          "self_serve.py", "ah_ops.py", "ah_parity.py",  # self-serve policy library, `ah ops` recipes, `ah ops doctor` parity (goodqa#16757)
          "supervisor_grant.py", "supervisor_policy.json",  # supervisor power: request, user grant, check at use (goodqa#16944)
+         "transcript_guard.py",  # file tools never write a session transcript (goodqa#16944, PR 326 F5)
          "ahc_release.json")  # imported or read by ahc_runner (goodqa#16049; ahc_release.json: AC-11 preflight)
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
@@ -104,7 +105,8 @@ def managed_scripts(claude: Path) -> set[str]:
             for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py",
                          "command_guard_hook.py", "kill_guard.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py", "log_backup.py", "bg_lint.py",
                          "dropped_gate.py", "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py",
-                         "mc_inbox.py", "owner_inbox.py", "mission_gate.py", "status_truth.py", "idle_guard.py", "copy_hygiene.py")}
+                         "mc_inbox.py", "owner_inbox.py", "mission_gate.py", "status_truth.py", "idle_guard.py", "copy_hygiene.py",
+                         "transcript_guard.py")}
 
 
 # Every agent type: a narrower matcher left general-purpose, claude and Explore owners without any
@@ -226,6 +228,12 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
             "matcher": "Bash",
             "hooks": [{"type": "command", "command": "python3",
                        "args": [str(claude / "hooks" / "copy_hygiene.py"), "pretool"], "timeout": 5}],
+        }, {
+            # Session transcripts are written by the client only (goodqa#16944, PR 326 F5): supervisor power reads the
+            # model of a call from them. The command guard covers shell writes; this covers the file tools. Fails closed.
+            "matcher": "Write|Edit|MultiEdit|NotebookEdit",
+            "hooks": [{"type": "command", "command": "python3", "args": [str(claude / "hooks" / "transcript_guard.py")],
+                       "timeout": 10, "onFailure": "block"}],
         }, {
             "matcher": PROD_DELETE_MATCHER,
             "hooks": [prod_delete],

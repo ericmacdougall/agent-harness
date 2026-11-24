@@ -1341,7 +1341,10 @@ class Enabler:
         out(module.terminal_text(request, body))
         confirm(self.env, "supervisor")
         signed = dict(body, signature=b64url(key.sign(module.signed_message(body))))
-        path = module.write_grant(signed)
+        try:
+            path = module.write_grant(signed)
+        except module.Refusal as refusal:
+            raise Refused(refusal.message) from None
         out("granted: supervisor grant %s written to %s. Revoke: ah supervisor revoke %s" % (signed["gid"], path, signed["gid"]))
         return 0
 

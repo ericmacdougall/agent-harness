@@ -35,6 +35,8 @@ GUARD_NAMES = frozenset({
     "codex_pool_policy.json", "ahd_policy.json",
     # the installers themselves: replacing them changes what every later install checks
     "ah_install.py", "ah_ops.py", "guard_files.py", "supervisor_grant.py",
+    # keeps the record supervisor power reads the model from client-written (goodqa#16944)
+    "transcript_guard.py",
 })
 GUARD_PREFIXES = ("command_guard", "kill_guard", "copy_hygiene", "merge_gate", "provenance", "self_serve", "settings")
 POLICY_JSON = re.compile(r"^[A-Za-z0-9_]+_policy(\.local)?\.json(\.example)?$")
