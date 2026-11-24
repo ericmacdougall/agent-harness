@@ -98,14 +98,12 @@ class ResolvedAskAlerts(Base):
         self.assertEqual(self.keys(), set())
 
     def test_an_over_long_line_is_skipped_and_never_parsed(self):
-        # #170 round 5 F4: the safe reader's per-line cap, not a plain read of whatever the line holds
+        # #170 round 5 F4: the safe reader's per-line cap (1 MiB, one WAL row), not a plain read of whatever the line
+        # holds. A real over-long row, nothing patched: the old plain read parsed it and hid the alert.
         self.raise_ask("w00000000014")
-        self.main_log(SESS, [resolved("w00000000014", source="x" * 400)])
-        old = ow.RESOLVED_LINE_MAX_BYTES
-        self.addCleanup(setattr, ow, "RESOLVED_LINE_MAX_BYTES", old)
-        ow.RESOLVED_LINE_MAX_BYTES = 200
+        self.main_log(SESS, [resolved("w00000000014", source="x" * (1 << 20))])
         self.assertEqual(self.keys(), {"ask:w00000000014:due"})
-        ow.RESOLVED_LINE_MAX_BYTES = old
+        self.main_log(SESS, [resolved("w00000000014", source="x" * 4000)])  # the same row, short enough
         self.assertEqual(self.keys(), set())
 
     def test_the_log_is_read_through_the_safe_reader_and_parser(self):
