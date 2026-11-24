@@ -854,10 +854,22 @@ class RealTree(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
             rc = U.main(["--home", self.home, "--no-remote"], reader=lambda p: self.head[:12], environ=CLEAN_ENV)
-        print("--- real-tree run (temp home, no settings.json) ---\n" + out.getvalue()[-1500:] + err.getvalue()[-1500:])
-        self.assertIn(rc, (U.EXIT_OK, U.EXIT_REGISTER), err.getvalue())
-        self.assertIn("Mac: every listed file matches %s" % self.head[:12], out.getvalue())
-        self.assertEqual(rc, U.EXIT_REGISTER, "a home with no settings.json has every declared hook unregistered")
+        print("--- real-tree run (temp home, no settings.json) ---\n" + out.getvalue()[-800:] + err.getvalue()[-800:])
+        # The real doctor exits 2 when it cannot read settings.json, so registration is not proven: STOP, not Done.
+        self.assertEqual(rc, U.EXIT_STOP, err.getvalue())
+        self.assertIn("registration is not proven", err.getvalue())
+        self.assertNotIn("Done.", out.getvalue())
+        for rel in ("hooks/doctor.py", "hooks/command_guard.py", "skills/check-dropped-workstreams/SKILL.md"):
+            self.assertTrue(Path(self.home, ".claude", rel).is_file(), rel)
+        Path(self.home, ".claude", "settings.json").write_text("{}\n")
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = U.main(["--home", self.home, "--no-remote"], reader=lambda p: self.fail("nothing to install asks"),
+                        environ=CLEAN_ENV)
+        print("--- real-tree rerun (settings.json with no hooks) ---\n" + out.getvalue()[-800:] + err.getvalue()[-800:])
+        self.assertEqual(rc, U.EXIT_REGISTER, err.getvalue())
+        self.assertIn("Mac: 0 file(s) differ", out.getvalue())
+        self.assertIn("Mac (already before this run): declared but not registered", out.getvalue())
         self.assertIn("NOT fully active", out.getvalue())
 
 

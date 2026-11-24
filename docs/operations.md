@@ -129,7 +129,7 @@ What it checks and does, in order. Any failed step stops the run, and nothing af
 9. **Registration.** `--hooks-only` never edits `settings.json`, so a hook the new manifest declares is not running
    until it is registered. The Mac's doctor runs before the install and again at the end of every real run, whether
    or not anything was installed. A doctor that does not answer at the end stops the run (exit 1: registration not
-   proven). A hook that was wired before and is not wired after stops the run. Any declared hook the doctor reports
+   proven); the doctor does not answer when `~/.claude/settings.json` is missing or unreadable. A hook that was wired before and is not wired after stops the run. Any declared hook the doctor reports
    `MISSING` (newly declared or already missing before this run, listed apart), or any `unregistered` name a t2-dev
    install reports, gives exit 3. A host where nothing was installed is not re-checked (the remote installer reports
    registration only when it installs), and the output says so.
