@@ -5,6 +5,7 @@ which is a speed bump against careless agents and not a boundary (PR 345 review 
 the canonical URL and a fake ssh runs the real remote program against a temporary host home). The launch check gets a
 fake process view; the stamp is the real one main's mission_gate hook writes; the receipt check runs with a fake `gh`
 and a real merge-gate waiver log in a temporary state directory. Nothing here touches a real host or hooks directory."""
+import contextlib
 import json
 import os
 import subprocess
@@ -117,6 +118,7 @@ class LaunchCheck(unittest.TestCase):
             with self.subTest(label):
                 reason, facts = launch_check.check(env)
                 self.assertIn("ssh connection or a terminal multiplexer", reason or "")
+                self.assertNotIn("--from-ssh-or-multiplexer", reason)  # F14: the refusal does not hand over the flag
                 self.assertFalse(facts["allow_remote"])
                 reason, facts = launch_check.check(env, allow_remote=True)
                 self.assertIsNone(reason)
@@ -386,6 +388,45 @@ class Gate(Base):
     def push(self):
         git(self.tmp, "--git-dir", str(self.origin), "fetch", "-q", str(self.work), "+main:main")
 
+    def host_state(self, *names):
+        """What a refused run must leave alone: the sha of each named host file (None when absent) and every audit row."""
+        return {n: self.live(n) if (self.hooks / n).exists() else None for n in names}, len(self.rows())
+
+    def gated(self, call, *names, fetch=True):
+        """call() is refused with code guard_file and changes neither the named host files nor the audit. fetch=False:
+        the refusal must come before fetch_source (a fetch raises AssertionError, which is not an InstallError)."""
+        before = self.host_state(*names)
+        with mock.patch.object(ai, "fetch_source", side_effect=AssertionError("fetched before the gate")) if not fetch \
+                else contextlib.nullcontext():
+            with self.assertRaises(ai.InstallError) as caught:
+                call()
+        self.assertEqual(caught.exception.code, "guard_file")
+        self.assertEqual(self.host_state(*names), before)
+        return caught.exception
+
+    def assert_flag_not_named(self, err):
+        """F14: the ssh or multiplexer refusal points at the docs and never names the flag that lifts it."""
+        self.assertIn("ssh connection or a terminal multiplexer", str(err))
+        self.assertIn("docs/harness-repair.md", str(err))
+        self.assertNotIn("--from-ssh-or-multiplexer", str(err))
+        self.assertNotIn("from-ssh", json.dumps(err.data))
+
+    def edit_start_row(self, run, change):
+        """Test setup only (the installer only appends): edit the run's install start row in place, to stand for a row
+        written before PR 326a (no guard_gate key) or a record that names no guard file."""
+        path = ai.audit_path(self.mac)
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        hit = [r for r in rows if r.get("run") == run and r.get("event") == "start" and r.get("kind") == "install"]
+        self.assertEqual(len(hit), 1)
+        change(hit[0])
+        path.write_text("".join(json.dumps(r, ensure_ascii=False, separators=(",", ":")) + "\n" for r in rows))
+
+    def resume_of(self, run):
+        return lambda **kw: ai.resume(run, TICKET, self.mac, "s", "a", self.runner, self.poster, **kw)
+
+    def rollback_of(self, run):
+        return lambda **kw: ai.rollback(run, TICKET, (), self.mac, "s", "a", self.runner, self.poster, **kw)
+
     # --- positive controls
 
     def test_main_installs_a_reviewed_merged_commit(self):
@@ -534,7 +575,8 @@ class Gate(Base):
             with self.subTest(env.env), mock.patch.object(ai, "PROOF_ENV", env):
                 with self.assertRaises(ai.InstallError) as caught:
                     ai.rollback(run, TICKET, (), self.mac, "s", "a", self.runner, self.poster)
-                self.assertIn("multiplexer", str(caught.exception))
+                self.assertEqual(caught.exception.code, "guard_file")
+                self.assert_flag_not_named(caught.exception)
                 self.assertEqual(self.before(), before)
         with mock.patch.object(ai, "PROOF_ENV", VIA_SSH):  # positive control: the user's own run with the flag
             self.assertIn(ai.rollback(run, TICKET, (), self.mac, "s", "a", self.runner, self.poster, allow_remote=True)["result"],
@@ -543,12 +585,13 @@ class Gate(Base):
         gate = [r for r in self.rows("start") if r.get("kind") == "rollback"][-1]["guard_gate"]
         self.assertEqual((gate["branch"], gate["facts"]["allow_remote"]), ("not_agent_launched", True))
 
-    def unknown_install(self):
+    def unknown_install(self, ref=None, files=("ah.py", "extra.py")):
         """An install by the user whose commit ran on the host and whose answer was lost: an unfinished run."""
         self.inject = ("commit", 1, "after")
         with mock.patch.object(ai, "PROOF_ENV", FakeEnv()), self.assertRaises(ai.InstallError) as caught:
-            self.install()
+            self.install(ref=ref, files=files)
         self.inject = None
+        self.assertEqual(ai.unfinished_runs(self.mac, "t2-dev"), [caught.exception.data["run"]])
         return caught.exception.data["run"]
 
     def test_resume_of_a_guard_file_is_the_users_end_to_end(self):
@@ -606,6 +649,152 @@ class Gate(Base):
         self.assertEqual(self.install(ref=c2, files=("newcheck.py",))["result"], "installed")
         gate = self.rows("start")[-1]["guard_gate"]
         self.assertEqual((gate["branch"], gate["guard_files"]), ("main-release", ["newcheck.py"]))
+
+    # --- the recorded gate through rollback() and resume() (PR 345 review F11). In each case only the run's record
+    # makes the file a guard file: this machine's tree does not, so a test that installs ah.py cannot notice the record.
+
+    def test_rollback_of_a_ref_only_guard_file_is_the_users(self):
+        """newcheck.py is a guard file only at c2. The user installs it; an agent, even with main's live stamp for that
+        exact command, cannot roll it back: the host and the audit are unchanged. The user's own rollback goes ahead."""
+        c2 = self.skew_commit()
+        with mock.patch.object(ai, "PROOF_ENV", FakeEnv()):
+            run = self.install(ref=c2, files=("newcheck.py",))["run"]
+        self.assertEqual(ai.start_row(self.mac, run)["guard_gate"]["guard_files"], ["newcheck.py"])
+        self.assertEqual(guard_files.guard_subset(["newcheck.py"], ai.HOOKS_DIR), [])  # the local tree alone lets it by
+        self.stamp(self.line(ref=c2, files=("newcheck.py",)))
+        rollback = self.rollback_of(run)
+        err = self.gated(rollback, "newcheck.py")
+        self.assertIn("--rollback names guard file(s) newcheck.py", str(err))
+        self.assertIn("are the user's", str(err))
+        with mock.patch.object(ai, "PROOF_ENV", VIA_SSH):
+            self.assert_flag_not_named(self.gated(rollback, "newcheck.py"))
+        self.assertEqual(self.receipts, [])
+        with mock.patch.object(ai, "PROOF_ENV", FakeEnv()):  # positive control
+            self.assertEqual(rollback()["result"], "restored")
+        self.assertFalse((self.hooks / "newcheck.py").exists())
+
+    def test_resume_of_a_ref_only_guard_file_is_refused_before_the_fetch(self):
+        """The run's record gates --resume of newcheck.py before anything is fetched (not only at the ref gate after it)."""
+        c2 = self.skew_commit()
+        run = self.unknown_install(ref=c2, files=("newcheck.py",))
+        self.stamp(self.line(ref=c2, files=("newcheck.py",)))
+        err = self.gated(self.resume_of(run), "newcheck.py", fetch=False)
+        self.assertIn("--resume names guard file(s) newcheck.py", str(err))
+        self.assertEqual(self.receipts, [])
+        with mock.patch.object(ai, "PROOF_ENV", FakeEnv()):  # positive control
+            self.assertEqual(self.resume_of(run)()["result"], "installed")
+
+    def test_a_run_recorded_before_the_gate_is_gated_end_to_end(self):
+        """A start row written before PR 326a has no guard_gate key, so every file of it counts. extra.py is a guard file
+        in no tree, so only that rule stops an agent's --resume (before the fetch) and --rollback."""
+        run = self.unknown_install(files=("extra.py",))
+        self.edit_start_row(run, lambda row: row.pop("guard_gate"))
+        self.assertNotIn("guard_gate", ai.start_row(self.mac, run))
+        self.gated(self.resume_of(run), "extra.py", fetch=False)
+        self.gated(self.rollback_of(run), "extra.py")
+        with mock.patch.object(ai, "PROOF_ENV", FakeEnv()):  # positive control: the user resumes it
+            self.assertEqual(self.resume_of(run)()["result"], "installed")
+        self.gated(self.rollback_of(run), "extra.py")  # still the user's once finished
+        with mock.patch.object(ai, "PROOF_ENV", FakeEnv()):
+            self.assertEqual(self.rollback_of(run)()["result"], "restored")
+        self.assertEqual(self.receipts, [])
+
+    def test_a_record_that_names_no_guard_file_never_narrows_the_local_tree(self):
+        """The record only adds guard files: a start row whose guard_gate names none (an edited or wrong row) still has
+        ah.py gated, because this machine's tree counts it."""
+        run = self.unknown_install()
+        self.edit_start_row(run, lambda row: row.update(guard_gate=None))
+        self.assertEqual(ai.recorded_guard(ai.start_row(self.mac, run)), [])
+        self.gated(self.resume_of(run), "ah.py", "extra.py", fetch=False)
+        self.gated(self.rollback_of(run), "ah.py", "extra.py")
+        with mock.patch.object(ai, "PROOF_ENV", FakeEnv()):  # positive controls
+            self.assertEqual(self.resume_of(run)()["result"], "installed")
+            self.assertEqual(self.rollback_of(run)()["result"], "restored")
+
+    def test_the_ref_gate_keeps_resume_the_users_when_the_record_names_none(self):
+        """The ref gate also runs for --resume: a newcheck.py run whose record names no guard file is refused there, after
+        the fetch and before any remote write, even with main's live stamp for that command."""
+        c2 = self.skew_commit()
+        run = self.unknown_install(ref=c2, files=("newcheck.py",))
+        self.edit_start_row(run, lambda row: row.update(guard_gate=None))
+        self.stamp(self.line(ref=c2, files=("newcheck.py",)))
+        err = self.gated(self.resume_of(run), "newcheck.py")
+        self.assertIn("--resume names guard file(s) newcheck.py", str(err))
+        self.assertEqual(self.receipts, [])
+        with mock.patch.object(ai, "PROOF_ENV", FakeEnv()):  # positive control
+            self.assertEqual(self.resume_of(run)()["result"], "installed")
+
+    def test_a_ref_only_guard_file_downgrade_is_the_users(self):
+        """--allow-older of a file that is a guard file only at the ref: refused at the ref gate even with a live bound
+        stamp for the exact command and a good receipt, and the stamp is left unused. The user's own downgrade goes ahead."""
+        c2 = self.skew_commit()
+        (self.work / "harness" / "hooks" / "newcheck.py").write_text("# a newer merged version\n")
+        git(self.work, "commit", "-qam", "c3")
+        self.push()
+        self.calls_seen += 1
+        parts = guard_files.install_stamp_parts("t2-dev", c2, ["newcheck.py"], TICKET)
+        self.assertTrue(caller_identity.put_stamp(guard_files.INSTALL_STAMP, parts, session=SESSION, home=self.mac,
+                                                  tool_use_id="toolu_%08d" % self.calls_seen, transcript=str(self.transcript)))
+
+        def downgrade():
+            return ai.install_files("t2-dev", c2, ["newcheck.py"], TICKET, False, self.mac, "s", "a", self.runner, self.poster,
+                                    allow_older=True)
+        err = self.gated(downgrade, "newcheck.py")
+        self.assertIn("--allow-older", str(err))
+        self.assertEqual(self.receipts, [])
+        self.assertIsNotNone(caller_identity.take_stamp(guard_files.INSTALL_STAMP, parts, home=self.mac, bound=True))
+        with mock.patch.object(ai, "PROOF_ENV", FakeEnv()):  # positive control
+            self.assertEqual(downgrade()["result"], "installed")
+        row = self.rows("start")[-1]
+        self.assertEqual((row["allow_older"], row["guard_gate"]["branch"]), (True, "not_agent_launched"))
+
+    def test_the_record_lists_the_refs_guard_files_too(self):
+        """N1: when this machine's tree decides the gate (ah.py), the start row still lists newcheck.py, which only the ref
+        counts, so a later --resume or --rollback sees both."""
+        c2 = self.skew_commit()
+        with mock.patch.object(ai, "PROOF_ENV", FakeEnv()):
+            run = self.install(ref=c2, files=("ah.py", "newcheck.py"))["run"]
+        self.assertEqual(ai.start_row(self.mac, run)["guard_gate"]["guard_files"], ["ah.py", "newcheck.py"])
+
+    # --- ssh or a multiplexer at every route (F1, F14)
+
+    def test_an_install_over_ssh_or_in_a_multiplexer_needs_the_users_flag(self):
+        """A person over ssh or in tmux (no agent marker) is refused before the fetch without the flag, and the refusal
+        does not name the flag; with it the same install goes ahead."""
+        for env in (VIA_SSH, IN_TMUX):
+            with self.subTest(env.env), mock.patch.object(ai, "PROOF_ENV", env):
+                self.assert_flag_not_named(self.gated(lambda: self.install(), "ah.py", "extra.py", fetch=False))
+        with mock.patch.object(ai, "PROOF_ENV", VIA_SSH):  # positive control
+            out = ai.install_files("t2-dev", self.c1, ["ah.py", "extra.py"], TICKET, False, self.mac, "s", "a", self.runner,
+                                   self.poster, allow_remote=True)
+        self.assertEqual(out["result"], "installed")
+        self.assertEqual(self.rows("start")[-1]["guard_gate"]["facts"]["allow_remote"], True)
+
+    def test_a_ref_only_install_over_ssh_needs_the_users_flag(self):
+        c2 = self.skew_commit()
+        with mock.patch.object(ai, "PROOF_ENV", VIA_SSH):
+            self.assert_flag_not_named(self.gated(lambda: self.install(ref=c2, files=("newcheck.py",)), "newcheck.py"))
+            out = ai.install_files("t2-dev", c2, ["newcheck.py"], TICKET, False, self.mac, "s", "a", self.runner,
+                                   self.poster, allow_remote=True)  # positive control
+        self.assertEqual(out["result"], "installed")
+
+    def test_a_resume_over_ssh_or_in_a_multiplexer_needs_the_users_flag(self):
+        run = self.unknown_install()
+        for env in (VIA_SSH, IN_TMUX):
+            with self.subTest(env.env), mock.patch.object(ai, "PROOF_ENV", env):
+                self.assert_flag_not_named(self.gated(self.resume_of(run), "ah.py", "extra.py", fetch=False))
+        with mock.patch.object(ai, "PROOF_ENV", VIA_SSH):  # positive control
+            self.assertEqual(self.resume_of(run)(allow_remote=True)["result"], "installed")
+
+    # --- the dry-run route skips the gate; what makes that safe is that it writes nothing
+
+    def test_an_agents_dry_run_of_a_guard_file_writes_nothing(self):
+        before = self.before()
+        out = self.install(dry_run=True)
+        self.assertEqual(out["result"], "dry_run")
+        self.assertEqual(self.before(), before)
+        self.assertEqual(self.rows("start"), [])
+        self.assertEqual(self.receipts, [])
 
 
 class Stamps(unittest.TestCase):
