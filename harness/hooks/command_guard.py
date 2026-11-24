@@ -187,9 +187,17 @@ DEFAULT_POLICY = {
                            'ignored_top_ok': ['.venv', 'venv', 'dist', 'build', 'target', '.next', '.gradle']},
     'marker': {'default_ttl_seconds': 900, 'max_ttl_seconds': 86400, 'max_walk_entries': 200000,
                'max_walk_seconds': 2.0, 'max_hash_bytes': 21474836480, 'recent_change_seconds': 600,
-               'approve_remote_types': ['dropbox'], 'no_backup_remote_hosts': ['github.com', 't2-dev']},
+               'approve_remote_types': ['dropbox'],
+               # a backend type that is approved only for remotes with these exact names (supervisor standing
+               # authority, rule 4: "verified copy on b2-archive or Dropbox"). b2-archive2 is a b2 remote that is
+               # NOT approved. Built in: a policy file never widens it (it is not in ADDITIVE_LISTS).
+               'approve_remote_names': {'b2': ['b2-archive']},
+               'no_backup_remote_hosts': ['github.com', 't2-dev']},
 }
 
+# The one operator-facing description of which remotes approve a delete. Every guidance string and refusal message that
+# names the accepted remotes uses it; tests/test_approve_remote_b2.py fails when an operator-facing string drifts.
+APPROVE_REMOTES = 'Dropbox or the b2 remote named exactly b2-archive'
 SECRET_DUMP, LOG_DELETE, BROAD_KILL = 'secret_dump', 'log_delete', 'broad_kill'
 BULK_STAGING = 'bulk_staging'  # goodqa#15787: git add -A, git commit -a in a dirty original checkout; warn by default
 PARSE = 'parse'  # warn-only notes: input the guard could not fully parse
@@ -3984,7 +3992,7 @@ def _build_fallback(c):
                            r'write_text|write_bytes|writefilesync|file_put_contents|sponge)\b|'
                            r'\bopen\b[^\n]{0,200}?\s(?:w|wb|w\+|a\+)(?:\s|$)|\bfs\.(?:rm|rmdir|unlink)\b')
     add((L, 'log-delete-text', ('and', protected, destroyer),
-         'removes or rewrites Claude/Codex logs or WALs', 'back them up to Dropbox, run command_guard.py approve-delete, then delete'))
+         'removes or rewrites Claude/Codex logs or WALs', 'back them up to ' + APPROVE_REMOTES + ' (rclone copy), run command_guard.py approve-delete, then delete'))
     # the secret word must be part of the variable's own name: `os.environ['API_TOKEN']`, `getenv("DB_PASSWORD")`,
     # `process.env.GH_TOKEN`; quotes and brackets are already spaces here. Not `os.environ['SCRATCH'] ... 'key'`.
     envs = re.compile(r'(?:\benviron(?:\.get)?|\bgetenv|\bprocess\.env\.?|\$env:|\benv\b(?:\.fetch)?)\s*'
@@ -7539,8 +7547,8 @@ class Analyzer:
         ctx.add(LOG_DELETE, 'log-delete',
                 ('%s targets %s (%s). Claude/Codex/harness logs and state are never deleted, moved or truncated '
                  'without a verified backup' % (what, label, name[:60]))[:300],
-                instead or 'back up to Dropbox (rclone copy), then `command_guard.py approve-delete --path P --remote '
-                'REMOTE`, then delete the literal path' + ('' if literal else '; spell out the literal path, globs and '
+                instead or 'back up to ' + APPROVE_REMOTES + ' (rclone copy), then `command_guard.py approve-delete --path P '
+                '--remote REMOTE` (for example dropbox:backups/x or b2-archive:bucket/x), then delete the literal path' + ('' if literal else '; spell out the literal path, globs and '
                                                            'variables cannot be approved')
                 + self._clone_hint(path))
         return True
@@ -7802,7 +7810,7 @@ class Analyzer:
             folded = norm_path(alt, ctx).casefold()
             if folded in ctx.c.state_files:
                 ctx.add(LOG_DELETE, 'state-forgery', 'writes the delete-approval marker or its key directly',
-                        'use command_guard.py approve-delete after the Dropbox backup is verified')
+                        'use command_guard.py approve-delete after the backup on ' + APPROVE_REMOTES + ' is verified')
                 return True
             if transcript_write(ctx.c, folded):
                 ctx.add(LOG_DELETE, 'transcript-forgery', 'writes into ~/.claude/projects, where session transcripts '
@@ -9103,7 +9111,7 @@ def format_block(f, more=0, warn=False):
 # local key. The hook lets a destructive command through only when every protected operand is the exact approved
 # path, the path's device, inode and stat manifest are unchanged, and the entry can be removed under an exclusive
 # lock (so two commands cannot share one approval). Everything is appended to log-delete-audit.jsonl and, for
-# approve-delete, to the WAL named with --wal. The agent itself may approve after a verified Dropbox backup: the
+# approve-delete, to the WAL named with --wal. The agent itself may approve after a verified copy on Dropbox or b2-archive: the
 # safeguard is the verified copy, the single use and the audit trail, not a human prompt.
 
 ARCHIVE_KIND = 'archive'  # an approval backed by one verified remote tar archive (goodqa#15068)
@@ -9857,10 +9865,12 @@ def _approval_refusal(real, policy, home=None):
 
 
 def _check_remote(remote, policy, verifier):
-    """Only named remotes of an allowed backend type (default dropbox); never local paths or on-the-fly backends."""
+    """Only named remotes of an allowed backend type (default dropbox) or a pinned name (b2-archive); never local paths
+    or on-the-fly backends."""
     if not isinstance(remote, str) or ':' not in remote or remote.startswith((':', '/', '.', '~')) or ',' in \
             remote.split(':', 1)[0] or '\\x00' in remote:
-        raise ValueError('remote must be a named rclone remote such as dropbox:backups/claude (not a local path, '
+        raise ValueError('remote must be a named rclone remote such as dropbox:backups/claude or b2-archive:bucket/claude '
+                         '(' + APPROVE_REMOTES + '; not a local path, '
                          'an on-the-fly :backend: or a connection string)')
     name = remote.split(':', 1)[0]
     allowed = [t.casefold() for t in policy['marker'].get('approve_remote_types', ['dropbox'])]
@@ -9869,8 +9879,11 @@ def _check_remote(remote, policy, verifier):
     kind = (found or {}).get(name)
     if kind is None:
         raise ValueError('remote %r is not configured in rclone' % name[:40])
-    if kind.casefold() not in allowed:
-        raise ValueError('remote %r has backend type %r; approvals need one of %s' % (name[:40], kind[:20], allowed))
+    pinned = policy['marker'].get('approve_remote_names', {})
+    named = name in (pinned.get(kind.casefold()) or [])  # exact name; a type alone never approves a pinned type
+    if kind.casefold() not in allowed and not named:
+        raise ValueError('remote %r has backend type %r; approvals need one of %s or a pinned remote name %s'
+                         % (name[:40], kind[:20], allowed, sorted(n for names in pinned.values() for n in names)))
 
 
 def _first_symlink(path):
@@ -11076,7 +11089,8 @@ def main(argv=None):
     rep.add_argument('paths', nargs='+')
     appr = sub.add_parser('approve-delete')
     appr.add_argument('--path', required=True)
-    appr.add_argument('--remote', help='named rclone remote mirroring --path, e.g. dropbox:backups/x')
+    appr.add_argument('--remote', help='named rclone remote mirroring --path (Dropbox or the b2 remote named exactly b2-archive), e.g. '
+                      'dropbox:backups/x or b2-archive:bucket/x')
     appr.add_argument('--archive', help='named rclone remote of ONE tar archive (.tar, .tar.gz or .tar.zst) of --path, '
                                         'whose members start with the directory name of --path (goodqa#15068)')
     appr.add_argument('--archive-sha256', dest='archive_sha256', help='remote .sha256 file of --archive')
