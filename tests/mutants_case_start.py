@@ -60,8 +60,7 @@ MUTANTS = {
     'an alias is ignored': [
         ("    if ps or _aliases_a_keyword(tokens):\n        return list(tokens)", "    if ps:\n        return list(tokens)")],
     'a subscripted alias is read from the expanded text only': [
-        ("    return any(w.text == 'alias' or w.text.startswith('aliases[') or (w.raw or '').startswith('aliases[')",
-         "    return any(w.text == 'alias' or w.text.startswith('aliases[')")],
+        ("        for text in (w.text, w.raw or ''):", "        for text in (w.text,):")],
     'a quoted in is accepted': [
         ("and _keyword_word(tokens[i + 2][1], 'in'):", "and tokens[i + 2][1].text == 'in':")],
 }
