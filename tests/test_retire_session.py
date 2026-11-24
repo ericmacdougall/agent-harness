@@ -83,7 +83,7 @@ class Base(unittest.TestCase):
         class FakeDT(dt.datetime):  # the decision line and the audit are stamped by the same fake clock
             @classmethod
             def now(cls, tz=None):
-                return dt.datetime.fromtimestamp(test.clock, tz)
+                return dt.datetime.fromtimestamp(test.clock + 1, tz)  # a write is stamped just after the request's own time
         test = self
         d = mock.patch.object(ah.dt, "datetime", FakeDT)
         d.start()
