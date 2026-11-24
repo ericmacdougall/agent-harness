@@ -168,7 +168,8 @@ def chat_send_stamps(cmd: str) -> list:
             continue
         if getattr(args, "dry_run", True):
             continue
-        parts = ah_chat_send.stamp_parts(args.conversation, args.with_user, args.org, args.text_file)
+        parts = ah_chat_send.stamp_parts(args.conversation, args.with_user, args.org, args.text_file,
+                                         getattr(args, "approval_id", None))
         if parts:
             out.append(parts)
     return out

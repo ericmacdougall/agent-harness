@@ -614,9 +614,11 @@ class ParseRefusalTests(Base):
             self.assertIn("usage: ah chat", p.stdout, argv)
         self.assertEqual(self.stub.hits, [])
 
-    def test_send_is_refused_when_a_global_option_comes_first(self):
+    def test_send_without_its_text_file_is_a_quiet_parse_refusal_when_a_global_option_comes_first(self):
+        # goodqa#16399: send exists now (ah_chat_send.py, tested in test_ah_chat_send.py); a send that misses its required
+        # --text-file is the one fixed parse refusal on stdout, with nothing read or sent
         p = self.raw("--text", "chat", "send", "--with", PEER)
-        self.assertEqual((p.returncode, json.loads(p.stdout)["code"], p.stderr), (2, "not_available", ""))
+        self.assertEqual((p.returncode, json.loads(p.stdout)["code"], p.stderr), (2, "bad_request", ""))
         self.assertEqual(self.stub.hits, [])
 
 

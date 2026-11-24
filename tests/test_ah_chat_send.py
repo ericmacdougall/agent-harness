@@ -16,7 +16,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_ah_chat import (AH, CONV, DM_SENTINEL, HOOKS, ME, ORG, PEER, USER_SENTINEL, SCHEME, Base, ok,  # noqa: E402
-                          tool_error)
+                          ok_bare, tool_error)
 
 sys.path.insert(0, str(HOOKS))
 import ah_chat_send  # noqa: E402
@@ -126,6 +126,14 @@ class MainAgentSends(SendBase):
         self.assertEqual(self.result(p)["code"], "refused")
         self.assertEqual(self.sends(), [])
 
+    def test_a_group_dm_down_to_two_members_is_still_refused(self):
+        group = dict(DM_LIST["conversations"][0], kind="group_dm")  # the third member left; it is still a group conversation
+        self.stub.tools["list_direct_conversations"] = lambda a: ok({"conversations": [group]})
+        data = self.result(self.send(target=("--conversation", CONV)))
+        self.assertEqual(data["code"], "refused")
+        self.assertIn("one-to-one", data["message"])
+        self.assertEqual(self.sends(), [])
+
 
 class MainOnly(SendBase):
     def test_a_subagent_gets_no_stamp_and_sends_nothing(self):
@@ -146,6 +154,18 @@ class MainOnly(SendBase):
         p = self.ah(*argv)  # the same command again with no new hook call: the stamp was single use
         self.assertEqual(self.result(p)["code"], "main_only")
         self.assertEqual(len(self.sends()), 1)
+
+    def test_a_stamp_of_a_call_that_already_ended_is_dead(self):
+        """The hook ran, but Claude Code already recorded that call's result (the call was denied, or it ended): a later
+        process with the same argv is not that call and finds no live stamp."""
+        argv = self.argv()
+        self.hook(argv)
+        with self.transcript.open("a") as out:
+            out.write(json.dumps({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_%08d" % self.calls, "content": "denied"}]}}) + "\n")
+        p = self.ah(*argv)
+        self.assertEqual(self.result(p)["code"], "main_only")
+        self.assertEqual(self.sends(), [])
 
     def test_a_text_file_edited_after_the_hook_ran_finds_no_stamp(self):
         argv = self.argv()
@@ -194,6 +214,21 @@ class Refusals(SendBase):
             self.text.unlink()  # the test's own input holds the sentinel; every file the command wrote must not
             self.assert_no_token(p)
         self.assertEqual(self.sends(), [])
+
+    def test_the_base_is_refused_before_the_text_file_is_even_looked_at(self):
+        p = self.ah("send", "--with", PEER, "--org", ORG, "--text-file", "msg.txt", base="https://goodqa.example.test/v1")
+        self.assertEqual(self.result(p)["code"], "refused")  # the base refusal, not the text file's bad_request
+        self.assertEqual(self.stub.hits, [])
+
+    def test_a_relative_path_is_refused_even_when_it_names_a_real_file(self):
+        cwd = os.getcwd()
+        os.chdir(str(self.home))
+        self.addCleanup(os.chdir, cwd)
+        self.assertTrue(Path("msg.txt").is_file())
+        with self.assertRaises(ah_chat_send.ChatError) as caught:
+            ah_chat_send.read_text("msg.txt")
+        self.assertEqual(caught.exception.code, "bad_request")
+        self.assertEqual(ah_chat_send.read_text(str(self.text))[0], "Thanks Tisha, the fix is on staging now.")
 
     def test_a_relative_path_a_symlink_and_control_characters_are_refused(self):
         p = self.ah("send", "--with", PEER, "--org", ORG, "--text-file", "msg.txt")
@@ -246,10 +281,41 @@ class NoRetry(SendBase):
     def test_a_damaged_ledger_refuses_every_send(self):
         ledger = self.home / ".agent-harness" / "state" / "ah" / "store" / "chat-send.jsonl"
         ledger.parent.mkdir(parents=True, exist_ok=True)
-        for damage in ('{"id": "x", "kind": "pending"', "not json\n"):
+        # an unfinished record that happens to be valid JSON (the write stopped before its line break), a torn record and
+        # a malformed one: each refuses every send
+        for damage in ('{"id": "x", "kind": "pending"}', '{"id": "x", "kind": "pending"', "not json\n"):
             ledger.write_text(damage)
             self.assertEqual(self.result(self.send())["code"], "ledger_damaged", damage)
         self.assertEqual(self.sends(), [])
+
+    def test_a_timeout_is_uncertain_is_never_retried_and_holds_the_text_back(self):
+        """The server stores the message but answers after the client gave up (20 s): one request, status uncertain, and the
+        same text refused afterwards even though the server now answers at once."""
+        import time as _time
+
+        def slow(a):
+            _time.sleep(ah_chat_send.chat.Client.__init__.__defaults__[1] + 4)
+            return ok_bare(SENT)
+        self.stub.tools["send_direct_message"] = slow
+        data = self.result(self.send())
+        self.assertEqual((data["ok"], data["status"]), (False, "uncertain"), data)
+        self.assertEqual(len(self.sends()), 1)  # the one request; nothing was sent again after the timeout
+        self.stub.tools["send_direct_message"] = lambda a: ok_bare(SENT)
+        self.assertEqual(self.result(self.send())["code"], "duplicate")
+        self.assertEqual(len(self.sends()), 1)
+        self.assert_no_token()
+
+    def test_the_same_text_window_is_24_hours_whatever_the_outcome(self):
+        for status in ("sent", "uncertain", "pending"):
+            rows = [{"id": "a", "kind": "pending", "peer": PEER, "sha": "d", "at": 1000.0}]
+            if status != "pending":
+                rows.append({"id": "b", "kind": "outcome", "ref": "a", "status": status})
+            with self.assertRaises(ah_chat_send.ChatError, msg=status):
+                ah_chat_send.check_ledger(rows, PEER, "d", 1000.0 + 86400 - 1)
+            ah_chat_send.check_ledger(rows, PEER, "d", 1000.0 + 86400 + 1)  # a day later it may go again
+            ah_chat_send.check_ledger(rows, PEER, "other text", 1000.0 + 1)  # other text, or another person, is not held
+            ah_chat_send.check_ledger(rows, "someone-else", "d", 1000.0 + 1)
+
 
     def test_a_crash_after_the_pending_row_still_blocks_the_same_text(self):
         rows = ah_chat_send._rows  # the pending row is all that a crash between the request and the outcome leaves
@@ -262,6 +328,81 @@ class NoRetry(SendBase):
         ledger.write_text(json.dumps({"id": "a" * 32, "kind": "pending", "peer": PEER, "sha": digest, "at": time.time()}) + "\n")
         self.assertEqual(self.result(self.send())["code"], "duplicate")
         self.assertEqual(self.sends(), [])
+
+
+class Approval(SendBase):
+    APPROVAL = "88888888-8888-4888-8888-888888888888"
+
+    def gate(self, code):
+        return lambda a: (200, {"jsonrpc": "2.0", "id": 1, "result": {"isError": True, "content": [{"type": "text", "text": json.dumps(
+            {"error": {"code": code, "message": "needs approval", "details": {"approvalId": self.APPROVAL}}})}]}})
+
+    def test_approval_required_prints_the_id_and_the_approved_send_carries_it(self):
+        self.stub.tools["send_direct_message"] = self.gate("human_approval_required")
+        data = self.result(self.send())
+        self.assertEqual((data["status"], data["approval_id"]), ("approval_required", self.APPROVAL), data)
+        self.assertIn("--approval-id " + self.APPROVAL, data["next"])
+        self.stub.tools["send_direct_message"] = self.gate("human_approval_pending")  # not approved yet: nothing stored
+        self.assertEqual(self.result(self.send("--approval-id", self.APPROVAL))["status"], "approval_pending")
+        self.stub.tools["send_direct_message"] = lambda a: ok_bare(SENT)
+        data = self.result(self.send("--approval-id", self.APPROVAL))
+        self.assertEqual(data["status"], "sent", data)
+        bodies = [c[1] for c in self.sends()]
+        self.assertEqual([b.get("approvalId") for b in bodies], [None, self.APPROVAL, self.APPROVAL])
+        self.assertEqual(len({b["body"] for b in bodies}), 1)  # the permit is bound to the exact body: it never changes
+        self.assertEqual(self.result(self.send("--approval-id", self.APPROVAL))["code"], "duplicate")
+
+    def test_a_refused_approval_frees_the_text_but_any_other_refusal_does_not(self):
+        for code in ("approval_expired", "approval_denied", "approval_mismatch"):
+            self.stub.tools["send_direct_message"] = self.gate(code)
+            self.assertEqual(self.result(self.send())["status"], "approval_refused", code)
+        self.stub.tools["send_direct_message"] = self.gate("forbidden")
+        self.assertEqual(self.result(self.send())["status"], "uncertain")
+        self.assertEqual(self.result(self.send())["code"], "duplicate")
+
+    def test_a_stamp_without_the_approval_id_does_not_cover_a_send_with_it(self):
+        self.hook(self.argv())
+        p = self.ah(*self.argv("--approval-id", self.APPROVAL))
+        self.assertEqual(self.result(p)["code"], "main_only")
+        self.assertEqual(self.sends(), [])
+
+    def test_a_malformed_approval_id_is_refused_before_anything_is_read(self):
+        p = self.send("--approval-id", "not-an-id")
+        self.assertEqual(self.result(p)["code"], "bad_request")
+        self.assertEqual(self.stub.hits, [])
+
+
+class OneRead(SendBase):
+    def test_the_stamp_is_matched_against_the_text_that_is_sent(self):
+        """A file swapped between the sender's read and a second read cannot pair the stamped text's stamp with another body:
+        the sender matches the stamp against the digest of the one read whose text it sends."""
+        argv = self.argv()
+        self.hook(argv)  # stamped for the original text
+        original = self.text.read_text()
+        calls = []
+        real = ah_chat_send.read_text
+
+        def swapping(path):  # the first read sees other text; any later read would see the stamped text again
+            calls.append(path)
+            if len(calls) == 1:
+                self.write("Text the hook never saw.")
+                try:
+                    return real(path)
+                finally:
+                    self.text.write_text(original)
+            return real(path)
+        with mock.patch.object(ah_chat_send, "read_text", swapping), \
+                mock.patch.dict(os.environ, {"HOME": str(self.home), "AH_HOME": str(self.home), "GQ_BROWSER_TEST_LOOPBACK": "1"}):
+            with self.assertRaises(ah_chat_send.ChatError) as caught:
+                ah_chat_send.send(Path(str(self.home)), None, PEER, ORG, str(self.text), base=self.stub.base)
+        self.assertEqual(caught.exception.code, "main_only")
+        self.assertEqual(self.sends(), [])
+        # the positive control on the same in-process path: no swap, the stamp is found and the stamped text is sent
+        self.hook(argv)
+        with mock.patch.dict(os.environ, {"HOME": str(self.home), "AH_HOME": str(self.home), "GQ_BROWSER_TEST_LOOPBACK": "1"}):
+            data = ah_chat_send.send(Path(str(self.home)), None, PEER, ORG, str(self.text), base=self.stub.base)
+        self.assertEqual(data["status"], "sent", data)
+        self.assertEqual([c[1]["body"] for c in self.sends()], [PREFIX + original.rstrip("\n")])
 
 
 if __name__ == "__main__":

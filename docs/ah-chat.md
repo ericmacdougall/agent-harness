@@ -2,7 +2,7 @@
 
 `harness/hooks/ah_chat.py` (goodqa#16396) lets an agent session read your GoodQA direct messages. The harness member key acts as "Claude (agent)", which is not a party to your DMs, so it answers `not_found` for them. `ah chat` uses your own tokens instead, so the session acts as you, through one reviewed path.
 
-**This build is read only.** `ah chat send` answers `{"ok": false, "code": "not_available", ...}` with exit 2 and names goodqa#16399. `ah.py` returns that answer before it parses the arguments or imports `ah_chat`, so the refusal reads no token, opens no file and makes no request. Sending was taken out after review found two problems. Automatic DM retries rested on an unverified server delivery contract. The local send file could not make a DM idempotent on its own. goodqa#16399 holds those findings, what a send needs from the server first (an inspectable delivery contract and server-side DM dedupe), and the saved implementation.
+`ah_chat.py` stays read only. Sending is a separate module, `ah_chat_send.py` (goodqa#16399), described under [Sending one DM](#sending-one-dm-ah-chat-send) below.
 
 ```
 ah chat probe [--token dm|user]                 what the endpoint offers (tool and parameter names only); dm is the default
@@ -10,7 +10,24 @@ ah chat conversations [--org ID] [--limit N] [--cursor C]   your direct and grou
 ah chat history --conversation ID [--limit N] [--before SEQ] [--no-text]   a DM or group DM by its id  (dm-read token)
 ah chat history --with USER_ID_OR_NAME [--org ID] [--limit N] [--no-text]   the DM with one person    (dm-read token)
 ah chat files   --conversation ID [--surface chat|issue|personal] [--offset N]   chat: a DM's files (dm-read token); issue, personal: file_list (user token)
+ah chat send    (--conversation ID | --with USER_ID_OR_NAME) [--org ID] --text-file /abs/path [--approval-id ID] [--dry-run]
+                one short DM to one person, main agent only, never retried (user token; --conversation also reads the DM list)
 ```
+
+## Sending one DM (`ah chat send`)
+
+GoodQA's `send_direct_message` (`POST /v1/orgs/:org/dm/:user`) stores each message with `clientMsgId` null, so the server does not dedupe a DM. A retry after a lost answer could deliver the same words twice. `ah chat send` is built around that:
+
+- **One request per run, never an automatic retry.** A timeout, a dropped connection or an unclear answer is reported as `status: "uncertain"` with "Do NOT resend". Read `ah chat history` to see whether it arrived.
+- **The ledger comes first.** `~/.agent-harness/state/ah/store/chat-send.jsonl` gets a complete, fsynced `pending` row (under a lock) before the request, and an `outcome` row after it. A ledger with a malformed or unfinished record refuses every send until a person has looked at it.
+- **The same text to the same person is refused for 24 hours** after any attempt, whatever its outcome, including a crash that left only the pending row. The exception is an attempt that the user-token approval gate refused (`human_approval_required`, `human_approval_pending`, `approval_expired`, `approval_denied`, `approval_mismatch`). That gate runs before the route stores anything. **At most 6 attempts per person per hour**, counting every attempt.
+- **Approval.** When the user's token asks for approval, the result has `status: "approval_required"` and an `approval_id`. The user approves it in the GoodQA web app (Account, User tokens). Then the same command with the same text file and `--approval-id ID` sends that exact body, which the server binds the permit to.
+- **Main agent only.** mission_gate's PreToolUse hook writes a one-shot stamp only for a payload `caller_identity.is_main` accepts. The stamp is bound to that tool call (it dies when the call's result is in main's transcript), the target, the org, the approval id, the text file's real path and the SHA-256 of its bytes. The sender checks the stamp against the one read whose text it sends. A sub-agent, a script, a replay, a call that already ended, or a text file edited after the hook ran all find no stamp and get `main_only`. **Until the hook with chat-send support is installed (`python3 install.py --apply --hooks-only` from a checkout that has this change), send fails closed for everyone.** Run it in the foreground: a background call gets its tool result at once, which ends the stamp.
+- **What is sent.** `"Claude (Eric's bot). "` (one constant, `PREFIX`) followed by the file's text. The file is an absolute path to a regular file with one link (no symlink), at most 600 characters of UTF-8, with no control characters other than line breaks. Text with a secret shape or a piece of either GoodQA token is refused. No attachments, no channels, no group DMs (`--conversation` must resolve to a `dm` with exactly you and one other person).
+- **Tokens.** The user token sends (and answers `whoami`); `--conversation` also reads the DM list with the dm-read token. Both go only to the pinned base. `--dry-run` reads no token and makes no request; it prints exactly the body that would be sent.
+- **Records.** Each attempt appends a `chat_send` row to the main session's WAL with the person, conversation, org, the text's SHA-256, its length and the outcome. The text is written nowhere except the request.
+
+goodqa#16399 tracks the server half: an optional idempotency key on the DM send, so a lost answer can be retried safely. When that ships, `ah chat send` will pass one; nothing else here is relaxed.
 
 ## Two tokens, two files, no fallback
 

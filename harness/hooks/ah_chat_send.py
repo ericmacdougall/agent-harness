@@ -1,6 +1,6 @@
 """ah chat send: one short direct message to one person, sent by the main agent as the user's bot (goodqa#16399).
 
-  ah chat send (--conversation ID | --with USER_ID_OR_NAME) [--org ID] --text-file /abs/path [--dry-run]
+  ah chat send (--conversation ID | --with USER_ID_OR_NAME) [--org ID] --text-file /abs/path [--approval-id ID] [--dry-run]
 
 Why this is shaped the way it is. GoodQA's send_direct_message (MCP; POST /v1/orgs/:org/dm/:user) stores the message with
 clientMsgId null, so the server has no dedupe for a DM. A retry after a lost answer can deliver the same message twice. So:
@@ -8,8 +8,10 @@ clientMsgId null, so the server has no dedupe for a DM. A retry after a lost ans
 - ONE request per invocation and NO automatic retry, ever. A refusal, a timeout or an unclear answer is reported, never resent.
 - The same text (by SHA-256) to the same person is refused for SAME_TEXT_WINDOW seconds after ANY earlier attempt, whatever
   its outcome (sent, uncertain, or a crash that left only the pending row). The one exception: every earlier attempt was
-  answered `human_approval_required`. That refusal comes from the user-token auth gate, which runs before the route handler
-  stores anything (bugtracker apps/api/src/modules/user-tokens/auth-gate.ts:647-683 at a70289c7).
+  refused by the user-token approval gate (NOT_STORED: approval required, pending, expired, denied or for other text). That
+  gate runs before the route handler stores anything (bugtracker apps/api/src/modules/user-tokens/auth-gate.ts:639-697 at
+  a70289c7). When it asks for approval the result prints the approval id; once the user approves it in the web app, the
+  same command with --approval-id sends that exact body (the server binds the permit to it) and consumes the permit.
 - At most RATE_LIMIT attempts per person per RATE_WINDOW seconds, counting every attempt.
 - The ledger (~/.agent-harness/state/ah/store/chat-send.jsonl) gets a pending row, written completely and fsynced, BEFORE the
   request; the outcome row after it. A ledger with a malformed or unterminated record refuses every send until a person has
@@ -54,7 +56,13 @@ STAMP = "chat-send"
 LEDGER = "chat-send.jsonl"
 MAX_LEDGER = 8 << 20
 MAX_DM_PAGES = 5
-APPROVAL_CODE = "human_approval_required"
+# Refusals of the user-token approval gate, which runs before the route handler and so before anything is stored
+# (bugtracker apps/api/src/modules/user-tokens/auth-gate.ts:639-697 and service.ts:1364-1412 at a70289c7). An attempt
+# answered with one of these did not deliver, so it does not hold the text back. Every other answer does.
+NOT_STORED = {"human_approval_required": "approval_required", "human_approval_pending": "approval_pending",
+              "approval_expired": "approval_refused", "approval_denied": "approval_refused",
+              "approval_mismatch": "approval_refused"}
+FREE_STATUSES = frozenset(NOT_STORED.values())
 CONTROL = re.compile(r"[\x00-\x09\x0b-\x1f\x7f  ]")
 
 
@@ -107,16 +115,28 @@ def _syntax(conversation, with_, org):
     chat._org_syntax(org)
 
 
-def stamp_parts(conversation, with_, org, text_file):
-    """The parts a main-agent stamp is bound to: target, org, the text file's real path and the SHA-256 of its bytes. The hook
-    (mission_gate) and the sender compute them with this one function. None when the arguments would be refused anyway."""
+def _approval_syntax(approval):
+    if approval is not None and not chat._is_uuid(approval):
+        raise ChatError("bad_request", "--approval-id is the approval id a previous send printed (a UUID)", fixed=True)
+
+
+def _parts(conversation, with_, org, text_file, digest, approval):
+    target = ("conversation:" + conversation) if conversation else ("with:" + with_.strip().casefold())
+    return ["send", target, org or "", os.path.realpath(text_file), digest, approval or ""]
+
+
+def stamp_parts(conversation, with_, org, text_file, approval=None):
+    """The parts a main-agent stamp is bound to: target, org, the text file's real path, the SHA-256 of its bytes and the
+    approval id. The hook (mission_gate) computes them here; the sender computes them with _parts from the ONE read of the
+    file whose text it sends, so a file swapped between two reads cannot pair one text's stamp with another text's body.
+    None when the arguments would be refused anyway."""
     try:
         _syntax(conversation, with_, org)
+        _approval_syntax(approval)
         _text, digest = read_text(text_file)
     except ChatError:
         return None
-    target = ("conversation:" + conversation) if conversation else ("with:" + with_.strip().casefold())
-    return ["send", target, org or "", os.path.realpath(text_file), digest]
+    return _parts(conversation, with_, org, text_file, digest, approval)
 
 
 # ------------------------------------------------------------------ the ledger
@@ -194,7 +214,7 @@ def check_ledger(rows, peer, digest, now):
     """Refuse a duplicate or a send over the rate. Every attempt counts, whatever its outcome."""
     mine = [a for a in _attempts(rows).values() if a["peer"] == peer and isinstance(a["at"], (int, float))]
     same = [a for a in mine if a["sha"] == digest and now - a["at"] < SAME_TEXT_WINDOW]
-    if same and any(a["status"] != "approval_required" for a in same):
+    if same and any(a["status"] not in FREE_STATUSES for a in same):
         raise ChatError("duplicate", "this exact text already went to this person in the last 24 hours (or its outcome is "
                                      "unknown). It is never resent automatically: check `ah chat history` and, if it really "
                                      "did not arrive, send a reworded message. Nothing was sent", fixed=True)
@@ -275,10 +295,11 @@ def _peer_of_conversation(home, base, org, conversation, me):
 
 # ------------------------------------------------------------------ the command
 
-def send(home, conversation=None, with_=None, org=None, text_file=None, dry_run=False, base=None, now=None):
+def send(home, conversation=None, with_=None, org=None, text_file=None, dry_run=False, base=None, now=None, approval=None):
     chat._pinned_base(base)  # first: a refused base reads nothing
     _syntax(conversation, with_, org)
-    text, digest = read_text(text_file)
+    _approval_syntax(approval)
+    text, digest = read_text(text_file)  # the one read: the stamp below is matched against this text's digest
     body = PREFIX + text
     target = {"conversation": conversation} if conversation else {"with": with_}
     if dry_run:  # no token, no request, no ledger row, no stamp
@@ -286,7 +307,7 @@ def send(home, conversation=None, with_=None, org=None, text_file=None, dry_run=
                 "body": body, "chars": len(body), "text_sha256": digest,
                 "note": "nothing was sent; without --dry-run this exact body goes to the person once, never retried"}
     import caller_identity  # noqa: PLC0415
-    stamp = caller_identity.take_stamp(STAMP, stamp_parts(conversation, with_, org, text_file) or ["refused"], home=home,
+    stamp = caller_identity.take_stamp(STAMP, _parts(conversation, with_, org, text_file, digest, approval), home=home,
                                        bound=True)
     if stamp is None:
         raise ChatError("main_only", "only the main agent sends chat messages: its own hook stamps this exact command (target, "
@@ -319,25 +340,34 @@ def send(home, conversation=None, with_=None, org=None, text_file=None, dry_run=
         except OSError:
             raise ChatError("ledger_damaged", "the pending record could not be written completely; nothing was sent. Check "
                                               "the chat-send ledger before sending again", 3, fixed=True) from None
-        status, message_id, sent_conv, code = "uncertain", None, None, None
-        try:
-            data = client.tool("send_direct_message", {"orgId": org, "userId": peer, "body": body})
+        status, message_id, sent_conv, code, approval_id = "uncertain", None, None, None, None
+        arguments = {"orgId": org, "userId": peer, "body": body}
+        if approval:
+            arguments["approvalId"] = approval
+        try:  # exactly one request: whatever happens below, nothing here sends again
+            data = client.tool("send_direct_message", arguments)
             message = data.get("message") if isinstance(data, dict) and isinstance(data.get("message"), dict) else {}
             message_id = message.get("id") if chat._is_uuid(message.get("id")) else None
             sent_conv = data.get("conversationId") if isinstance(data, dict) and chat._is_uuid(data.get("conversationId")) else None
             status = "sent" if message_id else "uncertain"
         except ChatError as error:
             code = getattr(error, "server_code", None)
-            status = "approval_required" if code == APPROVAL_CODE else "uncertain"
+            status = NOT_STORED.get(code, "uncertain")
+            approval_id = getattr(error, "approval_id", None) if status in FREE_STATUSES else None
         outcome = {"id": uuid.uuid4().hex, "kind": "outcome", "ref": attempt, "status": status, "message": message_id,
                    "at": time.time()}
         try:
             _append(path, outcome)
         except OSError:
             pass  # the pending row already counts as an attempt: the same text stays refused
-        wal_id = _wal(home, session, dict(record, status=status, message=message_id, attempt=attempt))
+        try:
+            wal_id = _wal(home, session, dict(record, status=status, message=message_id, attempt=attempt))
+        except Exception:  # noqa: BLE001 - the request already happened: report it, never let a traceback hide it
+            wal_id = None
     result = {"ok": status == "sent", "status": status, **target, "peer": peer, "org": org, "chars": len(body),
               "text_sha256": digest, "wal": wal_id, "retry": "never automatic"}
+    if wal_id is None:
+        result["wal_warning"] = "the WAL row could not be written; the chat-send ledger still records this attempt"
     if shown:
         result["with_name"] = shown
     if message_id:
@@ -346,9 +376,17 @@ def send(home, conversation=None, with_=None, org=None, text_file=None, dry_run=
         result["sent_conversation"] = sent_conv
         if conversation and sent_conv != conversation:
             result["warning"] = "GoodQA delivered into a different conversation than the one named"
-    if status == "approval_required":
-        result["next"] = ("GoodQA asks the user to approve this send first (his user token's approval setting). Nothing was "
-                          "stored. After he approves, run the same command again")
+    if status in FREE_STATUSES:
+        result["server_code"] = code
+        if approval_id:
+            result["approval_id"] = approval_id
+    if status in ("approval_required", "approval_pending"):
+        result["next"] = ("GoodQA holds this send for the user's approval (his user token's approval setting). Nothing was "
+                          "stored. He approves it in the GoodQA web app under Account > User tokens; then run the same "
+                          "command with the same text file and --approval-id %s" % (approval_id or approval or "<id>"))
+    elif status == "approval_refused":
+        result["next"] = ("GoodQA refused the approval (%s): it expired, was denied, or was given for different text. Nothing "
+                          "was stored. Run the command without --approval-id to ask for a new approval" % code)
     elif status == "uncertain":
         result["next"] = ("the outcome is unknown. Do NOT resend: read `ah chat history` to see whether it arrived. The same "
                           "text stays refused for 24 hours")

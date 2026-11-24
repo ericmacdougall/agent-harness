@@ -3566,6 +3566,7 @@ def build_parser():
     cs.add_argument("--with", dest="with_user", help="user id, or a member's exact name")
     cs.add_argument("--org", help="organization id (default: org in browser-defaults.json)")
     cs.add_argument("--text-file", dest="text_file", required=True, help="absolute path to the message text (at most 600 characters)")
+    cs.add_argument("--approval-id", dest="approval_id", help="the approval id an earlier send printed, after the user approved it")
     cs.add_argument("--dry-run", action="store_true", help="print exactly what would be sent; reads no token, sends nothing")
     for name in ("probe", "conversations", "history", "files"):
         c = chs.add_parser(name)
@@ -3813,7 +3814,7 @@ def run(args, home: Path) -> dict:
             if args.sub == "send":
                 import ah_chat_send  # noqa: PLC0415
                 return ah_chat_send.send(home, args.conversation, args.with_user, args.org, args.text_file, args.dry_run,
-                                         args.base)
+                                         args.base, approval=args.approval_id)
             if args.sub == "probe":
                 return ah_chat.probe(args.base, args.token)
             if args.sub == "conversations":
