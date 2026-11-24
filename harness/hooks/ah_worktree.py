@@ -182,4 +182,26 @@ def remove(host, path, reason, authenticated=False, session="", agent="", home=N
               "skipped_processes": outcome.get("skipped_processes")}
     if "audit_warning" in outcome:
         answer["audit_warning"] = outcome["audit_warning"]
+    step = next_step(host, path, result, authenticated)
+    if step:
+        answer["next"] = step
     return answer
+
+
+def next_step(host, path, result, authenticated=False):
+    """The exact commands that clear a stale-tracking-ref refusal (goodqa#16943): the verifier keeps that rule; the caller
+    gets `git -C <registry repo> fetch --prune <remote>` on the same host, then this same removal. None otherwise, and None
+    when the verifier's repository or remote name is not a plain literal (it is printed for an agent to run)."""
+    if result.get("removable") is not False or "stale or names a moved" not in str(result.get("reason") or ""):
+        return None
+    repo, urls = result.get("repo"), result.get("urls") if isinstance(result.get("urls"), dict) else {}
+    remote = "origin" if "origin" in urls else next(iter(urls), "origin")
+    if not (isinstance(repo, str) and PATH_RE.fullmatch(repo) and ".." not in repo.split("/")
+            and isinstance(remote, str) and re.fullmatch(r"[\w.-]{1,60}", remote)):
+        return None
+    fetch = "git -C %s fetch --prune %s" % (repo, remote)
+    if host != "local":
+        fetch = "ssh %s %s" % (host, shlex.quote(fetch))
+    return ("run `%s` first (the registry repository keeps refs of deleted branches), then repeat: python3 -I "
+            "~/.claude/hooks/ah.py worktree-remove --host %s --path %s --reason \"<why>\"%s" % (
+                fetch, host, path, " --remote-auth" if authenticated else ""))

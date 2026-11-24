@@ -2678,22 +2678,60 @@ def _clean_reason(reason):
     return re.sub(r'[^\x20-\x7e]', '?', str(reason))[:160]
 
 
-def _worktree_instead(reason):
+WORKTREE_ROUTE_HOSTS = ('t2-dev',)  # the remote hosts `ah worktree-remove` serves (ah_worktree.REMOTE_HOSTS)
+_ROUTE_PATH = re.compile(r'/[A-Za-z0-9_@+=:,.-]+(?:/[A-Za-z0-9_@+=:,.-]+)*')  # what ah_worktree.check_path accepts
+_ROUTE_REPO = re.compile(r'/[A-Za-z0-9_@+=:,./-]{1,400}')
+
+
+def _worktree_route(path=None, host=None):
+    """The exact sanctioned command for removing ONE worktree (goodqa#16943): `ah worktree-remove`, with the literal path
+    filled in when it is one the route accepts (else a placeholder) and --host t2-dev only for an ssh payload aimed at that
+    host. An ssh payload aimed at any other host gets no command, because the route does not serve it."""
+    target = path if isinstance(path, str) and _ROUTE_PATH.fullmatch(path) and '..' not in path.split('/') \
+        and len(path) <= 1024 else '<abs path>'
+    where = 'local' if host is None else host
+    if where != 'local' and where not in WORKTREE_ROUTE_HOSTS:
+        return ('ah worktree-remove serves only this machine and %s; remove the worktree from a session on that host'
+                % ', '.join(WORKTREE_ROUTE_HOSTS))
+    return ('python3 -I ~/.claude/hooks/ah.py worktree-remove --host %s --path %s --reason "<why>" (one literal path, '
+            'no --force, audited; add --remote-auth for a private repository)' % (where, target))
+
+
+def worktree_prune_hint(repo, remote='origin'):
+    """`git -C <registry repo> fetch --prune <remote>` for a stale-tracking-ref refusal, or None when the values are not
+    plain literal paths and names (they are printed for an agent to run, so nothing shell-active may reach the text)."""
+    if not (isinstance(repo, str) and _ROUTE_REPO.fullmatch(repo) and '..' not in repo.split('/')
+            and isinstance(remote, str) and re.fullmatch(r'[\w.-]{1,60}', remote)):
+        return None
+    return 'git -C %s fetch --prune %s' % (repo, remote)
+
+
+def _worktree_registry(path):
+    """The primary worktree of `path`'s repository (where `fetch --prune` updates the shared refs), or None."""
+    try:
+        listing = _git_out(path, ['worktree', 'list', '--porcelain'], 2.0)
+    except Exception:  # noqa: BLE001 - only advice depends on it
+        return None
+    return next((line[len('worktree '):] for line in listing.splitlines() if line.startswith('worktree ')), None)
+
+
+def _worktree_instead(reason, route=None, repo=None):
     """The advice for a refused `git worktree remove`: the verifier's reason, its next step, and the delegated route
     (ah worktree-remove runs the full verifier, on this Mac or t2-dev). None when no reason is known."""
     if not reason:
         return None
-    return ('verifier: %s. %s%s' % (_clean_reason(reason), (_worktree_next_step(reason) or '') + '; or ' if
-                                    _worktree_next_step(reason) else '',
-                                    'python3 -I ~/.claude/hooks/ah.py worktree-remove --host local|t2-dev --path <abs path> '
-                                    '--reason <why> (no --force; audited)'))
+    route = route or _worktree_route()
+    step = _worktree_next_step(reason, repo)
+    return 'verifier: %s. %s%s' % (_clean_reason(reason), step + '; then ' if step else '', route)
 
 
-def _worktree_next_step(reason):
+def _worktree_next_step(reason, repo=None):
     """What to do about a verifier reason (None when there is nothing specific to say). Never advises discarding work."""
     reason = str(reason or '')
     if 'stale or names a moved' in reason:
-        return 'run git fetch --prune <remote> in the repository, then repeat the removal'
+        prune = worktree_prune_hint(repo)
+        return ('run `%s` first' % prune if prune else
+                'run `git -C <registry repo> fetch --prune origin` first (the repository the worktree was added from)')
     if 'did not answer' in reason:
         return ('the guard reads the remote without credentials; for a private repository use '
                 'python3 -I ~/.claude/hooks/ah.py worktree-remove --host local --path <abs path> --reason <why> '
@@ -3854,6 +3892,7 @@ class Ctx:
         self.origin_cwd = cwd  # the payload's working directory, None when the host sent none
         self.cwd_known = bool(cwd)  # becomes True after an absolute or home `cd` in the command
         self.work_refusal = False
+        self.ssh_host = None  # the host of the ssh payload being analysed (advice only: names the route's --host)
         self.token_sink_ok = False
         self.token_allowed = 0
         self.top_commands = 0
@@ -3890,7 +3929,7 @@ class Ctx:
 
     # what one reading of a script can change; findings accumulate across readings and the rest is not analysis state
     NOT_STATE = ('findings', 'budget', 'c', 'marker', 'raw_top', 'ps', 'tail_visible', 'fork_depth', 'readings_capped',
-                 'fs_cache', 'seen_texts')
+                 'fs_cache', 'seen_texts', 'ssh_host')
 
     def state(self):
         return {k: (v.copy() if isinstance(v, (set, dict, list)) else v) for k, v in vars(self).items()
@@ -5322,6 +5361,7 @@ class Analyzer:
                         i += 1
                     continue
                 host_seen = True
+                host = t
                 i += 1
                 break
             i += 1
@@ -5329,7 +5369,11 @@ class Analyzer:
         if rest and rest[0] == '--':
             rest = rest[1:]
         if rest:
-            self.script(' '.join(rest), depth + 1, tail_visible=True)
+            saved, self.ctx.ssh_host = self.ctx.ssh_host, (host.rsplit('@', 1)[-1] if host_seen else '?')[:64]
+            try:
+                self.script(' '.join(rest), depth + 1, tail_visible=True)
+            finally:
+                self.ctx.ssh_host = saved
 
     def container(self, name, args, words, depth, pl, idx):
         texts = [a.text for a in args]
@@ -5826,16 +5870,20 @@ class Analyzer:
             targets = _nondash(args[i + 2:])
             one_target = len(targets) == 1  # the verifier judged ONE path; with several its reason belongs to none
             for w in targets:
-                refused = self.refuse('git worktree remove', w,
-                                      instead=_worktree_instead(getattr(self, '_worktree_reason', None) if rest[:1] == ['remove'] and one_target else None))
-                if rest[:1] == ['remove'] and not refused:
-                    reason = getattr(self, '_worktree_reason', None) if one_target else None
+                if rest[:1] != ['remove']:
+                    self.refuse('git worktree remove', w)
+                    continue
+                # goodqa#16943: every refused removal names the sanctioned route with this target and host filled in
+                reason = getattr(self, '_worktree_reason', None) if one_target else None
+                route, repo = self._worktree_advice(w, reason)
+                refused = self.refuse('git worktree remove', w, instead=_worktree_instead(reason, route, repo) or route)
+                if not refused:
+                    step = _worktree_next_step(reason, repo)
                     ctx.add(LOG_DELETE, 'linked-worktree-remove',
                             'git worktree remove is allowed only for one verified clean, published, registered linked '
                             'worktree top; this target or command shape is not verified'
                             + (' (verifier: %s)' % _clean_reason(reason) if reason else ''),
-                            _worktree_next_step(reason) or
-                            'use the standalone literal non-forced form after cleaning and publishing the worktree')
+                            (step + '; then ' if step else '') + route)
         if sub == 'init' and rest:
             for w in _nondash(args[i + 1:])[-1:]:
                 self.note_created(_join_word(w, '.git'))
@@ -7165,6 +7213,19 @@ class Analyzer:
                  'ancestor': 'a directory that contains protected logs', 'unknown':
                  'a path the guard cannot resolve that points at protected logs'}[cls]
         name = posixpath.basename(path.rstrip('/')) or path
+        if cls == 'root' and self._under_work(path) is not None and not self._kept(path):
+            # goodqa#16943 (H6): durable work state, not a log. Same refusal, but the advice is the documented place for
+            # disposable files instead of the log-backup procedure (docs/operations.md, "Under ~/.agent-harness/work").
+            ctx.add(LOG_DELETE, 'log-delete',
+                    ('%s targets durable harness work state under ~/.agent-harness/work (%s). It is not a log, but files '
+                     'there (packets, kits, evidence) are kept: only the git worktree you work in and a task folder\'s '
+                     'tmp/ are deletable' % (what, name[:60]))[:300],
+                    instead or 'make disposable files in ~/.agent-harness/work/<session>/<task>/tmp/ (rm and mv of a '
+                    'literal path there are allowed) and move them from there, or copy (cp) instead of moving; '
+                    'retired task and session folders are removed by python3 ~/.claude/hooks/workdir.py prune --apply'
+                    + ('' if literal else '; spell out the literal path, globs and variables are judged as protected')
+                    + self._clone_hint(path))
+            return True
         ctx.add(LOG_DELETE, 'log-delete',
                 ('%s targets %s (%s). Claude/Codex/harness logs and state are never deleted, moved or truncated '
                  'without a verified backup' % (what, label, name[:60]))[:300],
@@ -7224,6 +7285,31 @@ class Analyzer:
             self.ctx.budget.deadline += time.monotonic() - started
         self._worktree_reason = reason
         return reason is None
+
+    def _worktree_advice(self, word, reason):
+        """(the exact `ah worktree-remove` command for this target, the registry repository for a fetch --prune hint).
+        The path is filled in only when the guard resolved it to a literal path; inside an ssh payload the host is the
+        payload's host, and the remote repository is unknown here."""
+        host = self.ctx.ssh_host
+        try:
+            cls, path, literal = self.target_class(word)
+        except Blocked:
+            raise
+        except Exception:  # noqa: BLE001 - advice only; the refusal itself does not depend on it
+            path, literal = None, False
+        if word.dynamic or word.subs or word.glob:
+            path = None
+        elif host is not None:
+            # an ssh payload's path belongs to the remote host: ~ and variables would resolve to THIS machine's values,
+            # so only a plain absolute spelling with no variable is printed
+            spelled = word.raw.strip('\'"') if isinstance(word.raw, str) else None
+            path = word.text if spelled == word.text and str(word.text).startswith('/') and not word.vars else None
+        elif not literal:
+            path = None
+        repo = None
+        if path and host is None and reason and 'stale or names a moved' in str(reason) and not self._foreign_home(path):
+            repo = _worktree_registry(path)
+        return _worktree_route(path, host), repo
 
     def _dash_c_refusal(self, path, repo):
         """With a -C the verification ran from the -C directory. Red-team F1: the shell may itself stand inside the
