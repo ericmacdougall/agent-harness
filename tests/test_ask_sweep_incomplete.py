@@ -3,6 +3,7 @@ writer refuses (real ask_sweep.py, wal_note.py and provenance as subprocesses un
 
 - A dangling wal: pointer under an answer row makes that ask manual and the listing exit 2 with the walk under
   `incomplete`; the same fixture with the pointer intact exits 0. Another ask's close still applies.
+- A session named with --related whose WAL folder is not on this host is listed as unread, and the listing exits 2.
 - An ask that wal_note's bounded tail read no longer sees (more than 4 MiB of later rows) is listed manual with
   wal_note's own "no open ask" reason, and wal_note refuses that close too; with the rows trimmed it is offered.
 
@@ -107,6 +108,20 @@ class IncompleteWalk(Base):
         items = {i["ask"]: i for i in doc["evidence"]}
         self.assertEqual((items[ASK]["kind"], items[ASK]["manual"]), ("answer", True))  # a wal: source closes no answer
         self.assertNotIn("could not be traced", items[ASK]["action"])
+
+
+class NamedSessionNotOnThisHost(Base):
+    """A related session named with --related whose WAL folder is not on this host (another host has it) is listed as
+    unread and the listing exits 2, so its rows are never silently missing. A regression guard for the cross-host
+    claim of round 6: the behaviour predates it (session_rows)."""
+
+    def test_a_named_session_this_host_lacks_is_unread_and_exits_2(self):
+        self.write_rows(IncompleteWalk.rows(self, ANSWER_ROW))
+        self.assertEqual(self.sweep()[0], 0)  # the control: every named session is here
+        absent = "cccccccc-9999-4999-8999-0000000c0de9"
+        code, doc = self.sweep("--related", absent)
+        self.assertEqual(code, 2)
+        self.assertIn((f"{absent} WAL folder", "FileNotFoundError"), [(u["source"], u["reason"]) for u in doc["unread"]])
 
 
 class BeyondTheWritersTail(Base):
