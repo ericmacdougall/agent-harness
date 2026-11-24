@@ -1208,6 +1208,8 @@ class UsageStore:
         directory = self._run_directory(run_id)
         with self._lock():
             start = self._owned_start(run_id)
+            # The `inspect --reference` handle for this START, so a holder of unknown state can be looked at (RT2-4).
+            start_sha = hashlib.sha256(file_bytes(directory / 'start.json')).hexdigest()
             finished = os.path.lexists(directory / 'completion.json')
             liveness = owner_liveness(start, self._children(directory))
         busy = (not finished and liveness['state'] != 'DEAD' and not liveness['past_deadline']
@@ -1215,7 +1217,8 @@ class UsageStore:
         return {'run_id': run_id, 'busy': busy, 'state': liveness['state'], 'why': liveness['why'],
                 'finished': finished, 'past_deadline': liveness['past_deadline'],
                 'started_at': start.get('started_at') if isinstance(start.get('started_at'), str) else None,
-                'deadline': liveness.get('deadline'), 'label': start.get('label')}
+                'deadline': liveness.get('deadline'), 'label': start.get('label'),
+                'start_reference': '%s:start:%s' % (run_id, start_sha)}
 
     def _children(self, directory):
         path = directory / 'children.json'
@@ -1274,6 +1277,7 @@ class UsageStore:
 # limit with no reliable time is re-probed after 30 minutes, and no skip lasts longer than 6 hours from now.
 AVAILABILITY_REPROBE_SECONDS = 30 * 60
 AVAILABILITY_MAX_SKIP_SECONDS = 6 * 3600
+# ASSUMPTION (owner decision, RT2-9): a record dated up to 5 minutes in the future is tolerated as clock skew.
 AVAILABILITY_CLOCK_SKEW_SECONDS = 300
 AVAILABILITY_MAX_RECORD = 4096
 AVAILABILITY_MAX_ENTRIES = 4096

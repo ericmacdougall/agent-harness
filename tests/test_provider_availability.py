@@ -559,6 +559,46 @@ class BusyPool(LoopFixture):
         self.assertEqual(store.released, [('codex', {'reason': 'NONE'})])
         self.assertIn('Provider skipped: codex pool codex-harness', stderr)
 
+    def test_a_live_holder_past_its_deadline_is_unknown_not_stale(self):
+        # RT2-5: a hung cleanup outlives its deadline but is still ALIVE: never advise reconciling it.
+        sleeps = []
+        status = self.busy(busy=False, state='ALIVE', past_deadline=True, why='owner process is alive')
+        store = self.store({'codex': self.held()}, status)
+        options = self.options(store, reviewer='codex-only')
+        with mock.patch.object(pr, '_pool_sleep', side_effect=sleeps.append):
+            _, error, stderr = self.review(options)
+        self.assert_neutral(options, error, stderr, sleeps)
+
+    def test_the_unknown_line_names_the_inspect_command_for_the_holder(self):
+        # RT2-4: the way out is inspecting the holder's START, then a person decides; not a reconcile that just failed.
+        reference = self.HOLDER + ':start:' + 'ab' * 32
+        status = self.busy(busy=False, state='UNCERTAIN', why='owner facts missing or malformed', deadline=None,
+                           start_reference=reference)
+        store = self.store({'codex': self.held()}, status)
+        options = self.options(store, reviewer='codex-only')
+        with mock.patch.object(pr, '_pool_sleep', side_effect=lambda seconds: None):
+            self.review(options)
+        rendered = rd.render(options['attempts'][-1], stage='pr', head='a' * 40)
+        self.assertIn('usage_guard.py inspect --reference ' + reference + '`', rendered)
+        self.assertIn('decides whether it is live before any manual reconcile', rendered)
+        self.assertNotIn('reconcile --run', rendered)
+
+    def test_a_limit_recorded_between_the_check_and_an_unwaited_acquire_is_not_launched_into(self):
+        # RT2-6: the holder records QUOTA and releases just before this run's first acquire succeeds.
+        store = self.Store()
+        original = store.acquire_pool
+
+        def acquire(provider, pool, run_id):
+            self.records.record('codex', 'codex-harness')
+            return original(provider, pool, run_id)
+        store.acquire_pool = acquire
+        options = self.options(store, reviewer='codex-only')
+        result, error, stderr = self.review(options)
+        self.assertIsNone(result)
+        self.assertEqual((error.outcome['reason'], self.calls), ('QUOTA', []))
+        self.assertEqual(store.released, [('codex', {'reason': 'NONE'})])
+        self.assertIn('Provider skipped: codex pool codex-harness', stderr)
+
     def test_the_busy_message_names_the_holder_repo_and_pr(self):
         selections = pr.ladder.state_root() / 'selections'
         selections.mkdir(mode=0o700, exist_ok=True)
@@ -585,6 +625,10 @@ class HolderStatusStore(unittest.TestCase):
         status = self.fixture.store.holder_status(run.run_id)
         self.assertTrue(status['busy'], status)
         self.assertEqual(status['state'], 'ALIVE')
+        # RT2-4: the START handle works with the existing `inspect --reference` command.
+        self.assertEqual(status['start_reference'], '%s:start:%s' % (run.run_id, run.start_ref['sha256']))
+        self.assertEqual(self.fixture.store.inspect(guard.reference_argument(status['start_reference']))
+                         ['historical_start']['run_id'], run.run_id)
         later = guard.now_utc() + guard.timedelta(hours=2)
         with mock.patch.object(guard, 'now_utc', return_value=later):
             status = self.fixture.store.holder_status(run.run_id)
@@ -641,6 +685,12 @@ class AhcDaemonClasses(unittest.TestCase):
                          ('contention', 'POOL_BUSY'))
         record = {'until': NOW + 3600, 'recorded_at': NOW, 'basis': 'provider_reset', 'hint': 'in 1 hour'}
         self.assertLessEqual(abs(self.runner._reset_time(pr.skip_text('codex', 'p', record)) - (NOW + 3600)), 3600)
+        # Plan review F3: pin the exact wording ahc reads, so a rewording cannot quietly lose the retry time.
+        self.assertEqual(pr.skip_text('codex', 'p', record),
+                         'codex pool p is out of quota (usage limit recorded 2030-03-17T17:46:40Z); skipped until it '
+                         'resets at 2030-03-17T18:46:40Z (the provider gave this reset time); the provider said it '
+                         'resets in 1 hour')
+        self.assertRegex(pr.skip_text('codex', 'p', record), self.runner.RESET.pattern)
 
     def test_every_diagnostic_code_is_classified_on_purpose(self):
         unknown = {code for code in rd.CONTRACT if self.runner.classify_review_failure(
@@ -692,11 +742,35 @@ class CommandLine(unittest.TestCase):
         lines = [line for line in result.stderr.splitlines() if 'PROVIDER_SKIPPED' in line]
         self.assertEqual(len(lines), 1, result.stderr)
         self.assertIn('NOT_COUNTED', lines[0])
+        # Plan review F3: the earliest reset comes first, in the "resets at <UTC>Z" form ahc's RESET reads.
+        self.assertRegex(lines[0], r'^REVIEW_DIAGNOSTIC code=PROVIDER_SKIPPED reason=QUOTA: every reviewer provider is '
+                                   r'skipped until the earliest resets at \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ, ')
         self.assertIn('codex pool default', lines[0]); self.assertIn('claude pool default', lines[0])
         self.assertFalse(self.launches.exists())
         self.assertFalse(output.exists())
         self.assertEqual(list((self.root / 'usage-state' / 'runs').iterdir()), [])
         self.assertNotIn('PASS', result.stdout)
+
+    def test_distinct_pools_reach_the_preflight_by_provider(self):
+        # RT2-7: Codex runs under --pool and Claude under --fallback-pool. Records for codex/a and claude/a must not
+        # skip claude/b, so the run launches Claude; records for codex/a and claude/b skip everything.
+        guard.UsageStore(self.root / 'usage-state')
+        records = guard.ProviderAvailability(self.root / 'usage-state')
+        records.record('codex', 'pool-a'); records.record('claude', 'pool-a')
+        pools = ('--pool', 'pool-a', '--fallback-pool', 'pool-b')
+        first = self.invoke(stage='code-inspection', output=self.root / 'a.md', extra=pools,
+                            env={'PROVIDER_LAUNCH_LOG': str(self.launches)})
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(self.launches.read_text().split(), ['claude'])
+        self.assertIn('Provider skipped: codex pool pool-a', first.stderr)
+        self.launches.unlink()
+        records.clear('claude', 'pool-a'); records.record('claude', 'pool-b')
+        self.packet.write_text('A second disposable review (a new packet, so not a repeat).')
+        second = self.invoke(stage='code-inspection', output=self.root / 'b.md', extra=pools,
+                             env={'PROVIDER_LAUNCH_LOG': str(self.launches)})
+        self.assertEqual(second.returncode, 2, second.stderr)
+        self.assertIn('claude pool pool-b', second.stderr)
+        self.assertFalse(self.launches.exists())
 
     def test_both_providers_refusing_prints_both_attempts(self):
         result = self.execute(self.root / 'both.md', CODEX_EVENTS=codex_quota(), CODEX_EXIT='1',

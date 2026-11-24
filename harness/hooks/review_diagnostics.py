@@ -92,7 +92,8 @@ CONTRACT = {
                   'budget, only when no other provider can be tried; it never waits on a holder whose state is unknown. '
                   'A pool that stays held ends the run with nothing launched (not counted).',
                   ['Read the Detail line: it names the holder run, its repository and PR when known, and its deadline.',
-                   'Do not reconcile a run you do not own that may be live. Rerun after the holder finishes or its deadline passes.']),
+                   'Do not reconcile a run you do not own that may be live. Rerun after the holder finishes or its deadline passes.',
+                   'When the Detail says the holder state is unknown, a person runs the inspect command it names and decides whether that run is live before any manual reconcile.']),
     'PROVIDER_AUTH': ('AUTH', 'The provider rejected authentication.',
                       ['Sign in again with the provider CLI, then rerun once.']),
     'PROVIDER_UNAVAILABLE': ('TRANSIENT_INFRA', 'The provider was overloaded, rate limited or its model was unavailable.',
@@ -583,7 +584,7 @@ def provider_attempt(provider, resolution, code, stdout, stderr, outcome, *, lau
         # Popen may succeed before an on_spawn/child-record failure leaves code unset.
         if ((reason == 'POOL_BUSY' or outcome.get('busy') is True or outcome.get('holder_unknown') is True)
                 and launch_state == 'NOT_STARTED'):
-            return diagnostic('POOL_BUSY', provider=provider, detail=sanitize(local_detail, 500))
+            return diagnostic('POOL_BUSY', provider=provider, detail=sanitize(local_detail, 600))
         code_name = 'REVIEW_NOT_STARTED' if launch_state == 'NOT_STARTED' else 'REVIEW_LAUNCH_UNCONFIRMED'
         typed_reason = reason if reason in PROVIDER_REASON_CODES else 'UNKNOWN'
         detail = ('Local outcome: ' + typed_reason + '. ' + sanitize(local_detail, 400)).strip()
@@ -699,7 +700,9 @@ _RESET = re.compile(r'\bresets?\b[ \t:]+([^\n]{1,80})', re.IGNORECASE)
 
 def usage_limit_reset_hint(message):
     """The provider's own reset wording after "resets" ("Nov 29 at 6pm (America/Denver)"), sanitized and bounded, or
-    None. Display text only: nothing parses it into a time."""
+    None. This function only extracts it for display. usage_guard.parse_reset_text later reads a time from it for the
+    availability record, but only from an ISO-8601 time with Z or an offset or a relative "in N minutes, hours or
+    days", capped at 6 hours."""
     if not isinstance(message, str) or len(message) > 4096:
         return None
     match = _RESET.search(message)

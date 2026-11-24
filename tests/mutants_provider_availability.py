@@ -85,8 +85,25 @@ MUTANTS = {
         'usage_guard.py', "return {**value, 'until': min(value['until'], now + AVAILABILITY_MAX_SKIP_SECONDS)}",
         'return value', ['StoreTests']),
     'a limit recorded during the wait is launched into': (
-        'peer_review.py', 'late = availability_skip(availability, provider, pool) if waited else None',
-        'late = None', ['BusyPool']),
+        'peer_review.py', '                    late = availability_skip(availability, provider, pool)\n',
+        '                    late = None\n', ['BusyPool']),
+    'a limit recorded before an unwaited acquire is launched into': (
+        'peer_review.py', '                    late = availability_skip(availability, provider, pool)\n',
+        '                    late = availability_skip(availability, provider, pool) if waited else None\n',
+        ['BusyPool']),
+    'a live holder past its deadline gets reconcile advice': (
+        'peer_review.py', "    if status.get('finished') is True or status.get('state') == 'DEAD':",
+        "    if status.get('finished') is True or status.get('state') == 'DEAD' or status.get('past_deadline') is True:",
+        ['BusyPool']),
+    'the unknown line names no inspect command': (
+        'peer_review.py', "if isinstance(reference, str) and START_REFERENCE.fullmatch(reference)", 'if False',
+        ['BusyPool']),
+    'holder_status gives no START reference': (
+        'usage_guard.py', "'start_reference': '%s:start:%s' % (run_id, start_sha)}", "'start_reference': None}",
+        ['HolderStatusStore']),
+    'the preflight checks Claude under the Codex pool': (
+        'peer_review.py', "'claude': options.get('fallback_pool', 'default'),", "'claude': options.get('pool', 'default'),",
+        CLI),
     'a pool wait spends no aggregate time': (
         'usage_guard.py', "                    spent += elapsed\n                    if zero_launch_attempt(record):",
         "                    if not zero_launch_attempt(record):\n                        spent += elapsed\n"

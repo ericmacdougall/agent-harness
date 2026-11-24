@@ -75,8 +75,10 @@ def review_policy():
 def prose_quota_failure(message):
     """Free-text usage limit: unlock the one independent fallback, but never an account-pool cooldown.
 
-    The provider's own reset wording ("resets Nov 29 at 6pm (TZ)") is kept as display text only (`reset_hint`), so
-    the operator sees when to come back on the first failure; it is never parsed into a cooldown time."""
+    The provider's own reset wording is kept as `reset_hint`, so the operator sees when to come back on the first
+    failure. It never becomes a pool cooldown. The availability record (goodqa#17108) parses it only when it is an
+    ISO-8601 time with Z or an offset, or a relative "in N minutes, hours or days", and caps it at 6 hours; anything
+    else ("Nov 29 at 6pm (TZ)") gets the 30-minute re-probe."""
     if diagnostics.usage_limit_prose(message, review_policy()):
         return {**provider_failure({'code': 'quota_exceeded'}, trusted=False), 'reset_at': None,
                 'reset_hint': diagnostics.usage_limit_reset_hint(message)}
@@ -1486,23 +1488,36 @@ def holder_status(store, run_id):
 
 
 def holder_kind(status):
-    """'busy' (live: wait or fall back, no advice), 'stale' (provably dead, past its deadline or finished: the
-    reconcile advice), 'unknown' (state not established: no advice and no wait) or None (no holder facts)."""
+    """'busy' (live with a future deadline: wait or fall back, no advice), 'stale' (provably dead or finished: the
+    reconcile advice), 'unknown' (anything else, including a live run past its deadline: no advice and no wait) or
+    None (no holder facts at all)."""
     if status is None:
         return None
-    if status.get('busy') is True and not status.get('unreadable'):
+    if status.get('unreadable'):
+        return 'unknown'
+    if status.get('busy') is True:
         return 'busy'
-    if not status.get('unreadable') and (status.get('finished') is True or status.get('state') == 'DEAD'
-                                         or status.get('past_deadline') is True):
+    if status.get('finished') is True or status.get('state') == 'DEAD':
         return 'stale'
     return 'unknown'
 
 
+START_REFERENCE = re.compile(r'[0-9a-f]{32}:start:[0-9a-f]{64}')
+
+
 def unknown_text(provider, pool, status):
+    reference = status.get('start_reference')
+    where = ('`python3 ~/.claude/hooks/usage_guard.py inspect --reference %s`' % reference
+             if isinstance(reference, str) and START_REFERENCE.fullmatch(reference)
+             else 'the START record of run %s in the usage store' % status['run_id'])
+    why = status.get('why')
+    if status.get('past_deadline') is True:
+        why = 'past its deadline but not provably dead; %s' % why
+    # The inspect command comes before the holder context, so the diagnostic's length cap can only trim context.
     return diagnostics.sanitize(
-        'pool held: %s/%s by run %s (%s); holder state unknown: %s. Not waiting and giving no reconcile advice, '
-        'because that run may still be live' % (provider, pool, status['run_id'], ', '.join(holder_parts(status)),
-                                                status.get('why')), 500)
+        'pool held: %s/%s by run %s; holder state unknown: %s. No wait and no reconcile advice: it may be live. A '
+        'person inspects it with %s and decides whether it is live before any manual reconcile. Holder: %s'
+        % (provider, pool, status['run_id'], why, where, ', '.join(holder_parts(status))), 600)
 
 
 def holder_parts(status):
@@ -1684,9 +1699,11 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                                            # the wait never eats the launch's own deadline: two deadlines in all
                                            wait_limit=remaining - per_provider)
                     leased = True
-                    late = availability_skip(availability, provider, pool) if waited else None
+                    # Checked again after every acquire, waited or not (RT2-6): another run can record this provider
+                    # out of quota and release the pool between the check at the top of the loop and this lease.
+                    late = availability_skip(availability, provider, pool)
                     if late is not None:
-                        # The holder recorded this provider out of quota while we waited: do not launch into it.
+                        # The holder recorded this provider out of quota meanwhile: do not launch into it.
                         store.release_pool(provider, pool, run_record.run_id, reason='NONE')
                         leased = False
                         raise ReviewFailure(skip_attempt(options, provider, pool, late), source)
@@ -1721,7 +1738,8 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                             last_message = read_bounded(last, PROVIDER_LIMIT + 1)
                             outcome = normalize_provider(provider, code, stdout, stderr, last_message, stage)
         except GuardError as error:
-            local_detail = diagnostics.sanitize(error.message)
+            # A held-pool message names the holder and, for an unknown one, the inspect command: keep it whole.
+            local_detail = diagnostics.sanitize(error.message, 600 if isinstance(error, PoolBusy) else 300)
             outcome = {**provider_failure({}), 'reason': error.reason,
                        'fallback_allowed': error.reason in {'QUOTA', 'AUTH'}}
             if isinstance(error, PoolUnavailable) and launch_state == 'NOT_STARTED':
