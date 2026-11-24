@@ -52,6 +52,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "ahc_contracts.py", "ahc_crash.py", "ahc_migrate.py", "ahc_clock.py", "ahc_scan.py", "ahc_shadow.py", "ahc_guard.py",
          "ahc_observe.py", "ahc_w21.py", "ahc_review.py",
          "self_serve.py", "ah_ops.py", "ah_parity.py",  # self-serve policy library, `ah ops` recipes, `ah ops doctor` parity (goodqa#16757)
+         "supervisor_grant.py", "supervisor_policy.json",  # supervisor power: request, user grant, check at use (goodqa#16944)
          "ahc_release.json")  # imported or read by ahc_runner (goodqa#16049; ahc_release.json: AC-11 preflight)
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
@@ -246,6 +247,11 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
     # report-only reap at most every 6 h. Never deletes; fails open.
     managed["SessionStart"].append({"hooks": [{
         "type": "command", "command": "python3", "args": [str(claude / "hooks" / "copy_hygiene.py"), "session-start"],
+        "timeout": 5}]})
+    # Supervisor power (goodqa#16944): a resumed or replacement session is told at start whether a grant is live.
+    # Context only; never blocks.
+    managed["SessionStart"].append({"hooks": [{
+        "type": "command", "command": "python3", "args": [str(claude / "hooks" / "supervisor_grant.py"), "session-start"],
         "timeout": 5}]})
     if log_backup:
         # Visible alert when the scheduled log backup has not succeeded for an hour; fails open. Only registered

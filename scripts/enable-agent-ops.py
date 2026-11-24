@@ -4,6 +4,9 @@
     python3 ~/.agent-harness/bin/ah_enable_self_serve.py            dry run: print the diff and the capability list
     python3 ~/.agent-harness/bin/ah_enable_self_serve.py --apply --ref <40-hex canonical-main SHA>
     ... --status | --undo | --disable <capability|all> | --resume RUN
+    ... --grant-supervisor <request id>   grant supervisor power for one `ah supervisor request` (supervisor_grant.py):
+        remove projects or powers you do not want, pick the expiry (8 hours by default; 'until revoked' only when you
+        type those words), read the summary, type the dialog code
     ... --apply --fallback-denylist GLOB   (optional, repeatable) paths the same-harness fallback may never cover.
         By default no denylist is written and every changed path is allowed. Source:
         answer:1471f671-0ed0-40c3-8506-255cb670e4de/44bc4b2f-436b-4711-a4d8-9d7bd7cf0a06 "Allow every path".
@@ -730,6 +733,35 @@ def validate_params(params) -> dict:
             "expires_days": days, "fallback_denylist": check_globs(params.get("fallback_denylist") or [])}
 
 
+def load_supervisor(layout):
+    """supervisor_grant.py from this home's installed hooks, loaded by path (never sys.path), only when it is a plain file
+    of this user's that group and others cannot write. Anything else is a refusal."""
+    path = layout.claude / "hooks" / "supervisor_grant.py"
+    try:
+        info = os.lstat(path)
+    except OSError:
+        raise Refused("supervisor_grant.py is not installed in %s; install the merged hook files first" % path.parent) from None
+    if not stat.S_ISREG(info.st_mode) or info.st_uid not in (os.getuid(), 0) or info.st_mode & 0o022:
+        raise Refused("supervisor_grant.py is not a plain file of this user's that only they can write; not loading it")
+    spec = importlib.util.spec_from_file_location("supervisor_grant", str(path))
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as error:  # noqa: BLE001 - a module that cannot load is a refusal, never a pass
+        raise Refused("supervisor_grant.py could not be loaded (%s)" % error.__class__.__name__) from None
+    return module
+
+
+def _numbers(answer: str, count: int, what: str) -> list:
+    """0-based indexes from `1 3`-style input; anything else is a refusal (never a silent keep-all)."""
+    picked = []
+    for word in answer.replace(",", " ").split():
+        if not word.isdigit() or not 1 <= int(word) <= count:
+            raise Refused("%r is not one of the %s numbers; nothing was changed" % (word[:20], what))
+        picked.append(int(word) - 1)
+    return sorted(set(picked))
+
+
 class Enabler:
     def __init__(self, layout: Layout, *, env=None, upstream=None, remote=None, parity=None, template=None, out=print,
                  on_step=None, now=None):
@@ -1255,6 +1287,64 @@ class Enabler:
                           "run --undo, then apply again" % reason)
         return policy, key
 
+    def grant_supervisor(self, rid: str, supervisor=None) -> int:
+        """Grant supervisor power for one request (supervisor_grant.py). The person removes what they do not want, picks
+        the expiry (8 hours by default; 'until revoked' only when typed), reads the summary and types the dialog code.
+        Choices only remove from the request; nothing can be added."""
+        module = supervisor or load_supervisor(self.layout)
+        try:
+            request = module.load_request(rid)
+        except module.Refusal as refusal:
+            raise Refused("request %s: %s" % (rid[:16], refusal.message)) from None
+        identity = self._identity()
+        if identity is None:
+            raise Refused("there is no self-serve signing key yet; run --apply once first")
+        key, key_id, _public = identity
+        if key_id not in load_pinned(self.layout):
+            raise Refused("the signing key %s is not pinned in %s; run --apply first" % (key_id, self.layout.pubkeys))
+        out = self.out
+        out("Supervisor request %s from session %s (model %s)." % (request["rid"], request["session"], request["model"]))
+        out("Reason (the agent's words, shown as data): %s" % json.dumps(request.get("reason", ""))[:1100])
+        out("Projects requested:")
+        for number, project in enumerate(request["projects"], 1):
+            out("  %d. %s on %s" % (number, project["repo"], ", ".join(project["hosts"])))
+        drop_projects = []
+        if len(request["projects"]) > 1:
+            picked = _numbers(self.env.read_nonce("Projects to REMOVE (numbers, space separated), or Enter to keep all: "),
+                              len(request["projects"]), "project")
+            drop_projects = [request["projects"][i]["repo"] for i in picked]
+        out("Powers requested:")
+        for number, power in enumerate(request["powers"], 1):
+            out("  %d. %s" % (number, power))
+        drop_powers = []
+        if len(request["powers"]) > 1:
+            picked = _numbers(self.env.read_nonce("Powers to REMOVE (numbers, space separated), or Enter to keep all: "),
+                              len(request["powers"]), "power")
+            drop_powers = [request["powers"][i] for i in picked]
+        include = False
+        if request.get("include_subagents"):
+            answer = self.env.read_nonce("Include this session's sub-agents? Type yes to include them; Enter keeps them out: ")
+            if answer.strip().lower() not in ("", "yes", "no"):
+                raise Refused("answer yes, no or Enter; nothing was changed")
+            include = answer.strip().lower() == "yes"
+        answer = self.env.read_nonce("How long? Enter for %s, or type %s, or the words '%s': "
+                                     % (module.DEFAULT_EXPIRY, ", ".join(module.EXPIRY_CHOICES), module.UNTIL_REVOKED))
+        expiry = answer.strip().lower() or module.DEFAULT_EXPIRY
+        if expiry != module.UNTIL_REVOKED and expiry not in module.EXPIRY_CHOICES:
+            raise Refused("%r is not an expiry choice; nothing was changed" % answer.strip()[:30])
+        try:
+            body = module.grant_body(request, key_id=key_id, expiry=expiry, include_subagents=include,
+                                     drop_projects=drop_projects, drop_powers=drop_powers, now=self.clock)
+        except module.Refusal as refusal:
+            raise Refused(refusal.message) from None
+        out("")
+        out(module.terminal_text(request, body))
+        confirm(self.env, "supervisor")
+        signed = dict(body, signature=b64url(key.sign(module.signed_message(body))))
+        path = module.write_grant(signed)
+        out("granted: supervisor grant %s written to %s. Revoke: ah supervisor revoke %s" % (signed["gid"], path, signed["gid"]))
+        return 0
+
     def disable(self, what: str) -> int:
         layout = self.layout
         if what != "all" and what not in CAPABILITIES:
@@ -1504,12 +1594,15 @@ def parse(argv):
     mode.add_argument("--undo", action="store_true")
     mode.add_argument("--disable", metavar="CAPABILITY|all")
     mode.add_argument("--resume", metavar="RUN")
+    mode.add_argument("--grant-supervisor", metavar="REQUEST_ID",
+                      help="grant supervisor power for one `ah supervisor request` (needs a terminal and the dialog code)")
     mode.add_argument("--bootstrap", action="store_true", help="scan the pinned SHA, repair both hosts, then --apply")
     parser.add_argument("--home", type=Path, default=Path.home(), help=argparse.SUPPRESS)
     return parser.parse_args(argv)
 
 
-def main(argv=None, *, env=None, upstream=None, remote=None, runner=None, out=print, on_step=None, parity=None) -> int:
+def main(argv=None, *, env=None, upstream=None, remote=None, runner=None, out=print, on_step=None, parity=None,
+         supervisor=None) -> int:
     options = parse(sys.argv[1:] if argv is None else argv)
     layout = Layout(options.home)
     if options.host and not HOST.match(options.host):
@@ -1526,6 +1619,11 @@ def main(argv=None, *, env=None, upstream=None, remote=None, runner=None, out=pr
             return 0
         if options.bootstrap:
             return bootstrap(layout, params, env=enabler.env, upstream=enabler.upstream, runner=runner, out=out)
+        if options.grant_supervisor:
+            require_human(enabler.env)  # before any read or write
+            if not re.match(r"^[0-9a-f]{16}$", options.grant_supervisor):
+                raise Refused("--grant-supervisor needs the 16-hex request id that `ah supervisor request` printed")
+            return enabler.grant_supervisor(options.grant_supervisor, supervisor=supervisor)
         if options.undo or options.disable or options.resume or options.apply:
             require_human(enabler.env)  # before any read or write
             if options.undo:

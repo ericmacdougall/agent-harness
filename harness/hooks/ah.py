@@ -4020,6 +4020,9 @@ def _parse_chat(given):
 
 def main(argv=None) -> int:
     given = list(sys.argv[1:] if argv is None else argv)
+    if given[:1] == ["supervisor"]:  # supervisor power: request, status, revoke (supervisor_grant.py claims main's stamp itself)
+        import supervisor_grant  # noqa: PLC0415
+        return supervisor_grant.cli(given[1:])
     if given[:1] in (["ops"], ["install-files"]):  # self-serve: take main's one-shot stamp for exactly this command before anything runs
         try:
             import ah_ops  # noqa: PLC0415

@@ -51,7 +51,7 @@ ENABLER = "python3 ~/.agent-harness/bin/ah_enable_self_serve.py --apply"
 LIB_DIR = Path(__file__).resolve().parent  # the only place policy and gate code is loaded from (never sys.path)
 STAMP_PURPOSE = "self-serve-ops"  # main's PreToolUse hook stamps `ah ops ...` / `ah install-files ...`; the process claims it
 STAMP_TTL_SECONDS = 120
-STAMPED_COMMANDS = ("ops", "install-files")
+STAMPED_COMMANDS = ("ops", "install-files", "supervisor")  # supervisor: `ah supervisor request` (supervisor_grant.py)
 
 REF_RE = re.compile(r"[0-9a-f]{40}")
 REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}")
@@ -251,7 +251,7 @@ def pretool(payload, home=None):
             return 0
         tool_input = payload.get("tool_input")
         cmd = str((tool_input if isinstance(tool_input, dict) else {}).get("command") or "")
-        if "ops" not in cmd and "install-files" not in cmd:
+        if "ops" not in cmd and "install-files" not in cmd and "supervisor" not in cmd:
             return 0
         ci = load_lib("self_serve")["caller_identity"]
         tool_use_id = payload.get("tool_use_id")
