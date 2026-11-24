@@ -854,6 +854,7 @@ class UsageStore:
         with self._lock():
             purpose = self._directory(self.root / 'purposes' / invocation['fingerprint'])
             previous, counted, zero_launch, spent = [], [], [], 0
+            counted_why = []  # goodqa#16811: the refusal names what was counted, not only that something was
             for number in range(1, MAX_ATTEMPTS + 1):
                 path = purpose / ('attempt-' + str(number) + '.json')
                 if not os.path.lexists(path): break
@@ -876,6 +877,7 @@ class UsageStore:
                         raise GuardError('UNKNOWN', 'Prior reservation has no final receipt; reconcile before retry', entry['start'])
                     # Launches are unknown for a run without a final, so it counts as a launch.
                     spent += started['timeout']; counted.append(entry)
+                    counted_why.append('run %s has no final receipt (reconciled)' % entry['run_id'][:8])
                 else:
                     completed = read_json(completion)
                     if set(completed) != {'schema', 'reference'} or completed.get('schema') != SCHEMA:
@@ -897,8 +899,14 @@ class UsageStore:
                         zero_launch.append((entry, started.get('started_at')))
                     else:
                         counted.append(entry)
+                        counted_why.append('run %s ended %s' % (entry['run_id'][:8], record.get('reason')))
             if counted and (repeat_reason is None or len(counted) >= 2):
-                raise GuardError('BUDGET_EXHAUSTED', 'Identical invocation already reserved; use evidence or one justified repeat', counted[-1]['start'])
+                spent_repeat = len(counted) >= 2  # the first attempt plus the one declared repeat
+                raise GuardError('BUDGET_EXHAUSTED', 'Identical invocation already reserved; %s (counted attempts: %d; '
+                                 'last: %s)' % (
+                                     'the one declared repeat is already used, so change the packet instead'
+                                     if spent_repeat else 'use evidence or one justified repeat (--repeat-reason)',
+                                     len(counted), counted_why[-1]), counted[-1]['start'])
             recent = [entry for entry, at in zero_launch if within_window(at, ZERO_LAUNCH_WINDOW)]
             if len(recent) >= ZERO_LAUNCH_CAP:
                 raise GuardError('BUDGET_EXHAUSTED', 'Repeated infrastructure refusals before any provider launch '

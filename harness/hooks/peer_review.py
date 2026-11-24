@@ -69,9 +69,13 @@ def review_policy():
 
 
 def prose_quota_failure(message):
-    """Free-text usage limit: unlock the one independent fallback, but never an account-pool cooldown."""
+    """Free-text usage limit: unlock the one independent fallback, but never an account-pool cooldown.
+
+    The provider's own reset wording ("resets Nov 29 at 6pm (TZ)") is kept as display text only (`reset_hint`), so
+    the operator sees when to come back on the first failure; it is never parsed into a cooldown time."""
     if diagnostics.usage_limit_prose(message, review_policy()):
-        return {**provider_failure({'code': 'quota_exceeded'}, trusted=False), 'reset_at': None}
+        return {**provider_failure({'code': 'quota_exceeded'}, trusted=False), 'reset_at': None,
+                'reset_hint': diagnostics.usage_limit_reset_hint(message)}
     return None
 DOMAIN_SECTION_LIMIT = 9000  # generated reviewer checklist, kept outside the signed packet bytes
 
@@ -384,13 +388,29 @@ def normalize_provider(provider, code, stdout, stderr='', last_message='', reque
     work, so the refusal stands only when the transcript itself shows no work (goodqa#16725, PR 318 review F1).
     """
     outcome = classify_provider(provider, code, stdout, stderr, last_message, requested_stage)
-    if outcome.get('provider_refused') is True and not (
-            not work_signal(outcome.get('usage')) and refusal_before_work(provider, stdout, last_message)):
-        outcome = {**outcome, 'provider_refused': False}
+    if outcome.get('provider_refused') is True:
+        if not work_signal(outcome.get('usage')) and refusal_before_work(provider, stdout, last_message):
+            # goodqa#16811: a proven refusal before work reports all-zero counters (a weekly limit hit on the first
+            # call); they are not reported usage, so the attempt does not read as spent.
+            outcome = {**outcome, 'usage': None}
+        else:
+            outcome = {**outcome, 'provider_refused': False}
     return outcome
 
 
 WORK_SIGNAL_KEYS = ('usage', 'total_cost_usd', 'modelUsage', 'costUSD', 'duration_api_ms', 'server_tool_use')
+# Descriptive labels Claude puts beside its counters directly inside a record's `usage` block ("service_tier":
+# "standard", "speed": "standard", "inference_geo": ""). Only there, and only as a short string, is a label not work.
+WORK_LABEL_KEYS = frozenset({'service_tier', 'speed', 'inference_geo'})
+
+
+def without_usage_labels(usage):
+    """A `usage` block minus the short WORK_LABEL_KEYS labels directly inside it (goodqa#16811). Labels anywhere
+    else, longer ones and every counter are kept, so they still read as work."""
+    if not isinstance(usage, dict):
+        return usage
+    return {key: item for key, item in usage.items()
+            if not (key in WORK_LABEL_KEYS and isinstance(item, str) and len(item) <= 32)}
 
 
 def work_signal(value, depth=0):
@@ -433,7 +453,8 @@ def refusal_before_work(provider, stdout, last_message=''):
                    and record['item'].get('type') == 'error' and set(record['item']) <= {'id', 'type', 'message'})
         if kind not in allowed and not warning:
             return False
-        if any(work_signal(record.get(key)) for key in WORK_SIGNAL_KEYS):
+        if any(work_signal(without_usage_labels(record.get(key)) if key == 'usage' else record.get(key))
+               for key in WORK_SIGNAL_KEYS):
             return False
         turns = record.get('num_turns')
         if turns is not None and (type(turns) is not int or turns > 1):
