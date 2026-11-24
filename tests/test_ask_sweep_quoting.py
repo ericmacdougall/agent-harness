@@ -134,6 +134,11 @@ class QuotingContract(unittest.TestCase):
                     self.assertFalse({"source", "close", "apply", "pin"} & set(short[ask]), short[ask])
                     self.assertEqual(short[ask].get("elided", False), expected == "elided")
                     self.assertIn("by hand", short[ask]["reason"])
+                    if expected == "uncitable":
+                        # the citation's own reason, found before any close is built: since round 6 the writer's
+                        # precheck would also refuse it, but with a reason about a source the user never saw
+                        self.assertTrue(short[ask]["reason"].startswith(("provenance would accept no excerpt",
+                                                                         "too short to cite")), short[ask]["reason"])
         self.assertEqual(len(listed), sum(e == "close" for _, e in CORPUS))
         # the printed close commands, run as printed through a shell
         for ask, item in listed.items():
