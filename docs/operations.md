@@ -731,6 +731,30 @@ Residuals, disclosed:
 - An allowlisted host constrains the host, not the repository path: `t2-dev` accepts any path, including a disposable worktree that may be cleaned up later. Prefer a GitHub remote as the proof.
 - The backup route does not have the sole-segment rule; there the backup was verified first.
 
+### Removing a finished clone in an agent work dir (goodqa#17119)
+
+`ah clone-remove` removes one whole, fully published clone that an agent left inside its work dir, on this Mac or on `t2-dev`. Nothing is removed by hand.
+
+```bash
+python3 -I ~/.claude/hooks/ah.py clone-remove --host <local|t2-dev> --path <absolute path of the clone> \
+  --reason "<why>" [--check] [--remote-auth] [--session <id>] [--agent <id>]
+```
+
+`--check` runs the verification only. `--remote-auth` reads a private repository's remote with the target host's own credentials; refs can never be supplied. The answer is one JSON object: rc 0 when removed (or removable with `--check`), 3 when refused or unknown, 2 on a bad request.
+
+The caller refuses first when the owning session (the `<session>` segment of `~/.agent-harness/work/<session>/...`) is live on any host checked: its main WAL there was written in the last 6 hours, or `ah owners --session <id> --all` lists an owner that is live, quiet, working, waiting or active in that window. A session no host knows, or an owners read that is partial or fails, also refuses. It then runs `command_guard.py verify-clone` or `remove-clone` on the target host, which refuses unless all of these hold:
+
+- the path is literal, has no symlink, and lies strictly inside `~/.agent-harness/work/<session>/`, never the session dir itself, and no segment names a WAL, log, transcript, session, state or memory location;
+- no segment names a release, deploy or rollback (ASSUMPTION: the repository has no other marker of a release checkout), and the path is not named by `~/.agent-harness/bin/pp-release` (read for path names only, never printed);
+- no mount point is at or below it;
+- every rule of the guard's reproducible-clone exemption holds: clean tree (only the regenerable ignored folders), no stash, hooks, submodules, gitlinks, hidden index flags or replace refs, and every local branch, tag, HEAD, reflog entry and remote-tracking tip the remote no longer shows is reachable from a ref the remote shows live;
+- it has no linked worktree, present or prunable;
+- no process has its working directory or any open file inside it (`lsof`; a failed listing refuses).
+
+The removal renames the clone aside in its own directory, re-checks status, refs, HEAD, identity and processes there, moves it back on any change, and only then deletes it. Both sides append audit rows before acting: `~/.agent-harness/clone-audit.jsonl` on each host. An answer that does not arrive is recorded as an unknown outcome; check the host before retrying.
+
+Residuals, disclosed: without root, other users' processes are not listed; a writer that starts after the re-check can still race the delete; the release rule is a path-name assumption.
+
 ### Removing an archive-backed tree on another host
 
 Use this when a tree on another host (`dev2`, `t2-dev`, `ah-mac-mini`) has a verified Dropbox tar.gz, and a bundle if it has unpushed commits. That host's own guard has no user transcript, so it refuses relayed approvals. This route checks the approval on the Mac and then deletes over ssh, the way `ah kill --host` does (goodqa#15251):

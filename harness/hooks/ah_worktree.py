@@ -54,9 +54,9 @@ def _skipped(result):
     return [re.sub(r"[^\x20-\x7e]", "?", str(item))[:60] for item in items[:20]]
 
 
-def audit(home, record):
-    """Append one JSON row; raises when it cannot (the caller stops before acting)."""
-    path = Path(home) / ".agent-harness" / "worktree-audit.jsonl"
+def audit(home, record, name="worktree-audit.jsonl"):
+    """Append one JSON row to ~/.agent-harness/<name>; raises when it cannot (the caller stops before acting)."""
+    path = Path(home) / ".agent-harness" / name
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     record = dict(record, at=_now(), by="ah")
     for key in ("reason", "why"):

@@ -1612,19 +1612,29 @@ def _nested_repo(directory, limit=250000, deep=False, seconds=1.5):
     return False
 
 
-def reproducible_clone_refusal(path, policy=None, now=None):
-    """None when `path` is provably a reproducible clone, else the reason it is not."""
+def reproducible_clone_refusal(path, policy=None, now=None, *, remote_ls=None, delegated=False, facts=None):
+    """None when `path` is provably a reproducible clone, else the reason it is not.
+
+    `delegated` is the `ah clone-remove` verifier only (goodqa#17119). It keeps every rule below and adds: step budgets
+    scaled for large clones (the policy's `scale`), `remote_ls` (the host's own credentials for a private repository), an
+    empty linked-worktree registry instead of none at all, every remote-tracking tip the live remote no longer shows
+    counted as local work (its commits must be reachable from a live ref), and `facts` filled with what was verified.
+    The hook form passes none of these and behaves exactly as before."""
     cfg = dict(DEFAULT_POLICY['reproducible_clone'], **((policy or {}).get('reproducible_clone') or {}))
     if not cfg.get('enabled'):
         return 'the exemption is switched off'
     started = time.monotonic()
     total = float(cfg['total_seconds'])
+    scale = float(cfg.get('scale', 1.0)) if delegated else 1.0
 
     def left():
         remaining = total - (time.monotonic() - started)
         if remaining <= 0.2:
             raise TimeoutError('time budget')
         return remaining
+
+    def step(seconds):
+        return min(left(), seconds * scale)
     try:
         if not path or '\x00' in path or not os.path.isabs(path):
             return 'not a literal absolute path'
@@ -1638,27 +1648,31 @@ def reproducible_clone_refusal(path, policy=None, now=None):
             return '.git is not a real directory (linked worktree or not a clone)'
         for forbidden, why in (('worktrees', 'it owns linked worktrees'), ('modules', 'it has submodules'),
                                (os.path.join('info', 'grafts'), 'it has grafts'), ('refs/replace', 'it has replace refs')):
+            if forbidden == 'worktrees' and delegated:
+                why = _clone_registry_refusal(os.path.join(gitdir, 'worktrees'))
+                if why:
+                    return why
+                continue
             if os.path.lexists(os.path.join(gitdir, forbidden)):
                 return why
         if os.path.lexists(os.path.join(path, '.gitmodules')):
             return 'it has submodules'
         if os.path.getsize(os.path.join(gitdir, 'config')) > 256 * 1024:
             return 'the repository config is unusually large'
-        bad = _config_refusal(_git_out(path, ['config', '--local', '-z', '--list'], min(left(), 2.0)))
+        bad = _config_refusal(_git_out(path, ['config', '--local', '-z', '--list'], step(2.0)))
         if bad:
             return bad
         hooks_dir = os.path.join(gitdir, 'hooks')
         if os.path.isdir(hooks_dir) and any(not n.endswith('.sample') for n in os.listdir(hooks_dir)):
             return 'it has hand-written git hooks'
-        for entry in _git_out(path, ['ls-files', '-s', '-z'], min(left(), 3.0)).split('\x00'):
+        for entry in _git_out(path, ['ls-files', '-s', '-z'], step(3.0)).split('\x00'):
             if entry.startswith('160000'):
                 return 'a tracked path is an embedded repository (gitlink); its commits are not in this repository'
-        for entry in _git_out(path, ['ls-files', '-v', '-z'], min(left(), 3.0)).split('\x00'):
+        for entry in _git_out(path, ['ls-files', '-v', '-z'], step(3.0)).split('\x00'):
             if entry and entry[0] != 'H':
                 return 'a tracked file is marked assume-unchanged, skip-worktree or otherwise hidden from git status'
         ignored_ok, ignored_top_ok = set(cfg['ignored_ok']), set(cfg['ignored_top_ok'])
-        status = _git_out(path, ['status', '--porcelain=v1', '-z', '--untracked-files=normal', '--ignored=traditional',
-                                 '--no-renames'], min(left(), 3.0))
+        status = _git_out(path, CLONE_STATUS_ARGS, step(3.0))
         for entry in filter(None, status.split('\x00')):
             if entry.startswith('!! '):
                 name = entry[3:]
@@ -1666,7 +1680,11 @@ def reproducible_clone_refusal(path, policy=None, now=None):
                 top = '/' not in name.rstrip('/')
                 if not (name.endswith('/') and (leaf in ignored_ok or (top and leaf in ignored_top_ok))):
                     return _ignored_refusal(_ignored_offenders(status, ignored_ok, ignored_top_ok))
-                found = _nested_repo(os.path.join(path, name), deep=leaf not in ignored_ok)
+                if delegated:
+                    found = _nested_repo(os.path.join(path, name), limit=int(250000 * scale), deep=leaf not in ignored_ok,
+                                         seconds=step(1.5))
+                else:
+                    found = _nested_repo(os.path.join(path, name), deep=leaf not in ignored_ok)
                 if found == 'large':
                     return 'an ignored build directory is too large to check for nested repositories in time'
                 if found:
@@ -1674,55 +1692,74 @@ def reproducible_clone_refusal(path, policy=None, now=None):
             else:
                 return 'the working tree is not clean (modified, staged or untracked files)'
         refs = {}
-        for line in _git_out(path, ['for-each-ref', '--format=%(refname)%09%(objectname)'], min(left(), 2.0)).splitlines():
+        listing = _git_out(path, CLONE_REFS_ARGS, step(2.0))
+        for line in listing.splitlines():
             name, _, sha = line.partition('\t')
             refs[name] = sha
         if 'refs/stash' in refs:
             return 'it has a stash'
         if any(r.startswith('refs/replace/') for r in refs):
             return 'it has replace refs'
-        head = _git_out(path, ['rev-parse', '--verify', 'HEAD'], min(left(), 2.0)).strip()
-        remotes = [r for r in _git_out(path, ['remote'], min(left(), 2.0)).split() if re.fullmatch(r'[\w.-]+', r)]
+        head = _git_out(path, ['rev-parse', '--verify', 'HEAD'], step(2.0)).strip()
+        remotes = [r for r in _git_out(path, ['remote'], step(2.0)).split() if re.fullmatch(r'[\w.-]+', r)]
         if not remotes:
             return 'it has no remote'
-        live_all = {}
+        live_all, shown = {}, {}
         for remote in remotes:
-            urls = _git_out(path, ['remote', 'get-url', '--all', remote], min(left(), 2.0)).split()
+            urls = _git_out(path, ['remote', 'get-url', '--all', remote], step(2.0)).split()
             hosts = [_remote_host(u) for u in urls]
             if not urls or any(h is None or h not in cfg['remote_hosts'] for h in hosts):
                 return 'remote %s is not on a known hosting service (%s), so it is no proof of a backup' % (
                     remote[:30], ', '.join(cfg['remote_hosts'][:4]))
-            live = REMOTE_LS(urls[0], path, min(left(), float(cfg['remote_seconds'])))
+            try:
+                live = (remote_ls or REMOTE_LS)(urls[0], path, min(left(), float(cfg['remote_seconds'])))
+            except ValueError:
+                if not delegated:
+                    raise
+                live = None  # the host's ls-remote failed (private, unreachable or deleted)
             if not live:
                 return 'the remote did not answer (cannot prove the commits are pushed)'
             live_all[remote] = live
-        verified = set()
+            shown[remote] = [_shown_url(u) for u in urls[:4]]
+        verified, stale = set(), set()
         for name, sha in refs.items():
             if not name.startswith('refs/remotes/'):
                 continue
             remote, _, branch = name[len('refs/remotes/'):].partition('/')
             live = live_all.get(remote)
-            if live is None or not branch or branch == 'HEAD':
+            if branch == 'HEAD':
+                continue
+            if live is None or not branch:
+                if delegated:
+                    stale.add(sha)  # a tracking ref of a remote that is gone: its commits may be held only here
                 continue
             if live.get('refs/heads/' + branch) == sha:
                 verified.add(sha)
             elif 'refs/heads/' + branch in live:
                 return 'the remote branch %s moved since the last fetch; run `git fetch` first so it can be verified' % branch[:40]
+            elif delegated:
+                stale.add(sha)  # deleted on the remote: kept only if a live ref still reaches it (merged)
         for name, sha in refs.items():
             if name.startswith('refs/tags/') and any(v.get(name) == sha for v in live_all.values()):
                 verified.add(sha)
-        local = {sha for name, sha in refs.items() if not name.startswith('refs/remotes/')} | {head}
+        local = {sha for name, sha in refs.items() if not name.startswith('refs/remotes/')} | {head} | stale
         for pointer in ('ORIG_HEAD', 'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD'):
             pfile = os.path.join(gitdir, pointer)
             if os.path.isfile(pfile):
                 local |= set(re.findall(r'[0-9a-f]{40,64}', open(pfile, errors='replace').read(512)))
-        local |= set(re.findall(r'[0-9a-f]{40,64}', _git_out(path, ['reflog', 'show', '--all', '--format=%H'], min(left(), 3.0))))
+        local |= set(re.findall(r'[0-9a-f]{40,64}', _git_out(path, ['reflog', 'show', '--all', '--format=%H'], step(3.0))))
         if not verified:
             return 'no remote-tracking branch matches the remote'
         spec = '\n'.join(sorted(local)) + '\n--not\n' + '\n'.join(sorted(verified)) + '\n'
-        unpushed = _git_out(path, ['rev-list', '--count', '--stdin'], min(left(), 3.0), stdin=spec).strip()
+        unpushed = _git_out(path, ['rev-list', '--count', '--stdin'], step(3.0), stdin=spec).strip()
         if unpushed != '0':
-            return '%s local commit(s) are not on the remote' % unpushed[:8]
+            return '%s local commit(s) are not on the remote%s' % (
+                unpushed[:8], ' (counting %d remote-tracking ref(s) the remote no longer shows)' % len(stale) if stale else '')
+        if facts is not None:
+            local_names = sorted(n for n in refs if not n.startswith('refs/remotes/'))
+            facts.update(head=head, remotes=shown, commits_checked=len(local), stale_tracking_refs=len(stale),
+                         local_refs=len(local_names), local_ref_names=[_clean_reason(n)[:80] for n in local_names[:50]],
+                         _status=status, _refs=listing)
         return None
     except Exception as error:  # noqa: BLE001 - any surprise means "not provably reproducible"
         return 'could not verify (%s)' % type(error).__name__
@@ -2670,6 +2707,372 @@ def remove_worktree(path, authenticated=False, expect_head=None, policy=None, *,
                 {True: 'left', False: 'gone', None: 'unknown'}[listed], stderr)).strip()
         _worktree_audit({'event': 'result', 'path': path, 'removed': report['removed'], 'directory_removed': gone,
                          'registry_entry_left': listed, 'problem': problem})
+    return report
+
+
+# --------------------------------------------------------------------------- ah clone-remove (goodqa#17119)
+# `ah clone-remove` hands one literal path to verify-clone or remove-clone ON the target host. The verdict is
+# reproducible_clone_refusal in its delegated form (every rule of the guard's own clone exemption, a budget sized for
+# large clones, the host's own credentials for a private repository, stale remote-tracking tips counted as local work)
+# plus a scope rule, the release tooling's own paths, a mount check and a process check. The removal moves the clone
+# aside in its own directory, re-checks it there and only then deletes it.
+CLONE_VERIFIER_VERSION = 1  # ah_clone refuses an answer that does not report this (an old install on the target)
+CLONE_AUDIT = 'clone-audit.jsonl'
+CLONE_STATUS_ARGS = ['status', '--porcelain=v1', '-z', '--untracked-files=normal', '--ignored=traditional', '--no-renames']
+CLONE_REFS_ARGS = ['for-each-ref', '--format=%(refname)%09%(objectname)']
+CLONE_POLICY = {'total_seconds': VERIFY_SECONDS, 'remote_seconds': 30.0, 'scale': 15.0}
+CLONE_SESSION_SEGMENT = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}')
+CLONE_DENY_SEGMENTS = frozenset({'wal', 'wals', 'log', 'logs', 'transcript', 'transcripts', 'session', 'sessions',
+                                 'projects', 'state', 'memory', 'backup-stage', 'codex-wals', '.claude', '.codex'})
+# ASSUMPTION (main's ruling for goodqa#17119): the repository has no marker for a release checkout, so a path segment that
+# names a release, a deployment or a rollback refuses, and so does a checkout the release tooling names.
+CLONE_RELEASE_SEGMENT = re.compile(r'(?:^|[-_.])(?:release|releases|deploy|deployment|rollback)(?:[-_.]|$)', re.I)
+CLONE_RELEASE_TOOLING = ('.agent-harness/bin/pp-release',)  # home-relative; read for path names only, never printed
+CLONE_TOOLING_BYTES = 1 << 20
+_TOOLING_PATH = re.compile(r'(?:~|\$\{HOME\}|\$HOME|/(?:home|Users)/[A-Za-z0-9_.-]+)((?:/[A-Za-z0-9_.@+-]+)+)')
+CLONE_SKIP_NAMES = ('systemd', 'ssh-agent')
+CLONE_LSOF_SECONDS = 60
+CLONE_BYTES_SECONDS = 120
+CLONE_RECHECK_SECONDS = 60.0
+
+
+def _shown_url(url):
+    """A remote URL for a report or audit row: no userinfo (a token in an https URL), printable and bounded."""
+    return _clean_reason(re.sub(r'^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]*@', r'\1', str(url)))
+
+
+def _clone_registry_refusal(registry):
+    """The clone route accepts a linked-worktree registry only when it is absent or an empty plain directory. A clone
+    with any linked worktree, present or prunable, is refused: its directory or its admin entry (HEAD, index, reflog)
+    would go with the clone."""
+    try:
+        info = os.lstat(registry)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISDIR(info.st_mode):
+        return 'the linked-worktree registry is not a plain directory'
+    count = len(os.listdir(registry))
+    if count:
+        return 'it has %d linked worktree(s); remove each one first with ah worktree-remove' % count
+    return None
+
+
+def clone_scope_refusal(path):
+    """Where `ah clone-remove` may act: strictly inside a session's agent work dir (~/.agent-harness/work/<session>/...),
+    never the session dir itself, never a WAL, log, transcript, state or release location. Names are compared
+    case-folded (APFS is case insensitive)."""
+    if os.path.normpath(path) != path or os.path.realpath(path) != path:
+        return 'the path contains a symlink, dot segment or alias'
+    home = os.path.realpath(os.path.expanduser('~'))
+    root = os.path.join(home, '.agent-harness', 'work') + os.sep
+    if not path.casefold().startswith(root.casefold()):
+        return 'only a clone inside an agent work dir (~/.agent-harness/work/<session>/...) is removable'
+    parts = path[len(root):].split(os.sep)
+    if len(parts) < 2 or not all(parts):
+        return 'the path is a session work dir itself, not a clone inside it'
+    if not CLONE_SESSION_SEGMENT.fullmatch(parts[0]):
+        return 'the work dir is not named by a session id'
+    for part in parts:
+        if part.casefold() in CLONE_DENY_SEGMENTS or part.casefold().endswith(('.jsonl', '.log')):
+            return 'the path is a WAL, log, transcript, session or state location (%s)' % _clean_reason(part)[:40]
+        if CLONE_RELEASE_SEGMENT.search(part):
+            return ('the path may be a release checkout (%s; ASSUMPTION: a release, deploy or rollback path segment '
+                    'marks one)' % _clean_reason(part)[:40])
+    if re.match(DEFAULT_POLICY['protected_work_wal_regex'].replace('{home}', re.escape(home)), path, re.I):
+        return 'the path is a WAL location'
+    return None
+
+
+def _home_relative(path):
+    """The part of an absolute path after its home directory (/Users/<user>/ or /home/<user>/), or None."""
+    match = re.match(r'^/(?:Users|home)/[^/]+/(.+)$', path)
+    return match.group(1).rstrip('/') if match else None
+
+
+def release_tooling_refusal(path, home=None):
+    """Why `path` may be a checkout the release tooling uses, else None. Each tooling file is read for path names only
+    and is never printed. Paths are compared relative to their home directory, so a Mac tool that names a t2-dev checkout
+    still matches. A named path ending in '-' is a prefix (a dated release directory). A file that exists but cannot be
+    read refuses (fail closed); a missing one names nothing."""
+    home = (home or os.path.realpath(os.path.expanduser('~'))).rstrip(os.sep)
+    target = path[len(home) + 1:].rstrip(os.sep) if path.startswith(home + os.sep) else _home_relative(path)
+    if not target:
+        return 'the path is not under a home directory'
+    target = target.casefold()
+    for name in CLONE_RELEASE_TOOLING:
+        file, shown = os.path.join(home, name), os.path.basename(name)
+        try:
+            info = os.lstat(file)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return 'the release tooling (%s) cannot be inspected' % shown
+        if not stat.S_ISREG(info.st_mode) or info.st_size > CLONE_TOOLING_BYTES:
+            return 'the release tooling (%s) is not a plain file of a readable size' % shown
+        try:
+            with open(file, 'rb') as handle:
+                text = handle.read(CLONE_TOOLING_BYTES + 1).decode('utf-8', 'replace')
+        except OSError:
+            return 'the release tooling (%s) cannot be read' % shown
+        for match in _TOOLING_PATH.finditer(text):
+            named = match.group(1).lstrip('/').casefold()
+            stem = named.rstrip('/')
+            if not stem:
+                continue
+            if (target == stem or target.startswith(stem + '/') or stem.startswith(target + '/')
+                    or (named.endswith('-') and target.startswith(named))):
+                return 'the path is, holds or sits in a checkout the release tooling names (%s)' % shown
+    return None
+
+
+def _lsof_exe():
+    return next((exe for exe in ('/usr/sbin/lsof', '/usr/bin/lsof')
+                 if os.path.realpath(exe) == exe and os.path.isfile(exe)), None)
+
+
+def open_files_inside(path, timeout=CLONE_LSOF_SECONDS):
+    """[(pid, command)] of processes with any open file, working directory, root, program or mapped file at or below
+    `path`, from one whole-system `lsof` listing (a few seconds, where `lsof +D` walks the whole tree), or None when the
+    list cannot be trusted to be complete: no lsof, an error, a timeout or an oversized answer (fail closed). Limit,
+    stated: without root, other users' processes are not listed."""
+    exe = _lsof_exe()
+    if exe is None:
+        return None
+    try:
+        done = subprocess.run([exe, '-n', '-P', '-w', '-F', 'pcn'], capture_output=True, timeout=timeout, cwd=os.sep,
+                              env={'PATH': '/usr/bin:/usr/sbin:/bin', 'LC_ALL': 'C'})
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0 or done.stderr.strip() or len(done.stdout) > 256 * 1024 * 1024:
+        return None
+    fold = sys.platform == 'darwin'
+    target = path.casefold() if fold else path
+    busy, pid, command = {}, None, ''
+    for line in done.stdout.decode('utf-8', 'surrogateescape').splitlines():
+        tag, value = line[:1], line[1:]
+        if tag == 'p':
+            pid, command = (int(value) if value.isdigit() else None), ''
+        elif tag == 'c':
+            command = value[:40]
+        elif tag == 'n' and pid is not None and pid != os.getpid() and value.startswith('/'):
+            name = value[len('/System/Volumes/Data'):] if value.startswith('/System/Volumes/Data/') else value
+            name = name.casefold() if fold else name
+            if name == target or name.startswith(target + '/'):
+                busy.setdefault(pid, command)
+    return sorted(busy.items())
+
+
+def _clone_created(path):
+    """No later than when the clone was made: the modification time of .git/description, which `git clone` writes once
+    (a later rewrite only makes the process check stricter), or None (stricter still)."""
+    try:
+        return os.lstat(os.path.join(path, '.git', 'description')).st_mtime
+    except OSError:
+        return None
+
+
+def _shown_process(pid, name):
+    return 'pid %d (%s)' % (pid, re.sub(r'[^A-Za-z0-9_.()-]', '?', str(name))[:20])
+
+
+def clone_process_refusal(path, created=None):
+    """(reason or None, summary) for processes using the clone: busy_scan's working-directory rule, with its rules for
+    processes this user cannot inspect, and open_files_inside. Both fail closed."""
+    scan = busy_scan(path, CLONE_SKIP_NAMES, created)
+    files = open_files_inside(path)
+    summary = {'cwd_inside': len(scan['busy']), 'open_files_inside': None if files is None else len(files),
+               'uninspectable': len(scan['unreadable']),
+               'skipped': [_shown_process(pid, name) for pid, name in scan.get('skipped', [])[:20]]}
+    if scan['busy']:
+        return 'a process is using the clone as its working directory (%s)' % _shown_process(*scan['busy'][0]), summary
+    if scan['failed']:
+        return 'could not check for processes using the clone', summary
+    if scan['unreadable']:
+        return ('could not check for processes using the clone: %d process(es) of this user cannot be inspected and may '
+                'be using it (%s); let them end, then retry' % (
+                    len(scan['unreadable']), ', '.join(_shown_process(*item) for item in scan['unreadable'][:3]))), summary
+    if files is None:
+        return 'could not list the open files of running processes (lsof is missing, failed or timed out)', summary
+    if files:
+        return 'a process has a file open inside the clone (%s)' % _shown_process(*files[0]), summary
+    return None, summary
+
+
+def _tree_bytes(path, seconds=CLONE_BYTES_SECONDS):
+    """Bytes the tree occupies on disk (allocated blocks; symlinks are not followed), or None past the time bound or on
+    an error (the report then says the size is unknown)."""
+    stop = time.monotonic() + seconds
+    total, stack = 0, [path]
+    try:
+        while stack:
+            with os.scandir(stack.pop()) as entries:
+                for entry in entries:
+                    if time.monotonic() > stop:
+                        return None
+                    info = entry.stat(follow_symlinks=False)
+                    blocks = getattr(info, 'st_blocks', None)
+                    total += blocks * 512 if blocks is not None else info.st_size
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(entry.path)
+    except OSError:
+        return None
+    return total
+
+
+def _clone_policy(base=None):
+    """The user policy with the clone route's budget laid over its reproducible_clone section, whatever the caller loaded
+    (a policy FILE cannot set that section: load_policy ignores it)."""
+    base = base if isinstance(base, dict) else {}
+    section = base.get('reproducible_clone')
+    merged = dict(section) if isinstance(section, dict) else {}
+    merged.update(CLONE_POLICY)
+    return dict(base, reproducible_clone=merged)
+
+
+def _clone_state(path, seconds=CLONE_RECHECK_SECONDS):
+    """What the removal re-checks after moving the clone aside: the very status and ref listings the verifier read, and
+    HEAD. Run only on a clone whose config the verifier has vetted."""
+    return (_git_out(path, CLONE_STATUS_ARGS, seconds), _git_out(path, CLONE_REFS_ARGS, seconds),
+            _git_out(path, ['rev-parse', '--verify', 'HEAD'], seconds).strip())
+
+
+def _verify_clone(path, authenticated, policy):
+    report = {'path': path, 'removable': False, 'reason': None, 'head': None, 'remotes': {}, 'commits_checked': None,
+              'local_refs': None, 'local_ref_names': [], 'stale_tracking_refs': None, 'process_check': None,
+              'bytes': None, 'clone_verifier': CLONE_VERIFIER_VERSION}
+    facts = {}
+    if not isinstance(path, str) or '\x00' in path or not os.path.isabs(path):
+        reason = 'not a literal absolute path'
+    else:
+        reason = clone_scope_refusal(path) or release_tooling_refusal(path)
+    if reason is None:
+        try:
+            clear = _worktree_mount_clear(path)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            clear = False
+        if not clear:
+            reason = 'a mount point is at or below the path, or the mount table could not be read'
+    if reason is None:
+        reason = reproducible_clone_refusal(path, _clone_policy(policy),
+                                            remote_ls=authenticated_remote_refs if authenticated else None,
+                                            delegated=True, facts=facts)
+        for key in ('head', 'remotes', 'commits_checked', 'local_refs', 'local_ref_names', 'stale_tracking_refs'):
+            if key in facts:
+                report[key] = facts[key]
+    if reason is None:
+        reason, report['process_check'] = clone_process_refusal(path, _clone_created(path))
+    if reason is None:
+        report['bytes'] = _tree_bytes(path)
+    report['reason'] = reason
+    report['removable'] = reason is None and bool(report['head'])
+    return report, facts
+
+
+def verify_clone(path, authenticated=False, policy=None):
+    """Read-only verdict for one whole clone: {removable, reason, head, remotes, commits_checked, local_refs,
+    local_ref_names, stale_tracking_refs, process_check, bytes, clone_verifier}. `authenticated` reads the remote with
+    this host's own credentials (authenticated_remote_refs)."""
+    return _verify_clone(path, authenticated, policy)[0]
+
+
+def _clone_audit(record):
+    """One row in this host's ~/.agent-harness/clone-audit.jsonl. False when it could not be written: the removal then
+    stops before it moves anything."""
+    try:
+        folder = os.path.join(os.path.expanduser('~'), '.agent-harness')
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        record = dict(record, at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), by='command_guard')
+        fd = os.open(os.path.join(folder, CLONE_AUDIT), os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(fd, (json.dumps(record, separators=(',', ':')) + '\n').encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def remove_clone(path, authenticated=False, policy=None, *, _after_rename=None):
+    """Verify, move the clone aside in its own directory, re-check it there (the same directory, the same status, refs
+    and HEAD the verifier read, no process inside), then delete it. A failed re-check moves it back. Every attempt that
+    reaches the move is audited on this host, naming the quarantine path first, so an interrupted run is traceable."""
+    try:
+        before = os.lstat(path)
+    except OSError as error:
+        return {'path': path, 'removable': False, 'removed': False, 'clone_verifier': CLONE_VERIFIER_VERSION,
+                'reason': 'cannot stat the path (%s)' % type(error).__name__}
+    report, facts = _verify_clone(path, authenticated, policy)
+    report['removed'] = False
+    if not report['removable']:
+        return report
+    try:
+        after = os.lstat(path)
+    except OSError:
+        after = None
+    if after is None or not stat.S_ISDIR(after.st_mode) or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+        report.update(removable=False, reason='the path changed while it was verified')
+        return report
+    expected = (facts.get('_status'), facts.get('_refs'), report['head'])
+    parent, leaf = os.path.split(path)
+    quarantine = os.path.join(parent, '.%s.clone-remove-%s' % (leaf[:80], _secrets.token_hex(6)))
+    if os.path.lexists(quarantine):
+        report.update(removable=False, reason='the quarantine name is taken; retry')
+        return report
+    row = {'path': path, 'quarantine': quarantine, 'head': report['head'], 'remotes': report['remotes'],
+           'commits_checked': report['commits_checked'], 'local_refs': report['local_refs'],
+           'process_check': report['process_check'], 'bytes': report['bytes']}
+    if not _clone_audit(dict(row, event='move-aside')):
+        report.update(removable=False, reason='could not write the audit row; nothing was moved')
+        return report
+    try:
+        os.rename(path, quarantine)
+    except OSError as error:
+        report.update(removable=False, reason='could not move the clone aside (%s)' % type(error).__name__)
+        _clone_audit({'event': 'result', 'path': path, 'removed': False, 'why': report['reason']})
+        return report
+    try:
+        if _after_rename is not None:
+            _after_rename(quarantine)
+        if not _same_worktree_directory(quarantine, (before.st_dev, before.st_ino)):
+            problem = 'the moved directory is not the verified one'
+        elif _clone_state(quarantine) != expected:
+            problem = 'the clone changed after it was verified (its status, refs or HEAD)'
+        else:
+            problem, report['process_check'] = clone_process_refusal(quarantine, _clone_created(quarantine))
+    except Exception as error:  # noqa: BLE001 - any surprise keeps the clone
+        problem = 'could not re-check the moved clone (%s)' % type(error).__name__
+    if problem:
+        try:
+            os.rename(quarantine, path)
+            restored = True
+        except OSError:
+            restored = False
+        report.update(removable=False, quarantine=None if restored else quarantine,
+                      reason=problem if restored else '%s; it could not be moved back and is intact at %s' % (
+                          problem, quarantine))
+        _clone_audit({'event': 'result', 'path': path, 'quarantine': quarantine, 'removed': False,
+                      'restored': restored, 'why': problem})
+        return report
+    try:
+        free_before = shutil.disk_usage(parent).free
+    except OSError:
+        free_before = None
+    errors = []
+    try:
+        shutil.rmtree(quarantine, onerror=lambda function, name, info: errors.append(info[0].__name__))
+    except OSError as error:
+        errors.append(type(error).__name__)
+    gone = not os.path.lexists(quarantine)
+    try:
+        freed = max(0, shutil.disk_usage(parent).free - free_before) if free_before is not None else None
+    except OSError:
+        freed = None
+    report.update(removed=gone, directory_removed=gone, freed_bytes=freed, quarantine=None if gone else quarantine)
+    if not gone:
+        report['reason'] = 'the deletion did not complete (%d error(s)); what is left is at %s' % (len(errors), quarantine)
+    _clone_audit({'event': 'result', 'path': path, 'quarantine': quarantine, 'removed': gone, 'errors': len(errors),
+                  'freed_bytes': freed})
     return report
 
 
@@ -10100,6 +10503,12 @@ def main(argv=None):
                         help='read the remote with this host\'s own credentials (private repository); refs cannot be supplied')
         if name == 'remove-worktree':
             wt.add_argument('--expect-head')
+    for name in ('verify-clone', 'remove-clone'):
+        cl = sub.add_parser(name, help='JSON verdict for one whole clone inside an agent work dir (ah clone-remove runs '
+                                       'this on the target host; goodqa#17119)')
+        cl.add_argument('--path', required=True)
+        cl.add_argument('--remote-auth', action='store_true',
+                        help='read the remote with this host\'s own credentials (private repository); refs cannot be supplied')
     sub.add_parser('revoke-delete')
     scan = sub.add_parser('scan-wal')
     scan.add_argument('paths', nargs='+')
@@ -10181,6 +10590,14 @@ def main(argv=None):
             result = remove_worktree(args.path, args.remote_auth, args.expect_head, policy)
         print(json.dumps(result))
         return 0 if result.get('removable') and (args.cmd == 'verify-worktree' or result.get('removed')) else 1
+    if args.cmd in ('verify-clone', 'remove-clone'):
+        policy = load_policy()
+        if args.cmd == 'verify-clone':
+            result = verify_clone(args.path, args.remote_auth, policy)
+        else:
+            result = remove_clone(args.path, args.remote_auth, policy)
+        print(json.dumps(result))
+        return 0 if result.get('removable') and (args.cmd == 'verify-clone' or result.get('removed')) else 1
     if args.cmd == 'revoke-delete':
         try:
             revoke_delete()
