@@ -31,6 +31,13 @@ POLICY_ENV = 'AGENT_HARNESS_REVIEW_POLICY'
 POLICY_BYTES = 65536
 PROVIDERS = ('codex', 'claude')
 SNAPSHOT_MAX = 7200
+# goodqa#16947: the per-provider review deadline comes from provider_timeout in review_policy.json, by reviewer rung
+# and effort. The ceiling lives here, so no policy file can give one provider more; a malformed entry falls back to the
+# medium budget, never to the ceiling.
+PROVIDER_TIMEOUT_CEILING = 3600
+PROVIDER_TIMEOUT_DEFAULT = 720
+REVIEW_EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max')
+RUNG_KEY = re.compile(r'R[0-9]{1,2}')
 
 DEFAULT_POLICY = {
     'known_install_locations': {
@@ -40,8 +47,16 @@ DEFAULT_POLICY = {
                    '/opt/homebrew/bin/claude'],
     },
     'snapshot_timeout': {'base_seconds': 1800, 'per_gib_seconds': 60, 'max_seconds': SNAPSHOT_MAX},
+    # Mirrors review_policy.json (a test pins the two together). The larger budgets are an assumption: finished R2-R4
+    # review durations observed before goodqa#16947 were cut off at the old 720 second cap, so their real tail is unknown.
+    'provider_timeout': {'by_effort': {'low': 720, 'medium': 720, 'high': 1200, 'xhigh': 1800, 'max': 2700},
+                         'by_rung': {}, 'default_seconds': PROVIDER_TIMEOUT_DEFAULT,
+                         'ceiling_seconds': PROVIDER_TIMEOUT_CEILING},
     'usage_limit_phrases': ['hit your usage limit', 'usage limit reached', 'reached your usage limit',
-                            'exceeded your usage limit', "you've hit your limit"],
+                            'exceeded your usage limit', "you've hit your limit",
+                            # goodqa#16811: Claude's subscription wording ("You've hit your weekly limit · resets ...")
+                            'hit your weekly limit', 'weekly limit reached', 'hit your session limit',
+                            'session limit reached'],
 }
 
 NATIVE_EVIDENCE = ('Native evidence: if you continue without a helper receipt, record the native review as '
@@ -71,10 +86,29 @@ CONTRACT = {
                            ['Inspect the local run receipt and provider-pool reservation or cooldown. Reconcile only with the required ownership evidence; do not retry unchanged.']),
     'REVIEW_LAUNCH_UNCONFIRMED': ('UNKNOWN', 'No reviewer exit status was recorded; a provider process may have started. This does not establish a provider outage.',
                                 ['Inspect the run and child records and reconcile uncertain process ownership before any retry. Do not assume best-effort cleanup succeeded.']),
-    'BUDGET_EXHAUSTED': ('BUDGET_EXHAUSTED', 'The 1440 second review budget (720 per provider) was used up.',
-                         ['Do not loop. Reconcile the usage store, then decide with the main agent whether one repeat with --repeat-reason is justified.']),
-    'PROVIDER_TIMEOUT': ('TIMEOUT', 'The provider exceeded its 720 second deadline.',
-                         ['Reconcile the run in the usage store before any retry; do not loop.']),
+    'REVIEW_REPEAT_REQUIRED': ('BUDGET_EXHAUSTED', 'An earlier attempt of this exact invocation (same packet, commit, '
+                               'reviewer and policy) already counts, so the usage guard refuses an unchanged rerun. '
+                               'Attempts that provably did no provider work are not counted.',
+                               ['Read the Detail line: it names the counted run and how it ended.',
+                                "If one rerun is justified, run the same command once more with --repeat-reason "
+                                "'<why, in plain words>' in single quotes (no apostrophe, $, backtick, backslash or newline); "
+                                'only one declared repeat is allowed per invocation.',
+                                'If the declared repeat is already used, change the packet (new evidence or a new '
+                                'commit) instead of rerunning; do not loop.']),
+    'BUDGET_EXHAUSTED': ('BUDGET_EXHAUSTED', 'The review run budget (two per-provider deadlines: the primary and one '
+                         'fallback) was used up.',
+                         ['Do not loop. Reconcile the usage store, then decide with the main agent whether one repeat with --repeat-reason is justified.',
+                          'The Timing line shows the snapshot step and each provider step against its deadline.',
+                          'A timeout is not counted as a ladder failure; it still spends one of the task review '
+                          'launches and the rung review budget.']),
+    'PROVIDER_TIMEOUT': ('TIMEOUT', 'The provider exceeded its per-provider deadline (provider_timeout in '
+                         'review_policy.json, by reviewer rung and effort).',
+                         ['Reconcile the run in the usage store before any retry; do not loop.',
+                          'The Timing line shows the snapshot step and each provider step against its deadline. A '
+                          'reviewer that needs longer is a provider_timeout change in review_policy.json (at most '
+                          '3600 seconds per provider), not an unchanged rerun.',
+                          'A timeout is not counted as a ladder failure; it still spends one of the task review '
+                          'launches and the rung review budget.']),
     'PROVIDER_IO_UNKNOWN': ('UNKNOWN', 'The provider process could not be supervised to a known end.',
                             ['Reconcile the unknown run in the usage store before any retry.']),
     'PROVIDER_INVALID_OUTPUT': ('INVALID_OUTPUT', 'The provider produced no valid stage verdict.',
@@ -85,7 +119,8 @@ CONTRACT = {
                            ['Check the exit code and excerpt below, fix the cause, and rerun once with --repeat-reason.']),
     'SNAPSHOT_TIMEOUT': ('TRANSIENT_INFRA', 'Preparing the review snapshot exceeded its deadline.',
                          ['Rerun with a larger --snapshot-timeout (maximum 7200) or tune snapshot_timeout in review_policy.json.',
-                          'The snapshot deadline is separate from the 720 second per-provider budget.']),
+                          'The snapshot deadline is separate from the per-provider deadline (provider_timeout in '
+                          'review_policy.json).']),
     'SNAPSHOT_GIT_FAILED': ('TRANSIENT_INFRA', 'An isolated Git step failed.',
                             ['Run `git -C <repo> fsck --connectivity-only` and `git -C <repo> status` to see why.']),
     'SNAPSHOT_PARTIAL_CLONE': ('TRANSIENT_INFRA', 'The repository is a partial clone (promisor remote).',
@@ -224,7 +259,59 @@ def load_policy(path=None, warn=None):
         good = [p.lower() for p in phrases[:32] if isinstance(p, str) and 6 <= len(p) <= 128]
         if good:
             result['usage_limit_phrases'] = good
+    timeouts = raw.get('provider_timeout')
+    if isinstance(timeouts, dict):
+        result['provider_timeout'] = _provider_timeout_table(timeouts)
     return result
+
+
+def _deadline_seconds(value, ceiling):
+    """Whole seconds in 1..ceiling, else the medium budget: a malformed entry never widens a deadline."""
+    if type(value) is not int or not 1 <= value <= ceiling:
+        return min(PROVIDER_TIMEOUT_DEFAULT, ceiling)
+    return value
+
+
+def _provider_timeout_table(raw):
+    """The validated provider_timeout table (goodqa#16947). A file can lower the code ceiling, never raise it."""
+    ceiling = raw.get('ceiling_seconds')
+    if type(ceiling) is not int or not 1 <= ceiling <= PROVIDER_TIMEOUT_CEILING:
+        ceiling = PROVIDER_TIMEOUT_CEILING
+    built_in = DEFAULT_POLICY['provider_timeout']
+    by_effort = {effort: min(seconds, ceiling) for effort, seconds in built_in['by_effort'].items()}
+    efforts = raw.get('by_effort')
+    if isinstance(efforts, dict):
+        for effort in REVIEW_EFFORTS:
+            if effort in efforts:
+                by_effort[effort] = _deadline_seconds(efforts[effort], ceiling)
+    by_rung = {}
+    rungs = raw.get('by_rung')
+    if isinstance(rungs, dict):
+        for rung, seconds in list(rungs.items())[:32]:
+            if isinstance(rung, str) and RUNG_KEY.fullmatch(rung):
+                by_rung[rung] = _deadline_seconds(seconds, ceiling)
+    default = _deadline_seconds(raw.get('default_seconds', PROVIDER_TIMEOUT_DEFAULT), ceiling)
+    return {'by_effort': by_effort, 'by_rung': by_rung, 'default_seconds': default, 'ceiling_seconds': ceiling}
+
+
+def provider_deadline(policy, rung, effort, requested=None):
+    """(seconds, basis): the per-provider review deadline for a reviewer rung and effort (goodqa#16947).
+
+    A by_rung entry wins over by_effort, then default_seconds; the result never passes the ceiling. An explicit
+    --timeout can only lower it: raising a deadline is a policy change, which the invocation identity records."""
+    table = (policy or {}).get('provider_timeout') or DEFAULT_POLICY['provider_timeout']
+    ceiling = min(table['ceiling_seconds'], PROVIDER_TIMEOUT_CEILING)
+    if rung in table['by_rung']:
+        seconds, basis = table['by_rung'][rung], 'by_rung ' + rung
+    elif effort in table['by_effort']:
+        seconds, basis = table['by_effort'][effort], 'by_effort ' + effort
+    else:
+        seconds, basis = table['default_seconds'], 'default_seconds'
+    seconds = min(seconds, ceiling)
+    basis = 'provider_timeout ' + basis
+    if requested is not None and requested < seconds:
+        return requested, '--timeout %d (%s allows %d)' % (requested, basis, seconds)
+    return seconds, basis
 
 
 # ---------------------------------------------------------------- executable discovery
@@ -451,6 +538,7 @@ def classify_isolation_error(error):
         (r'gitlinks', 'SNAPSHOT_GITLINK'),
         (r'source changed|worktree changed during|HEAD or worktree changed', 'SNAPSHOT_SOURCE_CHANGED'),
         (r'isolated Git operation failed', 'SNAPSHOT_GIT_FAILED'),
+        (r'^Identical invocation already reserved', 'REVIEW_REPEAT_REQUIRED'),
     )
     if isinstance(error, TimeoutError) or type(error).__name__ == 'TimeoutExpired':
         return diagnostic('SNAPSHOT_TIMEOUT', detail=text)
@@ -463,6 +551,7 @@ def classify_isolation_error(error):
 PROVIDER_REASON_CODES = {'TRANSIENT_INFRA': 'PROVIDER_UNAVAILABLE', 'BUDGET_EXHAUSTED': 'BUDGET_EXHAUSTED', 'QUOTA': 'PROVIDER_USAGE_LIMIT', 'AUTH': 'PROVIDER_AUTH', 'TIMEOUT': 'PROVIDER_TIMEOUT',
                          'UNKNOWN': 'PROVIDER_IO_UNKNOWN', 'INVALID_OUTPUT': 'PROVIDER_INVALID_OUTPUT',
                          'OUTPUT_TOO_LARGE': 'PROVIDER_OUTPUT_TOO_LARGE'}
+RESET_MARK = '; the provider says its usage limit resets '
 
 
 def provider_attempt(provider, resolution, code, stdout, stderr, outcome, *, launch_state=None, local_detail=''):
@@ -483,13 +572,31 @@ def provider_attempt(provider, resolution, code, stdout, stderr, outcome, *, lau
         return {**diagnostic(code_name, provider=provider, detail=detail), 'reason': typed_reason}
     if reason in ('NONE', 'CODE_FINDINGS'):
         return None
+    detail = 'exit code %s' % code
+    if reason == 'QUOTA' and isinstance(outcome.get('reset_hint'), str):
+        # goodqa#16811: show when the limit resets on the first failure, so owners stop instead of retrying.
+        detail += RESET_MARK + sanitize(outcome['reset_hint'], 80)
     return diagnostic(PROVIDER_REASON_CODES.get(reason, 'PROVIDER_INVALID_OUTPUT'), provider=provider,
-                      exit_code=code, detail='exit code %s' % code,
-                      excerpt=(stderr or '') + ' ' + (stdout or ''))
+                      exit_code=code, detail=detail, excerpt=(stderr or '') + ' ' + (stdout or ''))
 
 
 def final_diagnostic(attempts, error, outcome_reason=None):
-    """Pick the diagnostic to print for a failed review."""
+    """Pick the diagnostic to print for a failed review. goodqa#16811: when an earlier provider hit a usage limit
+    and named its reset time, the chosen diagnostic keeps that time on its Detail line even when a later attempt
+    failed some other way, so the owner still learns when to come back."""
+    chosen = _final_diagnostic(attempts, error, outcome_reason)
+    earlier = [attempt for attempt in (attempts or [])[:-1]
+               if attempt and RESET_MARK in (attempt.get('detail') or '')]
+    if chosen is None or not earlier:
+        return chosen
+    notes = '; '.join('earlier %s usage limit resets %s' % (attempt.get('provider') or 'provider',
+                                                             attempt['detail'].split(RESET_MARK, 1)[1])
+                      for attempt in earlier)
+    detail = chosen.get('detail') or ''
+    return {**chosen, 'detail': sanitize((detail + '; ' if detail else '') + notes, 600)}
+
+
+def _final_diagnostic(attempts, error, outcome_reason=None):
     if error is not None and not attempts:
         return classify_isolation_error(error)
     if attempts:
@@ -506,6 +613,37 @@ def final_diagnostic(attempts, error, outcome_reason=None):
     return diagnostic('ISOLATION_FAILED')
 
 
+TIMING_CODES = ('PROVIDER_TIMEOUT', 'BUDGET_EXHAUSTED')
+
+
+def _seconds(value):
+    return int(round(value)) if type(value) in (int, float) and math.isfinite(value) and value >= 0 else None
+
+
+def timing_line(timing):
+    """One line naming the run, the reviewer rung, and how long the snapshot step and each provider step took against
+    their deadlines (goodqa#16947), so an owner can tell a slow snapshot from a slow reviewer. Harness numbers only."""
+    timing = timing if isinstance(timing, dict) else {}
+    parts = ['run %s' % timing.get('run_id', 'unknown'),
+             'reviewer rung %s %s' % (timing.get('rung', 'unknown'), timing.get('effort', 'unknown'))]
+    for step in (timing.get('providers') or [])[:3]:
+        if isinstance(step, dict):
+            parts.append('%s ran %s s of its %s s deadline' % (step.get('provider', 'provider'), _seconds(step.get('seconds')),
+                                                               _seconds(step.get('deadline'))))
+    if timing.get('basis'):
+        parts.append('per-provider deadline %s s from %s' % (_seconds(timing.get('deadline')), timing['basis']))
+    parts.append('snapshot step %s s of its %s s deadline' % (_seconds(timing.get('snapshot_seconds')),
+                                                              _seconds(timing.get('snapshot_deadline'))))
+    return sanitize('; '.join(parts), 400)
+
+
+def with_timing(diag, timing):
+    """The diagnostic with its Timing line, for a provider timeout or an exhausted run budget only."""
+    if not diag or diag.get('code') not in TIMING_CODES:
+        return diag
+    return {**diag, 'timing': timing_line(timing)}
+
+
 def render(diag, *, stage=None, head=None):
     note = ("python3 ~/.claude/hooks/wal_note.py --wal '<hook-supplied-WAL-path>' --event blocker --note "
             + shlex.quote('PEER_REVIEW_INFRA code=%s reason=%s stage=%s head=%s' % (
@@ -515,6 +653,8 @@ def render(diag, *, stage=None, head=None):
              'Cause: ' + diag['cause']]
     if diag.get('detail'):
         lines.append('Detail: ' + diag['detail'])
+    if diag.get('timing'):
+        lines.append('Timing: ' + sanitize(diag['timing'], 400))
     if diag.get('exit_code') is not None:
         lines.append('Provider exit code: %s' % diag['exit_code'])
     if diag.get('excerpt'):
@@ -534,6 +674,19 @@ def usage_limit_prose(message, policy=None):
     text = message.replace('’', "'").replace('‘', "'").lower()
     phrases = (policy or DEFAULT_POLICY)['usage_limit_phrases']
     return any(phrase in text for phrase in phrases)
+
+
+_RESET = re.compile(r'\bresets?\b[ \t:]+([^\n]{1,80})', re.IGNORECASE)
+
+
+def usage_limit_reset_hint(message):
+    """The provider's own reset wording after "resets" ("Nov 29 at 6pm (America/Denver)"), sanitized and bounded, or
+    None. Display text only: nothing parses it into a time."""
+    if not isinstance(message, str) or len(message) > 4096:
+        return None
+    match = _RESET.search(message)
+    hint = sanitize(match[1].strip(), 80) if match else ''
+    return hint or None
 
 
 # ---------------------------------------------------------------- packet lint

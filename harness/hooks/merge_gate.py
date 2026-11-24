@@ -55,6 +55,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 try:
     import safe_input  # noqa: E402
+    import shell_words  # noqa: E402  (goodqa#16811: the one shell reader shared with copy_hygiene)
 except Exception as _import_error:  # a broken install must block a merge, not crash with exit 1 (= allow)
     if sys.argv[1:2] == ["hook"]:
         sys.stderr.write("merge-gate: cannot load its helper module (" + type(_import_error).__name__ + "); blocking.\n")
@@ -112,6 +113,12 @@ STATE_NAMES = re.compile(r"merge-gate[-/](?:waivers|audit|approvals)|main-stamps
 # #134 red-team P2: the peer_review run that mints a merge authorization (pr stage with a GitHub binding)
 # any option order (B2): `peer_review.py --github-repo o/r --pr 5 pr ...` binds as well
 PEER_REVIEW_AUTH = re.compile(r"peer_review(?:\.py)?\b[^\n;&|]*\s--(?:github-repo|pr)\b")
+# goodqa#16811: the same mention across quoted separators, read per real command segment (or across the whole line
+# when shell_words cannot verify it), so `bash -c "...; peer_review.py --pr 5"` and `python3 -X utf8 ...` count.
+PEER_REVIEW_MENTION = re.compile(r"peer_review(?:\.py)?\b[\s\S]*?(?<![\w-])--(?:github-repo|pr)\b")
+# Only these tools run their command through a POSIX shell (bash or zsh); PowerShell, write_stdin and container
+# exec read quotes differently or not at all, so a review run through them never mints a stamp.
+POSIX_SHELL_TOOLS = frozenset(("bash", "shell", "local_shell", "exec_command", "unified_exec"))
 STATE_GLOB = re.compile(r"merge-gate-[wa*?\[]", re.I)  # subagents: globs and split spellings of the state files
 WAIVE_CMD = re.compile(r"merge_gate(?:\.py)?['\"]?\s+(?:--\S+\s+\S+\s+)*waive\b")
 WAIVE_ANY = re.compile(r"waive|add_waiver|consume_waiver|put_stamp|take_stamp", re.I)
@@ -1932,8 +1939,9 @@ def _shell_like(name):
     return name in SHELL_TOOLS or name.startswith(("bash", "shell", "exec"))
 
 
-def decide(payload, runner, state_dir, now=None):
-    """(exit code, stderr text) for one PreToolUse payload."""
+def decide(payload, runner, state_dir, now=None, notes=None):
+    """(exit code, stderr text) for one PreToolUse payload. `notes`, when a list, collects non-blocking context for
+    the agent (goodqa#16811: why a PR review minted no review-auth stamp); it never changes the decision."""
     state_dir = Path(state_dir)
     now = now if now is not None else time.time()
     tool = str(payload.get("tool_name") or "")
@@ -1952,7 +1960,11 @@ def decide(payload, runner, state_dir, now=None):
     plain = re.sub(r"[\"'\\$]", "", command)  # w''aive, $M and escaped spellings
     if STATE_NAMES.search(command) or STATE_NAMES.search(plain):
         return 2, "merge-gate: the waiver, audit and approval files are written only by merge_gate.py itself."
-    if subagent and PEER_REVIEW_AUTH.search(plain):
+    # A quoted `;` before the binding flags hides them from PEER_REVIEW_AUTH; the segment-wise mention still sees
+    # them, and a line shell_words cannot verify is read as one text (goodqa#16811).
+    bound_review = _launches_bound_review(command)
+    if subagent and (PEER_REVIEW_AUTH.search(plain) or bound_review or _mentions_bound_review(command)
+                     or _hidden_bound_review(command)):
         return 2, ("merge-gate: a subagent cannot run the PR review that mints a merge authorization (--github-repo/"
                    "--pr); run it without the GitHub binding, or ask the main agent.")
     # goodqa#15684: a missing agent_id is not proof of main (Codex hook payloads never carry one), so the waiver path
@@ -1963,8 +1975,10 @@ def decide(payload, runner, state_dir, now=None):
     stamp = None
     if WAIVE_CMD.search(command) and not subagent and _plain_waive(command) and _may_record_waiver(payload):
         stamp = _stamp_waive(command, payload, state_dir)  # written only if this decision allows (red-team M1)
-    if PEER_REVIEW_AUTH.search(plain):
-        _stamp_review(command, payload, now)
+    if PEER_REVIEW_AUTH.search(plain) or bound_review:
+        note = _stamp_review(command, payload, now, launches=bound_review, tool=tool)
+        if note and isinstance(notes, list):
+            notes.append(note)
     merges = find_merges(command, cwd=cwd)
     if not merges:
         return _allow(stamp, state_dir, now)
@@ -2012,8 +2026,8 @@ def _may_record_waiver(payload):
 
 def _plain_waive(command):
     """Only ONE plain `python3 [-I] .../merge_gate.py waive ...` command mints the stamp: no newline, `;`, `&`, `|`,
-    backtick, `<`, `>` or `$(` anywhere (so no echo, printf, pipe, redirect, wrapper or quoted separator), the same
-    rule `_plain_peer_review` applies to the review stamp."""
+    backtick, `<`, `>` or `$(` anywhere (so no echo, printf, pipe, redirect, wrapper or quoted separator). This stays
+    stricter than the review stamp's quote-aware `_review_binding` (goodqa#16811 changed only the review stamp)."""
     if _SHELL_SYNTAX.search(command):
         return False
     try:
@@ -2146,53 +2160,235 @@ def _stamp_waive(command, payload, state_dir):
             "main:session-" + re.sub(r"[^A-Za-z0-9_.-]", "", session) + "(hook)")
 
 
-def _stamp_review(command, payload, now):
-    """B2: the peer_review run that may mint a merge authorization gets a one-shot stamp, only from proven main."""
+def _stamp_review(command, payload, now, launches=None, tool="Bash"):
+    """B2: the peer_review run that may mint a merge authorization gets a one-shot stamp, only from proven main.
+
+    The repo and PR are read from the argv _review_binding validated, which is shell_words' own reading of the line
+    (goodqa#16811), so text inside a quoted --repeat-reason cannot rebind the stamp. Only a POSIX shell tool mints one.
+    Returns None when it minted a stamp or the command does not launch a bound peer_review.py; otherwise a short
+    note naming why no stamp was minted. The note is output only and never changes the decision."""
     import caller_identity  # noqa: PLC0415
-    if not _plain_peer_review(command):
-        return
+    launches = _launches_bound_review(command) if launches is None else launches
+    if str(tool or "").lower() not in POSIX_SHELL_TOOLS:
+        cause = "the %s tool is not a POSIX shell (bash or zsh), and only their quoting is checked" % clean(tool, 40)
+        return _review_note(cause) if launches else None
+    binding, cause = _review_binding(command)
+    if binding is None:
+        return _review_note(cause) if launches else None
     if not caller_identity.is_main(payload):
         # A Codex Desktop root is accepted here for the review receipt and, by the user's decision (answer
         # b6714826, goodqa#15565), for recording merge waivers (_may_record_waiver). Generic main authority still
         # controls protected Stop and owner handoffs.
+        refused = _review_note("this caller is not the proven main agent (a subagent, a spawned child or an "
+                               "unverified session never mints one)")
         try:
             from native_main import is_desktop_review_root  # noqa: PLC0415
             if is_desktop_review_root(payload) is not True:
-                return
+                return refused
         except Exception:
-            return
-    tokens, _ = tokenize(command)
-    values = {}
-    for index, token in enumerate(tokens):
-        for name in ("--github-repo", "--pr"):
-            if token == name and index + 1 < len(tokens):
-                values[name] = tokens[index + 1]
-            elif token.startswith(name + "="):
-                values[name] = token.split("=", 1)[1]
-    if values.get("--github-repo") and str(values.get("--pr", "")).isdigit():
-        caller_identity.put_stamp("review-auth", [values["--github-repo"], int(values["--pr"])],
-                                  session=str(payload.get("session_id") or ""), now=now)
+            return refused
+    # goodqa#16811 round 2 (F2): the stamp is bound to this one call, so a call another hook denies, the user
+    # rejects or that fails to launch leaves nothing a later process can take (caller_identity.take_stamp(bound=True)).
+    tool_use_id, transcript = payload.get("tool_use_id"), payload.get("transcript_path")
+    if not isinstance(tool_use_id, str) or not caller_identity.TOOL_USE_ID.match(tool_use_id):
+        return _review_note("the call carries no usable tool_use_id, so a stamp cannot be bound to it")
+    tool_input = payload.get("tool_input")
+    background = isinstance(tool_input, dict) and tool_input.get("run_in_background") is True
+    if not caller_identity.put_stamp("review-auth", [binding["--github-repo"], int(binding["--pr"])],
+                                     session=str(payload.get("session_id") or ""), now=now,
+                                     tool_use_id=tool_use_id, transcript=transcript, background=background,
+                                     require_bound=True):
+        return _review_note("the calling session's transcript_path is missing or unreadable, so a stamp cannot be "
+                            "bound to this call")
+    return None
 
 
-_SHELL_SYNTAX = re.compile(r"[\n;&|`<>]|\$\(")
+_SHELL_SYNTAX = re.compile(r"[\n;&|`<>]|\$\(")  # _plain_waive's rule (unchanged): refused anywhere, even quoted
 _PYTHON = re.compile(r"python3?(?:\.\d+)?")
+_PYTHON_FLAGS = ("-I", "-u", "-B", "-E", "-s")
+_REVIEW_BINDING = ("--github-repo", "--pr")
+_SHELL_C = re.compile(r"-[A-Za-z]*c[A-Za-z]*")  # sh -c, bash -lc, zsh -ec: the next word is a script
+_SCRIPT_SHELLS = frozenset(("sh", "bash", "zsh", "dash", "ksh"))
+_REVIEW_OPERATOR = {";": "a compound command", "&&": "a compound command", "||": "a compound command",
+                    "|": "a pipe", "|&": "a pipe", "&": "a compound or background command",
+                    "\n": "a newline (a second command or a heredoc)", ")": "a subshell"}
+_REVIEW_UNSAFE = "an unquoted comment, glob, brace, history or tilde character"
+_REVIEW_DQ = "a shell expansion inside double quotes (%r at offset %d); double quotes still expand `$` and backticks"
+_REVIEW_NOTE_LIMIT = 900
 
 
-def _plain_peer_review(command):
-    """Delta red-team D-F6: only a single plain `python3 [-I] .../peer_review.py ...` command mints the stamp, not an
-    echo, a heredoc, a comment or a compound command that merely mentions its options."""
-    if _SHELL_SYNTAX.search(command):
-        return False
-    try:
-        argv = shlex.split(command, comments=False)
-    except ValueError:
-        return False
+def _review_note(cause):
+    note = ("merge-gate: no review-auth stamp was minted: " + cause + ". This review cannot authorize a merge. To "
+            "mint one, the main agent runs exactly one plain `python3 ~/.claude/hooks/peer_review.py ... "
+            "--github-repo OWNER/REPO --pr N ... pr` command in the Bash tool: punctuation is fine inside quotes, "
+            "but no unquoted `;` `&` `|` `<` `>` or `#`, no newline, no backslash and no `$` or backtick even inside "
+            "double quotes (put free text such as --repeat-reason in single quotes, with no apostrophe inside).")
+    return note[:_REVIEW_NOTE_LIMIT]
+
+
+def _scan_cause(scan):
+    """The no-stamp cause for a line shell_words could not verify."""
+    at, char, dq = scan.offset, scan.char, scan.in_double_quotes
+    where = " at offset %d" % at
+    if dq and scan.kind in ("command_substitution", "arithmetic", "expansion_form", "expansion_suffix"):
+        return _REVIEW_DQ % (char if char in "$`" else "$", at)
+    if dq and scan.kind in ("backslash", "history"):
+        return "%r inside double quotes%s" % (char, where)
+    if scan.kind in ("command_substitution", "arithmetic"):
+        return "a command substitution (`%s`%s)" % ("`" if char == "`" else "$(", where)
+    if scan.kind == "ansi_c":
+        return "ANSI-C quoting (`$'`%s)" % where
+    if scan.kind in ("expansion_form", "expansion_suffix", "locale_quote"):
+        return "an unquoted shell expansion (`$`%s)" % where
+    if scan.kind == "backslash":
+        return "a backslash escape (`\\`%s)" % where
+    if scan.kind in ("comment", "history"):
+        return "%s (%r%s)" % (_REVIEW_UNSAFE, char, where)
+    if scan.kind == "unbalanced":
+        return "unbalanced quotes or parentheses%s" % where
+    if scan.kind in ("heredoc", "process_substitution", "numeric_glob", "glued_redirect", "null_command",
+                     "subshell_redirect"):
+        return "a redirect (%s%s)" % (scan.message, where)
+    return "%s%s" % (scan.message, where)
+
+
+def _review_command(command):
+    """(argv, None) when bash, zsh and shell_words read `command` as the same words of exactly one simple command
+    with no redirect, no expansion and no unquoted glob, brace, comment or tilde character; otherwise (None, cause),
+    the cause nearest the start of the line.
+
+    Control characters (newline, CR, tab, NUL, DEL, C1) are refused anywhere first: shlex reads CR and tab as spaces
+    where a shell may not. Then the line must be one verified shell_words segment. A leading `~/` (both shells expand
+    it to $HOME) and an `=` inside a word are allowed."""
+    for index, char in enumerate(command):
+        if char < " " or "\x7f" <= char <= "\x9f":
+            return None, ("a newline (a second command or a heredoc)" if char == "\n" else
+                          "a control character %r" % char) + " at offset %d" % index
+    scan = shell_words.scan(command)
+    if not scan.verified:
+        return None, _scan_cause(scan)
+    causes = []
+    for segment in scan.segments:
+        if segment.op:
+            causes.append((segment.op_offset, "%s (`%s` at offset %d)" % (
+                _REVIEW_OPERATOR.get(segment.op, "a compound command"), segment.op, segment.op_offset)))
+        if segment.depth:
+            causes.append((segment.start - 1, "a subshell (`(`)"))
+        for operator, offset, _ in segment.redirects:
+            causes.append((offset, "a redirect (`%s` at offset %d)" % (operator, offset)))
+        for word in segment.words:
+            for offset, inside, _ in word.expansions:
+                causes.append((offset, _REVIEW_DQ % ("$", offset) if inside else
+                               "an unquoted shell expansion (`$` at offset %d)" % offset))
+            for offset, char in word.unquoted:
+                if char == "~" and offset == word.start and command[offset + 1:offset + 2] == "/":
+                    continue
+                if char in _STAMP_UNSAFE_UNQUOTED or (char == "=" and offset == word.start):
+                    causes.append((offset, "%s (%r at offset %d)" % (_REVIEW_UNSAFE, char, offset)))
+    if len(scan.segments) != 1 and not causes:
+        causes.append((0, "not exactly one command"))
+    if causes:
+        return None, min(causes)[1]
+    return [word.value for word in scan.segments[0].words], None
+
+
+def _review_binding(command):
+    """({'--github-repo': repo, '--pr': n}, None) when `command` is exactly one plain `python3 [-I] .../peer_review.py
+    ...` invocation that names each binding flag once with a valid value; otherwise (None, cause).
+
+    Delta red-team D-F6 and goodqa#16811: an echo, a heredoc, a comment, a pipe, a redirect or a compound command
+    that merely mentions the options mints nothing, while `;`, `&`, `|`, `<` and `>` inside a quoted argument (a
+    --repeat-reason) are plain text. The binding comes from this same argv, so a reason holding `--pr 999` is one
+    word and binds nothing; a repeated binding flag mints nothing (argparse keeps the last, the stamp would be ours
+    to guess)."""
+    argv, cause = _review_command(command)
+    if argv is None:
+        return None, "the command is not one plain peer_review.py call: it contains " + cause
     if not argv or not _PYTHON.fullmatch(os.path.basename(argv[0])):
-        return False
+        return None, "the command does not start with python3 (it runs %r)" % (argv[0][:60] if argv else "")
     rest = argv[1:]
-    while rest and rest[0] in ("-I", "-u", "-B", "-E", "-s"):
+    while rest and rest[0] in _PYTHON_FLAGS:
         rest = rest[1:]
-    return bool(rest) and os.path.basename(rest[0]) == "peer_review.py"
+    if not rest or os.path.basename(rest[0]) != "peer_review.py":
+        return None, "python3 runs %r, not peer_review.py" % (rest[0][:60] if rest else "")
+    binding = {}
+    for index, word in enumerate(rest[1:], start=1):
+        for name in _REVIEW_BINDING:
+            if word == name:
+                value = rest[index + 1] if index + 1 < len(rest) else ""
+            elif word.startswith(name + "="):
+                value = word[len(name) + 1:]
+            else:
+                continue
+            if name in binding:
+                return None, "%s is given more than once" % name
+            binding[name] = value
+    repo, pr = binding.get("--github-repo", ""), binding.get("--pr", "")
+    if not REPO_NAME.fullmatch(repo) or not (pr.isascii() and pr.isdigit() and int(pr) > 0):
+        return None, "it does not name --github-repo OWNER/REPO and a numeric --pr exactly once"
+    return binding, None
+
+
+def _binding_flag(word):
+    return word in _REVIEW_BINDING or word.startswith(("--github-repo=", "--pr="))
+
+
+def _launches_bound_review(command, depth=0):
+    """True when a command of this line runs peer_review.py with a --github-repo or --pr flag: a python interpreter
+    word (with any options or wrappers) or the script itself as the program, then the flag later in the same
+    command; the script of `sh|bash|zsh|dash|ksh -c` and the code of `python3 -c` are read too, 4 levels deep. Quoted
+    text in any other command stays one word, so a grep pattern, an echo or a commit message that mentions the flags
+    is not a launch. A line shell_words cannot verify counts when it mentions both anywhere. Used for the no-stamp
+    note; the subagent rule also uses _mentions_bound_review, and only _review_binding decides a stamp."""
+    scan = shell_words.scan(command)
+    if not scan.verified:
+        return bool(PEER_REVIEW_MENTION.search(re.sub(r"[\"'\\$]", "", command)))
+    for segment in scan.segments:
+        argv = segment.argv
+        names = [os.path.basename(word) for word in argv]
+        for index, word in enumerate(argv):
+            if names[index] in ("peer_review.py", "peer_review"):
+                runs = index == 0 or any(_PYTHON.fullmatch(name) for name in names[:index])
+                if runs and any(_binding_flag(later) for later in argv[index + 1:]):
+                    return True
+            if index and _SHELL_C.fullmatch(argv[index - 1]) and depth < 4:
+                if any(name in _SCRIPT_SHELLS for name in names[:index - 1]) and _launches_bound_review(word, depth + 1):
+                    return True
+                if (argv[index - 1] == "-c" and any(_PYTHON.fullmatch(name) for name in names[:index - 1])
+                        and PEER_REVIEW_MENTION.search(word)):
+                    return True
+    return False
+
+
+def _mentions_bound_review(command):
+    """The strict subagent rule (goodqa#16811): peer_review then --github-repo or --pr inside one real command
+    segment of the line, quoted text included, or anywhere in a line shell_words cannot verify. Broader than a
+    launch on purpose: a subagent never needs to name both in one command."""
+    scan = shell_words.scan(command)
+    if not scan.verified:
+        return bool(PEER_REVIEW_MENTION.search(re.sub(r"[\"'\\$]", "", command)))
+    return any(PEER_REVIEW_MENTION.search(" ".join(segment.argv + [target.value for _, _, target in segment.redirects]))
+               for segment in scan.segments)
+
+
+_BUILT_WORD = frozenset("*?[]{}")  # unquoted glob or brace characters: the shell, not the text, picks the word
+_NAMES_PEER = re.compile(r"peer", re.I)
+_NAMES_BINDING = re.compile(r"(?<![\w-])--(?:github-repo|pr)\b")
+
+
+def _hidden_bound_review(command):
+    """The subagent rule for words the text does not spell out (goodqa#16811): a line that is not fully literal
+    (shell_words cannot verify it, or a word holds an expansion or an unquoted glob or brace character) and whose
+    text names `peer` and a binding flag anywhere, in any order. That covers `P=peer_review.py; python3 .../$P
+    --pr 5`, `G=--github-repo; ... peer_review.py $G o/r` and `.../peer_r*.py --pr 5`. A launch built wholly at run
+    time (`$(cat f)`, a wrapper script file) cannot be seen in the text at all; for those the review-auth stamp is
+    the authority control (minted only for proven main, taken by the run at launch, honoured for 120 s)."""
+    scan = shell_words.scan(command)
+    if scan.verified and not any(word.expansions or any(char in _BUILT_WORD for _, char in word.unquoted)
+                                 for segment in scan.segments for word in segment.words):
+        return False
+    plain = re.sub(r"[\"'\\$]", "", command)
+    return bool(_NAMES_PEER.search(plain) and _NAMES_BINDING.search(plain))
 
 
 def _deadline_seconds():
@@ -2228,7 +2424,8 @@ def hook_main(state_dir, runner, stdin, stdout, stderr):
             raise ValueError("payload is not an object")
         payload = parsed
         text = json.dumps(payload.get("tool_input"), ensure_ascii=False)[:MAX_COMMAND_CHARS]
-        code, message = decide(payload, runner or SubprocessGh(), state_dir)
+        notes = []
+        code, message = decide(payload, runner or SubprocessGh(), state_dir, notes=notes)
     except (ValueError, OSError) as error:
         if payload is None:
             stderr.write("merge-gate: hook input is not usable JSON (" + type(error).__name__ + "); blocking.\n")
@@ -2240,6 +2437,10 @@ def hook_main(state_dir, runner, stdin, stdout, stderr):
         return _fault(error, text, stderr)
     if code:
         stderr.write(message.rstrip() + "\n")
+    elif notes:
+        # Exit-0 stderr is not shown to the agent; PreToolUse additionalContext is (goodqa#16811, like bg_lint).
+        stdout.write(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                                        "additionalContext": " ".join(notes)[:1000]}}) + "\n")
     return code
 
 
