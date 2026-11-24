@@ -94,6 +94,12 @@ WRITES_NEXT = [
     # N14: a copier's own option writes a file in the tree
     ('N14a', 'rsync -a --log-file={w} /tmp/a /tmp/b'),
     ('N14b', 'rsync -a --backup --backup-dir={d} /tmp/a/ /tmp/b/'),
+    # N15: GNU sed's e command and s///e flag run shell text (found after C2b; allowed at 1cd9c4f9)
+    ('N15a', "sed -n '1e tee -a {w}' /tmp/rows"),
+    ('N15b', "sed 's/x/tee -a {w}/e' /tmp/rows"),
+    ('N15c', "sed -n 'e cat >>{w}' /tmp/rows"),
+    ('N15d', "sed --expression='1e tee -a {w}' /tmp/rows"),
+    ('N15e', "gsed -n '1{{e tee -a {w}\n}}' /tmp/rows"),
     # W1D: a program the guard cannot resolve, linked to the tree by its own words or the line's dataflow
     ('W1Da', 'python3 x.py {w}'),
     ('W1Db', 'bash x.sh {d}'),
@@ -152,6 +158,8 @@ READS_NEXT = [
     ('N12r', 'cp -a ~/.claude/wals /tmp/copy'),
     ('N12r2', 'rsync -a {d}/ /tmp/b/'),
     ('N12r3', 'ls -li {w}'),
+    ('N15r', "sed -n '/x/p' {w}"),
+    ('N15r2', "sed -n '1,5p;$=' {w}"),
     ('W1Dr', 'cat {w} | python3 x.py'),
     ('W1Dr2', 'python3 x.py < {w}'),
     ('W1Dr3', 'python3 x.py /tmp/out'),
@@ -170,7 +178,7 @@ PENDING_WRITES = frozenset({
     'F2a', 'F2b', 'F2c', 'F2d', 'F2e', 'F2f', 'F2g', 'F3a', 'F3b', 'F3c', 'F3d', 'F4a',
     'F4b', 'F5a', 'F5b', 'F5c', 'F6a', 'F6b', 'F7a', 'F7b', 'F7c', 'F8a', 'F8b', 'F9a', 'F9b', 'F10', 'N1a', 'N1b',
     'N1c', 'N1d', 'N1e', 'N1f', 'N1g', 'N1h', 'N2a', 'N2b', 'N3', 'N4', 'N5', 'N6', 'N9', 'N10d', 'N10e', 'N11', 'N12a',
-    'N12b', 'N12c', 'N12d', 'N14a', 'N14b', 'W1Da', 'W1Db', 'W1Dc', 'W1Dd', 'W1De', 'W1Df', 'W1Dg', 'C1', 'C2', 'C3',
+    'N12b', 'N12c', 'N12d', 'N14a', 'N14b', 'N15a', 'N15b', 'N15c', 'N15d', 'N15e', 'W1Da', 'W1Db', 'W1Dc', 'W1Dd', 'W1De', 'W1Df', 'W1Dg', 'C1', 'C2', 'C3',
     'C4', 'C5', 'C6', 'C7', 'C8', 'C9', 'C10', 'C11', 'C12'})
 PENDING_READS = frozenset({'F11a', 'F11b', 'F11c', 'F11d', 'F11e', 'F11f', 'F11g'})
 
