@@ -1202,7 +1202,8 @@ def _pair_attachments(rows: list) -> list:
     return [row for i, row in enumerate(rows) if i not in drop]
 
 
-def user_msgs(home: Path, session: str, text=None, recent=None, full=False, limit=20) -> dict:
+def user_msgs(home: Path, session: str, text=None, recent=None, full=False, limit=20, everything=False) -> dict:
+    """Citable user rows of one session. everything=True returns every row with no recent or limit cut (goodqa#17164)."""
     idx = index_transcript(home, session)
     msgs = _pair_attachments(verify_rows(find_transcript(home, session), idx["msgs"]))
     # A queued message that later became a human turn is the same message: point the queue id at the uuid id.
@@ -1227,12 +1228,13 @@ def user_msgs(home: Path, session: str, text=None, recent=None, full=False, limi
         out = [r for r in out if wanted in norm(r["text"])]
     elif recent:
         out = out[-int(recent):]
-    else:
+    elif not everything:
         raise AhError("bad_request", "give --text or --recent N")
     if not any(m["kind"] == "uuid" for m in msgs):
         # No human-origin turn: a `claude -p` helper session, whose prompt is agent text. Nothing here is a user.
         out = []
-    out = out[-limit:]
+    if not everything:
+        out = out[-limit:]
     for r in out:
         r["preview"] = re.sub(r"\s+", " ", r["text"]).strip()[:120]
         r.update(_message_source(r))
@@ -3197,7 +3199,7 @@ def approve_top_cmd(home: Path, args) -> dict:
     wanted = str(args.user_msg or "").strip()
     lookup = f"python3 {me} user-msg --session {session} --text-match fable"
     try:
-        rows = user_msgs(home, session, recent=200, full=True)["matches"]
+        rows = user_msgs(home, session, full=True, everything=True)["matches"]  # goodqa#17164: the whole index, no window
     except AhError as e:
         raise AhError(e.code, f"approve-top: cannot read the session transcript ({e}); run `{lookup}`", 2)
     index = next((i for i, m in enumerate(rows) if m["id"] == wanted), None)
