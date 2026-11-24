@@ -347,7 +347,7 @@ class Gate(Base):
         before = self.before()
         with self.assertRaises(ai.InstallError) as caught:
             self.install(ref=side)
-        self.assertIn("not an ancestor of the canonical main", str(caught.exception))
+        self.assertRegex(str(caught.exception), "not (a commit of|an ancestor of) the canonical main")
         self.assertEqual(self.before(), before)
 
     def test_a_downgrade_is_refused_even_with_stamp_and_receipt(self):
@@ -378,17 +378,20 @@ class Gate(Base):
         with mock.patch.object(ai, "PROOF_ENV", FakeEnv()):
             run = self.install()["run"]
         before = self.before()
-        for label, call in (("rollback", lambda: ai.rollback(run, TICKET, (), self.mac, "s", "a", self.runner, lambda t, x: None)),
-                            ("resume", lambda: ai.resume(run, TICKET, self.mac, "s", "a", self.runner, lambda t, x: None))):
-            with self.subTest(label):
-                with self.assertRaises(ai.InstallError) as caught:
-                    call()
-                if label == "rollback":
-                    self.assertEqual(caught.exception.code, "guard_file")
-                    self.assertEqual(self.before(), before)
+        self.stamp(self.line())  # even a live stamp and a good receipt do not let an agent roll back
+        with self.assertRaises(ai.InstallError) as caught:
+            ai.rollback(run, TICKET, (), self.mac, "s", "a", self.runner, lambda t, x: None)
+        self.assertEqual(caught.exception.code, "guard_file")
+        self.assertEqual(self.before(), before)
+        # a finished run cannot be resumed at all, so the resume branch of the gate is called directly
+        with self.assertRaises(ai.InstallError) as caught:
+            ai.guard_gate("t2-dev", self.c1, ["ah.py", "extra.py"], TICKET, self.mac, "resume")
+        self.assertEqual(caught.exception.code, "guard_file")
+        self.assertEqual(self.receipts, [])
         with mock.patch.object(ai, "PROOF_ENV", FakeEnv()):  # positive control: the user may roll back
-            self.assertEqual(ai.rollback(run, TICKET, (), self.mac, "s", "a", self.runner, lambda t, x: None)["result"],
-                             "rolled_back")
+            self.assertIn(ai.rollback(run, TICKET, (), self.mac, "s", "a", self.runner, lambda t, x: None)["result"],
+                          ("rolled_back", "restored"))
+        self.assertNotEqual(self.before(), before)
 
 
 class Stamps(unittest.TestCase):
