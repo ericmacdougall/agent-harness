@@ -79,7 +79,7 @@ CONTRACT = {
                                'Attempts that provably did no provider work are not counted.',
                                ['Read the Detail line: it names the counted run and how it ended.',
                                 "If one rerun is justified, run the same command once more with --repeat-reason "
-                                "'<why, in plain words>' in single quotes (no $, backtick, backslash or newline); "
+                                "'<why, in plain words>' in single quotes (no apostrophe, $, backtick, backslash or newline); "
                                 'only one declared repeat is allowed per invocation.',
                                 'If the declared repeat is already used, change the packet (new evidence or a new '
                                 'commit) instead of rerunning; do not loop.']),
@@ -476,6 +476,7 @@ def classify_isolation_error(error):
 PROVIDER_REASON_CODES = {'TRANSIENT_INFRA': 'PROVIDER_UNAVAILABLE', 'BUDGET_EXHAUSTED': 'BUDGET_EXHAUSTED', 'QUOTA': 'PROVIDER_USAGE_LIMIT', 'AUTH': 'PROVIDER_AUTH', 'TIMEOUT': 'PROVIDER_TIMEOUT',
                          'UNKNOWN': 'PROVIDER_IO_UNKNOWN', 'INVALID_OUTPUT': 'PROVIDER_INVALID_OUTPUT',
                          'OUTPUT_TOO_LARGE': 'PROVIDER_OUTPUT_TOO_LARGE'}
+RESET_MARK = '; the provider says its usage limit resets '
 
 
 def provider_attempt(provider, resolution, code, stdout, stderr, outcome, *, launch_state=None, local_detail=''):
@@ -499,13 +500,28 @@ def provider_attempt(provider, resolution, code, stdout, stderr, outcome, *, lau
     detail = 'exit code %s' % code
     if reason == 'QUOTA' and isinstance(outcome.get('reset_hint'), str):
         # goodqa#16811: show when the limit resets on the first failure, so owners stop instead of retrying.
-        detail += '; the provider says its usage limit resets ' + sanitize(outcome['reset_hint'], 80)
+        detail += RESET_MARK + sanitize(outcome['reset_hint'], 80)
     return diagnostic(PROVIDER_REASON_CODES.get(reason, 'PROVIDER_INVALID_OUTPUT'), provider=provider,
                       exit_code=code, detail=detail, excerpt=(stderr or '') + ' ' + (stdout or ''))
 
 
 def final_diagnostic(attempts, error, outcome_reason=None):
-    """Pick the diagnostic to print for a failed review."""
+    """Pick the diagnostic to print for a failed review. goodqa#16811: when an earlier provider hit a usage limit
+    and named its reset time, the chosen diagnostic keeps that time on its Detail line even when a later attempt
+    failed some other way, so the owner still learns when to come back."""
+    chosen = _final_diagnostic(attempts, error, outcome_reason)
+    earlier = [attempt for attempt in (attempts or [])[:-1]
+               if attempt and RESET_MARK in (attempt.get('detail') or '')]
+    if chosen is None or not earlier:
+        return chosen
+    notes = '; '.join('earlier %s usage limit resets %s' % (attempt.get('provider') or 'provider',
+                                                             attempt['detail'].split(RESET_MARK, 1)[1])
+                      for attempt in earlier)
+    detail = chosen.get('detail') or ''
+    return {**chosen, 'detail': sanitize((detail + '; ' if detail else '') + notes, 600)}
+
+
+def _final_diagnostic(attempts, error, outcome_reason=None):
     if error is not None and not attempts:
         return classify_isolation_error(error)
     if attempts:

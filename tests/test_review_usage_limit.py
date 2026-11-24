@@ -166,12 +166,21 @@ class FirstFailureShowsReset(unittest.TestCase):
     def review(self, refused_provider, run_result):
         refusal = guard.PoolUnavailable('TRANSIENT_INFRA', 'Provider pool has an active or unreconciled owner; no '
                                         'provider was launched', holder=self.HOLDER, kind='active')
+        refusals = {refused_provider: refusal} if refused_provider else {}
+        results = run_result if isinstance(run_result, dict) else None
+
+        def fake_run(command, *a, **k):
+            if results is None:
+                return run_result
+            return next(value for name, value in results.items()
+                        if any(str(part).endswith('/' + name) for part in command))
+
         record = type('Record', (), {'run_id': 'r' * 32, 'timeout': 1440, 'note_child': staticmethod(lambda child: None)})()
-        options = {'store': self.Store({refused_provider: refusal}), 'run_record': record}
+        options = {'store': self.Store(refusals), 'run_record': record}
         with tempfile.TemporaryDirectory() as temporary, \
              patch.object(pr.diagnostics, 'discover_executable',
                           side_effect=lambda name, **_: {'name': name, 'path': '/fixture/' + name, 'source': 'PATH', 'rejected': []}), \
-             patch.object(pr, 'run', side_effect=lambda command, *a, **k: run_result):
+             patch.object(pr, 'run', side_effect=fake_run):
             with self.assertRaises(pr.ReviewFailure):
                 pr.review_snapshot(Path(temporary), 'a' * 40, 'pr', 'Review', 'Evidence', options)
         final = {'execution': 'COMPLETED', 'reason': 'QUOTA', 'usage': {
@@ -199,6 +208,28 @@ class FirstFailureShowsReset(unittest.TestCase):
         options, zero_launch = self.review('codex', (1, json.dumps(mid_run_record()), ''))
         self.assertIs(options['attempt_summary'][-1]['refused_before_work'], False)
         self.assertFalse(zero_launch)
+
+    def test_the_primary_reset_survives_a_fallback_that_fails_another_way(self):
+        # Round 1 (L2): only the final diagnostic is printed, and it used to be the fallback's alone.
+        options, _ = self.review(None, {'codex': (1, '', PHRASES[2]), 'claude': (0, 'not json', '')})
+        self.assertEqual([attempt['provider'] for attempt in options['attempts']], ['codex', 'claude'])
+        rendered = rd.render(rd.final_diagnostic(options['attempts'], None))
+        self.assertNotIn('code=PROVIDER_USAGE_LIMIT', rendered)
+        self.assertIn('earlier codex usage limit resets 3am (UTC)', rendered)
+
+    def test_both_reset_times_are_shown_when_both_providers_are_limited(self):
+        options, _ = self.review(None, {'codex': (1, '', PHRASES[2]), 'claude': (1, json.dumps(limit_record()), '')})
+        rendered = rd.render(rd.final_diagnostic(options['attempts'], None))
+        self.assertIn('code=PROVIDER_USAGE_LIMIT', rendered)
+        self.assertIn('resets Nov 29 at 6pm (UTC)', rendered)
+        self.assertIn('earlier codex usage limit resets 3am (UTC)', rendered)
+
+    def test_a_single_limited_attempt_is_not_repeated_on_its_detail_line(self):
+        # Control: with no earlier attempt the Detail line is unchanged.
+        options, _ = self.review('codex', (1, json.dumps(limit_record()), ''))
+        detail = rd.final_diagnostic(options['attempts'], None)['detail']
+        self.assertEqual(detail.count('resets'), 1, detail)
+        self.assertNotIn('earlier', detail)
 
 
 class DuplicateRefusalNamesTheNextStep(unittest.TestCase):
@@ -251,6 +282,16 @@ class DuplicateRefusalNamesTheNextStep(unittest.TestCase):
                 self.assertIn('the one declared repeat is already used', error.message)
                 self.assertIn('run %s ended CODE_FINDINGS' % second.run_id[:8], error.message)
                 self.assertIn('counted attempts: 2', error.message)
+
+    def test_a_reconciled_run_without_a_final_is_counted_and_named(self):
+        # Round 1 (L3): the refusal branch for a reservation that was reconciled but never wrote a FINAL.
+        run = self.begin()
+        self.store.reconcile(run.run_id, actor='fixture', reason='owner exited without a final',
+                             evidence='fixture process table')
+        error = self.refusal()
+        self.assertIn('run %s has no final receipt (reconciled)' % run.run_id[:8], error.message)
+        self.assertIn('counted attempts: 1', error.message)
+        self.assertIn('--repeat-reason', error.message)
 
     def test_a_proven_no_work_limit_does_not_need_a_repeat(self):
         # Control for the PR 318 rule: an attempt summarised as refused before work is not counted.
