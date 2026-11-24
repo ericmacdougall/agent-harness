@@ -26,6 +26,8 @@ MUTANTS = {
     "an unknown program's text is ignored": [
         ('                if value is not None and self._names_wal_tree(value):', '                if False:')],
     'the refusal keeps the generic route': [("route + '; to write a row, ' + note if route else note", 'note')],
+    'an over-reading refusal does not name the launcher': [
+        ('                if kept and norm_name(args[k].text) not in KNOWN_TO_WAL_RULE:', '                if False:')],
 }
 
 

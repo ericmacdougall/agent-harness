@@ -550,11 +550,14 @@ class EveryLauncher(Case):
                 row = form.replace('{c}', inner)
                 if name == 'nohup' and expect == 'allow':
                     row = 'cd /tmp && ' + row  # nohup.out lands in the working directory, which the rule judges
-                if name in self.READ_REFUSED:
+                refused_read = name in self.READ_REFUSED and expect == 'allow'
+                if refused_read:
                     expect = 'block'
-                verdict = self.decide(self.fill(row, self.main))[0]
+                verdict, message = self.decide(self.fill(row, self.main))
                 if verdict != expect:
                     wrong.append((name, row, verdict))
+                elif refused_read and 'without %s' % name not in message:
+                    wrong.append((name, row, 'refused without naming the route'))  # the over-refusal names its route
         self.assertEqual(wrong, [])
 
 

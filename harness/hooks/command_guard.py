@@ -8251,7 +8251,7 @@ class Analyzer:
             if name == 'nohup' and here:
                 refuse('nohup writes nohup.out into the working directory, which is in the session WALs')
             elif here or self._names_wal_tree():
-                self._wal_launched_readings(args, depth, pl, idx)
+                self._wal_launched_readings(name, args, depth, pl, idx)
             return  # the command it runs is judged on its own
         if name in WAL_JUDGED_ELSEWHERE or name in SHELLS or self._is_script(name, words):
             return  # judged elsewhere, or a script on disk (an accepted limit: its source is not read)
@@ -8354,12 +8354,13 @@ class Analyzer:
             return
         refuse('%s is given a path in the session WALs and the guard cannot show it only reads it' % name[:40])
 
-    def _wal_launched_readings(self, args, depth, pl, idx):
+    def _wal_launched_readings(self, launcher, args, depth, pl, idx):
         """A quiet launcher's command start comes from wrapper()'s one reading of its options, which can be wrong (a
         flag read as taking a value, or a value option read as a flag, moves the start). In a command that names the
         WAL tree, every word that could start the launched command, up to the first program the guard models and
         before the first word naming the tree, is judged as the start too. Only WAL refusals are kept from these extra
-        readings, and the analysis state is given back after each one."""
+        readings, and the analysis state is given back after each one. A refusal from a word the guard does not model
+        (`gosu USER cat W` read with USER as the program) names the route: run the command without the launcher."""
         ctx = self.ctx
         stop = next((k for k, a in enumerate(args) if self._wal_hit(a) or self._names_wal_tree(a.raw or a.text)),
                     len(args))
@@ -8373,11 +8374,21 @@ class Analyzer:
                 break
         for k in starts:
             saved, before = ctx.state(), len(ctx.findings)
+            unmodelled = None
             try:
                 self.inner_words(args[k:], depth, pl, idx)
             finally:
-                ctx.findings[before:] = [f for f in ctx.findings[before:] if getattr(f, 'rule', None) == 'wal-forgery']
+                kept = [f for f in ctx.findings[before:] if getattr(f, 'rule', None) == 'wal-forgery']
+                if kept and norm_name(args[k].text) not in KNOWN_TO_WAL_RULE:
+                    unmodelled, kept = args[k].text, []
+                ctx.findings[before:] = kept
                 ctx.restore(saved)
+            if unmodelled is not None:
+                self._wal_forgery('%s runs a command given a path in the session WALs, and the guard cannot tell which '
+                                  'of its words starts that command (one reading runs %s, which it cannot show only '
+                                  'reads)' % (launcher[:40], unmodelled[:40]),
+                                  route='if the command only reads, run it without %s; on its own it is judged, and a '
+                                        'read of a WAL is allowed' % launcher[:40])
 
     def _wal_actor_refusal(self, tool, mine, why):
         self.ctx.add(LOG_DELETE, 'wal-actor', '%s aimed at a WAL this caller may not write: %s' % (tool[:40], why),
