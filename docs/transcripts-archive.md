@@ -297,6 +297,14 @@ other failure (zsha256, sha256, ruleset, unreadable) the chunk and every later s
 the generation is rewound and the range is re-chunked from source; a file that fails three times is held. A file
 the budget cuts off during the rescan waits whole.
 
+**Vendor token shapes (click-test O1, ruleset 2026.11.24-1).** Twilio, Shopify, Doppler, Square, Databricks, age,
+Slack webhook, PyPI, Grafana, Linear, Fly.io and PlanetScale tokens are redacted by pass 1 and checked by pass 2
+from one table (`_VENDOR` in transcript_redact.py), so a record quoting one is kept with the value replaced instead
+of its whole file being held at the rescan. `tests/test_transcript_vendor_shapes.py` is the contract: every seeded
+fixture is redacted (not omitted), and where gitleaks is installed every raw fixture must be one gitleaks flags and
+no redacted output may be. The ruleset bump makes every hold due for a retry at once. Cost: one more anchor scan per
+shape and per text pass 1 and pass 2 read (5 MB worst-case line on the Mac: 2.70 s before, 3.36 s after).
+
 **Egress gate (click-test F1, class C11).** `publish_tree` is the only function that runs git write plumbing
 (a guard test lists every site). Before it builds a tree it scans the repo name, the ref, the commit message, every
 tree path and every blob: bytes blobs with pass 2 per item and gitleaks once per commit; an outbox chunk may leave

@@ -425,13 +425,13 @@ class Remote:
         raise Refused('repo lookup failed for %s (ssh)' % repo)
 
     def ensure(self, repo):
-        if self.exists(repo):
-            return
-        # gate F5: creating a repo sends its name to GitHub, so the name passes the egress gate first. This and
-        # publish_tree are the only remote writers (the guard test lists every gh and git write site).
+        # gate F5: looking a repo up or creating it sends its name to GitHub, so the name passes the egress gate
+        # first. This and publish_tree are the only remote writers (the guard test lists every gh and git write site).
         failures = egress_check(self.cfg, repo, 'refs/heads/main', {}, 'create repository')
         if failures:
             raise egress_refusal(failures)
+        if self.exists(repo):
+            return
         if not self.cfg.has_gh:
             what = 'catalog-repo-missing' if repo == CATALOG else 'shard-repo-missing'
             raise Refused('%s: %s; create with gh on an authenticated host (transcripts.py ensure-repos)'
@@ -1306,6 +1306,12 @@ def entry_may_leave(e):
     return not (e and e.get('held'))
 
 
+def catalog_incomplete(st):
+    """Gate F1: True while the last catalog commit left something out at the egress gate (a manifest, an index line,
+    the shard list or an attestation). It forces the next catalog commit and keeps the run status off ok."""
+    return bool(st.get('catalog_withheld')) or bool(st.get('catalog_withheld_other'))
+
+
 def held_summary(st):
     """{'count', 'by_reason'} over every held file: the one view check, status, the receipt and deliver use."""
     by_reason = {}
@@ -1949,7 +1955,7 @@ class Run:
         for _, _, _, c in todo:
             if c['shard'] not in repos:
                 repos.append(c['shard'])
-        need_catalog = bool(todo) or bool(self.st.get('catalog_dirty')) or bool(self.st.get('catalog_withheld')) or (
+        need_catalog = bool(todo) or bool(self.st.get('catalog_dirty')) or catalog_incomplete(self.st) or (
             self.st.get('catalog_commit') is None and any(c['status'] == 'pushed' for *_, c in self.all_chunks()))
         if not todo and not need_catalog:
             return
@@ -2104,6 +2110,8 @@ class Run:
             self.notes.append('catalog items withheld at the egress gate: %d' % len(dropped))
         mkeys = {manifest_path(cfg, k): k for k in manifest_keys(self.st)}
         withheld = sorted({k for p, k in mkeys.items() if p in offered and p not in files})
+        held_sha = {sha12(p) for p, k in mkeys.items() if k in withheld}
+        other = len({w.split(':')[1] for w, _ in dropped} - held_sha)  # index lines, shard list, attestations
         commit, _, _ = publish_tree(cfg, CATALOG, files, message, deadline=self.deadline, overwrite=True)
         crash_point(cfg, 'after_catalog_push')
         self.st['catalog_dirty'] = False
@@ -2111,6 +2119,7 @@ class Run:
         # gate F1: a withheld manifest is persisted, retried by every later catalog commit and keeps the status off
         # ok until it passes the gate; it is never dropped by clearing manifest_dirty
         self.st['catalog_withheld'] = withheld
+        self.st['catalog_withheld_other'] = other  # rebuilt every run; kept so an unchanged next run retries it
         if commit:
             self.st['catalog_commit'] = commit
             self.catalog_commit = commit
@@ -2322,6 +2331,7 @@ def write_receipt(cfg, run=None, status=None, error=None, checkpoint=None):
                    'scanner_held_files': run.scanner_held if run else 0,
                    'catalog_withheld': run.catalog_withheld if run else 0,
                    'catalog_withheld_manifests': len(st.get('catalog_withheld') or []),
+                   'catalog_withheld_other': int(st.get('catalog_withheld_other') or 0),
                    'scanner': 'gitleaks %s + pass 2' % GITLEAKS_VERSION},
         'last_progress_at': st.get('last_progress_at') or st.get('created_at'),
         'killswitch': os.path.exists(cfg.p('killswitch.json')), 'notes': run.notes if run else [],
@@ -2477,7 +2487,7 @@ def sync_body(run, backfill):
         run.status = 'failed'
     for e in run.st['files'].values():
         e.pop('retry_of', None)  # a retry that ended without a new hold released the file
-    if (run.catalog_withheld or run.st.get('catalog_withheld')) and run.status == 'ok':
+    if (run.catalog_withheld or catalog_incomplete(run.st)) and run.status == 'ok':
         run.status = 'held'
     held = held_summary(run.st)
     if held['count'] and run.status == 'ok':

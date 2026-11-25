@@ -637,7 +637,9 @@ class Properties(unittest.TestCase):
         start = time.process_time()
         out, _, omitted = tr.redact_line(line, 1)
         elapsed = time.process_time() - start
-        self.assertLess(elapsed, 3.0)
+        # 3.0 s until ruleset 2026.11.24-1: the 12 vendor shapes of click-test O1 add one anchor scan each per copy
+        # pass 1 and pass 2 look at (measured on the Mac, best of 3, 5 MB line: 2.70 s before, 3.36 s after)
+        self.assertLess(elapsed, 4.0)
         self.assertIsNone(omitted)
 
     def test_keyword_dense_input_scales_linearly(self):

@@ -56,7 +56,7 @@ from urllib.parse import unquote
 
 import redact
 
-RULESET_VERSION = "2026.11.23-5"  # bump on any rule change: staged chunks with an older version are re-redacted
+RULESET_VERSION = "2026.11.24-1"  # bump on any rule change: staged chunks with an older version are re-redacted
 
 MAX_NEST = 8  # JSON-in-a-string decoding depth, pass 1 and pass 2; read only by _decode_nested
 _MAX_QUOTED_LAYERS = 64  # at the limit, quoted JSON-string layers unwrapped while looking for an object or array
@@ -174,8 +174,32 @@ _ANCHORS = {
     'email': ('@',),
 }
 
+# Vendor token shapes the third gate (gitleaks 8.30.1) flags but redact.py does not (PR #316 click-test O1). A record
+# quoting one is redacted here instead of the whole file being held. Each shape is generous on length so a gitleaks
+# hit is always inside a redacted span; tests/test_transcript_vendor_shapes.py checks every fixture against the real
+# scanner's rule ids where it is installed. (kind, anchors, pattern)
+_B = r'(?<![A-Za-z0-9_])'  # a token starts at a word boundary
+_VENDOR = [
+    ('twilio', ('sk',), _B + r'SK[0-9a-fA-F]{32}(?![0-9a-fA-F])'),
+    ('shopify', ('shpat_', 'shpca_', 'shppa_', 'shpss_'), _B + r'shp(?:at|ca|pa|ss)_[a-fA-F0-9]{32,64}'),
+    ('doppler', ('dp.',), r'(?i)' + _B + r'dp\.(?:pt|st|sa|ct|scim|audit)\.[a-z0-9]{40,64}'),
+    ('square', ('sq0atp-', 'sq0csp-', 'eaaa'), _B + r'(?:sq0(?:atp|csp)-|EAAA)[0-9A-Za-z_-]{22,100}'),
+    ('databricks', ('dapi',), _B + r'dapi[a-f0-9]{32}(?:-[0-9]{1,2})?'),
+    ('age', ('age-secret-key-1',), r'AGE-SECRET-KEY-1[QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L]{58}'),
+    ('slack-webhook', ('hooks.slack.com',),
+     r'(?i)(?:https?://)?hooks\.slack\.com/(?:services|workflows|triggers)/[A-Za-z0-9+/_-]{20,200}(?:/[A-Za-z0-9+/_-]{1,200}){0,3}'),
+    ('pypi', ('pypi-ageichlwas5vcmc',), r'pypi-AgEIcHlwaS5vcmc[A-Za-z0-9_-]{50,4096}'),
+    ('grafana', ('glsa_', 'glc_'), _B + r'(?:glsa_[A-Za-z0-9]{32}_[A-Fa-f0-9]{8}|glc_[A-Za-z0-9+/]{32,400}={0,2})'),
+    ('linear', ('lin_api_',), r'(?i)' + _B + r'lin_api_[a-z0-9]{40,64}'),
+    ('flyio', ('fo1_', 'fm1', 'fm2'), _B + r'(?:fo1_[A-Za-z0-9_-]{43,64}|fm[12][ar]?_[A-Za-z0-9+/]{100,4096}={0,3})'),
+    ('planetscale', ('pscale_',), _B + r'pscale_(?:tkn|pw|oauth)_[A-Za-z0-9=._-]{32,64}'),
+]
+for _kind, _anchors, _ in _VENDOR:
+    _ANCHORS[_kind] = _anchors
+
 _EXTRA = [
     ('named-credential', _NAMED),
+] + [(kind, re.compile(pattern)) for kind, _, pattern in _VENDOR] + [
     # redact.py's bearer needs whitespace; pass 2 also accepts "bearer:" and "bearer=", so pass 1 must too.
     ('bearer', re.compile(r'(?i)bearer[ \t:=]{1,4}(?P<v>[A-Za-z0-9._~+/=-]{8,4096})')),
     ('auth-header', re.compile(
@@ -757,7 +781,8 @@ _V2 = [
     ('v2-envpass', ('pgpassword', '_pwd', 'secret_key'), re.compile(
         r'(?i)(?:pgpassword|_pwd|secret_key)' + _V2_WS + r'=' + _V2_WS + r'(?!\[)[^\s"\']{4,}')),
     ('v2-cookie', ('cookie',), re.compile(r'(?i)cookie:' + _V2_WS + r'(?!\[)[^=\s;"]{1,64}=[^;\s"]{8,}')),
-]
+] + [('v2-' + kind, anchors, re.compile(pattern)) for kind, anchors, pattern in _VENDOR]  # O1: one table, both passes
+# (pass 2 shares these shapes with pass 1; gitleaks stays the independent third gate over the same tokens)
 _V2_KEY_SUFFIX = ('password', 'passwd', 'secret', 'apikey', 'accesstoken', 'refreshtoken', 'authtoken',
                   'clientsecret', 'privatekey', 'sessiontoken', 'authorization', 'cookie')
 _V2_ANSI = re.compile(r'\x1b(?:\[[\x30-\x3f]{0,64}[\x20-\x2f]{0,16}[\x40-\x7e]|\][^\x07\x1b]{0,4096}(?:\x07|\x1b\\)?|[\x40-\x5f])')

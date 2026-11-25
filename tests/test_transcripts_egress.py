@@ -224,12 +224,11 @@ class WithheldManifestTest(Base):
         self.addCleanup(setattr, T, 'manifest_of', orig)
         code, r = self.sync('takeover')
         self.assertEqual(r['status'], 'held')
-        self.assertEqual(r['egress'].get('catalog_withheld_manifests', 1), 1)
         self.assertTrue(self.chunks(), 'the chunks themselves archived')
         code, r = self.sync('takeover')  # nothing changed: before the fix this run reported ok
         self.assertNotEqual(code, 0)
         self.assertEqual(r['status'], 'held')
-        self.assertEqual(r['egress'].get('catalog_withheld_manifests', 1), 1)
+        self.assertEqual(r['egress']['catalog_withheld_manifests'], 1)
         self.assertEqual(self.state()['catalog_withheld'], [key])
         self.assertFalse(marker.encode() in all_object_bytes(self))
         T.manifest_of = orig
@@ -238,6 +237,29 @@ class WithheldManifestTest(Base):
         self.assertEqual(self.state()['catalog_withheld'], [])
         mpath = T.manifest_path(T.Cfg(), key)
         self.assertIn(mpath, self.tree(T.CATALOG), 'the manifest is published once it passes')
+
+    def test_a_dropped_index_line_keeps_the_status_off_ok_until_it_passes(self):
+        """Gate F1, non-manifest side: an index line dropped at the gate is retried by the next unchanged run."""
+        self.write('claude-projects', '-work-a/%s.jsonl' % UUID1, rec(1) + rec(2))
+        orig = T.index_rows
+        marker = 'GLFAKE-' + secrets.token_hex(6)
+
+        def dirty(cfg, st):
+            rows = orig(cfg, st)
+            return rows + [dict(rows[0], name=marker)] if rows else rows
+        T.index_rows = dirty
+        self.addCleanup(setattr, T, 'index_rows', orig)
+        code, r = self.sync('takeover')
+        self.assertEqual(r['status'], 'held')
+        code, r = self.sync('takeover')  # unchanged: the catalog is still incomplete
+        self.assertNotEqual(code, 0)
+        self.assertEqual(r['status'], 'held')
+        self.assertEqual(r['egress']['catalog_withheld_other'], 1)
+        self.assertFalse(marker.encode() in all_object_bytes(self))
+        T.index_rows = orig
+        code, r = self.sync('takeover')
+        self.assertEqual(r['status'], 'ok', r)
+        self.assertEqual(r['egress']['catalog_withheld_other'], 0)
 
 
 class ReadOnceTest(Base):
@@ -262,12 +284,15 @@ class ReadOnceTest(Base):
             return out
         T.egress_check = swap
         self.addCleanup(setattr, T, 'egress_check', orig)
-        with self.assertRaises(Exception):
+        with self.assertRaises(T.GitError) as cm:
             T.publish_tree(cfg, 'agent-transcripts-x', {'c.zst': p}, 'm')
+        self.assertIn('hash mismatch', str(cm.exception))
         self.assertIsNone(self.tip('agent-transcripts-x'))
 
 
 REAL_PATH = os.environ.get('PATH', '')  # read at import, before Base puts the stub scanner first on PATH
+# read at import too: Base.setUp clears every TRANSCRIPTS_* variable before a test's own setUp runs
+REQUIRE_GITLEAKS = os.environ.get('TRANSCRIPTS_REQUIRE_GITLEAKS') == '1'
 REAL_HOME = os.path.expanduser('~')
 
 
@@ -288,7 +313,7 @@ class RealGitleaksTest(Base):
         super().setUp()
         b = real_gitleaks()
         if not b:
-            if os.environ.get('TRANSCRIPTS_REQUIRE_GITLEAKS') == '1':
+            if REQUIRE_GITLEAKS:
                 self.fail('gitleaks %s is required on this host but was not found' % T.GITLEAKS_VERSION)
             self.skipTest('real gitleaks not installed on this host')
         self.setenv(TRANSCRIPTS_GITLEAKS=b)
