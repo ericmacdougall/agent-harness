@@ -387,6 +387,7 @@ def caller_roles(home, session, agent=""):
 
 def _live_patterns():
     try:
+        # input-ok: the shipped policy file beside this script
         policy = json.loads(Path(__file__).resolve().with_name("kill_guard_policy.json").read_text())
         return [re.compile(p) for p in policy.get("staging_live") or [] if isinstance(p, str)]
     except (OSError, ValueError, re.error):

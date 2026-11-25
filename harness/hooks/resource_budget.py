@@ -155,6 +155,7 @@ def _log_ignored(line: str) -> None:
         try:
             with open(path, "rb") as handle:
                 handle.seek(max(0, os.path.getsize(path) - 1024))
+                # input-ok: the tail after a seek to the last 1 KB of its own log
                 if handle.read().decode("utf-8", "replace").rstrip("\n").endswith(line):
                     return
         except OSError:

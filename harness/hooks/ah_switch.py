@@ -92,6 +92,7 @@ def read_json(path: Path):
 
 def read_text(path: Path):
     try:
+        # input-ok: the harness's own release and install files, read by the user's switch command
         return path.read_bytes().decode("utf-8")
     except FileNotFoundError:
         return None
@@ -486,6 +487,7 @@ def clear_pending(home, flavor) -> None:
 def read_release(root) -> int:
     """harness/RELEASE of a checkout: one integer. A checkout without it predates the floor (release 0)."""
     try:
+        # input-ok: the harness's own release and install files, read by the user's switch command
         return int((Path(root) / "harness" / "RELEASE").read_text().strip())
     except (OSError, ValueError):
         return 0
@@ -536,6 +538,7 @@ def write_snapshot(home, flavor, release, commit, files, settings_spec=None, ins
         for path in files:
             path = Path(path)
             rel = path.relative_to(home).as_posix()
+            # input-ok: the harness's own release and install files, read by the user's switch command
             data = path.read_bytes()
             target = tmp / "files" / rel
             target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -730,6 +733,7 @@ def check_flavor(home, flavor, entry, state, repair=False, now=None) -> dict:
     changed = []
     for rel, meta in sorted(snap["files"].items()):
         try:
+            # input-ok: the harness's own release and install files, read by the user's switch command
             current = sha256((home / rel).read_bytes())
         except OSError:
             current = None
@@ -776,6 +780,7 @@ def check_flavor(home, flavor, entry, state, repair=False, now=None) -> dict:
         root = ah_dir(home) / "releases" / str(release) / flavor / "files"
         for rel in changed:
             meta = snap["files"][rel]
+            # input-ok: the harness's own release and install files, read by the user's switch command
             write_atomic(home / rel, (root / rel).read_bytes(), int(meta.get("mode") or 0o600))
         fixed.append(f"{len(changed)} file(s)")
     if new_hooks is not None:

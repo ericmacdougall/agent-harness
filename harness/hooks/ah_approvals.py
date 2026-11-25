@@ -165,13 +165,16 @@ def _inside(path: str, root: str) -> bool:
 def repo_slugs(directory) -> set:
     """owner/name of the GitHub remotes in a checkout's .git/config (lower case); empty when unreadable."""
     try:
+        import safe_input  # noqa: PLC0415 - bounded reads: this runs inside guards
         git = Path(_real(directory)) / ".git"
         if git.is_file():  # a linked worktree: "gitdir: <main>/.git/worktrees/<name>"
-            pointer = git.read_text(errors="replace").strip()
+            pointer = safe_input.read_bounded(git, 4096).decode("utf-8", "replace").strip()
             if pointer.startswith("gitdir:"):
                 git = Path(pointer.split(":", 1)[1].strip()).parent.parent
-        text = (git / "config").read_text(errors="replace")[:65536]
-    except OSError:
+        text = safe_input.read_bounded(git / "config", 1 << 20).decode("utf-8", "replace")
+    except (OSError, ValueError):
+        return set()
+    except Exception:  # noqa: BLE001 - safe_input.InputRejected (oversized or not a regular file): no slugs
         return set()
     return {m.lower() for m in REMOTE.findall(text)}
 

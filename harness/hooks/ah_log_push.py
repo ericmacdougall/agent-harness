@@ -102,6 +102,7 @@ def visibility_refusal(url: str, gh_runner=subprocess.run) -> str | None:
 
 def load_config(home=None) -> dict:
     try:
+        # input-ok: the CLI's own small config file under ~/.agent-harness/state
         data = json.loads((state(home) / CONFIG_NAME).read_text())
     except (OSError, ValueError):
         raise PushError("not_configured", "no log repository is set: run `ah log-push --setup <private repo url>`")

@@ -58,6 +58,7 @@ class SecretError(Exception):
 def config(home=None) -> dict:
     path = Path(home or Path.home()) / '.agent-harness' / 'secrets.json'
     try:
+        # input-ok: the user's own secret store or file, read by the user's CLI command
         data = json.loads(path.read_text())
     except (OSError, ValueError):
         return {}
@@ -250,6 +251,7 @@ class FileStore(Store):
 
     def get(self, name):
         try:
+            # input-ok: the user's own secret store or file, read by the user's CLI command
             return self._target(name).read_bytes()
         except OSError as error:
             raise SecretError('not_found', 'cannot read %s (%s)' % (name, type(error).__name__))
@@ -289,6 +291,7 @@ def _source(spec) -> bytes:
         return sys.stdin.buffer.read(MAX_VALUE * 64 + 1)
     if spec.startswith('file:') and len(spec) > 5:
         try:
+            # input-ok: the user's own secret store or file, read by the user's CLI command
             return Path(os.path.expanduser(spec[5:])).read_bytes()
         except OSError as error:
             raise SecretError('bad_request', 'cannot read the source file (%s)' % type(error).__name__)

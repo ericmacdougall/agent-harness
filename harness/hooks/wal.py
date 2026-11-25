@@ -346,7 +346,7 @@ def changed(state: dict, key: str, signature: str) -> bool:
     return True
 
 
-def budget_once(session, name: str, fingerprint: str = "", *, every_s: float = 0, signature: str | None = None,
+def budget_once(session, name: str, fingerprint: str = "", *, every_s: float = 0, signature: "str | None" = None,
                 home=None) -> bool:
     """One call for the other hooks: may `name` speak now? Silent repeats of the same registration within the
     duplicate window, and (when given) more than once per `every_s`, or the same `signature` as last time, all
