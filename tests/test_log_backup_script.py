@@ -2075,7 +2075,9 @@ class BulkBackoff(Case):
         return p.read_text().split() if p.exists() else None
 
     def bulk_sent(self):
-        return [c for c in self.copies() if any(".agent-harness/work" in a or "archived_sessions" in a for a in c)]
+        # by destination only: a checkout under ~/.agent-harness/work (t2-dev) puts that path in --exclude-from too
+        return [c for c in self.copies()
+                if c[-1].split("/testhost/", 1)[-1].startswith((".agent-harness/work", ".codex/archived_sessions"))]
 
     def test_a_throttled_bulk_run_backs_off_and_the_next_run_skips_bulk_but_not_tier_1(self):
         t0 = int(time.time())
