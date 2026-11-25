@@ -10,6 +10,7 @@ Every guard and gate asks here instead of keeping its own idea of roles.
   supervised_roots(payload) the project directories that supervisor covers.
   may_delete(payload, path) (allowed, reason): the delete rule the user set on 2026-11-24.
   may_handle_secrets(payload) Fable and Astra may; nobody else.
+  may_edit_harness(payload) a Fable or Astra session marked as supervisor may change the harness itself.
 
 Rules (the user, 2026-11-24):
   * Fable and Astra may delete files and folders anywhere, and may handle secrets.
@@ -225,9 +226,17 @@ def may_handle_secrets(payload) -> bool:
     return is_top_rung(payload)
 
 
+def may_edit_harness(payload, home=None) -> bool:
+    """A Fable or Astra session the user marked as a supervisor is a harness maintainer (the user, 2026-11-24): it
+    may change the harness machinery itself (hook scripts, guard policies, the instruction block, hook wiring) and
+    weaken a guard to fit reality, with the user's approval recorded in `ah approvals` (kind `harness`). No guard
+    refuses it for working on the harness."""
+    return is_top_rung(payload) and is_supervisor(payload, home)
+
+
 def describe(payload, home=None) -> dict:
     return {"off": harness_off(home), "model": caller_model(payload), "top_rung": is_top_rung(payload),
-            "supervisor": is_supervisor(payload, home),
+            "supervisor": is_supervisor(payload, home), "harness_maintainer": may_edit_harness(payload, home),
             "supervised": [str(p) for p in supervised_roots(payload, home)],
             "own": [str(p) for p in own_roots(payload, home)]}
 
