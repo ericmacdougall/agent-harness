@@ -4082,6 +4082,9 @@ def main(argv=None) -> int:
     if given[:2] in (["task", "kit"], ["task", "succeed"], ["task", "kits"]):  # goodqa#15565: successor kit (successor.py)
         import successor  # noqa: PLC0415
         return successor._cli(["list" if given[1] == "kits" else given[1]] + given[2:])
+    if given[:1] == ["secret"]:  # clipboard -> secret store, and use without printing (ah_secret.py, docs/secrets.md)
+        import ah_secret  # noqa: PLC0415
+        return ah_secret.main(given[1:])
     if given[:1] == ["decision"]:  # goodqa#16651: signed central top-rung decisions (central_decisions.py)
         import central_decisions  # noqa: PLC0415
         return central_decisions.main(given[1:])
