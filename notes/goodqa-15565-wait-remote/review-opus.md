@@ -1,0 +1,6 @@
+# Opus adversarial review, goodqa#15565 wait-remote (agent a0c568dfa08e7eb86)
+
+Spec at 64092686: BLOCK. No way to run caller text found; F1 stale match (a reused log already holds the text), F2 tail exit 1 covers missing and unreadable, F3 a quoted tilde path never matches, F4 the found or timeout answer is a substring oracle over any remote file (command_guard credential and protected-path rules must apply to the file); lows: ssh 255 also covers auth and host-key failures, POSIX shell assumption, bounded stderr, no fail line, ssh config ProxyCommand. Spec at f430418e: BLOCK, B1 a malformed size line must be UNPROVEN and never a reset, B2 the offset must advance by bytes received, with NEGs; folded in (AC-1, AC-2, D4, AC-10, NEG-13 to NEG-17) with the ACCEPT condition met by cc5386a8.
+Code at cc5386a8: BLOCK, H1 the read-on `continue` skipped the deadline check (the timeout stopped bounding the wait), H2 raw_sensitive refused run-kit and .claude logs (the main use case). Both fixed at 74dc6a68 with an endless-stub test and allow-tests.
+At 773c3cd5: ACCEPT (code and spec; dropping the two transcript-path refusals from the tests is not material, decide() allows reading them, so parity with the guard's read rules holds).
+Verdict: ACCEPT

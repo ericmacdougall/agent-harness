@@ -17,6 +17,17 @@ wrote atomically to a status file. Anything unproven fails closed.
       exit 0 only when the status file says the job exited 0. Exit 1: the job ran and failed (EXIT_STATUS=n).
       Exit 2: no trustworthy status (missing, garbled, wrong job, or dead with no status) -> fail closed.
       Exit 3: timeout while still running.
+  bg_job.py wait --name N --ssh-job
+      Same, but a job whose status is 255 (ssh's own connection failure) is INFRA, exit 5, not a failed job.
+  bg_job.py wait-remote --host H --file F --until-file-line TEXT --timeout S [--fail-line TEXT] [--include-existing]
+      Waits for TEXT (a fixed substring) in bytes appended to a remote log, polling over ssh with one fixed read-only
+      command (retried once on a connection failure). Exit 0 LINE_FOUND; 1 FAIL_LINE_FOUND; 2 UNPROVEN (remote command
+      failed, file unreadable, ssh refused: auth, host key, name); 3 TIMEOUT; 5 INFRA (the link kept failing); 64 usage
+      (bad arguments, or the file is a path command_guard refuses to read). Baseline: only bytes appended after the first
+      successful look count (a line written before it, including while the link was down, counts as existing), so a run launched BEFORE the wait can finish first and be missed. Give the run its own fresh log and use
+      --include-existing, or for a log appended across runs take its size before the launch and pass --from-offset N.
+      Limits: wait on an append-only log; a path command_guard does not know is not judged; ssh config ProxyCommand, LocalCommand
+      and RemoteCommand apply as for plain ssh; the remote needs a POSIX login shell.
   bg_job.py status --name N [--dir D]
       Prints RUNNING / EXITED status=n / LOST / ... (exit 0 for a readable record, 2 otherwise).
 
@@ -53,6 +64,7 @@ MAX_RECORD_BYTES = 64 * 1024
 EXIT_OK, EXIT_JOB_FAILED, EXIT_UNPROVEN, EXIT_TIMEOUT = 0, 1, 2, 3
 EXIT_FAILED_TO_START = 3
 EXIT_USAGE = 64
+EXIT_INFRA = 5
 
 
 def job_dir(arg):
@@ -318,6 +330,16 @@ def supervise(args, proc, nonce, log, status, argv, before):
     return fail(reason)
 
 
+def _exited(args, code):
+    """Print and return the outcome of a job that exited with `code`. With --ssh-job a status of 255 (ssh's own connection
+    failure) is infrastructure, not a failed task (goodqa#15565 item 7)."""
+    if code == 255 and getattr(args, "ssh_job", False):
+        print("INFRA name=%s EXIT_STATUS=255 (an ssh connection failure, not a job failure)" % args.name)
+        return EXIT_INFRA
+    print("EXITED name=%s EXIT_STATUS=%d" % (args.name, code))
+    return EXIT_OK if code == 0 else EXIT_JOB_FAILED
+
+
 def cmd_wait(args):
     record, why = load_record(job_dir(args.dir), args.name)
     if record is None:
@@ -327,8 +349,7 @@ def cmd_wait(args):
     while True:
         code, why = read_status(record)
         if code is not None:
-            print("EXITED name=%s EXIT_STATUS=%d" % (args.name, code))
-            return EXIT_OK if code == 0 else EXIT_JOB_FAILED
+            return _exited(args, code)
         if why != "missing":
             print("UNPROVEN name=%s reason=status file %s" % (args.name, why))
             return EXIT_UNPROVEN
@@ -338,8 +359,7 @@ def cmd_wait(args):
             # Status is written before the wrapper exits; one last look closes the exit/read race.
             code, why = read_status(record)
             if code is not None:
-                print("EXITED name=%s EXIT_STATUS=%d" % (args.name, code))
-                return EXIT_OK if code == 0 else EXIT_JOB_FAILED
+                return _exited(args, code)
             print("UNPROVEN name=%s reason=process is gone and left no status (killed, or its PID was reused)" % args.name)
             return EXIT_UNPROVEN
         if end is not None and time.time() >= end:
@@ -427,6 +447,249 @@ def cmd_wait_file(args):
         time.sleep(max(0.05, min(args.poll, end - time.time())))  # the timeout stays a hard bound
 
 
+# ---- wait-remote (goodqa#15565 items 7 and 8) ----
+# Wait for a line to be APPENDED to a log on a remote host. The remote command is one fixed read-only template; the only
+# caller text in it is the shell-quoted file name and an integer offset. The ssh binary and its options are fixed.
+SSH = "/usr/bin/ssh"
+SSH_OPTIONS = ("-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2")
+SSH_CALL_BOUND = 30  # seconds per ssh call: a hung connection counts as an infrastructure failure
+READ_CAP = 65536
+REMOTE_TEMPLATE = ("[ -e {f} ] || exit 10; [ -f {f} ] && [ -r {f} ] || exit 11; wc -c < {f} || exit 12; "
+                   "{{ tail -c +{off} -- {f}; echo __bgjob_rc=$? >&2; }} | head -c %d" % READ_CAP)
+EXIT_ABSENT, EXIT_UNREADABLE = 10, 11
+HOST_RE = re.compile(r"^([A-Za-z0-9._-]{1,32}@)?[A-Za-z0-9][A-Za-z0-9.-]{0,62}$")
+SSH_REFUSED = re.compile(r"Permission denied|Host key verification failed|Could not resolve hostname")
+MAX_POLLS_LIMIT = 20
+
+
+def _bad_text(value, limit, what):
+    if not isinstance(value, str) or not 1 <= len(value) <= limit or re.search(r"[\0\r\n]", value):
+        return "%s must be 1 to %d characters without NUL or a line break" % (what, limit)
+    return None
+
+
+def remote_arguments_problem(args):
+    """None, or why the arguments are refused before any ssh call (exit 64)."""
+    if not HOST_RE.match(args.host or ""):
+        return "--host must be [user@]host (letters, digits, . - _), not starting with - or ."
+    problem = _bad_text(args.file, 512, "--file") or _bad_text(args.until_file_line, 200, "--until-file-line")
+    if problem is None and args.fail_line is not None:
+        problem = _bad_text(args.fail_line, 200, "--fail-line")
+    if problem:
+        return problem
+    if args.file.startswith("~"):
+        return "--file must not start with ~ (use an absolute path or a path relative to the remote home)"
+    if args.timeout is None or not math.isfinite(args.timeout) or not 0 < args.timeout <= MAX_FILE_WAIT_S:
+        return "--timeout is required, 1 to %d seconds" % MAX_FILE_WAIT_S
+    if not math.isfinite(args.poll) or not 0.05 <= args.poll <= 60:
+        return "--poll must be between 0.05 and 60 seconds"
+    if not 1 <= args.max_infra_polls <= MAX_POLLS_LIMIT:
+        return "--max-infra-polls must be between 1 and %d" % MAX_POLLS_LIMIT
+    if args.from_offset is not None and (args.include_existing or not 0 <= args.from_offset < 2 ** 50):
+        return "--from-offset must be a byte count >= 0 and cannot be combined with --include-existing"
+    return None
+
+
+def file_judged_by_guard(path):
+    """(allowed, why). The wait answers found or not found about any remote file, which is a substring oracle: the
+    credential and protected-location rules that refuse `ssh host cat FILE` apply to FILE too. No guard, no wait."""
+    try:
+        import shlex
+        import command_guard
+        # a relative path is relative to the remote home: judge it as ~/PATH too (the Mac's home differs from the host's)
+        forms = [shlex.quote(path)] if path.startswith("/") else [shlex.quote(path), '"$HOME"/' + shlex.quote(path)]
+        # raw_credential (credential locations), not raw_sensitive: run kits and job logs live under ~/.agent-harness and
+        # ~/.claude, and reading them is what this command is for; decide() below judges the read itself
+        for text in [path] + ([] if path.startswith("/") else ["~/" + path]):
+            if command_guard.raw_credential(text):
+                return False, "the path names a credential location"
+        for form in forms:
+            verdict, message = command_guard.decide("cat -- " + form)
+            if verdict == "block":
+                return False, str(message)[:200]
+    except Exception as exc:  # noqa: BLE001 - fail closed
+        return False, "command_guard could not judge the path (%s)" % type(exc).__name__
+    return True, ""
+
+
+def _bounded_line(text):
+    for line in (text or "").splitlines():
+        if line.strip():
+            return re.sub(r"[^\x20-\x7e]", "?", line.strip())[:160]
+    return ""
+
+
+OVERFLOW = -2  # _ssh_once: stdout went past its cap and the process was stopped
+
+
+def _stop_and_reap(proc):
+    proc.terminate()
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        proc.send_signal(signal.SIGKILL)
+        proc.wait()
+
+
+def _ssh_once(host, command, budget=SSH_CALL_BOUND):
+    """(status, stdout bytes, stderr text) for one ssh call, bounded in time (`budget` seconds, at most SSH_CALL_BOUND) and in
+    bytes (both streams are read with a hard cap, never buffered whole). A hung call returns 255 with a timeout note; stdout
+    past its cap stops and reaps the process and returns OVERFLOW; stderr past its cap does the same and returns 255."""
+    import selectors
+    argv = [SSH, *SSH_OPTIONS, "--", host, command]
+    env = {k: os.environ[k] for k in ("PATH", "HOME", "SSH_AUTH_SOCK", "LANG") if k in os.environ}
+    budget = min(SSH_CALL_BOUND, max(0.0, budget))
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    except OSError as exc:
+        return 255, b"", "ssh could not start (%s)" % type(exc).__name__
+    caps = {proc.stdout: READ_CAP + 64, proc.stderr: 2000}
+    bufs = {proc.stdout: b"", proc.stderr: b""}
+    stop, outcome = time.monotonic() + budget, None
+    sel = selectors.DefaultSelector()
+    try:
+        for stream in caps:
+            sel.register(stream, selectors.EVENT_READ)
+        while sel.get_map() and outcome is None:
+            left = stop - time.monotonic()
+            if left <= 0:
+                outcome = "timeout"
+                break
+            for key, _events in sel.select(min(left, 1.0)):
+                stream = key.fileobj
+                chunk = os.read(stream.fileno(), 65536)
+                if not chunk:
+                    sel.unregister(stream)
+                    continue
+                room = caps[stream] - len(bufs[stream])
+                bufs[stream] += chunk[:room]
+                if len(chunk) > room:
+                    outcome = "overflow-out" if stream is proc.stdout else "overflow-err"
+                    break
+        if outcome is None:
+            try:
+                proc.wait(timeout=max(0.1, stop - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                outcome = "timeout"
+    finally:
+        sel.close()
+        if outcome is not None or proc.poll() is None:
+            _stop_and_reap(proc)
+        for stream in (proc.stdout, proc.stderr):
+            stream.close()
+    err = bufs[proc.stderr].decode("utf-8", "replace")
+    if outcome == "timeout":
+        return 255, b"", "ssh call timed out after %d s" % budget
+    if outcome == "overflow-out":
+        return OVERFLOW, b"", "ssh output went past its cap after %d bytes" % len(bufs[proc.stdout])
+    return (255 if outcome else proc.returncode), bufs[proc.stdout], err
+
+
+def _poll(host, quoted, offset, end):
+    """One poll, with the single retry on a connection failure, never past the deadline `end` (a time.monotonic value):
+    (kind, size, data, note); kind is ok, absent, unreadable, refused (not infrastructure), infra, failed or deadline."""
+    command = REMOTE_TEMPLATE.format(f=quoted, off=offset + 1)
+    for attempt in (0, 1):
+        budget = end - time.monotonic()
+        if budget <= 0:  # no time left for this attempt (or for the retry)
+            return "deadline", 0, b"", ""
+        status, out, err = _ssh_once(host, command, min(SSH_CALL_BOUND, budget))
+        if status == OVERFLOW:
+            return "failed", 0, b"", "the remote sent more than the read cap"
+        if status == 255:
+            if SSH_REFUSED.search(err):
+                return "refused", 0, b"", _bounded_line(err)
+            if attempt == 0:
+                continue
+            return "infra", 0, b"", _bounded_line(err)
+        break
+    if status == EXIT_ABSENT:
+        return "absent", 0, b"", ""
+    if status == EXIT_UNREADABLE:
+        return "unreadable", 0, b"", ""
+    if status != 0:
+        return "failed", 0, b"", "exit %d" % status
+    head, _, data = out.partition(b"\n")
+    if not re.fullmatch(rb"\s*[0-9]{1,18}\s*", head):  # a banner, empty output or a garbled size is never a reset
+        return "failed", 0, b"", "no size line"
+    size, data = int(head), data[:READ_CAP]
+    # the template's `tail | head` pipeline reports head's status, so the read status travels in a marker on stderr
+    marker = re.search(r"__bgjob_rc=([0-9]+)", err)
+    if marker is None:
+        return "failed", 0, b"", "no read status"
+    code = int(marker.group(1))
+    if code != 0 and not (code == 141 and len(data) >= READ_CAP):  # 141: tail stopped by head at the cap, a full read
+        return "failed", 0, b"", "the remote read failed (tail exit %d)" % code
+    return "ok", size, data, ""
+
+
+def cmd_wait_remote(args):
+    import shlex
+    problem = remote_arguments_problem(args)
+    if problem is None:
+        allowed, why = file_judged_by_guard(args.file)
+        problem = None if allowed else "--file refused by command_guard: %s" % why
+    if problem:
+        print("UNPROVEN reason=%s" % problem)
+        return EXIT_USAGE
+    quoted = shlex.quote(args.file)
+    until, fail = args.until_file_line.encode(), (args.fail_line.encode() if args.fail_line else None)
+    keep = max(len(until), len(fail or b"")) - 1
+    name = os.path.basename(args.file)[:40] or "file"
+    end = time.monotonic() + args.timeout  # one deadline for the whole wait, passed into every ssh attempt
+    # offset = bytes of the file already examined. It starts at 0 and moves only by the bytes RECEIVED (never by the reported
+    # size, which the read cap can outrun), except for the first look at an existing file: that sets it to the size, so only
+    # appended bytes count, unless --include-existing or the caller's own baseline --from-offset (taken before the launch).
+    offset, carry, first, infra_polls = 0, b"", True, 0
+    if args.from_offset is not None:
+        offset, first = args.from_offset, False
+    while True:
+        kind, size, data, note = _poll(args.host, quoted, offset, end)
+        if kind in ("ok", "absent", "infra") and time.monotonic() >= end:
+            kind = "deadline"  # a result that arrives after the deadline is not accepted, a match included
+        if kind == "deadline":
+            pass
+        elif kind == "infra":
+            infra_polls += 1
+            if infra_polls >= args.max_infra_polls:
+                print("INFRA host=%s polls=%d %s" % (args.host, infra_polls, note))
+                _wait_alert(name, "infra", "ssh to %s failed %d polls in a row (%s)" % (args.host, infra_polls, note))
+                return EXIT_INFRA
+        elif kind == "refused":
+            print("UNPROVEN host=%s reason=ssh refused (%s)" % (args.host, note))
+            return EXIT_UNPROVEN
+        elif kind in ("unreadable", "failed"):
+            print("UNPROVEN host=%s file=%s reason=remote command failed (%s)" % (
+                args.host, args.file, "not a readable regular file" if kind == "unreadable" else note))
+            return EXIT_UNPROVEN
+        else:
+            infra_polls = 0
+            if kind == "ok":
+                if first and not args.include_existing:
+                    offset, data = size, b""  # only what is appended after this first look counts (D2)
+                elif size < offset:  # truncated or rotated: judge the new content from its start
+                    offset, carry, data = 0, b"", b""
+                first = False
+                buf = carry + data
+                offset += len(data)
+                carry = buf[-keep:] if keep > 0 else b""
+                if fail is not None and fail in buf:
+                    print("FAIL_LINE_FOUND host=%s file=%s" % (args.host, args.file))
+                    return EXIT_JOB_FAILED
+                if until in buf:
+                    print("LINE_FOUND host=%s file=%s" % (args.host, args.file))
+                    return EXIT_OK
+                if len(data) >= READ_CAP and time.monotonic() < end:
+                    continue  # more is waiting: read on without sleeping, but never past the deadline
+            else:  # absent: not there yet; a file that appears later holds only new bytes
+                first = False
+        if time.monotonic() >= end:
+            print("TIMEOUT host=%s file=%s line not seen after %ss" % (args.host, args.file, args.timeout))
+            _wait_alert(name, "timeout", "%s on %s did not show the line after %ss" % (args.file, args.host, args.timeout))
+            return EXIT_TIMEOUT
+        time.sleep(max(0.05, min(args.poll, end - time.monotonic())))
+
+
 def cmd_status(args):
     record, why = load_record(job_dir(args.dir), args.name)
     if record is None:
@@ -460,6 +723,22 @@ def main(argv=None):
     p.add_argument("--name", required=True)
     p.add_argument("--timeout", type=float)
     p.add_argument("--dir")
+    p.add_argument("--ssh-job", dest="ssh_job", action="store_true",
+                   help="the job is an ssh command: report its exit status 255 as INFRA (exit 5), not as a failed job")
+    p = sub.add_parser("wait-remote")
+    p.add_argument("--host", required=True)
+    p.add_argument("--file", required=True)
+    p.add_argument("--until-file-line", dest="until_file_line", required=True,
+                   help="a fixed text (not a pattern) to wait for in bytes appended to the remote file")
+    p.add_argument("--fail-line", dest="fail_line", help="a fixed text that ends the wait early as a failure (exit 1)")
+    p.add_argument("--include-existing", dest="include_existing", action="store_true",
+                   help="also match what the file already holds at the first look (default: only appended bytes)")
+    p.add_argument("--from-offset", dest="from_offset", type=int,
+                   help="count only bytes after this offset (the file size taken BEFORE the run was launched); for a log "
+                        "appended across runs. A run with its own fresh log needs no baseline: use --include-existing")
+    p.add_argument("--timeout", type=float, help="required: seconds, at most 86400")
+    p.add_argument("--poll", type=float, default=1.0)
+    p.add_argument("--max-infra-polls", dest="max_infra_polls", type=int, default=3)
     p = sub.add_parser("wait-file")
     p.add_argument("--file", required=True)
     p.add_argument("--producer", required=True, help="what writes the file: job:<bg_job name> or pid:<number>")
@@ -485,7 +764,8 @@ def main(argv=None):
             print("UNPROVEN reason=--%s must be a finite number >= 0" % opt)
             return EXIT_USAGE
     try:
-        return {"launch": cmd_launch, "wait": cmd_wait, "wait-file": cmd_wait_file, "status": cmd_status}[args.cmd](args)
+        return {"launch": cmd_launch, "wait": cmd_wait, "wait-file": cmd_wait_file, "wait-remote": cmd_wait_remote,
+                "status": cmd_status}[args.cmd](args)
     except Exception as exc:
         if args.cmd == "launch":
             raise
