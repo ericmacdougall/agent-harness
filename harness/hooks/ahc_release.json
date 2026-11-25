@@ -8,19 +8,20 @@
   "ahc_fs.py": "cfffa4a962c7286aacd69be1215669bf54c087bc91655af5cf3968a58c5a9a90",
   "ahc_guard.py": "1a0a5cd99c563b10922bb7d1bbd96c0d2bdcd12c8bf8f9a8da59cc3ff18fb30b",
   "ahc_install.py": "880ba7d79829369385ff2cf44da41780c3bdfe1444a87becd5585fca15a229c5",
+  "ahc_merge.py": "a7a34efc79860a67e0d39e9e8ad5457b26baab9c78c19265999e63d8cee2270b",
   "ahc_migrate.py": "f28f0b4c522bdab04acbb056f4d3495a1482187dd94785e82f27aa04841cbafb",
   "ahc_observe.py": "5adbdeceb9e0a8c15dac6481701418ebe7cca7e36c498f8a698fadd7bb0e4af9",
   "ahc_packet.py": "0c6e8fd1440c79ec3050c2f8c7945112e9c227335696e7b2bb9be146e3d352a4",
   "ahc_review.py": "06a7a90d725f6b3e5fde02c157cc620cfcef3188c0a29ec99d61954290ab752c",
-  "ahc_runner.py": "4baecf2b0e82297a55b3ac111d03ee4e5b0b5d3523f85a2ebeeb7a0a3c976095",
+  "ahc_runner.py": "0d7970fd0e68c130bebd76cccfcbf5a8b912ee6b0ca2e7c938a2392110f8f4a2",
   "ahc_scan.py": "30b001910cf78995fd0b94e6c9bf88a0abeb3bbc5de161d386ebaa585b9d829b",
   "ahc_shadow.py": "fec4eb5856f8be96919dff7adb96f79d53f9247a9f4155107da1d482d7deb8b7",
   "ahc_w21.py": "04101af2e72ca39ec1d714977d7676d472d17ca4033827734170b856dfdf6b46"
  },
  "helpers": {
-  "ah": "99aa4f3585380e530c0846998687267682037ecc7012d1663aceba70d28acc75",
-  "ops_watch": "94d0d1ee5d0f990145e01c70df78ffeef914582073b51ab4a0e87ff0db5f5b6f",
-  "peer_review": "6731fc44d0f91963247432967637cf8764c65b520dc6250eef0d33759bc109e1"
+  "ah": "6b82e45f6afd9f45bf5dc837967b15f1550da536ce77166e0a52b6b075394d3b",
+  "ops_watch": "5b4a93920eeafc550a0cbc92fb57aeb7fe844f43aca3c89d9b8aa5e3d5f56c1b",
+  "peer_review": "f7510294358a72f28d690d3f0f38fa4b167810a44be15205a7a786a88680f932"
  },
  "note": "v5 entry-point and legacy-helper sha256 list; regenerate with scripts/ahc_release_hashes.py"
 }
