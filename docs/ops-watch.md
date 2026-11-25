@@ -55,7 +55,7 @@ Alert text is redacted when written to the ring and again when injected. The con
 - **Active alerts:** an alert is active when the latest event for its key is a `raise`.
 - **Reassertion:** a producer whose raise has been overwritten by the ring wrapping must re-emit it with `detail.reasserted=true`. ops-watch does this every run.
 
-`wal.py` adds `ops_watch.injection_text()` to the SessionStart, UserPromptSubmit and SubagentStart context. It reads only regular files, without blocking and with a size cap. It never raises, and it is empty when nothing is active. Alert text is reduced to a safe character set and labelled as data, not instructions. On the Mac it also includes the peers' active alerts, read from each peer's `~/.agent-harness/state/ops-watch/active.json` over ssh.
+Context (2026-11-24): at SessionStart, `wal.py` (Claude) and `codex/hooks/wal.py` (Codex) add one `ops_watch.session_summary()` line: counts by severity, at most three alerts about this machine or this session, and the status command. On a prompt the Claude hook adds only new critical alerts this session can act on, each once (`new_alerts_text`); Codex adds nothing per prompt, and sub-agents get no alerts. Both read only regular files with a size cap, never raise, and label alert text as data, not instructions.
 
 ## Delivery of transitions
 

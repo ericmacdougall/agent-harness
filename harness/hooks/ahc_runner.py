@@ -2590,12 +2590,9 @@ def _pass_body(iid, req, data, verdict):
         lines.append(data["protected"])
     if verdict != "PASS":
         lines.append("PASS-WITH-TICKETS is not a pure PASS: main decides.")
-    lines += ["Gate 1: main merges. Exact command (checks green):",
-              "    " + merge_command(req),
-              "If merge_gate reports no_ci, main first runs:",
-              "    python3 ~/.claude/hooks/merge_gate.py waive --repo %s --pr %s --head %s --ticket '%s' "
-              "--reason 'ahc exact-head PASS receipt %s'" % (req["repo"], req["pr"], req["head"], req["ticket"],
-                                                             Path(str(data.get("report"))).name)]
+    # the merge gate accepts the settled PASS receipt of this head itself (2026-11-24: no CI or waiver step)
+    lines += ["Gate 1: main merges. Exact command:",
+              "    " + merge_command(req)]
     return "\n".join(lines)
 
 

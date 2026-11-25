@@ -29,9 +29,9 @@ Normal protected pinned fast-forward preserves the supported layout and ignored-
 | `watch-tests.py` | Polling test runner for source edits. |
 | `commit_policy.py`, `commit_policy.json`, `ticket_adapters.py` | Commit message policy: PreToolUse hook, git `commit-msg` backstop, range and GitHub checks, GoodQA ticket verification and delivery comments, waivers. |
 | `domain_gates.py`, `domain_checklists.json` | Blockchain domain gates: detect blockchain work from repo signals and supply a risk checklist, test scaffolds and follow-up prompts to specs and review prompts. |
-| `worktree_hygiene.py` | Stop/SubagentStop gate (rule S18): no turn ends with uncommitted work in a worktree it touched; reports unpushed, merged and duplicate worktrees (vendored from Hawkeye). |
-| `wal_cadence.py` | Stop/SubagentStop nudge (rule W04): one bounded block when a big uncommitted diff has no recent human-readable WAL entry (ported from Hawkeye). |
-| `mission_coverage.py`, `mission_gate.py` | Mission goals (goodqa#15565): the goals file and its audit chain, the coverage rule, and the Stop gate that blocks main while a goal has no live owner, live disposition or done evidence (see Mission coverage). |
+| `worktree_hygiene.py` | Stop/SubagentStop check (rule S18): flags uncommitted work in a worktree the turn touched; reports unpushed, merged and duplicate worktrees (vendored from Hawkeye). |
+| `wal_cadence.py` | Stop/SubagentStop nudge (rule W04): one advisory line, once per diff, when a big uncommitted diff has no recent human-readable WAL entry (ported from Hawkeye). |
+| `mission_coverage.py`, `mission_gate.py` | Mission goals (goodqa#15565): the goals file and its audit chain, the coverage rule, and the Stop hook that gives main one advisory line while a goal has no live owner, live disposition or done evidence (see Mission coverage). |
 | `prod_delete_guard.py` | PreToolUse gate on destructive SQL against production databases, lifted only by a user-sourced, target-bound grant (ported from Hawkeye). |
 | `spec_flow.py`, `spec_policy.json`, `spec_template.md` | Spec-driven tickets: spec documents, spec reviews, per-criterion evidence, click-test records, sign-off and the done gate (CLI, plan-review ticket gate, PreToolUse hook on GoodQA status changes). |
 
@@ -240,13 +240,9 @@ python3 ~/.claude/hooks/escalation.py approve-top --task TASK --ask ASK_ID --wal
 
 A recorded permission can be published to the GoodQA ledger with `ah decision publish --task TASK`, so the worker host accepts it without a local session (signed, per task, at most 12 h, revocable; see `docs/central-decisions.md`, goodqa#16651). `ah approve-top` also refuses if the user mentioned the top rung again later; the latest words decide. "Keep fable disabled", "fable? no" and a hand-written pair that cites an unrelated message are all refused (review F1 and F2). A state file that is missing, corrupt or locked resets the task to the lowest rung with a durable reset record (reason code, prior state hash, preserved copy) and a notification in `notifications.jsonl`; a corrupt file can never raise a rung. Every escalation or reset also appends a decision entry to the WAL named by `AGENT_HARNESS_MAIN_WAL`. Ladder limits (8 failing review launches, 3 automatic climbs, $60 per task, each counted launch spending the rung's review budget until helpers report real cost) block further writer spawns until a human signs off; `escalation.py gate-digest` lists what the hook refused or would have refused. On its own errors (an unreadable table, a symlinked or unwritable state directory) the hook denies spawns and `claude`/`codex`/`rescue.py`/`peer_review.py` launch lines only and never blocks plain shell use. `python3 ~/.claude/hooks/model_tiers.py mode` shows the installed mode and `mode --set warn` is the one-command rollback after the enforce flip (the rewrite reformats the table: sorted keys, indent 1). The Bash check reads literal tokens: `$c` and `--model $M` variable indirection, `xargs` and data-driven forms are not parsed (a `claude --model $M` line is denied as an off-table model under enforce: spell the model out), and a heredoc body mentioning a launch is split like text, so under enforce write such text to a file instead of a heredoc.
 
-**Owner cap.** `caps.session_owner_agents`, 8 by default (raised from 4 by the user on 2026-11-09), is the user's limit on active owners; `caps.session_live_agents` is 16. Two rules decide what counts:
-- **Which agents.** Every spawn type that is not in `caps.helper_types` counts as an owner. The helper types are red-team, click-tester, reviewer, fixer, Explore, Plan, claude-code-guide and statusline-setup. So general-purpose, claude and fork agents, an unknown type and an invented type all count (review F3 and 50bca42).
-- **Which states.** The count comes from `ah owners` on the session WALs, and every running state counts: live, quiet and SILENT. Only a stopped owner frees its slot. When the session has no main WAL yet, the SubagentStart live map is used instead.
+**Owner cap.** One cap: `max_live_owners` in `resource_limits.json` (read with `resource_budget.owner_cap()`; `ah limits show`, and `ah limits set` where only the owner or a supervisor tightens it). Helper types (`caps.helper_types`: red-team, click-tester, reviewer, fixer, Explore, Plan, claude-code-guide, statusline-setup) never count; every other spawn type does, in every running state (live, quiet, SILENT); a stopped or disposed owner (closed, finished, superseded, wontdo, legacy) frees its slot. With `enforce` false (the default) a spawn over the cap gets a note and still runs.
 
-A refusal lists the live owner ids. The cap ships in warn mode with the rest of the ladder, so a spawn over the cap gets a "would deny" note but still runs.
-
-`tier_gate.py` is the PreToolUse hook for Agent, Task, Workflow and Bash. Bash lines launching `claude`, `codex`, `rescue.py` or `peer_review.py` are checked segment by segment (the line is split on unquoted `;`, `&&`, `||`, `|`, `&` and newlines; any denied segment denies the line; a review line at a permission rung needs the installed ledger's permission). A spawn names its task with `[task:KEY]` in the prompt or description; without it the hook generates a key and resets to the lowest rung. The requested model and effort must match the task's rung: above it is downgraded through `updatedInput`, below it needs a `[rung-below:REASON]` token, review-only rungs never write, reviewer spawns (red-team, click-tester, reviewer) sit one rung above, and the top writing rung needs the recorded permission. `mode` in `model_tiers.json` is `warn` (the hook only adds context and logs what enforce would do to `~/.agent-harness/escalation/gate.jsonl`) or `enforce`; an unreadable table denies. SubagentStart and SubagentStop keep a per-session live-agent count under `caps.session_live_agents` (default 40).
+`tier_gate.py` is the PreToolUse hook for Agent, Task, Workflow and Bash. Bash lines launching `claude`, `codex`, `rescue.py` or `peer_review.py` are checked segment by segment (the line is split on unquoted `;`, `&&`, `||`, `|`, `&` and newlines; any denied segment denies the line; a review line at a permission rung needs the installed ledger's permission). A spawn names its task with `[task:KEY]` in the prompt or description; without it the hook generates a key and resets to the lowest rung. The requested model and effort must match the task's rung: above it is downgraded through `updatedInput`, below it needs a `[rung-below:REASON]` token, review-only rungs never write, reviewer spawns (red-team, click-tester, reviewer) sit one rung above, and the top writing rung needs the recorded permission. `mode` in `model_tiers.json` is `warn` (the hook only adds context and logs what enforce would do to `~/.agent-harness/escalation/gate.jsonl`) or `enforce`; an unreadable table denies.
 
 `peer_review.py --task TASK [--author-rung R] [--author-harness claude|openai]` picks the reviewer from the table (one rung above the author, the other harness preferred, the same harness one effort up when the other is unavailable, an unknown author reviewed at Opus/Sol medium and flagged), writes a selection receipt under `~/.agent-harness/escalation/selections/`, stamps `Author-Rung`, `Reviewer-Rung` and `Reviewer-Selection` on the report, and records the FINAL receipt in the task ledger so reviews count where they are consumed. `rescue.py --task TASK` runs at the task's computed writing rung on the other harness; `--rung` overrides it; a rung that needs permission is refused before any launch unless `approve-top` recorded it.
 
@@ -618,7 +614,7 @@ Blocked: `rclone config show|dump|file|redacted|reconnect|paste`, a bare `rclone
 
 `rclone config file` is blocked too. It prints only a path, but it is the first step of the incident, and `doctor` reports where the config lives.
 
-**Credential scripts and pinned routes (GoodQA goodqa#14518).** An existing script is otherwise judged only for log deletion. A script run by a shell or Python, or by its own path when its suffix or shebang says it is one, is also refused when its text outside comment lines names the rclone config directory or file, dumps the config with `rclone config show` or `dump`, or names the `GOODQA_CLOUDFLARE_API_TOKEN` secret. In Python the dump must open a string or be an argument list, so a table or a rule's wording that mentions the command is not refused, and neither is a real dump inside a longer string such as `"sudo rclone config show"`. `.json`, `.jsonl` and `.md` files, binaries, `bash -n`, `test_*.py` directly in a folder named `tests`, and the guard's own files are skipped. This check only adds refusals. It runs as a separate pass after the rest of the analysis has finished, with its own 1.5-second cap, and only when nothing else already blocks the command. The rest of the analysis is unchanged and keeps its whole time limit, so a slow read cannot turn any other refusal into a warning. A stop in this pass, including a read that stalls until the hook's alarm, ends the pass with what it found so far, and the rest of the verdict stands. Each file is read once per command. Commands inside a script already on disk are not checked, since they are judged only for log deletion. A command can take up to 1.5 seconds longer to judge. Its reads never wait on a FIFO or other non-regular file.
+**Scripts.** Running a script is judged by what the script does: the guard reads an existing script file and applies the same effect rules to its commands.
 
 This is a text match with stated gaps. It does not catch a script that builds the name at runtime or calls another script, a name past the first 1 MiB, scripts reached after the pass's 1.5 seconds, a path the guard cannot resolve (`"$PWD/x"`, a glob, an exported variable), a runner it does not unwrap (`uv run`, `tmux`, `python3 -m cProfile`, `cat x | python3`), or a file run by another language (`node`, `perl`, `ruby`). A file on another host cannot be read. Copying the config as a command, such as `cp -r ~/.config/rclone /backup/x` or `cp` of the file itself, is not refused yet (GoodQA goodqa#14762).
 
@@ -644,9 +640,16 @@ A heredoc whose body contains a deletion of a protected location gets an advisor
 
 The guard never emits an explicit allow, so the host's own permission flow still applies.
 
-### Fail closed
+### Fail open
 
-The registered command is the launcher `command_guard_hook.py`, not the analyser. Claude Code allows a command when a hook crashes or times out unless the entry sets `onFailure: block` (Claude Code 2.1.295 and later), and Codex always allows. The launcher therefore runs the analyser in a child process with a 10 s watchdog. If the child crashes, cannot start, prints invalid output or runs out of time, the launcher decides from the raw text with the same probe and exits 2 for sensitive input. Non-shell tools return at once. The Claude Code entry matches `Bash|PowerShell` with a 30 s timeout and `onFailure: block`. Both entries pass the verb `hook`, which the launcher ignores; `cmd/harness/gates.json` lists `command-guard hook` as a fail-closed gate, so the Go front door blocks rather than allows when it cannot run the guard. The Codex entry has no matcher, because the host does not re-check `write_stdin` text typed into a running shell, and the guard analyses that text as shell input. It is the last `PreToolUse` group: Codex keys hook trust by position (`[hooks.state."<hooks.json>:pre_tool_use:<group>:<handler>"]` in `config.toml`), so appending it keeps the existing hooks' trusted hashes valid, and only the new guard entry needs trusting with `/hooks` in a new Codex session (GoodQA #14590). Upgrading from an install that placed the guard first moves every later group back one position, so hooks trusted under that layout need one re-trust. A command split across several `write_stdin` calls is a residual risk.
+The registered command is the launcher `command_guard_hook.py`, not the analyser. It runs the analyser in a child
+process with a 10 s watchdog; when the child is missing, crashes, cannot start, prints invalid output or runs out of
+time, the command is allowed with one line on stderr (2026-11-24), whatever words it contains. Findings from a
+completed analysis still refuse. The one exception to "unsure allows" is a `>!` command the guard cannot judge under
+both shell readings whose visible text deletes, moves or overwrites a transcript, session WAL or audit-log path: that
+still refuses. The entries carry no `onFailure`. The Claude Code entry matches `Bash|PowerShell`; the Codex entry has no
+matcher (the host does not re-check `write_stdin` text) and is the last `PreToolUse` group, so Codex's position-keyed
+hook trust stays valid for the groups before it (GoodQA #14590).
 
 ### Deleting logs on purpose
 
@@ -772,7 +775,7 @@ python3 ~/.claude/hooks/remote_delete.py --host t2-dev --path /home/eric/wt/<nam
 
 | Command | Purpose |
 | --- | --- |
-| `command_guard.py doctor` | Checks the installed files, the registration (`onFailure`, matcher, Codex no-matcher), the Claude Code version, and runs built-in self-test probes. Exit 0 when healthy. |
+| `command_guard.py doctor` | Checks the installed files, the registration (matcher, Codex no-matcher) and runs built-in self-test probes. Exit 0 when healthy. |
 | `command_guard.py explain --file F [--cwd D]` | Shows the decision and every finding for a command stored in a file. Never put a command you are unsure about into a shell argument. |
 | `command_guard.py check 'CMD'` | Shows the decision for one command. Runs nothing. |
 | `command_guard.py replay T.jsonl...` | Counts decisions over real transcripts for false-positive measurement. Prints rule counts and digests, never commands. Failure-path blocks are counted separately. |
@@ -786,109 +789,26 @@ Run `replay` over recent transcripts and the red-team hold-out set before the en
 
 ## Kill guard
 
-**Remote spawn (2026-11-06, GoodQA goodqa#14927).** `python3 ~/.claude/hooks/kill_guard.py spawn --host HOST [--log REMOTE_FILE] -- CMD ARGS...` starts CMD detached on HOST over ssh (BatchMode, words single-quoted, never re-parsed) and records the host, remote PID and the start time the host reports in a per-host ledger (`remote:HOST` root, HMAC-signed like the local one). From then on `ssh HOST kill [-SIG] PID` is allowed for exactly that PID, and only while a bounded probe (`ssh HOST ps -o lstart= -p PID`, 5 s) still reports the recorded start time, so a reused PID or a dead process is refused. Everything else stays refused: another host, a PID not in that host's ledger, a mixed PID list, a container, a nested hop (`ssh gw ssh HOST ...`), a variable host, a pid finder, every broad verb, and any ssh option that could reroute the connection (`-o HostName=`, `-J`/`ProxyJump`, `ProxyCommand`, `-F`, `-W`, `-S`, or anything not in the small plain set: `-p N`, `-l user`, `-q`, `-T`, `-n`, `-t`, `-4`, `-6`, `-o BatchMode|ConnectTimeout|LogLevel|ServerAlive*|ConnectionAttempts`; and, because OpenSSH keeps reading options after the destination, any option word right after the host other than `--`). `--log` takes a plain remote path (no `~`: it is single-quoted on the host). This is the route for an agent that must stop its own remote wait loop; it never makes a foreign remote process killable.
+`kill_guard.py` (GoodQA #14506, redesign 2026-11-24) is a PreToolUse guard against stopping a process the caller does
+not own. It judges effect, not words: a broad kill (`pkill`, `killall`, `pgrep ... | xargs kill`, `fuser -k`) is resolved
+against the live process table, and only a match that is not the caller's is refused, together with `kill -1`-style
+"everything at once" forms.
 
-`kill_guard.py` (GoodQA #14506, matrix X05) is a PreToolUse guard that stops an agent from killing processes it does not own. It exists because an owner piped `pgrep -f` into `xargs kill`, and another ran `pkill -f`, and both stopped other owners' test runs on a shared host. It is separate from the command guard and reuses its parser, so wrappers (`sudo`, `env`, `nohup`, `timeout`, `sh -c`, `eval`, here-documents, aliases, script files) are followed. Threat model: careless agents and common obfuscation, not an agent that edits its own hooks.
+Who may stop what (roles from `ah_roles`):
 
-### What is blocked
+- anyone: its own processes (descendants of its agent process, pids started with `kill_guard.py spawn`, processes whose
+  cwd or program is in its work dir, scratch or worktree, `$!`, `$$`, job specs);
+- a supervisor: also processes of a project it supervises;
+- Fable or Astra: any process except the protected list (harness daemons, log backup, and what
+  `kill_guard_policy.json` marks staging/live); a harness maintainer may stop the harness daemons;
+- never, for anyone: pid 1, the agent session running the command, system processes.
 
-| Form | Result |
-|---|---|
-| `pkill`, `killall`, `killall5`, `skill`, `slay`, `fkill`, `kill-port`, `fuser -k`, `taskkill`, `Stop-Process`, `systemctl kill`, `launchctl kill`, `tmux kill-server`, `pm2 kill`, `loginctl kill-*` and `terminate-*`, the PowerShell `kill` alias | blocked in any form, including after any wrapper (`sudo`, `env`, `time -p`, `gtimeout`, `xargs` with any options, `systemd-run`, `tmux`, `at`, `npx` ...): the first later word that is a kill verb starts the real command |
-| `kill` fed by `xargs`, `$(...)`, backticks, `while read` or a `for` loop variable, or any variable, glob or negative, zero or non-ASCII PID | blocked: the targets cannot be proven yours |
-| interpreter code (`-c`, `-e`, here-documents, here-strings) or PowerShell text that mentions `kill`, `terminate(`, `send_signal`, `taskkill`, `Invoke-CimMethod` or `GetProcessById` (a liveness probe `os.kill(pid, 0)` is exempt) | blocked; this is deliberately broad and can block code that merely prints the word. A kill word only inside the test path of an exact test-runner line is a file name, not code (goodqa#16124): `python3 lanes/pgpool.py run --job N --lane L --ttl 1500 --mode server -- ~/qacp-work/fable-b1/dbtest-any.sh WT LOG test/qac-kill-switch-ceiling.test.ts [-t NAME]` passes, directly or as an ssh remote command. This is an allowlist. The whole interpreter command must be `python3 [-I\|-u\|-B] lanes/pgpool.py run`, using only the options `--job`, `--lane`, `--ttl`, `--mode`, `--template` and `--database` (each with a VALUE), then `--` and exactly one of `[/abs/\|~/]dbtest-any.sh WT LOG TEST [-t NAME]`, `npx [-y] vitest run TEST...` or `pnpm --filter PKG exec vitest run TEST...`. The other allowed lines are `python3 [-I\|-u\|-B] -m pytest TEST...` and `node --test TEST...`. Every word must be literal. TEST is a plain unquoted relative path word (no leading `/`, no `~`, no empty, `.` or `..` component, so `tests/../tools/kill-all.js` is scanned) with a `test/`, `tests/` or `__tests__/` directory component and a test-shaped file name (`.test.` or `.spec.`, or a `test_` or `test-` prefix). A symlink inside a test directory cannot be seen by a static check. A wrapper before the interpreter (`env CI=1 python3 -m pytest ...`) also keeps the full scan. Only TEST words are exempt; WT, LOG, PKG, option values and the `-t` name stay scanned. Anything else keeps the full scan, including any wrapper (`env`, `timeout`, `sudo`), any other runner (`tsx`, `bunx`, `yarn dlx`, `deno run`), any extra option and any generic script (`python3 tools/lint.py src/kill-switch.go`). Set `script_kill_pattern` to an empty string in the policy to turn this check off |
-| `find -exec kill`, `parallel kill`, `netwatch orphans --kill` with `--all`, `--force`, `--match` or without `--pid` | blocked |
-| text that names a kill and is run as shell code: anything on the left of a pipe into a shell (`sh`, `zsh`, `bash -s`, `sudo sh`, `ssh host bash`, `timeout 30 ssh host bash`, `ssh jump ssh host bash`, `docker exec -i c sh`, `S="ssh host"; ... \| $S bash`, `S=(ssh host bash); ... \| "${S[@]}"`, `xargs -I{} sh -c {}`), including a `for`, `while`, `if`, `{ }` or `( )` body and a here-document, or a substitution given to `eval`, `sh -c` or a shell as a file operand (`bash <(...)`) | blocked as `text-to-shell`, even when the PIDs are yours; the guard does not compute what the left side prints. Text that is only printed, searched or piped to something else stays allowed. A word after an option may be that option's value (`sudo -u git bash`), so it does not end the search for the shell; with kill text on the left, `\| sudo -n grep sh` is refused for that reason. `skill`, `slay`, `spps` and `wmic` do not count as kill words in text, so `echo 'skill -9 foo' \| ssh dev2 bash` is allowed. Other routes into a shell are in Known limits, rows 19, 21, 22 and 25 |
-| `kill PID...` with literal PIDs | allowed only when every PID is proven yours (below) |
-| `kill -0` with literal PIDs or one quoted simple variable (`"$PID"`), `kill -l`, `kill -L`, job specs (`kill %N`, `%%`, `%+`, `%-`, `%name`), `pgrep`, `ps`, `lsof`, `timeout -s KILL`, text that only contains the word | allowed |
-| `kill -0` with a dash word anywhere among its targets (procps `/usr/bin/kill` reads options after the PID), an unquoted or operator variable (`$PID`, `${x:-..}`), `"$@"`, an array, a substitution or glob, or fed by `xargs` | blocked: the probe shortcut ends, and the targets are judged like any kill |
-| a `kill` whose option words (the words before the PID list) are not single literal tokens: `-SIG`, `-NUM`, `-s SIG`, `-n SIG`, `--signal SIG`, `--signal=SIG`, `--`; or that has a quoted, expanded, braced or globbed option word, an unknown long option, or any dash word after the first signal option; `kill -l` with an expanded or quoted word | blocked as `unprovable-target`; bash and zsh read these words differently from each other and from a text scan, so no PID after them can be proven yours |
-
-### How ownership is proven
-
-A PID is yours when it is not PID 1, not the hook process or any ancestor of it (the agent CLI and its shell), not a protected program (`claude`, `codex`, `sshd`, `launchd`, `systemd`, `init`, `tmux`, `screen`, `netwatch`), has your uid, and one of these holds:
-
-1. its cwd (Linux `/proc/PID/cwd`, macOS `lsof -a -d cwd -p PID`) is inside your git worktree;
-2. its program (`argv[0]`) is a path inside your worktree, or `argv[0]` is an interpreter or shell and `argv[1]` is a path inside your worktree (a `tail` or editor that merely names a file there does not count);
-3. it is in this worktree's spawn ledger with the same start time.
-
-Your worktree is the git toplevel of the tool call's working directory, not of a `cd` inside the command, so a `cd` into another owner's worktree proves nothing. Worktrees nested inside yours are excluded, and `/`, HOME and its ancestors are never used. Anything that cannot be read, times out (2 s per probe) or does not parse is unprovable and blocked. The probes run only after a kill verb is found, so ordinary commands cost nothing extra.
-
-Process ancestry is deliberately not a proof: subagents share the CLI process, so another owner's processes are descendants of it too.
-
-### Kill grammar
-
-Once the shared command parser has handed the guard a `kill` command, the guard accepts it only if every word fits a closed grammar, checked against the word's exact source text so a form the lexer does not understand cannot pass as a literal (`kill_guard.py`, `parse_kill_words`). This covers the kill words only. A kill the parser never presents to the guard is not judged at all; those gaps are listed under Known limits below and tracked in goodqa#14654 (items 1-14) and goodqa#14677 (item 16):
-
-- option, first word only and unquoted: `-SIG`, `-s SIG`, `-n SIG`, `--signal SIG`, `--signal=SIG`, then an optional `--`; or `-l`, `-L`, `--list`, `-t`, `--table` with plain signal values;
-- target: a literal integer, a job spec `%N`, `%%`, `%+`, `%-` or `%name` matching `[A-Za-z_][A-Za-z0-9_.-]*`, unquoted or wholly inside one pair of quotes;
-- `kill -0` only: one target that is exactly `"$NAME"` or `"${NAME}"`.
-
-Everything else fails closed, whatever it would expand to: `$!`, `PID=4001; kill $PID`, `{4001,4016}`, `\\4001`, `$'4001'`, `$x""`, `%a$=x`, `%?str`, and a parenthesis in a command that holds a kill (`kill 4001(N) 4004`, where zsh drops the first word). The shell may read such words again as code, so the parenthesis rule judges the command up to the parenthesis with its variables resolved, whatever the command is called: `gkill`, `K=kil; ${K}l`, `$(...)`, `K=kill; eval $K 4001(N) 4004` and `eval "kill 4001" 4001(N) 4004` all count, as do `env -S` with a separate value, `watch`, `sh -c`, and a wrapper with the parenthesis word directly before the kill (`timeout 5 x(N) kill 4004`). A parenthesis word among a wrapper's own options is not seen (Known limits, row 26). When a value is unknown, a shell, `eval`, `source`, `trap`, a listed wrapper or remote tool, or a command whose name holds an expansion is refused if the input names a kill anywhere. Other commands that run text are not, such as `cmd /c` and `pnpm exec` (row 26). A command that only prints or searches its words (`echo`, `print`, `printf`, `ls`, `cat`, `head`, `tail`, `wc`, `grep`, `rg`, `ag`, `ack`) leaves them as data unless it is piped into a shell. A parenthesis in another command does not count (`[[ "$s" =~ ^(a|b)$ ]] && kill 4001`, `case "$x" in (a) kill 4001;; esac`), and neither does the definition `kill() { ...; }` or the parenthesis of an array literal. An array assigns its variable like any other, so `K=(kill); $K 4004` and `a=(kill 4001); $a 4004` are judged as the kills they run; in bash `$a` is only the first element, and the guard judges all of them. The words of a literal are also still read as a command, so `K=(kill stop)` is refused on its own and `K=(kill)` is not (Known limits, row 24). After a background job use `kill %1`, or start it with `kill_guard.py spawn` and use the printed PID.
-
-### Starting processes you will need to stop
-
-`python3 ~/.claude/hooks/kill_guard.py spawn [--log FILE] -- CMD ARGS...` starts the command detached from inside a git worktree, records its PID and start time in `~/.agent-harness/state/kill-guard/ledger-<hash>.jsonl` with an HMAC under a 0600 key in a 0700 directory, and prints the PID. `spawn` takes a command, never a PID, and the guard judges the spawned command as if you had typed it. The ledger protects against accident: anyone who can read the key can forge a line. A later call's `kill "$SERVER_PID"` is blocked by design; use the printed PID literally, or `netwatch orphans --kill --pid N`.
-
-### Remote kills
-
-Ownership cannot be checked on another machine, so every kill verb and every kill with a numeric PID inside `ssh`, `mosh`, `docker exec` or `kubectl exec` is blocked, as is the code of `ssh -o ProxyCommand=` and `-o LocalCommand=`. Remote listing and `kill -0` are allowed. The only remote kill is `ssh HOST netwatch orphans --kill --pid N[,N...]` (digits only; flags `--json` allowed). netwatch signals only processes it lists as orphans, and the guard recognises it by name. A local `netwatch orphans --kill --pid N` is allowed without the ownership proof, so an orphan of another owner can still be named by PID; that trust is accepted.
-
-### Block messages and audit
-
-Every block is one line and names `netwatch orphans --kill --pid <pid>`. It carries a rule code and PIDs, never the command, a secret or another process's command line. Each block appends a redacted line (time, rule, PIDs, a 16-character hash of the command) to `~/.agent-harness/state/kill-guard/audit.jsonl`.
-
-### Fail closed
-
-The registered command is `kill_guard.py hook`, a launcher that runs the analysis in a child process with a 10 s limit (8 s watchdog inside). If the child crashes, cannot start, times out, prints garbage, the launcher blocks when the normalised command text (the whole text, with quotes, backslashes and `$` removed) contains `kill`, `fuser`, `Stop-Process` or an indirection marker (ANSI-C quote, `eval`, `base64`, `xxd`), and otherwise allows with a note. Input above 8 MiB is always blocked. A harmless `eval` is therefore blocked while the analyser is broken. The Claude Code entry matches `Bash|PowerShell` with `onFailure: block`; the Codex entry has no matcher. The guard never blocks reading or editing its own files. Policy is `kill_guard_policy.json` (`mode`: `enforce`, `warn` or `off`; the file is human-edited, there is no override variable).
-
-zsh and bash read `>!` differently, so the shared analyzer judges a script under both readings, and a kill either one runs is blocked (see the command guard's section on this operator). `>! kill 4004` is a kill only under bash, and `>! y kill 4004` only under zsh. A shell string sent over `ssh` is read both ways too, so `echo "kill 4004" | ssh h '>! bash -s'` is blocked. When a reading cannot be judged (too deeply nested, too large for the budget, or the readings disagree on what a later command uses), the guard blocks with rule `readings-capped`, whatever the text says, because a kill can be spelled without the word (`K=ki; K+=ll; $K 4004`). The size limit depends on time, so it moves with load. Harmless commands are refused in that case too, for example a nested `bash -c 'echo a > out.log; echo b >>! out.log'; grep -c killed out.log`, or `A=1; bash -c '>! y A=2'; echo $A`. The command guard only warns on these. Running an existing repository script that holds such a line (`bash disp.sh`) is refused too. Likewise, when the analysis stops on a command containing a clobber operator, the guard blocks even without a kill word, because the stop can come before the reading that holds the kill (a script written with `>!` is judged on disk first). A kill found before the analysis stops stays found. Without a clobber operator, a stop still allows text that has no kill word or indirection (see Known limits).
-
-### Known limits
-
-**Not covered: kills the shared parser never hands to the guard (goodqa#14654; the protected-log variant is goodqa#14655).** Found by the red-team of `4922c22`; the lexer in `command_guard.py` predates the kill guard and is being changed by another owner. Payload shapes (real-shell results are macOS bash 3.2 and zsh 5.9 on sleepers only):
-
-| # | Shape | Example |
-|---|---|---|
-| 1 | text piped into a remote login shell with no command named (`| ssh dev2 bash` is now blocked, the goodqa#14617 incident shape) | `printf 'pkill -f x\n' \| ssh dev2` |
-| 3 | backslash-newline continuation inside a comment, after a heredoc last line, or after an escaped backslash | `# note \` then a `kill` on the next line |
-| 4 | substitutions inside `${...}`, `$((...))` and case patterns are not read | `echo ${x:-$(kill -9 4004)}` |
-| 5 | case state entered from an argument | `echo then case x in; kill -9 4004` |
-| 6 | heredoc delimiter taken from expanded text | `cat <<$x` then a `kill` after the body |
-| 9 | a variable head whose value is never visible | `read x <<< kill; $x -9 4004` |
-| 10 | zsh command forms | `=kill`, `nocorrect kill`, `repeat 1 kill`, `zargs`, `zpty`, `hash k=/bin/kill` |
-| 12 | local stdin shells | `source /dev/stdin <<< 'kill ...'` |
-| 13 | a literal PID rewritten at parse time | `alias -g 4001=4004; eval "kill -9 4001"` |
-| 14 | wrappers and remote tools the guard does not list | `xcrun kill`, `tailscale ssh`, `pdsh`, `ansible -a`, `fd -x` |
-| 15 | an alias of the kill verb, because `_alias()` in `command_guard.py` does nothing | `alias K=kill` then `K -9 4004` on the next line |
-| 16 | interpreter code in a heredoc given to a remote command; the body is read as shell, not as interpreter code, so this is the goodqa#14617 route (goodqa#14677; a local `python3 - <<PY` is blocked) | `ssh dev2 python3 - <<'PY'` with `os.kill(4004, 9)` in the body |
-| 17 | a command name from a zsh expansion flag, split or joined from variables (goodqa#14684, medium) | `A=ki; B=ll; R="$A$B -15"; ${=R} 4004`, `K=(kill); ${(@)K} 4004` |
-| 18 | `find -exec` with the Homebrew-prefixed verb (goodqa#14685, low; `find -exec kill` is blocked) | `find . -exec gkill 4004 \;` |
-| 19 | kill text that reaches a shell by a route other than a pipe into it (goodqa#14691) | `echo "kill 4004" \| while read l; do eval "$l"; done`, `echo "kill 4004" \| tee >(sh)`, `echo "kill 4001" x(N) 4004 > x.sh; sh x.sh`, a shell in a variable with no visible value (`read S; ... \| $S`) |
-| 20 | kill text that only exists once a command has run, so no word names it (goodqa#14691) | `python3 gen.py \| sh`, `cat gen.txt \| sh` when the file cannot be read, `echo ki ll \| tr -d ' ' \| sh`, `for a in ki; do for b in ll; do echo "$a$b 4004"; done; done \| sh` |
-| 21 | a substitution or function that reaches a shell by a route other than a pipe stage or a file operand (goodqa#14697, low) | `bash < <(for p in 4001 4004; do echo "kill $p"; done)`, `sh <<< "$(for p in 4001 4004; do echo "kill $p"; done)"` (`sh <<< "$(echo kill 4004)"` is blocked), `ssh dev2 "$(echo kill 4004)"`, `cat <<< "$(echo kill 4004)" \| sh`, `f() { echo "kill 4004"; }; f \| sh` |
-| 22 | a pipe into a shell the guard does not recognise as reading its input (goodqa#14697, low) | `\| sudo -s`, `\| sudo su`, `\| su -`, `\| (sh)`, `\| (cd /tmp && sh)`, `\| { cd /tmp; sh; }`, `\| parallel -j 4`, `\| $(which bash)` |
-| 23 | a command name whose value reaches its variable by a copy, a loop or a builtin, or a glued `env -S` (goodqa#14697, low) | `K=(kill); c="${K[0]}"; $c 4004`, `for c in kill; do $c 4004; done`, `set -A K kill; $K 4004`, `printf -v K kill; $K 4004`, `K=kill; env -S"$K" 4001(N) 4004`, `env -S"kill 4001" 4001(N) 4004` |
-| 24 | a false refusal, not a gap: the words of an array literal are read as a command, as they were before this rule (goodqa#14697, low) | `K=(kill stop); echo "${K[@]}"` is refused |
-| 25 | a shell named by an array or variable the guard does not read exactly (goodqa#14712, goodqa#14772, goodqa#14773, low): the first assignment is by subscript, an element is set later, by a builtin or under control flow it does not follow, a zsh element is the command name, an element is picked behind a wrapper or with extra quoting, or a path with a space is held in a variable (zsh does not split it) or given to a container exec; and a remote command line split over several words where a stop word comes before the shell | `S[0]=bash; ... \| "${S[@]}"`, `K=(echo kill); K[0]=kill; $K 4004`, zsh `K=(echo kill); $K[2] 4004`, `K=(echo kill); find . -exec ${K[1]} 4004 \;`, `K=kill; (K=echo); $K 4004`, `S=(cat bash); ... \| sudo "${S[1]}"`, `... \| "${S[1]}"''`, `... \| ""$S`, `B="/opt/my dir/bash"; ... \| $B` in zsh, `\| docker exec -i c "/opt/my dir/bash"`, `\| ssh dev2 "true &&" git status "\|\|" bash` |
-| 26 | a regression from dropping the whole-command check of `d6ae1ff`: a parenthesis word among a wrapper's own options, or an unknown value given to an unlisted command that runs text (goodqa#14713, low) | `timeout x(N) 5 kill 4004`, `flock x(N) /tmp/l kill 4004`, `nice -n x(N) 5 kill 4004`, `sudo -u x(N) root kill 4004`, `read x; cmd /c $x 4001(N) 4004; kill 4001`. The same with `pnpm exec` is allowed too, but `2f3bf1b` allowed it as well |
-
-Verdicts in rows 17 to 26 come from `decide()`, the guard's classifier. `S[0]=bash; ... \| "${S[@]}"` in row 25 killed a stand-in on dev2; the other row 25 forms were not run. The two path forms in row 25 are refused on the commit before goodqa#14712 and need a shell at a path with a space. A `decide()` comparison of 2715 unique rows (the grammar corpus, earlier probe sets and review probes) against that commit found no other form that fix lets through except two that run no shell (`\| ssh dev2 'cat > /tmp/bash'` and `\| ssh dev2 "/opt/my dir/bash"`). A held value that expands to nothing (`K=(); "${K[@]}" kill 4004`, `K=; $K pkill -f x`) is dropped only when every variable in it is known and untainted and it has no substitution or literal text; the word after it is then judged as the command. "Known" is the guard's reading of the last assignment in the text: it does not follow a subshell, a branch or a function body, so `K=(kill); (K=()); "${K[@]}" 4004` is allowed, as it is by the earlier rule (goodqa#14896, high). When a word was dropped, a kill verb among the next two words is refused, as the earlier rule refused a command name built at run time, so `K=(); "${K[@]}" nocache kill 4004`, `"${K[@]}" which pkill` and `"${K[@]}" echo kill 4004` are refused even though `nocache` is not a listed wrapper and `which` and `echo` alone are allowed. Real-shell results come from dev2 with stand-in sleepers. There, every form of rows 21, 22 and 23 that ran killed while the guard allowed it, and so did `timeout`, `flock` and `nice` in row 26. The `sudo`, `su`, `ssh` and `parallel` forms were not run in a real shell, and neither were `docker`, `cmd /c` or `pnpm exec`, so the outcome of those forms is inferred. Further low gaps are listed in goodqa#14713.
-
-The guard therefore does not close the incident class. It closes the kill words it is shown.
-
-**A budget stop allows a kill with no kill word (goodqa#14764, high).** When the analysis stops (size, time or nesting) before it reaches a kill spelled without the word, and the text has no kill word, indirection or clobber operator, the guard allows. Example: `bash stop.sh`, where the script holds a 256 KB clean prefix and then `K=ki; K+=ll; $K 4004`. The time limit moves with load (goodqa#14763), so a command that is judged on a quiet host can stop on a busy one.
-
-**Other limits.** A verb assembled from several variables at run time, `eval "$(cat file)"`, kill calls inside script files or interpreter files that were not typed in the same input (`python3 file.py`), `make` or `npm` targets, compiled programs, `docker kill`, `kubectl delete pod`, `supervisorctl`, `launchctl remove` and `scp -S`, `rsync -e` or `git -c core.sshCommand` local command options, code run by `awk`, `sed 1e`, `tar --to-command`, `vim -c` or `emacs --eval`, `tmux send-keys`, and a wrapper option whose value is itself the name of an ordinary command (`exec -a echo pkill x`; the scan ends at the first ordinary command so `sudo grep kill file` stays allowed) are not covered. Between 1 and 8 MiB the crash fallback is weaker than the analyser (it does not rebuild a verb split by variables). Not verified: busybox and util-linux `kill` option parsing, live `docker exec` and `kubectl exec` kills, and interactive zsh with Claude Code's shell snapshot (the zsh-only forms are refused by the closed grammar; only `kill A(N) B` and the `#` comment form were run, on macOS zsh 5.9 against sleepers). `sleep N; kill PID` is judged when the hook runs, not when the kill runs, so a PID reused in between is a residual risk. On macOS `ps` loses argument boundaries, so only the first two whitespace-separated words are read and a path with spaces is unprovable.
-
-### Commands and rollout
-
-| Command | Purpose |
-|---|---|
-| `kill_guard.py spawn [--log F] -- CMD...` | Start a process you can later kill. |
-| `kill_guard.py explain FILE [--cwd D]` | Show the decision for a command stored in a file. Runs nothing. |
-
-Install with `install.py --apply` and `install_codex.py --apply`; both register the kill guard together with the command guard, and `--no-command-guard` removes both registrations. Tests: `python3 -m unittest tests.test_kill_guard` (decides text only, signals nothing, safe anywhere). The live canary test, `tests/live_kill_canary.py`, starts its own sleepers and a canary, and runs only on dev2: `env -i HOME=$(mktemp -d) PATH=/usr/bin:/bin KILL_GUARD_LIVE=1 python3 tests/live_kill_canary.py`. Rules registry entry: `docs/rules/kill-guard.json`.
+A live `ah approve kill --pids N` record (docs/approvals.md) lifts a role refusal; staging/live needs a record the owner
+granted. Every refusal names that command. Reads, `--help`, prose, quoted and here-document text are never refused, and
+when the guard cannot tell (a pid read from a file, a variable, a remote host, a crash) it allows and writes one line to
+`~/.agent-harness/state/kill-guard/audit.jsonl`. The hook is registered without `onFailure` (fail-open). `ah kill`
+applies the same roles and approvals and audits every pid. Tests: `python3 -m unittest tests.test_kill_guard
+tests.test_ah_proc`. Rules registry entry: `docs/rules/kill-guard.json`.
 
 ## Production-delete guard
 
@@ -978,7 +898,7 @@ Residuals, disclosed:
 
 `wal_cadence.py` is a Stop and SubagentStop hook for rule W04. It nudges once when real work has piled up without a human-readable WAL entry. It is a port of Hawkeye's `hawkeye-wal-cadence.py`, which ran on dev2 only (goodqa#14908).
 
-The hook blocks the stop once (exit 2) when all of these hold:
+The hook prints one advisory line (a `systemMessage`, exit 0; it never blocks) when all of these hold:
 
 - The agent's worktree has at least 40 uncommitted source lines, tracked or untracked. Changes under `docs/`, `plans/`, `devstate/` and `audit/`, and `README.md` and `CONTRIBUTING.md`, do not count.
 - That agent's WAL has no `wal_note.py` entry with a note from the last 20 minutes. Hook metadata rows do not count.
@@ -994,7 +914,7 @@ The nudge names the files and gives the exact `wal_note.py` command.
 
 The nudge is bounded:
 
-- It fires once per agent per distinct diff fingerprint. The state is kept in `~/.agent-harness/state/wal-cadence/<session>.json`.
+- It fires once per agent per distinct diff fingerprint, and at most once per agent per 30 minutes. The state is kept in `~/.agent-harness/state/wal-cadence/<session>.json`.
 - It never fires on a repeated stop (`stop_hook_active`).
 - `HARNESS_WAL_CADENCE=off` turns it off.
 - Every internal error fails open, so the hook is registered without `onFailure`.
@@ -1439,7 +1359,7 @@ One canonical file, `~/.agent-harness/mission/goals.json` (directory 0700 and no
 
 | field | type | meaning |
 | --- | --- | --- |
-| `mission_session` | session id | the main session the Stop gate holds to the mission; set by the first `import-initiatives` or by `set-session` (main only; see the hand-over rule below) |
+| `mission_session` | session id | the main session the Stop hook holds to the mission; set by the first `import-initiatives` or by `set-session` (main only; see the hand-over rule below) |
 | `id` | `[a-z0-9][a-z0-9_-]{0,63}` | unique goal id (the dashboard initiative id) |
 | `title` | text, up to 300 | what the goal is |
 | `ticket` | `goodqa#N`, `Project#N` or `""` | the stream ticket; owners are matched by it, never by name. Changing it is main only |
@@ -1500,19 +1420,8 @@ bound to main's tool call) that `mission_gate.py pretool` writes only when the P
   stores every PreToolUse hook's stdout verbatim in main's transcript, so the nonce would sit in clear text in a Claude
   log during the call. It was not shipped for that reason; it is the design to reuse for the `review-auth` and
   `ack-handoff` stamps (goodqa#15829) if that copy is accepted.
-- Since 2026-11-24 merge_gate no longer mints the `review-auth` stamp: the merge gate reads the settled review receipt
-  itself (see Merge gate), so the stamp path below is dormant until peer_review.py drops it.
-- The `review-auth` stamp (merge_gate's hook for main's bound `peer_review.py pr --github-repo --pr`) is bound the
-  same way since goodqa#16811 round 2: a payload without `tool_use_id` or a readable `transcript_path` mints none and
-  the hook says why, and `peer_review.py` honours a stamp only while that call is still running and at most 120 s
-  old. One exception: a review started with `run_in_background` gets its "started in the background" tool_result at
-  once, so its stamp is marked `background` and accepts exactly that one record (a `user` record whose only block is
-  the call's tool_result with `is_error` false and whose `toolUseResult.backgroundTaskId` is a non-empty string);
-  any other record naming the call ends it, and PostToolUse keeps such a stamp while PostToolUseFailure and
-  PermissionDenied still delete it. Not controlled, stated: any process that runs the same bound review while main's
-  call is live or waiting at a permission prompt is taken for main; a background stamp stays takable until it is
-  taken or 120 s pass even if main's process died first; and a Codex Desktop root's rollout never names a
-  `tool_use_id`, so for it only the 120 s window and single use bound the stamp.
+- Since 2026-11-24 there is no `review-auth` stamp: merge_gate reads the settled review receipt itself (see Merge
+  gate) and peer_review.py no longer takes or burns one (`--no-main-stamp` is accepted and ignored).
 
 - The stamp is keyed by the sha256 of the exact argument list after the script (`argv_key`; `--flag=value` reads as
   `--flag value`), so it covers that one command and nothing else.
@@ -1602,7 +1511,7 @@ A covered goal is STALLED when none of its owners wrote an own WAL entry for mor
 `repos` names the ticket in that time. Hook lifecycle rows and rows another agent wrote into the owner's WAL do not
 count. The report gives the age.
 
-When the owner cap (`model_tiers.json` caps.session_owner_agents) is full and a goal is uncovered, the message names the
+When the owner cap (`resource_budget.owner_cap()`) is full and a goal is uncovered, the message names the
 owner to free or queue: owners on no mission goal first (most idle first), then owners of the lowest-priority, most
 stalled goal, plus the option to queue the goal on its ticket.
 
@@ -1625,16 +1534,9 @@ stalled goal, plus the option to queue the goal on its ticket.
 
 ### Enforcement
 
-- Stop gate (`mission_gate.py`, registered next to the dropped-owner gate):
-  - It runs only for main (`caller_identity.is_main`) and only in the mission session. Other sessions, sub-agents and
-    hosts without a goals file never block.
-  - It blocks with the 5 worst uncovered goals, the count of the rest, `mission_coverage.py report` and the fixes once,
-    in at most 1.5 KB. Every value from the goals file, a WAL or a ticket is stripped of control characters and capped
-    at 80 characters. A goal without a ticket gets "give it a ticket with `set --goal ID --ticket T` first".
-  - An unreadable or tampered file blocks with one line.
-  - At most 25 blocks per signature (the sorted uncovered ids). After that the turn may end and a high
-    `mission:gate-valve` alert goes to the ring. The count starts again from zero when the signature clears or changes.
-  - A repeated Stop in the same turn is not blocked.
+- Stop hook (`mission_gate.py`, registered next to the dropped-owner gate; 2026-11-24): main only, mission session
+  only, never blocks. When the set of uncovered goals changes it adds one advisory line naming them; the fixes are in
+  `mission_coverage.py report`. Silent where no goals file exists.
 - ops-watch `mission` check (enabled by default; `{"mission": {"enabled": false}}` in ops-watch.json turns it off):
   - It checks the session in `mission_session` and raises `mission:<goal>:uncovered` (high, `stop_block`),
     `mission:<goal>:stalled` (warning) and `mission:goals:unreadable` (high). Alerts clear when the goal is covered.
@@ -1684,13 +1586,9 @@ stalled goal, plus the option to queue the goal on its ticket.
 - `status_truth.py` hooks, mission session only (decided from the ledger, remembered in
   `~/.agent-harness/state/status-truth/mission-session` so a broken ledger never widens it; before the first remembered
   value, from the verified ledger header, so a first-run timeout still says GOALS UNAVAILABLE there): UserPromptSubmit injects
-  the goals for a status question; SessionStart re-injects them after a compaction; Stop lints the final assistant
-  text (contradictions against the ledger, and a status answer given without running `ah goals`). Injected text holds
-  only fixed-pattern fields (ids, check names, enums, ages, the main-set target). Policy key `status_lint` in
-  provenance_policy.json: `warn` (shipped: a systemMessage the user sees, and a flag row in
-  `~/.agent-harness/state/status-truth/flags.jsonl` with ids and rules only), `enforce` (blocks once per human turn
-  through `stop_blocks.py`; main switches it only on the spec's precision bound) or `off`. When the transcript tail
-  holds no user prompt the turn is unknown and the lint only warns, in enforce too.
+  the goals for a status question; SessionStart re-injects them after a compaction. The Stop lint is no longer
+  registered (2026-11-24). Injected text holds only fixed-pattern fields (ids, check names, enums, ages, the main-set
+  target).
   `status_truth.py calibrate <transcript>` replays both rules over a transcript.
 - `ah owners` lists in `attention` each SILENT owner whose recorded wait expired, or that has been silent 6 h with no
   disposition (row reason `wait-expired` or `silent-undisposed`); `ah status` prints the same list on its owners line.
@@ -1783,10 +1681,10 @@ directory under `~/.agent-harness/work/<session>/` that is a clean, pushed workt
 
 `idle_guard.py` stops main from sitting idle while work that does not need the user exists. A user rejecting one question pauses that question only.
 
-- Stop hook (`idle_guard.py stop`, main only, bounded to 2 blocks per problem signature, fails open): blocks with the named streams and next steps when no progress happened for `AH_IDLE_GUARD_MIN` minutes (default 30) and a stream holds a non-user next step; also when every owner waits on a user ask while another owner holds a returned result nobody took; also when a user rejection is in this turn and independent work exists. A Bash-only checkpoint script is not progress.
+- Stop hook (`idle_guard.py stop`, main only, never blocks, fails open; 2026-11-24): one advisory line naming the streams, only when the problem changed, when no progress happened for `AH_IDLE_GUARD_MIN` minutes (default 30) and a stream holds a non-user next step; also when every owner waits on a user ask while another owner holds a returned result nobody took. A Bash-only checkpoint script is not progress.
 - ops-watch check `idle_guard` raises the high `idle-guard:<session8>` alert from the same `assess()`.
 - `ah owners` is the only judge of whether an owner needs main; `assess()` re-derives no rule. An owner is actionable exactly when its row is `decision_required` or has `attention`, and a user wait only when it is not actionable and its `wait_on` is an open ask. `attention` now also carries `result-unacked` (a done, handoff or returned result younger than 24 h that nobody took: taken only by a resume, reassignment, terminal disposition or main's `--ack-handoff` wait recorded at or after the result's own WAL time (whole seconds, no slack; each row's `result_at`), or by the live parent of a nested helper; later owner notes neither revoke an ack nor restart the 24 h window) and `wait-not-user` (a live wait on a ticket, agent or main). An owner's own `waiting` disposition never takes its result. `decision_required` is unchanged.
-- `idle_guard.py reject` (PostToolUseFailure, PermissionDenied, UserPromptSubmit) adds "A rejected question pauses only that question; keep every independent stream moving." after a user rejection. A rejection may produce no Post event, so the next prompt and the Stop hook also catch it from the transcript. A turn starts only at a human prompt as `provenance.user_authorship()` defines one (string or text blocks, origin `human`); task notifications, peer messages, reminders and tool results do not end the rejected turn.
+- `idle_guard.py reject` (PostToolUseFailure, PermissionDenied, UserPromptSubmit) adds "A rejected question pauses only that question; keep every independent stream moving." after a user rejection, at most once per 30 minutes per session. A rejection may produce no Post event, so the next prompt and the Stop hook also catch it from the transcript. A turn starts only at a human prompt as `provenance.user_authorship()` defines one (string or text blocks, origin `human`); task notifications, peer messages, reminders and tool results do not end the rejected turn.
 - A `waiting` disposition on an ask is per owner: `ah task dispose --kind waiting` refuses an ask that names another owner (`wal_note.py --event ask --owner <agent>`) or is already another owner's live wait.
 - `ah owners` carries `agents_active_1h` (and each row `active_1h`); `ah status` repeats it under `owners`. Collectors that read transcripts skip an unreadable file, never the section.
 - Limits: unreviewed PRs and specs are not looked up over the network; SendMessage is not hooked, so it is not progress.

@@ -504,15 +504,15 @@
  {
   "id": "S27",
   "source": "ticket:GoodQA goodqa#14506 (matrix X05, G08); docs/rules/kill-guard.json",
-  "rule": "No agent kills a process it cannot prove it owns: no pkill, killall, fuser -k, taskkill, Stop-Process or pgrep-fed kill, and no plain kill of another owner's PID.",
+  "rule": "No agent stops a process that is not its own (or its supervised project's; Fable/Astra may stop any but the protected list): a broad kill resolves against the process table, and an `ah approve kill` record lifts a role refusal.",
   "enforcement": "HOOK-ENFORCED",
-  "live_evidence": "kill_guard.py (GoodQA #14506) blocks these on Claude Code and Codex; install.py and install_codex.py register it. On Codex it runs only once its hook is trusted.",
+  "live_evidence": "kill_guard.py (GoodQA #14506) refuses on effect on Claude Code and Codex; install.py and install_codex.py register it (fail-open). On Codex it runs only once its hook is trusted.",
   "checkable": "YES",
-  "checkable_reason": "Kill verbs and targets are parseable, and ownership is checked from process cwd, argv and a spawn ledger.",
+  "checkable_reason": "Kill targets are resolved against the live process table; ownership comes from the agent process tree, cwd, a spawn ledger and ah_roles.",
   "proposed_event": "PreToolUse Bash (+Codex PreToolUse)",
-  "proposed_check": "Parse the command, judge kill words with a closed grammar, and block any target not proven to be the caller's.",
-  "on_failure": "block",
-  "failing_first_test": "tests/kill_guard_grammar_corpus.json judged by decide(): R4, R5, RR, TC and AH hold rows that fail at d1a0fd5, while OK, R3OK, R4OK, RROK and PKILL pin what must keep working; tests/live_kill_canary.py on dev2 with its own sleepers.",
+  "proposed_check": "Resolve the targets; refuse only those the caller's role does not cover; allow with one audit line when unsure.",
+  "on_failure": "allow",
+  "failing_first_test": "tests/test_kill_guard.py (ReportedFalseRefusals fail at 2ad9bbb0; Refusals, Roles and ApprovalsLiftRoleRefusals pin what still refuses).",
   "priority": "P0",
   "owner_overlap": "feat/kill-guard-14506; open routes are in docs/operations.md Kill guard Known limits, starting from goodqa#14654 and goodqa#14712",
   "matrix_rows": "X05,G08",
@@ -523,7 +523,7 @@
    "file": "kill_guard_policy.json",
    "key": "mode"
   },
-  "partial_reason": "text and value routes in docs/operations.md Kill guard Known limits are not closed, and the threat model is careless agents, not one that edits its hooks"
+  "partial_reason": "pids read from files or variables and remote hosts are allowed with a note (unsure allows), and the threat model is careless agents, not one that edits its hooks"
  },
  {
   "id": "S28",

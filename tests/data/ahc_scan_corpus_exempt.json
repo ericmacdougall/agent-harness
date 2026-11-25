@@ -482,12 +482,6 @@
   },
   "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
  },
- "tests/test_guard_pinned_routes.py": {
-  "counts": {
-   "redact:named-credential:prefix": 4
-  },
-  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
- },
  "tests/test_heavy_copy.py": {
   "counts": {
    "redact:url-userinfo:prefix": 1
