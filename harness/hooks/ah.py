@@ -691,7 +691,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
             if _prov().wal_record_problem(rec):   # receipt v10 F2: e.g. a subagent_stop with no event or a bad time
                 tally.skipped += 1
                 continue
-            if isinstance(rec, dict) and rec.get("kind") not in ("retired_session", "retire_revoked"):
+            if is_session_activity(rec):  # not ah's own decision, deadline or disposition lines
                 main_last = max(main_last, parse_ts(rec.get("at")) or 0.0)
             if isinstance(rec, dict) and rec.get("event") in ("scope", "intent", "decision") \
                     and isinstance(rec.get("note"), str):
@@ -1546,8 +1546,9 @@ def precheck(op: str, args: dict) -> None:
         if dropped and not TICKET_RE.match(args.get("ticket") or ""):
             raise AhError("bad_request", "task.retire-session: --dropped needs --ticket 'GoodQA <project>#N', the ticket that "
                                          "holds the dropped work (a stream nobody works on is a defect)")
-        if args.get("expect") is not None and not re.fullmatch(r"[0-9a-f]{16}", str(args["expect"])):
-            raise AhError("bad_request", "task.retire-session: --expect is the owners_sha a --dry-run printed")
+        if not re.fullmatch(r"[0-9a-f]{16}", str(args.get("expect") or "")):
+            raise AhError("bad_request", "task.retire-session: --expect <owners_sha> is required: run --dry-run first and pass "
+                                         "the owners_sha it prints, so the retire covers exactly the list that was reviewed")
     elif op == "task.retire_revoke":
         need("session", "decision", "source", "at")
         if not SESSION_RE.match(args["session"]) or not re.fullmatch(r"ah[0-9a-f]{10}", args["decision"]):
@@ -2876,18 +2877,39 @@ def _retire_transcripts(home: Path, session: str) -> dict:
     return {"main_at": main_at, "newest_at": newest, "files": files}
 
 
-def main_transcript_at(home: Path, session: str) -> float:
-    """Newest mtime of the session's main transcript (0.0 when there is none): a resumed session writes it."""
+AH_WRITTEN_EVENTS = frozenset({"disposition", "deadline", "deadline_done", "pending_stop"})  # ah's own bookkeeping
+AH_WRITERS = frozenset({"ah", "ahd", "dropped_gate"})
+
+
+def is_session_activity(rec) -> bool:
+    """Whether a main-WAL record shows the SESSION doing something (a hook event, a spawn or stop, an ask, a note it
+    wrote), as opposed to ah's own bookkeeping about it: a disposition, a deadline, a pending-stop marker, anything an
+    ah writer signed. A retired session reopens only on the first kind; main recording a decision about it later must not
+    bring the stale alerts back (goodqa#17148, plan review F1). The one predicate every reopen reader uses."""
+    if not isinstance(rec, dict):
+        return False
+    return rec.get("event") not in AH_WRITTEN_EVENTS and rec.get("by") not in AH_WRITERS
+
+
+def main_transcript_at(home: Path, session: str, strict: bool = False) -> float:
+    """Newest mtime of the session's main transcript (0.0 when there is none): a resumed session writes it. strict
+    (the retire preflight): a folder or file that exists but cannot be read raises, it does not read as "inactive"."""
     best = 0.0
     try:
         with os.scandir(home / ".claude" / "projects") as projects:
             for proj in projects:
                 try:
                     best = max(best, os.stat(os.path.join(proj.path, session + ".jsonl")).st_mtime)
-                except OSError:
+                except (FileNotFoundError, NotADirectoryError):
                     continue
-    except OSError:
-        pass
+                except OSError as e:
+                    if strict:
+                        raise AhError("retire_unreadable", f"task.retire-session: a transcript of {session} cannot be read "
+                                                           f"({type(e).__name__}); nothing is retired", 3)
+    except OSError as e:
+        if strict:
+            raise AhError("retire_unreadable", f"task.retire-session: the transcript folder cannot be listed ({type(e).__name__}); "
+                                               "nothing is retired", 3)
     return best
 
 
@@ -3009,7 +3031,7 @@ def _retire_preflight(home: Path, args: dict, now: float, caller_session: str) -
     if rb:
         if not _wal_path(home, rb, "main").is_file():
             raise AhError("bad_request", f"task.retire-session: --replaced-by {rb} is not a session of this host (no main WAL)", 3)
-        if not (_retire_registry_live(home, rb) or now - main_transcript_at(home, rb) < RETIRE_REPLACER_S):
+        if not (_retire_registry_live(home, rb) or now - main_transcript_at(home, rb, strict=True) < RETIRE_REPLACER_S):
             raise AhError("bad_request", f"task.retire-session: --replaced-by {rb} is neither live nor active in the last "
                                          f"{RETIRE_REPLACER_S // 3600} h, so it holds no work", 3)
     else:  # --dropped: the dropped work must be on a ticket, which must exist
@@ -3030,7 +3052,7 @@ def _retire_pin(home: Path, args: dict) -> None:
     disposition recorded since the preflight is seen, never overwritten), and refused when it is not the list main
     previewed (--expect)."""
     ev = retire_evidence(home, args["session"], time.time())
-    if args.get("expect") and args["expect"] != ev["owners_sha"]:
+    if args["expect"] != ev["owners_sha"]:
         raise AhError("retire_stale", f"task.retire-session: the owners of {args['session']} are not the list that was "
                                       f"previewed (now {ev['owners_sha']}, expected {args['expect']}); run --dry-run again", 3)
     args["retire"] = {"owners": ev["owners"], "skipped": ev["skipped"], "owner_count": ev["owner_count"],
@@ -3048,9 +3070,15 @@ def retire_dry_run(home: Path, session: str) -> dict:
 def _retire_revoke_preflight(home: Path, args: dict, caller_session: str) -> dict:
     """The way back: a revoke makes the decision's owners read as they did before it (alerts return)."""
     import provenance  # noqa: PLC0415
-    res = provenance.resolve(args["source"])
+    if caller_session and caller_session == args["session"]:
+        raise AhError("forbidden", "task.retire-session --revoke: a session cannot revoke its own retire", 3)
+    try:
+        res = provenance.resolve(args["source"])
+    except Exception as e:  # a resolver crash is a rejection, never a traceback
+        raise AhError("provenance", f"source check failed ({type(e).__name__})", 3)
     if not res["ok"]:
-        raise AhError("provenance", "source rejected", 3)
+        first = res["problems"][0] if res["problems"] else {"code": "rejected", "message": "rejected"}
+        raise AhError("provenance", f"source rejected ({first['code']}): {first['message']}"[:300], 3)
     rows = _ledger(home)
     target = next((r for r in rows if r.get("op") == "task.retire_session" and r.get("id") == args["decision"]
                    and (r.get("args") or {}).get("session") == args["session"]), None)
@@ -3127,7 +3155,7 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
         if guarded and args.get("kind") in liveness.CLOSING:
             _close_burst(home, args, actor(session), time.time())  # first: a burst is refused whatever its arguments
         precheck(op, args)
-        if op == "task.retire_session" and session and session == args.get("session"):  # never retire yourself
+        if retiring and session and session == args.get("session"):  # never retire (or revoke) your own session
             raise AhError("forbidden", "task.retire-session: a session cannot retire itself", 3)
     except AhError as e:
         if guarded:
@@ -4118,7 +4146,7 @@ def build_parser():
     rs.add_argument("--dropped", action="store_true", help="nobody took the work (needs --ticket)")
     rs.add_argument("--ticket", help="--dropped: 'GoodQA <project>#N', the ticket that holds the dropped work")
     rs.add_argument("--source", help="where the decision comes from (user:<session>/<uuid> \"words\", ticket:..., ...)")
-    rs.add_argument("--expect", help="the owners_sha a --dry-run printed: the retire is refused if the owners changed")
+    rs.add_argument("--expect", help="REQUIRED for a real retire: the owners_sha a --dry-run printed; refused if the owners changed")
     rs.add_argument("--revoke", metavar="DECISION", help="undo a retire decision (ah + 10 hex): its owners alert again")
     rs.add_argument("--dry-run", dest="dry_run", action="store_true",
                     help="print the evidence and the owners it would cover; write nothing")

@@ -144,6 +144,13 @@ class Base(unittest.TestCase):
 
     def retire(self, session=SESSION, stamp=True, caller="", **extra):
         key = extra.pop("key", None)
+        if extra.get("expect", None) is None:  # --expect is required: take it from a dry run like main does
+            try:
+                extra["expect"] = ah.retire_dry_run(self.home, session)["owners_sha"]
+            except ah.AhError:
+                extra["expect"] = "0" * 16  # the real call then meets its own refusal
+        elif extra["expect"] is False:
+            extra.pop("expect")
         a = {"session": session, "ended": ended(OLD), "at": iso(self.clock), "source": SOURCE, "dropped": True, "ticket": TICKET}
         a.update(extra)
         if "dropped" in extra and extra["dropped"] is None:  # a --replaced-by call carries no ticket
@@ -236,9 +243,10 @@ class Accepted(Base):
                 self.refused("retire_running")
 
     def test_a_retry_is_a_duplicate_not_a_second_decision(self):
-        first = self.retire()
+        sha = ah.retire_dry_run(self.home, SESSION)["owners_sha"]
+        first = self.retire(expect=sha)
         self.clock += 30
-        again = self.retire()
+        again = self.retire(expect=sha)
         self.assertEqual(again["result"], "duplicate")
         self.assertEqual(again["id"], first["id"])
         self.assertEqual(len(self.applied()), 1)
@@ -248,7 +256,7 @@ class Accepted(Base):
         self.retire(key="retire-key-0001")
         with self.assertRaises(ah.AhError) as cm:
             ah.write(self.home, "task.retire_session", {"session": SESSION, "ended": ended(OLD - 7200), "at": iso(self.clock),
-                                                         "source": SOURCE, "dropped": True, "ticket": TICKET}, "", "retire-key-0001")
+                                                         "source": SOURCE, "dropped": True, "ticket": TICKET, "expect": "0" * 16}, "", "retire-key-0001")
         self.assertEqual(cm.exception.code, "key_conflict")
 
     def test_a_second_retire_of_retired_owners_finds_nothing_to_do(self):
@@ -376,7 +384,7 @@ class Refused(Base):
             self.stamp()  # even main's stamp does not let a session retire itself
             with self.assertRaises(ah.AhError) as cm:
                 ah.write(self.home, "task.retire_session", {"session": SESSION, "ended": ended(OLD), "at": iso(NOW),
-                                                             "source": SOURCE, "dropped": True, "ticket": TICKET}, SESSION)
+                                                             "source": SOURCE, "dropped": True, "ticket": TICKET, "expect": "0" * 16}, SESSION)
         self.assertEqual(cm.exception.code, "forbidden")
         self.assertIn("itself", str(cm.exception))
 
@@ -670,6 +678,71 @@ class Reopen(Base):
         self.stamp()
         ah.write(self.home, "task.retire_revoke", {"session": SESSION, "decision": out["id"], "at": iso(self.clock), "source": SOURCE}, "")
         self.assert_alerting(self.owners())
+
+
+class PlanReview(Base):
+    """The plan review's F1 to F5: ah's own bookkeeping, a mandatory preview, old readers, revoke parity, unreadable."""
+
+    def test_expect_is_required_for_a_real_retire(self):
+        err = self.refused("bad_request", expect=False)
+        self.assertIn("--expect", str(err))
+        self.refused("bad_request", expect="not-a-sha")
+
+    def test_the_predicate_counts_only_what_the_session_wrote(self):
+        mine = [{"event": "status", "note": "x"}, {"event": "subagent", "agent_id": "a1"}, {"event": "ask", "id": "w1"},
+                {"event": "intent", "note": "y"}, {"event": "subagent_stop", "agent_id": "a1"}]
+        theirs = [{"event": "disposition", "kind": "closed"}, {"event": "deadline"}, {"event": "deadline_done"},
+                  {"event": "pending_stop"}, {"event": "status", "by": "dropped_gate"}, {"event": "status", "by": "ah"},
+                  {"event": "disposition", "kind": "retired_session"}, "not a dict", None]
+        self.assertTrue(all(ah.is_session_activity(r) for r in mine))
+        self.assertFalse(any(ah.is_session_activity(r) for r in theirs))
+
+    def test_a_dispose_or_deadline_after_the_decision_does_not_reopen_the_others(self):
+        self.retire()
+        self.clock += 600
+        ah.write(self.home, "task.deadline.add" if False else "deadline.add",
+                 {"session": SESSION, "at": iso(self.clock + 7200), "ref": TICKET, "owner": agent(0), "note": "check back"}, "")
+        ah.write(self.home, "task.dispose", {"agent": agent(1), "session": SESSION, "kind": "waiting", "ref": TICKET,
+                                              "until": iso(self.clock + 3600), "at": iso(self.clock)}, "")
+        by = {r["agent_id"]: r for r in self.owners()["owners"]}
+        for who in (agent(0), agent(2), agent(3), agent(4)):
+            self.assertEqual(by[who]["state"], "retired", who)
+            self.assertNotIn("retired-reopened", by[who]["flags"])
+        self.assertEqual(ahd.liveness_alerts({SESSION: self.owners()}, ahd.load_policy()).keys(),
+                         {k for k in ahd.liveness_alerts({SESSION: self.owners()}, ahd.load_policy()) if agent(1) in k})
+
+    def test_a_reader_ignores_an_op_it_does_not_know(self):
+        # what an older ah does with the new rows: it sees an unknown op and ignores it, so the owners alert as before
+        row = {"state": "applied", "seq": 99, "id": "ahffffffffff", "key": "k-future", "sha": "s", "op": "task.future_op",
+               "args": {"session": SESSION, "agent": agent(0), "kind": "closed", "retire": {"owners": [agent(0)]}}}
+        ah._append_line(ah.store_dir(self.home) / "ledger.jsonl", row)
+        self.assertEqual(ah.dispositions(self.home, SESSION), {})
+        self.assertEqual(len(self.owners()["undisposed"]), self.N - 1)
+
+    def test_revoke_wraps_the_resolver_and_refuses_the_target_session(self):
+        out = self.retire()
+        import provenance
+        self.stamp()
+        with mock.patch.object(provenance, "resolve", side_effect=RuntimeError("boom")):
+            with self.assertRaises(ah.AhError) as cm:
+                ah.write(self.home, "task.retire_revoke", {"session": SESSION, "decision": out["id"], "at": iso(self.clock),
+                                                            "source": SOURCE}, "")
+        self.assertEqual(cm.exception.code, "provenance")
+        with self.assertRaises(ah.AhError) as cm:
+            ah.write(self.home, "task.retire_revoke", {"session": SESSION, "decision": out["id"], "at": iso(self.clock),
+                                                        "source": SOURCE}, SESSION)
+        self.assertEqual(cm.exception.code, "forbidden")
+
+    def test_an_unreadable_replacement_transcript_is_retire_unreadable(self):
+        (self.home / ".claude" / "projects" / "-proj" / f"{OTHER}.jsonl").write_text("{}\n")
+        real = os.stat
+
+        def deny(path, *a, **k):
+            if str(path).endswith(f"{OTHER}.jsonl"):
+                raise PermissionError(13, "denied")
+            return real(path, *a, **k)
+        with mock.patch.object(ah.os, "stat", side_effect=deny):
+            self.refused("retire_unreadable", dropped=None, replaced_by=OTHER)
 
 
 class PartialFailure(Base):
