@@ -20,9 +20,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "harness" / "hooks"))
 sys.path.insert(0, str(HERE))
 import caller_identity  # noqa: E402
-import merge_gate as mg  # noqa: E402
 import mission_gate  # noqa: E402
-import test_merge_gate as fixture  # noqa: E402
 import test_review_merge_authorization as e2e  # noqa: E402
 
 
@@ -131,7 +129,7 @@ class StampBoundToMainsCall(unittest.TestCase):
     """goodqa#16811 round 2 (F2): main's hook mints the stamp for one call, and only a process that runs while that
     call is still running may take it. Each must-fail case below mints the stamp through the real merge_gate hook for
     a main call, writes what Claude Code writes when that call is refused or fails, and then starts the bound review
-    as another process: before this change the review took the stamp and authorized the merge."""
+    as another process: before goodqa#16811 the review took the stamp and authorized the merge."""
 
     setUp = e2e.EndToEndTests.setUp
     fake = e2e.EndToEndTests.fake
@@ -160,19 +158,13 @@ class StampBoundToMainsCall(unittest.TestCase):
             os.environ.pop(name, None)
 
     def mint(self, call, background=False, now=None):
-        """main's PreToolUse(Bash) payload for the review command, through merge_gate.decide."""
+        """main's review-auth stamp bound to one call. merge_gate's hook used to mint it; since the 2026-11-24 redesign
+        nothing in the gate does, so the fixture writes it the way that hook did (caller_identity is under test)."""
         self.environment()
         transcript = e2e.main_transcript(self.root)
-        tool_input = {"command": self.COMMAND}
-        if background:
-            tool_input["run_in_background"] = True
-        payload = fixture.bash(self.COMMAND, tool_input=tool_input, session_id=e2e.MAIN_SID, tool_use_id=call,
-                               transcript_path=str(transcript), hook_event_name="PreToolUse")
-        notes = []
-        code, text = mg.decide(payload, fixture.FakeGh(fixture.SCENARIOS["green"]), self.root / "gate", now=now,
-                               notes=notes)
-        self.assertEqual(code, 0, text)
-        self.assertEqual(notes, [], "the fixture call must mint a stamp")
+        self.assertTrue(caller_identity.put_stamp("review-auth", ["o/r", 5], session=e2e.MAIN_SID, home=self.root,
+                                                  now=now, tool_use_id=call, transcript=str(transcript),
+                                                  background=background, require_bound=True))
         return transcript
 
     def append(self, transcript, *records):
