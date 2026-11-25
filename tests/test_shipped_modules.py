@@ -62,7 +62,8 @@ class ShippedModules(unittest.TestCase):
         self.assertEqual(set(NOT_SHIPPED) & set(install.HOOKS), set(), 'shipped now: drop from NOT_SHIPPED')
 
     def test_the_redesign_modules_ship_to_both_hosts(self):
-        for name in ('ah_hook.py', 'ah_roles.py', 'ah_switch.py', 'ah_approvals.py', 'ah_secret.py', 'ah_log_push.py'):
+        for name in ('ah_hook.py', 'ah_roles.py', 'ah_switch.py', 'ah_approvals.py', 'ah_secret.py', 'ah_log_push.py',
+                     'git_save.py', 'ah_reap.py', 'session_env.py', 'autosave.py'):  # docs/lifecycle.md
             self.assertIn(name, install.HOOKS)
             self.assertIn(name, install_codex.DELIVERY_HELPERS)
         self.assertIn('ahc_merge.py', install.HOOKS)

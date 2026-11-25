@@ -949,6 +949,74 @@
    ],
    "status": "installed",
    "rules": []
+  },
+  {
+   "id": "session_env:session-start",
+   "script": "session_env.py",
+   "arg": null,
+   "event": "SessionStart",
+   "tools": [],
+   "flavors": [
+    "claude",
+    "codex"
+   ],
+   "status": "installed",
+   "rules": [],
+   "canaries": [
+    {
+     "payload": {
+      "hook_event_name": "SessionStart",
+      "session_id": "doctor-canary"
+     },
+     "expect": "allow"
+    }
+   ]
+  },
+  {
+   "id": "autosave:stop",
+   "script": "autosave.py",
+   "arg": null,
+   "event": "Stop",
+   "tools": [],
+   "flavors": [
+    "claude",
+    "codex"
+   ],
+   "status": "installed",
+   "rules": [],
+   "canaries": [
+    {
+     "payload": {
+      "hook_event_name": "Stop",
+      "session_id": "doctor-canary"
+     },
+     "expect": "allow"
+    }
+   ]
+  },
+  {
+   "id": "autosave:subagent-stop",
+   "script": "autosave.py",
+   "arg": null,
+   "event": "SubagentStop",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "autosave:session-end",
+   "script": "autosave.py",
+   "arg": null,
+   "event": "SessionEnd",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
   }
  ]
 }

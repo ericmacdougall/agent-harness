@@ -20,6 +20,11 @@ file (tests).
 | `ticket_base_url` | https URL of a GoodQA API | `gq_browser` / `ah chat`: the one host a GoodQA token is sent to | `https://goodqa.app/v1` |
 | `db_tool_patterns` | `[{"tool": "<tool name regex>", "fields": [...]}]` | prod-delete guard: extra MCP tools whose input fields are read as commands; `install.py` adds them to the hook matcher (re-run it after a change) | none |
 | `review_forbidden_topics` | `[{"pattern": "<regex>", "label": "..."}]` | `kimi_review.py`: text that must never reach an external reviewer | none (Granola and interview material are built in) |
+| `rescue_remote` | URL of a **private** git repository you chose | `git_save.py` (the save hook `autosave.py` and `ah reap`): every unsaved commit, stash and working-tree snapshot is pushed there under `refs/rescue/<host>/<session>/...` before anything is deleted; see [lifecycle.md](lifecycle.md) | none: see `rescue_to_origin` |
+| `rescue_to_origin` | `"private"`, `"always"` or `"never"` | `git_save.py`, when `rescue_remote` is not set: may saved work go to the checkout's own remote? `"private"` needs `gh` to prove the repository is private. When the answer is no, the work goes into a verified bundle under `~/.agent-harness/rescue/` | `"private"` |
+| `reap_idle_hours` | number of hours | `ah reap run`: how long a session folder must be idle before it may be removed (`--idle-hours` on the command line wins) | `48` |
+| `session_tmpdir` | `true` or `false` | `session_env.py`: `false` stops it exporting `TMPDIR=~/.agent-harness/tmp/<first 8 characters of the session id>` to the session's shell commands | `true` |
+| `session_quota_gb` | number of GB | `session_env.py`: a session whose folder was last measured above this gets one extra line at session start naming its three largest directories; nothing is refused | `10` |
 
 Keys the harness does not know are ignored. A key of the wrong type falls back to its default.
 
