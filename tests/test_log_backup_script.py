@@ -97,7 +97,7 @@ if argv and argv[0] == "copy":
                     sys.exit(10)
                 spent += 1
                 os.makedirs(os.path.dirname(target), exist_ok=True)
-                shutil.copy2(os.path.join(src, name), target)  # rclone keeps the modification time
+                shutil.copyfile(os.path.join(src, name), target)
         open(counter, "w").write(str(spent))
         sys.exit(0)
     real = os.environ.get("FAKE_DELEGATE")
@@ -222,18 +222,6 @@ class Case(unittest.TestCase):
     def copies(self):
         return [c["argv"] for c in self.recorded() if c["argv"][0] == "copy"]
 
-    @staticmethod
-    def is_bulk(argv):
-        """A tier-2 copy. Tier 1 sends from the stage, its trees as --files-from-raw chunks too (2026-11-25)."""
-        return "--files-from-raw" in argv and "backup-stage" not in argv[argv.index("--") + 1]
-
-    def change_trees(self):
-        """A new line in each live tree: a tree with nothing new sends nothing, and some tests need its copy."""
-        self.changes = getattr(self, "changes", 0) + 1
-        for rel in (".claude/projects/p1/a.jsonl", ".claude/wals/s1/main.jsonl", ".codex/sessions/2026/x.jsonl"):
-            path = self.home / rel
-            self.put(rel, path.read_bytes() + b"more %d\n" % self.changes)
-
     def remote_files(self):
         base = self.remote / "testhost"
         return {str(p.relative_to(base)) for p in base.rglob("*") if p.is_file()
@@ -260,10 +248,8 @@ def assert_copy_only(test, calls):
         test.assertIn(argv[0], ("copy", "listremotes", "lsf"), argv)
         if argv[0] == "listremotes":
             continue
-        if argv[0] == "lsf":  # read-only: a local source (an absolute path), or once per new tier-1 checkpoint the
-            # remote copy of that source (to seed what is already sent, 2026-11-25)
-            test.assertEqual(argv[-2], "--", argv)
-            test.assertTrue(argv[-1].startswith("/") or "/testhost/" in argv[-1], argv)
+        if argv[0] == "lsf":  # read-only, and only ever of a local source (an absolute path), never the remote
+            test.assertTrue(argv[-1].startswith("/") and argv[-2] == "--", argv)
             continue
         test.assertIn("--", argv, argv)
         flags = [a for a in argv[: argv.index("--")] if a.startswith("--")]
@@ -707,10 +693,9 @@ class DisallowedNames(Case):
         for rel in ORDINARY:
             self.assertIn(rel, files)
         self.assertFalse([f for f in files if f.lower().rsplit("/", 1)[-1] in REFUSED])
-        # Since 2026-11-25 tier-1 trees go through the checkpoint too, so only single files take the plain path.
         plain, chunk = self.offered("plain"), self.offered("chunk")
+        self.assertTrue(plain, "the plain copy path ran")
         self.assertTrue(chunk, "the files-from path ran")
-        self.assertTrue([n for n in chunk if n.startswith("p1/")], "the tier-1 trees went through the checkpoint")
         self.assertFalse([n for n in plain + chunk if n.lower().rsplit("/", 1)[-1] in REFUSED], plain + chunk)
 
     def test_a_stale_checkpoint_list_that_still_names_a_refused_file_is_filtered_before_the_copy(self):
@@ -729,6 +714,8 @@ class DisallowedNames(Case):
         done = self.run_refusing(LOG_BACKUP_EXCLUDES=str(self.excludes_without_names()))
         self.assertEqual(done.returncode, 0, done.stderr.decode() + self.log_tail())
         self.assertTrue(self.last_ok().exists())
+        self.assertTrue([n for n in self.offered("plain") if n.lower().rsplit("/", 1)[-1] in REFUSED],
+                        "the stub really offered refused names on the plain path")
         self.assertIn("refused by the remote by name", (self.logs / "log-backup.log").read_text())
         self.assertRegex((self.logs / "log-backup.refused").read_text(), r"refused=[1-9]")
 
@@ -897,107 +884,6 @@ class BulkResume(Case):
         self.assertFalse((st / "pending").exists())
 
 
-class LiveResume(Case):
-    """2026-11-25: last-ok had been stuck since 2026-11-13. Every run copied the whole staged .claude/projects tree,
-    ran out of its budget (rclone's own rate limit spent on listing) and withheld last-ok, so partial progress never
-    counted. Tier 1 now sends each staged tree as a checkpointed pass and keeps a marker per source; last-ok is the
-    oldest of them."""
-
-    bulk_runs = BulkResume.bulk_runs
-
-    def setUp(self):
-        super().setUp()
-        if not REAL_RCLONE:
-            if os.environ.get("LOG_BACKUP_REQUIRE_RCLONE") == "1":
-                self.fail("rclone is required on this host (LOG_BACKUP_REQUIRE_RCLONE=1) but was not found")
-            self.skipTest("rclone not installed (the local listing uses it)")
-        self.names = [f".claude/projects/p{i // 10}/s{i:02d}.jsonl" for i in range(30)]
-        for i, rel in enumerate(self.names):
-            self.put(rel, b"line %d\n" % i)
-
-    def live_runs(self, runs, budget, **extra):
-        return self.bulk_runs(runs, budget, FAKE_OPS_MATCH=".claude/projects", **extra)
-
-    def projects_remote(self):
-        return {f for f in self.remote_files() if f.startswith(".claude/projects/")}
-
-    def src_marker(self, rel):
-        path = self.logs / "log-backup.src.d" / rel.replace("/", "_")
-        return path.read_text().split()[0] if path.exists() else None
-
-    def test_a_projects_tree_too_big_for_one_run_finishes_across_runs_and_then_marks_fresh(self):
-        self.live_runs(1, 12)
-        self.assertFalse(self.last_ok().exists(), "a pass cut short must not mark the backup fresh")
-        self.assertIsNotNone(self.src_marker(".claude/wals"), "the sources that finished keep their own marker")
-        self.assertIsNone(self.src_marker(".claude/projects"))
-        self.live_runs(10, 12)
-        want = set(self.names) | {".claude/projects/p1/a.jsonl", ".claude/projects/p1/sub/b.jsonl"}
-        self.assertEqual(self.projects_remote(), want, (self.logs / "log-backup.log").read_text()[-2000:])
-        self.assertTrue(self.last_ok().exists(), "the finished pass makes the backup fresh")
-        # last-ok is the oldest source marker: the run that listed the projects pass, not the run that finished it.
-        stamp = self.last_ok().read_text().split()[0]
-        self.assertEqual(stamp, self.src_marker(".claude/projects"))
-        self.assertLessEqual(stamp, self.src_marker(".claude/wals"))
-
-    def test_after_a_finished_pass_only_changed_transcripts_are_checked(self):
-        self.live_runs(12, 12)
-        self.assertTrue(self.last_ok().exists())
-        checked = Path(str(self.calls) + ".checked")
-        checked.unlink()
-        self.put(self.names[7], b"grew by one line\nand another\n")
-        before = self.last_ok().read_text().split()[0]
-        time.sleep(1.1)  # stamps have one-second resolution
-        done = self.live_runs(1, 12)
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(checked.read_text().split(), [self.names[7].split("/", 2)[2]])
-        self.assertEqual((self.remote / "testhost" / self.names[7]).read_bytes(), b"grew by one line\nand another\n")
-        self.assertGreater(self.last_ok().read_text().split()[0], before, "a clean run moves last-ok forward")
-
-    def test_a_new_checkpoint_takes_what_the_remote_already_holds_as_sent(self):
-        # Upgrading from the full-copy version: the remote already holds the tree. The first pass lists the remote once
-        # instead of checking every file one rate-limited operation at a time.
-        self.live_runs(12, 12)
-        for st in (self.logs / "log-backup.bulk.d").glob("live_*"):
-            shutil.rmtree(st)
-        checked = Path(str(self.calls) + ".checked")
-        checked.unlink()
-        self.put(self.names[2], b"changed since the last full copy\n")
-        done = self.live_runs(1, 12)
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(checked.read_text().split(), [self.names[2].split("/", 2)[2]])
-        self.assertIn("files already on the remote taken as sent", (self.logs / "log-backup.log").read_text())
-
-    def test_a_pass_listed_from_a_partial_snapshot_does_not_mark_the_source(self):
-        st = self.logs / "log-backup.bulk.d" / "live_.claude_projects"
-        self.live_runs(1, 12)
-        (st / "listed").write_text("partial\n")  # as a pass listed after rsync exit 23 records it
-        self.live_runs(10, 12)
-        self.assertTrue((self.remote / "testhost" / self.names[-1]).exists())
-        log = (self.logs / "log-backup.log").read_text()
-        self.assertIn("cannot record the .claude/projects marker", log)
-        # The next pass, listed from a clean snapshot, marks it.
-        self.live_runs(1, 12)
-        self.assertTrue(self.last_ok().exists())
-
-    def test_last_ok_never_moves_back(self):
-        self.live_runs(12, 12)
-        stamp = self.last_ok().read_text()
-        marks = self.logs / "log-backup.src.d"
-        remote = (marks / ".claude_projects").read_text().split(" ", 1)[1].strip()
-        time.sleep(1.1)
-        self.put(".claude/wals/s1/main.jsonl", b"wal line\nanother\n")
-        # The WAL copy fails, so its marker is left as planted. One from another remote does not count ...
-        (marks / ".claude_wals").write_text("2026-01-01T00:00:00Z elsewhere:\n")
-        done = self.live_runs(1, 12, FAKE_FAIL_MATCH=".claude/wals", LOG_BACKUP_RETRIES="0")
-        self.assertNotEqual(done.returncode, 0)
-        self.assertEqual(self.last_ok().read_text(), stamp)
-        self.assertIn("no completed pass yet for .claude/wals", (self.logs / "log-backup.log").read_text())
-        # ... and an older one for this remote cannot pull last-ok back.
-        (marks / ".claude_wals").write_text("2026-01-01T00:00:00Z %s\n" % remote)
-        self.live_runs(1, 12, FAKE_FAIL_MATCH=".claude/wals", LOG_BACKUP_RETRIES="0")
-        self.assertEqual(self.last_ok().read_text(), stamp)
-
-
 class Failure(Case):
     def test_failed_source_fails_the_run_and_keeps_last_ok(self):
         self.logs.mkdir(parents=True)
@@ -1053,14 +939,11 @@ class Failure(Case):
         for argv in self.copies():
             live = argv[-2].startswith(str(stage))
             self.assertNotIn("--min-age", argv)  # live sources are snapshots; a bulk chunk carries no filter flags
-            if not live:  # a bulk chunk; live trees are checkpointed chunks too (2026-11-25), live files are not
-                self.assertIn("--files-from-raw", argv)
+            self.assertEqual("--files-from-raw" in argv, not live, argv)
         lists = [c["argv"] for c in self.recorded() if c["argv"][0] == "lsf"]
         self.assertTrue(lists)
         for argv in lists:
-            # A staged snapshot is listed whole (it holds no young files); --fast-list is the one-time remote seed.
-            if not argv[-1].startswith(str(stage)) and "--fast-list" not in argv:
-                self.assertIn("--min-age", argv)  # static sources skip young files when their pass is listed
+            self.assertIn("--min-age", argv)  # static sources skip young files when their pass is listed
 
     def test_snapshot_temp_files_live_outside_every_uploaded_tree(self):
         stage = self.home / ".agent-harness/backup-stage"
@@ -1213,8 +1096,7 @@ class Failure(Case):
             self.assertEqual(len({tuple(c[-2:]) for c in self.copies()}), n_sources)  # one attempt per source, no retry
 
     def test_bulk_only_budget_exit_withholds_only_the_bulk_marker(self):
-        # A tier-2 destination: tier-1 trees send --files-from-raw chunks too since 2026-11-25.
-        done = self.run_script(FAKE_EXIT="10", FAKE_EXIT_MATCH="lessons-dropbox:Backups/agent-logs/testhost/.codex/archived_sessions")
+        done = self.run_script(FAKE_EXIT="10", FAKE_EXIT_MATCH="--files-from-raw")
         self.assertNotEqual(done.returncode, 0)
         self.assertTrue(self.last_ok().exists())     # transcripts completed
         self.assertFalse(self.bulk_ok().exists())    # the bulk gap is not hidden
@@ -1298,15 +1180,13 @@ class Failure(Case):
         for p in (self.last_ok(), self.bulk_ok()):
             os.unlink(p)
         self.put(".agent-harness/work/t1/more.md", b"more")  # the finished pass sends only new files: give it one
-        done = self.run_script(FAKE_FAIL_MATCH="testhost/.agent-harness/work", LOG_BACKUP_RETRIES="0")  # only bulk copies
+        done = self.run_script(FAKE_FAIL_MATCH="--files-from-raw", LOG_BACKUP_RETRIES="0")  # only bulk copies
         self.assertNotEqual(done.returncode, 0)
         self.assertTrue(self.last_ok().exists())            # transcripts are safe and say so
         self.assertFalse(self.bulk_ok().exists())           # the gap in the bulk tier is not hidden
         for p in (self.last_ok(), self.bulk_ok()):
             if p.exists():
                 os.unlink(p)
-        shutil.rmtree(self.logs / "log-backup.src.d")  # else last-ok comes back at the WAL tree's earlier stamp
-        self.change_trees()  # an unchanged tree sends nothing, so it could not fail
         done = self.run_script(FAKE_FAIL_MATCH=".claude/wals", LOG_BACKUP_RETRIES="0")  # transcripts tier fails
         self.assertNotEqual(done.returncode, 0)
         self.assertFalse(self.last_ok().exists())
@@ -1317,7 +1197,7 @@ class Failure(Case):
         done = self.run_script()
         self.assertEqual(done.returncode, 0, done.stderr)
         text = self.last_ok().read_text()
-        self.assertRegex(text, r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ sources=\d+ remote=lessons-dropbox oldest=\S+\n$")
+        self.assertRegex(text, r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ sources=\d+ remote=lessons-dropbox\n$")
         self.assertEqual([p.name for p in self.logs.glob("log-backup.last-ok.tmp*")], [])
 
     def test_rclone_missing_and_no_remote_give_one_line_errors(self):
@@ -1491,7 +1371,6 @@ class Contention(Case):
                       LOG_BACKUP_SLICE_RESERVE_SECONDS="5"))
         for extra in cases:
             open(self.calls, "w").close()
-            self.change_trees()
             for name in ("log-backup.throttled", "log-backup.log"):
                 if (self.logs / name).exists():
                     (self.logs / name).unlink()
@@ -1547,15 +1426,12 @@ class Contention(Case):
         # no throttled marker appears.
         self.assertEqual(self.run_script().returncode, 0)  # the first run also finishes the bulk passes
         open(self.calls, "w").close()
-        self.change_trees()
         healthy = self.run_script()
         self.assertEqual(healthy.returncode, 0, healthy.stderr)
         expected = len(self.copies())
         self.assertGreater(expected, 1)
         open(self.calls, "w").close()
         self.last_ok().unlink()
-        shutil.rmtree(self.logs / "log-backup.src.d")
-        self.change_trees()
         done = self.run_script(FAKE_RCLONE_LOG_TEXT="ERROR : Attempt 1/3 failed: too_many_write_operations")
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(len(self.copies()), expected)
@@ -1644,7 +1520,7 @@ class BulkTier(Case):
         return self.logs / "log-backup.bulk-last-try"
 
     def bulk_copies(self):
-        return [c for c in self.copies() if self.is_bulk(c)]
+        return [c for c in self.copies() if "--files-from-raw" in c]
 
     def test_bulk_tier_with_no_time_left_is_deferred_not_spent(self):
         done = self.run_script(LOG_BACKUP_BULK_EVERY_SECONDS="3600", LOG_BACKUP_BUDGET_SECONDS="30",
@@ -1765,8 +1641,8 @@ class BulkLane(Case):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("bulk=lane", (self.logs / "log-backup.last-run").read_text())
         self.assertIn("exit=0 bulk=0", self.wait_for_lane())
-        bulk = [c for c in self.copies() if self.is_bulk(c)]
-        live = [c for c in self.copies() if not self.is_bulk(c)]
+        bulk = [c for c in self.copies() if "--files-from-raw" in c]
+        live = [c for c in self.copies() if "--files-from-raw" not in c]
         self.assertTrue(bulk and live, self.copies())
         self.assertEqual({self.tps(c) for c in live}, {"3"}, "tier 1 copies at the full TPSLIMIT")
         self.assertEqual({self.tps(c) for c in bulk}, {"1"}, "the lane copies at BULK_TPS")
@@ -1793,7 +1669,7 @@ class BulkLane(Case):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertNotIn("bulk lane started", (self.logs / "log-backup.log").read_text())
         self.assertEqual({self.tps(c) for c in self.copies()}, {"2"})
-        self.assertEqual([c for c in self.copies() if self.is_bulk(c)], [])
+        self.assertEqual([c for c in self.copies() if "--files-from-raw" in c], [])
 
     def test_a_lane_stopped_by_sigterm_exits_only_after_its_copy_has_stopped(self):
         # PR #124 delta review N2: the lane released its lock while its copy was still committing a batch, and the
@@ -1805,7 +1681,7 @@ class BulkLane(Case):
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.addCleanup(lambda: proc.poll() is None and (proc.kill(), proc.wait()))
         end = time.time() + 20
-        while time.time() < end and not [c for c in self.copies() if self.is_bulk(c)]:
+        while time.time() < end and not [c for c in self.copies() if "--files-from-raw" in c]:
             time.sleep(0.1)
         self.assertTrue(self.copies(), "the lane started a copy")
         time.sleep(0.5)
@@ -1846,7 +1722,7 @@ class BulkLane(Case):
             done = self.run_script(LOG_BACKUP_TPSLIMIT="2", **extra)
             self.assertEqual(done.returncode, 0, done.stderr)
             self.assertEqual({self.tps(c) for c in self.copies()}, {"1"}, extra)
-            self.assertEqual([c for c in self.copies() if self.is_bulk(c)], [], "no second bulk writer")
+            self.assertEqual([c for c in self.copies() if "--files-from-raw" in c], [], "no second bulk writer")
         self.assertNotIn("bulk lane started", (self.logs / "log-backup.log").read_text(), "no second lane")
 
     def test_a_lane_run_exits_when_another_run_holds_the_checkpoint(self):
@@ -1861,7 +1737,7 @@ class BulkLane(Case):
         proc = self.hold_lane_lock()
         done = self.run_script()
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual([c for c in self.copies() if self.is_bulk(c)], [], "no second bulk writer")
+        self.assertEqual([c for c in self.copies() if "--files-from-raw" in c], [], "no second bulk writer")
         self.assertIn("bulk tier skipped: a bulk lane run holds the bulk checkpoint",
                       (self.logs / "log-backup.log").read_text())
         self.assertEqual((self.lane_lock() / "pid").read_text(), str(proc.pid), "the lane's lock is left alone")
@@ -1877,7 +1753,7 @@ class BulkLane(Case):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertTrue((stage_tmp / "partial").exists(), "the lane must not clear tier 1's snapshot temp files")
         self.assertTrue(marker.exists(), "the lane must not clear tier 1's watchdog markers")
-        self.assertEqual([c for c in self.copies() if not self.is_bulk(c)], [], "the lane copies tier 2 only")
+        self.assertEqual([c for c in self.copies() if "--files-from-raw" not in c], [], "the lane copies tier 2 only")
         self.assertFalse((self.logs / "log-backup.last-run").exists(), "the lane keeps its own run marker")
         self.assertTrue(self.bulk_ok().exists())
 
@@ -1886,7 +1762,7 @@ class BulkLane(Case):
             self.put(f".agent-harness/work/c/f{i:03d}.md", b"x%d\n" % i)
 
         def work_chunks():
-            return [c for c in self.copies() if self.is_bulk(c) and c[-1].endswith(".agent-harness/work")]
+            return [c for c in self.copies() if "--files-from-raw" in c and c[-1].endswith(".agent-harness/work")]
         done = self.run_script(LOG_BACKUP_BULK_LANE="1", LOG_BACKUP_TIER="bulk", LOG_BACKUP_TPSLIMIT="2")
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(len(work_chunks()), 1, "151 files fit one lane chunk")
@@ -1932,7 +1808,7 @@ class LaneYield(BulkLane):
         return self.logs / "log-backup.lock.d"
 
     def bulk_copies(self):
-        return [c for c in self.copies() if self.is_bulk(c)]
+        return [c for c in self.copies() if "--files-from-raw" in c]
 
     def test_ac1_with_tier_1_active_the_lane_makes_no_copy_requests(self):
         self.logs.mkdir(parents=True, exist_ok=True)
@@ -1986,7 +1862,7 @@ class LaneYield(BulkLane):
         log = (self.logs / "log-backup.log").read_text()
         self.assertNotIn("does not yield", log)
         self.assertIn("ended while tier 1 checked it", log)
-        self.assertEqual({self.tps(c) for c in self.copies() if not self.is_bulk(c)}, {"2"})
+        self.assertEqual({self.tps(c) for c in self.copies() if "--files-from-raw" not in c}, {"2"})
         if "bulk lane started" in log:
             self.wait_for_lane()
 

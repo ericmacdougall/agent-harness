@@ -50,10 +50,9 @@
 #   LOG_BACKUP_LANE_POLL_SECONDS  how often a lane copy checks for a tier-1 run (default 2, 1-60)
 #   LOG_BACKUP_LANE_BUDGET_SECONDS  wall time of one lane run (default 10800); the next scheduled run starts another
 #   LOG_BACKUP_TIER         internal: bulk marks the lane run itself; nothing else may set it
-# Freshness contract, two tiers with their own markers. Each tier-1 source (transcripts, WALs, ledgers) has its own
-# marker in log-backup.src.d, the START time of the run whose snapshot of it was sent in full (a staged tree is sent as
-# a checkpointed pass that may span runs). log-backup.last-ok is written atomically with the oldest of those once every
-# present tier-1 source has one and a primary source (.claude/projects or .codex/sessions) with files is among them. log-backup.bulk-last-ok (archived sessions, narrowed work tree)
+# Freshness contract, two tiers with their own markers. log-backup.last-ok (transcripts, WALs, ledgers) is written
+# atomically with the run START time only after every tier-1 source copied cleanly and a primary source
+# (.claude/projects or .codex/sessions) held files. log-backup.bulk-last-ok (archived sessions, narrowed work tree)
 # is written only after every tier-2 source copied cleanly. A run skipped because another run holds the lock writes
 # log-backup.last-skip and touches neither marker. With the lane on, the lane run writes bulk-last-ok and its own
 # log-backup.lane.last-run; the scheduled run's last-run then reads bulk=lane.
@@ -794,20 +793,17 @@ bulk_needs_listing() { # bulk_needs_listing SRC-REL: true when no generation is 
   return 0
 }
 bulk_upload() { # bulk_upload SRC-REL [filter args...] -- [copy args...]: one checkpointed pass; 0 when finished
-  # CK_ROOT (default ~/SRC-REL) is the local tree that is listed and sent; CK_PREFIX keeps a separate checkpoint (tier 1
-  # sends its staged snapshot through here with CK_PREFIX=live_, so it never shares state with the bulk tier).
-  local rel="$1" st n cur total chunk root
+  local rel="$1" st n cur total chunk
   shift
-  root=${CK_ROOT:-$HOME/$rel}
   local list_filters=() copy_args=()
   while [ $# -gt 0 ] && [ "$1" != -- ]; do list_filters+=("$1"); shift; done
   [ $# -gt 0 ] && shift
   copy_args=("$@")
-  st="$BULK_STATE/${CK_PREFIX:-}$(bulk_key "$rel")"
+  st="$BULK_STATE/$(bulk_key "$rel")"
   mkdir -p "$st" && chmod 700 "$BULK_STATE" "$st" || { say "cannot create bulk state for $rel"; ok=1; hard_fail=1; return 1; }
   # A checkpoint belongs to one destination: another remote or host starts over.
   if [ "$(cat "$st/remote" 2>/dev/null)" != "$R" ]; then
-    rm -f "$st/pending" "$st/cursor" "$st/done" "$st/listing" "$st/seeded" && printf '%s\n' "$R" > "$st/remote"
+    rm -f "$st/pending" "$st/cursor" "$st/done" "$st/listing" && printf '%s\n' "$R" > "$st/remote"
   fi
   # A pass listed with other exclude lists would send what they now exclude: list it again (the old `done` stays, so
   # files already verified are still not sent twice). A checkpoint from before this marker existed counts as changed.
@@ -817,7 +813,7 @@ bulk_upload() { # bulk_upload SRC-REL [filter args...] -- [copy args...]: one ch
   fi
   if [ ! -s "$st/pending" ]; then
     local filters=(--exclude-from "$EXCLUDES" --ignore-case "${list_filters[@]+"${list_filters[@]}"}")
-    "$RCLONE" lsf -R --files-only --format pst --separator $'\t' "${filters[@]}" -- "$root" \
+    "$RCLONE" lsf -R --files-only --format pst --separator $'\t' "${filters[@]}" -- "$HOME/$rel" \
       </dev/null > "$st/listing.tmp" 2>> "$LOG"
     rc=$?
     if [ $rc -ne 0 ]; then say "listing $rel failed (rclone exit $rc)"; ok=1; hard_fail=1; rm -f "$st/listing.tmp"; return 1; fi
@@ -825,12 +821,9 @@ bulk_upload() { # bulk_upload SRC-REL [filter args...] -- [copy args...]: one ch
     # full listing (it is counted, so it is never silently dropped).
     awk -F'\t' 'NF != 3 {bad++} END {print bad + 0}' "$st/listing.tmp" > "$st/odd"
     awk -F'\t' 'NF == 3' "$st/listing.tmp" > "$st/listing" && rm -f "$st/listing.tmp"
-    [ -z "${CK_SEED:-}" ] || ck_seed "$st" "$rel"
     touch "$st/done"
     awk -F'\t' 'FILENAME == ARGV[1] {seen[$0] = 1; next} !($0 in seen)' "$st/done" "$st/listing" > "$st/pending.tmp" \
       && mv "$st/pending.tmp" "$st/pending" && echo 0 > "$st/cursor" || { say "cannot build the $rel checkpoint"; ok=1; hard_fail=1; return 1; }
-    # The run that listed this generation: when it completes, the source is backed up as of this run's start.
-    if [ "${CK_CLEAN:-1}" = 1 ]; then printf '%s\n' "$STARTED" > "$st/listed"; else echo partial > "$st/listed"; fi
     # Written last: a crash before this line leaves no matching marker, so the next run lists again.
     printf '%s\n' "$FILTER_ID" > "$st/filters.tmp" && mv "$st/filters.tmp" "$st/filters" \
       || { say "cannot record the $rel filters; the next run lists it again"; ok=1; hard_fail=1; return 1; }
@@ -876,7 +869,7 @@ bulk_upload() { # bulk_upload SRC-REL [filter args...] -- [copy args...]: one ch
     if [ "$dropped" -gt 0 ]; then note_refused "$rel" "$dropped" "left out of the chunk, refused"; fi
     mv "$st/chunk.paths.tmp" "$st/chunk.paths" || { say "cannot filter the $rel chunk"; ok=1; hard_fail=1; return 1; }
     if [ -s "$st/chunk.paths" ]; then
-      upload "$root" "$rel" "${copy_args[@]+"${copy_args[@]}"}" --files-from-raw "$st/chunk.paths" --no-traverse
+      upload "$HOME/$rel" "$rel" "${copy_args[@]+"${copy_args[@]}"}" --files-from-raw "$st/chunk.paths" --no-traverse
     else
       copied=1 yielded=0   # nothing left in this chunk to send
     fi
@@ -898,50 +891,7 @@ bulk_upload() { # bulk_upload SRC-REL [filter args...] -- [copy args...]: one ch
     return 1
   fi
   say "$rel: pass complete ($total files sent or verified)"
-  CK_LISTED=$(cat "$st/listed" 2>/dev/null)
   return 0
-}
-
-# Tier-1 freshness per source (log-backup.src.d/KEY holds "STAMP REMOTE"): a source is backed up as of STAMP, the start
-# of the run whose snapshot was sent in full. log-backup.last-ok is then the oldest of them, so a run that stops on the
-# budget or the rate limit still counts for the sources it finished (before, partial progress never counted and the
-# marker stayed stuck from 2026-11-13).
-SRC_STATE="$LOGDIR/log-backup.src.d"
-ck_seed() { # ck_seed STATE-DIR SRC-REL: once per checkpoint, take the files already on the remote as verified
-  # A new tier-1 checkpoint would otherwise check every file the full copies already sent, one rate-limited operation
-  # each (about a day of runs for 38,000 files). One recursive listing of the remote is a few dozen operations; a file
-  # whose path, size and modification time match is not sent again. Tried once: a failed or stopped listing seeds
-  # nothing, and the pass then checks every file.
-  local st="$1" rel="$2" limit pid dog rc
-  [ ! -e "$st/done" ] && [ ! -e "$st/seeded" ] || return 0
-  limit=$(( $(time_left) / 3 ))
-  [ "$limit" -ge 30 ] || return 0
-  : > "$st/seeded"
-  "$RCLONE" lsf -R --files-only --fast-list --format pst --separator $'\t' --tpslimit "$TPSLIMIT" \
-    --exclude-from "$EXCLUDES" --ignore-case -- "$R/$rel" </dev/null > "$st/seed.tmp" 2>> "$LOG" &
-  pid=$!
-  ( sleep "$limit"; kill -TERM "$pid" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
-  dog=$!
-  wait "$pid"; rc=$?
-  kill "$dog" 2>/dev/null; wait "$dog" 2>/dev/null
-  if [ $rc -eq 0 ]; then
-    awk -F'\t' 'NF == 3' "$st/seed.tmp" > "$st/done.tmp" && mv "$st/done.tmp" "$st/done" \
-      && say "$rel: $(wc -l < "$st/done" | tr -d ' ') files already on the remote taken as sent"
-  else
-    say "$rel: listing the remote to seed the checkpoint failed (rclone exit $rc); this pass checks every file"
-  fi
-  rm -f "$st/seed.tmp" "$st/done.tmp"
-}
-src_mark() { # src_mark SRC-REL STAMP
-  printf '%s' "$2" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' || return 1
-  mkdir -p "$SRC_STATE" && chmod 700 "$SRC_STATE" || return 1
-  printf '%s %s\n' "$2" "$R" > "$SRC_STATE/$(bulk_key "$1").tmp.$$" && mv "$SRC_STATE/$(bulk_key "$1").tmp.$$" "$SRC_STATE/$(bulk_key "$1")"
-}
-src_stamp() { # src_stamp SRC-REL: the source's stamp for this remote, or nothing
-  local line
-  line=$(head -c 512 "$SRC_STATE/$(bulk_key "$1")" 2>/dev/null) || return 0
-  [ "${line#* }" = "$R" ] || return 0
-  printf '%s' "${line%% *}" | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
 }
 
 bulk_try="$LOGDIR/log-backup.bulk-last-try"
@@ -1004,10 +954,7 @@ transcripts_ok=0
 if [ "$TIER" != bulk ]; then
 later=0
 for src in "${LIVE[@]}"; do [ -e "$HOME/$src" ] && later=$((later + 1)); done
-run_fail=0
 for src in "${LIVE[@]}"; do
-  # ok is per source inside this loop (a source is clean when it ends at 0); run_fail keeps the run's result.
-  [ $ok -eq 0 ] || run_fail=1; ok=0
   [ -e "$HOME/$src" ] || [ -L "$HOME/$src" ] || continue
   later=$((later - 1)); [ $later -ge 0 ] || later=0
   # A later copy that hangs costs its slice, both graces and about 3 s to snapshot the source first.
@@ -1130,55 +1077,16 @@ for src in "${LIVE[@]}"; do
       say "snapshot failed: $src"; ok=1; continue
     fi
   fi
-  if [ -d "$snap" ] && [ ! -L "$snap" ]; then
-    # A staged tree is sent as a checkpointed pass of its new or changed files (the bulk tier's checkpoint): a full
-    # copy re-listed about 38,000 files against Dropbox every run and used the whole budget on it (2026-11-25).
-    # The staged copy keeps the source's files, so a chunk cut short is sent again and the cursor resumes there.
-    found_before=$found primary_before=$primary CK_LISTED=
-    if [ $ok -eq 0 ]; then src_clean=1; else src_clean=0; fi
-    if CK_ROOT="$snap" CK_PREFIX=live_ CK_SEED=1 CK_CLEAN=$src_clean bulk_upload "$src" --; then
-      found=$((found_before + 1)) primary=$primary_before
-      case "$src" in .claude/projects|.codex/sessions)
-        if [ -n "$(find "$HOME/$src" -type f -print -quit 2>/dev/null)" ]; then primary=$((primary + 1)); fi ;;
-      esac
-      [ $src_clean -eq 1 ] && [ $ok -eq 0 ] && { src_mark "$src" "$CK_LISTED" || say "cannot record the $src marker"; }
-    else
-      found=$found_before primary=$primary_before; ok=1
-    fi
-  else
-    upload "$snap" "$src"
-    [ $ok -eq 0 ] && { src_mark "$src" "$STARTED" || say "cannot record the $src marker"; }
-  fi
+  upload "$snap" "$src"
   stage_drop_after_upload "$snap"
 done
-[ $ok -eq 0 ] || run_fail=1; ok=$run_fail
 # Tier 1 (transcripts, WALs, ledgers) is done: mark it on its own, so a slow bulk pass can never hide a gap here.
 [ $primary -gt 0 ] || { say "no primary source (.claude/projects or .codex/sessions) was copied"; ok=1; }
 say "transcripts exit=$ok sources=$found remote=${R%%:*}"
 transcripts_ok=$ok
-# last-ok is the oldest per-source stamp over the live sources present, once each has one and a primary source with
-# files has one. It never moves back.
-oldest= oldest_src= have_primary=0 missing=
-for src in "${LIVE[@]}"; do
-  [ -e "$HOME/$src" ] || continue
-  st_=$(src_stamp "$src")
-  if [ -z "$st_" ]; then missing="$missing $src"; continue; fi
-  case "$src" in .claude/projects|.codex/sessions)
-    [ -z "$(find "$HOME/$src" -type f -print -quit 2>/dev/null)" ] || have_primary=1 ;;
-  esac
-  if [ -z "$oldest" ] || [[ "$st_" < "$oldest" ]]; then oldest=$st_ oldest_src=$src; fi
-done
-prev_ok=$(head -c 512 "$LOGDIR/log-backup.last-ok" 2>/dev/null | awk 'NR == 1 {print $1}')
-if [ -n "$missing" ]; then
-  say "last-ok withheld: no completed pass yet for$missing"
-elif [ -z "$oldest" ] || [ $have_primary -eq 0 ]; then
-  say "last-ok withheld: no primary source (.claude/projects or .codex/sessions) with files has a completed pass"
-elif [ -n "$prev_ok" ] && ! [[ "$prev_ok" < "$oldest" ]]; then
-  [ $ok -eq 0 ] || say "last-ok unchanged at $prev_ok (oldest source $oldest_src at $oldest)"
-else
-  echo "$oldest sources=$found remote=${R%%:*} oldest=$oldest_src" > "$LOGDIR/log-backup.last-ok.tmp.$$" \
+if [ $ok -eq 0 ]; then
+  echo "$STARTED sources=$found remote=${R%%:*}" > "$LOGDIR/log-backup.last-ok.tmp.$$" \
     && mv "$LOGDIR/log-backup.last-ok.tmp.$$" "$LOGDIR/log-backup.last-ok"
-  [ "$oldest" = "$STARTED" ] || say "last-ok advanced to $oldest (oldest source $oldest_src)"
 fi
 fi   # tier 1
 ok=0
