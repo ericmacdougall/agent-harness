@@ -1230,6 +1230,57 @@ def _expand_braces(s: str, cap: int = BRACE_CAP) -> "list[str]":
     return done
 
 
+# Quoted or backslash-escaped `{` `,` `}` are masked while a segment is split into words, so that brace expansion,
+# which no shell applies to quoted text, skips them; _cmd_lines unmasks every word before anything else reads it.
+_MASK = {"{": "", ",": "", "}": ""}
+_UNMASK = str.maketrans({v: k for k, v in _MASK.items()})
+# The command names delete_targets_line takes targets or bindings from. Only their words are brace-expanded, so code
+# in a heredoc body or a quoted ssh/node script is never expanded (goodqa#17182 replay: 48 commands refused by the cap).
+_BRACE_NAMES = DELETE_VERBS | {"mv", "gio", "find", "xargs", "git", "cd", "pushd", "for"}
+
+
+def _unmask(s: str) -> str:
+    return s.translate(_UNMASK)
+
+
+def _mask_quoted_braces(seg: str) -> str:
+    """seg with the braces and commas inside quotes, or after a backslash outside single quotes, masked. An unclosed
+    quote leaves seg as it is: expanding too much is the safe direction."""
+    out, q, i, n = [], "", 0, len(seg)
+    while i < n:
+        c = seg[i]
+        if c == "\\" and q != "'" and i + 1 < n:
+            out.append(c + _MASK.get(seg[i + 1], seg[i + 1]))
+            i += 2
+            continue
+        if q:
+            if c == q:
+                q = ""
+            out.append(_MASK.get(c, c))
+        else:
+            if c in "'\"":
+                q = c
+            out.append(c)
+        i += 1
+    return seg if q else "".join(out)
+
+
+def _expand_command_braces(words: list) -> list:
+    """Brace-expand a simple command's words when its name is one delete_targets_line reads, including a name that is
+    itself a brace word (`{rm,-rf,/p}`, `/bin/r{m,m}`); other commands' words, such as code after `f(` in a heredoc
+    body, are left as they are. A name word past the cap raises BraceOverflow when it could spell one of those names
+    (every alternative is built from the word's own characters, so one lacking a letter of each name cannot)."""
+    try:
+        names = _expand_braces(words[0]) if _BRACE_GROUP.search(words[0]) else [words[0]]
+    except BraceOverflow:
+        if any(set(n) <= set(words[0]) for n in _BRACE_NAMES):
+            raise
+        return words
+    if not any(os.path.basename(n) in _BRACE_NAMES for n in names):
+        return words
+    return [x for w in words for x in _expand_braces(w)]
+
+
 def _var_value(m, env: dict) -> "list[str] | None":
     """Values for one _VAR match, or None when unknown. ${D:?}, ${D%/} and the like use D's value (the suffix
     operators only trim); an unknown ${D:-x} / ${D:=x} / ${D-x} uses its default text."""
@@ -1313,6 +1364,7 @@ def _cmd_lines(cmd: str) -> "list[tuple[list, str]]":
     bracketed by _PUSH/_POP so a `cd` inside them does not leak out."""
     out = []
     sep = ";"
+    cmd = _unmask(cmd)          # a mask character typed in the command is read as the brace it stands for
     for seg, nsep, bodies in _split_line(cmd):
         cur_sep, sep = sep, nsep
         seg = seg.strip()
@@ -1321,21 +1373,21 @@ def _cmd_lines(cmd: str) -> "list[tuple[list, str]]":
                 out.append(([_PUSH], ";"))
                 out.extend(_cmd_lines(body))
                 out.append(([_POP], ";"))
-            seg = _strip_comment(seg)
+            seg = _mask_quoted_braces(_strip_comment(seg))
             try:
                 words = shlex.split(seg)                # not comments=True: it cuts `${f##*/}` mid-word
             except ValueError:
                 words = [w.strip("'\"") for w in seg.split()]
             words = _unwrap(words)
-            if words and os.path.basename(words[0]) in SHELLS:
+            if words and os.path.basename(_unmask(words[0])) in SHELLS:
                 j = next((i for i, w in enumerate(words[1:], 1) if re.match(r"^-[a-zA-Z]*c[a-zA-Z]*$", w)), 0)
                 if j and j + 1 < len(words):
                     out.append(([_PUSH], cur_sep))
-                    out.extend(_cmd_lines(words[j + 1]))
+                    out.extend(_cmd_lines(_unmask(words[j + 1])))    # the inner shell expands its own braces
                     out.append(([_POP], ";"))
                     words = []
             if words:
-                out.append((words, cur_sep))
+                out.append(([_unmask(w) for w in _expand_command_braces(words)], cur_sep))
         if nsep == "(":
             out.append(([_PUSH], nsep))
         elif nsep == ")":
@@ -1703,8 +1755,7 @@ def delete_targets_line(cmd: str, cwd: str) -> "list[tuple[str, bool, str]]":
                 pending_old = []
             if sep != "|":
                 find_ctx = None
-            words = [x for w in words for x in _expand_braces(w)]
-            name = os.path.basename(words[0])
+            name = os.path.basename(words[0])             # _cmd_lines already brace-expanded what this reads
             # find output bound to a loop variable: `for d in $(find R); do rm -rf "$d"` / `for d in $old`
             if name == "for" and len(words) >= 3 and words[2] == "in":
                 inherited = _inherit_finds(words[3:], subst_finds, var_finds)

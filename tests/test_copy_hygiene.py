@@ -1111,6 +1111,42 @@ class BraceCap(Base):
         self.assertEqual(code, 2)
         self.assertIn("PROTECTED PATH", err)
 
+    # goodqa#17182 replay at 1b0e57e9: all 68 cap refusals were words that are not delete or move operands (heredoc
+    # code, quoted ssh / node scripts). Only the words of commands the delete check reads are expanded, and quoted
+    # text never is.
+    def test_braces_in_code_and_quoted_scripts_are_not_expanded(self):
+        big = "".join("{a%d,b%d}" % (i, i) for i in range(9))          # 512 alternatives if it were expanded
+        tidy = " && rm -f /nonexistent-17182/tmp.out"                  # every line reaches the delete check
+        for cmd in ("cat > /nonexistent-17182/o.js <<'EOF'\nconst o = f(%s);\nexport default o;\nEOF" % big + tidy,
+                    "python3 - <<'EOF'\nimport json\nprint(%s)\nEOF" % big + tidy,
+                    "node <<'EOF'\nconsole.log(%s)\nEOF" % big + tidy,
+                    "ssh t2-dev 'cd /srv && echo %s'" % big + tidy,
+                    "node -e \"console.log(%s)\"" % big + tidy,
+                    "git commit -m \"note %s\"" % big + tidy,
+                    "find /nonexistent-17182 -name '%s' -delete" % big,
+                    "mv /nonexistent-17182/a /nonexistent-17182/b%s" % big.replace("{", "\\{").replace("}", "\\}"),
+                    "mv /nonexistent-17182/a '/nonexistent-17182/b%s'" % big):  # quoted or escaped: not expanded
+            self.assertEqual(self.run_hook(cmd), (0, ""), cmd)
+
+    def test_delete_and_move_operands_and_bindings_are_still_expanded(self):
+        big = self.groups(9)
+        for cmd in ("rm -rf " + big, "sudo rm -rf " + big, "mv %s /nonexistent-17182/dest/" % big,
+                    "{rm,x}" + "{,}" * 8 + " -rf /nonexistent-17182/p"):     # a name past the cap that can spell rm
+            code, err = self.run_hook(cmd)
+            self.assertEqual(code, 2, cmd)
+            self.assertIn("UNANALYSABLE DELETE", err, cmd)
+        h = str(self.home)
+        for cmd in ("bash -c 'rm -rf %s/svc/{work,other}'" % h,               # the inner shell expands its braces
+                    "for d in %s/svc/{work,other}; do rm -rf $d; done" % h,
+                    "find %s/svc/{work,other} -delete" % h,
+                    "cd %s/svc && rm -rf {work,other}" % h,
+                    "{rm,-rf,%s/svc/work}" % h,                                 # the name is itself a brace word
+                    "rm -rf '%s/svc/{work,other}" % h,                          # unclosed quote: expanded, fail closed
+                    "mv %s/svc/{work,old} /nonexistent-17182/" % h):
+            code, err = self.run_hook(cmd)
+            self.assertEqual(code, 2, cmd)
+            self.assertIn("PROTECTED PATH", err, cmd)
+
 
 class Install(unittest.TestCase):
     def test_installer_ships_and_wires_the_guard(self):
