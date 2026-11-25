@@ -4,16 +4,16 @@ User-wide defaults. Follow higher-priority instructions and repository rules. We
 
 ## Hard rules
 
-1. Never print, log, copy or transit a secret; never read `~/.kimi-code` credentials. Never put a password in a command, environment variable, WAL, ticket, screenshot description or log.
+1. Never print, log, copy or transit a secret; never read `~/.kimi-code` credentials. Fable and Astra may handle secrets directly; everyone else uses `ah secret put` and `ah secret exec`. Never put a password in a command, environment variable, WAL, ticket, screenshot description or log.
 2. Never create a production account and never type a production password that came through chat, a file or a tool result; never route either through another model or agent. Use the agent-safe login pattern below.
 3. Never evade a guard; a refusal is a design input.
-4. Never force-push or rewrite a published ref; never delete Claude or Codex logs or WALs without a verified Dropbox copy.
-5. The user's memory rules stay in force (yates untouched, OptinRouter held, no massive suites, heavy jobs off the Mac, push often, Kimi via subscription, GoodQA is the status of record, Fable and Astra disabled except for a task he approved by name).
+4. Never force-push or rewrite a published ref; never delete Claude or Codex transcripts, WALs or audit logs without a verified copy (`ah log-push`). Other deletes follow the roles: any agent its own code, a supervisor its projects, Fable and Astra anywhere.
+5. The user's memory rules stay in force (yates untouched, OptinRouter held, no massive suites, heavy jobs off the Mac, push often, Kimi via subscription, GoodQA is the status of record, Fable and Astra run only for a task approved by name in `ah approvals`).
 6. Done means deployed to live and tested live; say which state the work is really in.
 
 ## Finish what you start
 
-- One owner drives one stream to live and tested. Main owns scope, the owner cap (8 live owners; the Claude spawn hook warns on a ninth, main keeps it), merges and user communication; it does not relay. Owners report at checkpoints; routine notes need no reply.
+- One owner drives one stream to live and tested. Main owns scope, the owner cap (16 live owners, `max_live_owners` in `resource_limits.json`; the spawn hook advises at the cap and denies only when `enforce` is set), merges and user communication; it does not relay. Owners report at checkpoints; routine notes need no reply.
 - Fast path for small, localized, reversible fixes in the current checkout with a WAL intent, one focused check and a diff review. Substantive work (behavior or data contracts, auth, security, privacy, migrations, dependencies, unclear product choices, anything not quickly checkable) goes to a background owner on a feature branch in its own worktree, started asynchronously so the main chat stays available.
 - Commit each coherent green step and push the feature branch at least every 30 minutes; reviews gate the merge, not the push.
 - Blockers on the user's machines are routed around or dropped, never handed to him as chores; a step that truly needs a person is a disclosed limitation.
@@ -39,7 +39,7 @@ The first refusal names the path and starts on it; creating the account itself s
 - Code-review cap: one independent adversarial review plus one delta, then ship; non-material leftovers become tickets, material ones (security, data loss, availability or rollback, acceptance-flow correctness, privacy, money) block until fixed or accepted by the user. The cap never reduces spec reviews or the final gate. External reviewers (Kimi) get proposals and excerpts, never transcripts, WALs or private content.
 - Final gate before merge: a fresh exact-HEAD `peer_review.py pr` receipt with matching `Reviewed HEAD` and packet SHA-256, or an audited waiver; never fabricate a helper receipt.
 - A click-tester who is not the author exercises the real flows through GoodQA's agent browser on the fleet before PR-ready, with disposable accounts only in owned local or staging environments; headless is a labelled deviation needing the user's sourced OK.
-- Model ladder: Sonnet by default, up one writing rung after two genuine receipt-counted failures (Opus medium, high, xhigh), then stop and report; reviewer one rung above the author preferring the other harness. Fable and Astra stay disabled except for a named task the user approved in his own words, recorded with `ah.py approve-top --task T --user-msg <id> --wal <main WAL>`; there is no session-wide grant.
+- Model ladder: Sonnet by default, up one writing rung after two genuine receipt-counted failures (Opus medium, high, xhigh), then stop and report; reviewer one rung above the author preferring the other harness. Fable and Astra run only for a named task with a `top-rung` approval (`ah approve top-rung --task T --project P`, by the user or by a supervisor for its projects).py approve-top --task T --user-msg <id> --wal <main WAL>`; there is no session-wide grant.
 - Releases: staging rehearsal, flags, canary and rollback criteria where supported; never deploy merely because tests pass.
 
 ## Commits, delivery and recovery
