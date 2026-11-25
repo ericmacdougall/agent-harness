@@ -3809,15 +3809,15 @@ def build_parser():
     kp.add_argument("--host", help="run on dev2, t2-dev or ah-mac-mini over ssh; ah-spectre (Windows) takes one pid, "
                     "no --tree, and stops it with Stop-Process")
     kp.add_argument("--foreign", action="store_true",
-                    help="allow a process outside your worktree and process tree (audited; raises a high ops-watch notice)")
+                    help="a process outside your worktree, process tree and supervised projects (audited, ops-watch "
+                         "notice): a top-rung caller needs nothing more; anyone else adds --approved-by")
     kp.add_argument("--session-scope", action="store_true",
-                    help="main only (kill_guard enforces it): also treat as own a process that `kill_guard.py spawn` "
-                         "recorded (pid and start time) for a worktree in this session's ~/.agent-harness/work/<session>/ "
-                         "(audited, no --foreign)")
+                    help="also treat as own a process that `kill_guard.py spawn` recorded (pid and start time) for a "
+                         "worktree in this session's ~/.agent-harness/work/<session>/ (audited, no --foreign)")
     kp.add_argument("--approved-by", metavar="ASK_ID",
-                    help="main only, local only: id of a resolved ask whose answer is a real human turn at most 24 h old "
-                         "listing the exact pid (\"pid N\", no negation), in this session only; lifts the harness-console and claude/codex refusals for processes "
-                         "idle (sleeping, 0%% CPU) and started over 24 h ago and before this session (audited, high notice)")
+                    help="local only: id of a resolved ask in this session whose answer is a real human turn at most "
+                         "24 h old listing the exact pid (\"pid N\", no negation); lifts the foreign and protected "
+                         "refusals for that pid (never pid 1, your own session, root, another user or a system process)")
     kp.add_argument("--session")
     kp.add_argument("--agent", help="calling agent id for the audit row")
     kp.add_argument("--wal", help="caller WAL path (default: this session's main WAL)")
