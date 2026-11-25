@@ -697,7 +697,7 @@ class App:
         try:
             record, created = mc_chat.new_message(to, body.get("text"), client_key=body.get("client_key"),
                                                   session=body.get("session"), thread=body.get("thread"),
-                                                  root=self.root)
+                                                  reply_to=body.get("reply_to"), root=self.root)
         except mc_chat.ChatError as exc:
             status = 409 if exc.code in ("no-target", "key-conflict") else 400
             return status, {"error": exc.code, "message": str(exc)}

@@ -319,7 +319,7 @@ class AlertParityAndDegrade(unittest.TestCase):
         return subprocess.run([sys.executable, str(self.hook), 'hook'], input=json.dumps(payload), text=True,
                               capture_output=True, env=self.env, timeout=30)
 
-    def test_active_alert_reaches_prompt_session_and_subagent_context(self):
+    def test_active_alerts_are_one_session_start_line_and_never_per_prompt(self):
         # Run an installed-style copy (hook + ops_watch.py beside it, as install_codex ships them) so the positive
         # path is proven without the checkout-relative candidate; the test then passes from an archive without .git.
         import shutil
@@ -332,13 +332,17 @@ class AlertParityAndDegrade(unittest.TestCase):
         ops_watch.emit({'schema': 1, 'at': '2026-11-05T08:00:00+00:00', 'host': 'testhost', 'source': 'test-alert',
                         'event': 'raise', 'severity': 'high', 'key': 'disk:volume:/', 'message': 'ALERT-MARKER-41 disk 97 percent'},
                        home=Path(self.home.name))
-        for payload in ({'hook_event_name': 'SessionStart', 'session_id': 'alerts', 'source': 'startup'},
-                        {'hook_event_name': 'UserPromptSubmit', 'session_id': 'alerts', 'prompt': 'hi'},
-                        {'hook_event_name': 'SubagentStart', 'session_id': 'alerts', 'agent_id': 'a1', 'agent_type': 'general-purpose'}):
+        # 2026-11-24: one ops_watch.session_summary line at SessionStart; nothing per prompt or per sub-agent start
+        for payload, shown in (({'hook_event_name': 'SessionStart', 'session_id': 'alerts', 'source': 'startup'}, True),
+                               ({'hook_event_name': 'UserPromptSubmit', 'session_id': 'alerts', 'prompt': 'hi'}, False),
+                               ({'hook_event_name': 'SubagentStart', 'session_id': 'alerts', 'agent_id': 'a1',
+                                 'agent_type': 'general-purpose'}, False)):
             result = self.run_hook(payload)
             self.assertEqual(result.returncode, 0, result.stderr)
             context = json.loads(result.stdout)['hookSpecificOutput']['additionalContext']
-            self.assertIn('ALERT-MARKER-41', context, payload['hook_event_name'])
+            self.assertEqual('Ops alerts' in context, shown, (payload['hook_event_name'], context))
+            if shown:
+                self.assertIn('1 active (1 high)', context)
 
     def test_checkout_loader_candidate_is_not_used_from_an_install_dir(self):
         # Installed under <home>/.codex/agent-harness the checkout-relative candidate would be <home>/harness/hooks;
@@ -347,9 +351,9 @@ class AlertParityAndDegrade(unittest.TestCase):
         install_dir = Path(self.home.name) / '.codex' / 'agent-harness'; install_dir.mkdir(parents=True)
         shutil.copy(self.hook, install_dir / 'wal.py')
         decoy = Path(self.home.name) / 'harness' / 'hooks'; decoy.mkdir(parents=True)
-        (decoy / 'ops_watch.py').write_text('def injection_text(home, max_chars=700):\n    return " DECOY-LOADED"\n')
+        (decoy / 'ops_watch.py').write_text('def session_summary(home, session=""):\n    return "DECOY-LOADED", []\n')
         result = subprocess.run([sys.executable, str(install_dir / 'wal.py'), 'hook'],
-                                input=json.dumps({'hook_event_name': 'UserPromptSubmit', 'session_id': 'ld', 'prompt': 'hi'}),
+                                input=json.dumps({'hook_event_name': 'SessionStart', 'session_id': 'ld', 'source': 'startup'}),
                                 text=True, capture_output=True, env=self.env, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn('DECOY-LOADED', json.loads(result.stdout)['hookSpecificOutput']['additionalContext'])

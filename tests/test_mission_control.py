@@ -683,6 +683,17 @@ class Security(ServerHarness):
         self.assertEqual(json.loads(data)["error"], "owner-route-unavailable")
         self.assertEqual(mc_chat.inbox(), [])
 
+    def test_the_dashboard_reply_to_reaches_the_inbox_record(self):
+        # 2026-11-24: an answer typed under an agent's reply or an ask carries what it answers
+        cookie, csrf = self.login()
+        mc_chat.register_target("sess-1", os.getpid())
+        body = {"to": "claude", "session": "sess-1", "text": "yes, go ahead", "client_key": "reply-to-key-01",
+                "reply_to": "ask:w0123456789a"}
+        resp, data = self.post(cookie, csrf, body)
+        self.assertIn(resp.status, (200, 201), data)
+        record = mc_chat.load(json.loads(data)["id"])
+        self.assertEqual(record.get("reply_to"), "ask:w0123456789a")
+
     def test_launch_code_is_single_use_and_expires(self):
         code = mcs.mint_code(mc_chat.secret())
         first, _ = self.request("GET", "/launch?c=" + code)
