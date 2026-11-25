@@ -192,15 +192,46 @@ def records_only(command, assignments=False):
     return bool(statements) and all(_records(words) for words in statements)
 
 
+WORK_FILE = re.compile(r"cat[ \t]*>>?[ \t]*(?P<path>(?:~/)?[A-Za-z0-9_@%+:,./-]+)[ \t]*<<[ \t]*'(?P<end>[A-Za-z_][A-Za-z0-9_]{0,31})'[ \t]*")
+
+
+def work_file_only(command, session):
+    """True when `command` is only `cat > FILE <<'WORD'` here-documents (quoted, so nothing in them expands) into literal
+    files below the calling session's own ~/.agent-harness/work/<id>/. Nothing runs, so the text is data. command_guard
+    still judges the file that is written."""
+    if not isinstance(command, str) or len(command) > 1 << 20 or RECORD_CONTROL.search(command) \
+            or not isinstance(session, str) or not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', session):
+        return False
+    home = os.path.expanduser('~')
+    own = home + '/.agent-harness/work/' + session + '/'
+    lines, at = command.rstrip('\n').split('\n'), 0
+    while at < len(lines):
+        head = WORK_FILE.fullmatch(lines[at])
+        if head is None or head.group('end') not in lines[at + 1:]:
+            return False
+        path = head.group('path')
+        path = home + path[1:] if path.startswith('~/') else path
+        # answers from the user are read from these names (owner_inbox.py), so a file there is not plain text
+        answers = any(p.casefold() == 'inbox' or p.casefold().startswith('owner-decision') for p in path[len(home):].split('/'))
+        if answers or not RECORD_PATH.fullmatch(path) or '..' in path.split('/') or not path.startswith(own) \
+                or os.path.realpath(path) != os.path.realpath(home) + path[len(home):]:  # a symlink below the home
+            return False
+        at = lines.index(head.group('end'), at + 1) + 1
+    return True
+
+
 def payload_records_only(payload, assignments=False):
     """records_only() for the one command of a Bash tool call. Text typed into a running shell, a list, a second command
-    field and every other tool are judged as before: their state or shell is not known here. kill_guard, merge_gate and
-    dropped_gate call this with `assignments`; the launcher's own fast path does not."""
+    field and every other tool are judged as before: their state or shell is not known here. kill_guard, merge_gate,
+    dropped_gate and copy_hygiene call this with `assignments` (and then work_file_only() counts too); the launcher's own
+    fast path does not."""
     if not isinstance(payload, dict) or payload.get('tool_name') != 'Bash':
         return False
     tool_input = payload.get('tool_input')
-    return isinstance(tool_input, dict) and not any(k in tool_input for k in COMMAND_KEYS[1:]) \
-        and records_only(tool_input.get('command'), assignments)
+    if not isinstance(tool_input, dict) or any(k in tool_input for k in COMMAND_KEYS[1:]):
+        return False
+    command = tool_input.get('command')
+    return records_only(command, assignments) or assignments and work_file_only(command, payload.get('session_id'))
 
 
 def guarded_text(raw):

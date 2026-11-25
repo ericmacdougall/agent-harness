@@ -1879,6 +1879,12 @@ def pretool(event: dict, cfg: "dict | None" = None) -> "tuple[int, str]":
         copying = [w for w in copy_commands(cmd) if is_copy_command(w)]
         if not copying:
             return 0, ""
+        try:
+            from command_guard_hook import payload_records_only  # noqa: PLC0415
+            if payload_records_only(event, assignments=True):  # copy words in a note or a written file (goodqa#17099)
+                return 0, ""
+        except Exception:  # noqa: BLE001 - no helper, no exemption
+            pass
         cfg = normalize(cfg) if cfg is not None else load_config()
         target = home()
         for w in copying:
