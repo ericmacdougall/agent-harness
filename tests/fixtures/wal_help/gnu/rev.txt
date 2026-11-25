@@ -1,0 +1,9 @@
+Usage: rev [options] [file ...]
+
+Reverse lines characterwise.
+
+Options:
+ -h, --help     display this help
+ -V, --version  display version
+
+For more details see rev(1).

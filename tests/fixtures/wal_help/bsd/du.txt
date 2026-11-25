@@ -1,0 +1,25 @@
+SYNOPSIS
+     du [-Aclnx] [-H | -L | -P] [-g | -h | -k | -m] [-a | -s | -d depth]
+	[-B blocksize] [-I mask] [-t threshold] [file ...]
+
+     -A      Display the apparent size instead of the disk usage.  This can be
+     -B blocksize
+     -H      Symbolic links on the command line are followed, symbolic links
+     -I mask
+     -L      Symbolic links on the command line and in file hierarchies are
+     -P      No symbolic links are followed.  This is the default.
+     -a      Display an entry for each file in a file hierarchy.
+     -c      Display a grand total.
+     -d depth
+     -g      Display block counts in 1073741824-byte (1 GiB) blocks.
+     -h      "Human-readable" output.  Use unit suffixes: Byte, Kilobyte,
+     -k      Display block counts in 1024-byte (1 kiB) blocks.
+     -l      If a file has multiple hard links, count its size multiple times.
+     -m      Display block counts in 1048576-byte (1 MiB) blocks.
+     -n      Ignore files and directories with user "nodump" flag (UF_NODUMP)
+     -r      Generate messages about directories that cannot be read, files
+     -s      Display an entry for each specified file.	(Equivalent to -d 0)
+     --si    "Human-readable" output.  Use unit suffixes: Byte, Kilobyte,
+     -t threshold
+     -x      File system mount points are not traversed.
+     -h, -k, -m and --si options all override each other; the last one

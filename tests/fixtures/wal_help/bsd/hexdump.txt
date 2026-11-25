@@ -1,0 +1,15 @@
+SYNOPSIS
+     hexdump [-bcCdovx] [-e format_string] [-f format_file] [-n length]
+	     [-s offset] file ...
+
+     -b      One-byte octal display.  Display the input offset in hexadecimal,
+     -c      One-byte character display.  Display the input offset in
+     -C      Canonical hex+ASCII display.  Display the input offset in
+     -d      Two-byte decimal display.	Display the input offset in
+     -e format_string
+     -f format_file
+     -n length
+     -o      Two-byte octal display.  Display the input offset in hexadecimal,
+     -s offset
+     -v      Cause hexdump to display all input data.  Without the -v option,
+     -x      Two-byte hexadecimal display.  Display the input offset in

@@ -1,0 +1,32 @@
+SYNOPSIS
+     md5 [-pqrtx] [-c string] [-s string] [file ...]
+
+     md5sum [-bctwz] [--binary] [--check] [--help] [--ignore-missing]
+	    [--quiet] [--status] [--strict] [--tag] [--text] [--version]
+	    [--warn] [--zero] [file ...]
+
+	    (All other hashes have the same options and usage.)
+
+     shasum [-0bchqstUvw] [--01] [-a | --algorithm alg] [--binary] [--check]
+	    [--help] [--ignore-missing] [--quiet] [--status] [--strict]
+	    [--tag] [--text] [--UNIVERSAL] [--version] [--warn] [file ...]
+
+     -c string, --check=string
+     -p, --passthrough
+     -q, --quiet
+     -r, --reverse
+     -s string, --string=string
+     -t, --time-trial
+     -x, --self-test
+     -b, --binary
+     -c, --check
+     --help  Print a usage message and exit.
+     --ignore-missing
+     --quiet
+     --status
+     --strict
+     --tag   Produce BSD-style output.
+     -t, --text
+     --version
+     -w, --warn
+     -z, --zero

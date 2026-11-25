@@ -1,0 +1,58 @@
+SYNOPSIS
+     grep [-abcdDEFGHhIiJLlMmnOopqRSsUVvwXxZz] [-A num] [-B num] [-C num]
+	  [-e pattern] [-f file] [--binary-files=value] [--color[=when]]
+	  [--colour[=when]] [--context=num] [--label] [--line-buffered]
+	  [--null] [pattern] [file ...]
+
+     -A num, --after-context=num
+     -a, --text
+     -B num, --before-context=num
+     -b, --byte-offset
+     -C num, --context=num
+     -c, --count
+     --colour=[when], --color=[when]
+     -D action, --devices=action
+     -d action, --directories=action
+     -E, --extended-regexp
+     -e pattern, --regexp=pattern
+     --exclude pattern
+     --exclude-dir pattern
+     -F, --fixed-strings
+     -f file, --file=file
+     -G, --basic-regexp
+     -H      Always print filename headers with output lines.
+     -h, --no-filename
+     --help  Print a brief help message.
+     -I      Ignore binary files.  This option is equivalent to the
+     -i, --ignore-case
+     --include pattern
+     --include-dir pattern
+     -J, --bz2decompress
+     -L, --files-without-match
+     -l, --files-with-matches
+     --label
+     --mmap  Use mmap(2) instead of read(2) to read input, which can result in
+     -M, --lzma
+     -m num, --max-count=num
+     -n, --line-number
+     --null  Prints a zero-byte after the file name.
+     -O      If -R is specified, follow symbolic links only if they were
+     -o, --only-matching
+     -p      If -R is specified, no symbolic links are followed.  This is the
+     -q, --quiet, --silent
+     -R, -r, --recursive
+     -S      If -R is specified, all symbolic links are followed.  The default
+     -s, --no-messages
+     -U, --binary
+     -u      This option has no effect and is provided only for compatibility
+     -V, --version
+     -v, --invert-match
+     -w, --word-regexp
+     -x, --line-regexp
+     -y      Equivalent to -i.	Obsoleted.
+     -z, --null-data
+     -X, --xz
+     -Z, --decompress
+     --binary-files=value
+     --line-buffered
+     -f and file arguments.

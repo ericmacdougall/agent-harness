@@ -1,0 +1,23 @@
+SYNOPSIS
+     od [-aBbcDdeFfHhIiLlOosvXx] [-A base] [-j skip] [-N length] [-t type]
+	[[+]offset[.][Bb]] [file ...]
+
+     -A base	    Specify the input address base.  The argument base may be
+     -a 	    Output named characters.  Equivalent to -t a.
+     -B, -o	    Output octal shorts.  Equivalent to -t o2.
+     -b 	    Output octal bytes.  Equivalent to -t o1.
+     -c 	    Output C-style escaped characters.	Equivalent to -t c.
+     -D 	    Output unsigned decimal ints.  Equivalent to -t u4.
+     -d 	    Output unsigned decimal shorts.  Equivalent to -t u2.
+     -e, -F	    Output double-precision floating point numbers.
+     -f 	    Output single-precision floating point numbers.
+     -H, -X	    Output hexadecimal ints.  Equivalent to -t x4.
+     -h, -x	    Output hexadecimal shorts.	Equivalent to -t x2.
+     -I, -L, -l     Output signed decimal longs.  Equivalent to -t dL.
+     -i 	    Output signed decimal ints.  Equivalent to -t dI.
+     -j skip	    Skip skip bytes of the combined input before dumping.  The
+     -N length	    Dump at most length bytes of input.
+     -O 	    Output octal ints.	Equivalent to -t o4.
+     -s 	    Output signed decimal shorts.  Equivalent to -t d2.
+     -t type	    Specify the output format.	The type argument is a string
+     -v 	    Write all input data, instead of replacing lines of

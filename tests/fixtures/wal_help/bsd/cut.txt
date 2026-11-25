@@ -1,0 +1,12 @@
+SYNOPSIS
+     cut -b list [-n] [file ...]
+     cut -c list [file ...]
+     cut -f list [-w | -d delim] [-s] [file ...]
+
+     -b list
+     -c list
+     -d delim
+     -f list
+     -n      Do not split multi-byte characters.  Characters will only be
+     -s      Suppress lines with no field delimiter characters.  Unless
+     -w      Use whitespace (spaces and tabs) as the delimiter.  Consecutive

@@ -1,0 +1,6 @@
+SYNOPSIS
+     fold [-bs] [-w width] [file ...]
+
+     -b      Count width in bytes rather than column positions.
+     -s      Fold line after the last blank character within the first width
+     -w width

@@ -1,0 +1,11 @@
+SYNOPSIS
+     tr [-Ccsu] string1 string2
+     tr [-Ccu] -d string1
+     tr [-Ccu] -s string1
+     tr [-Ccu] -ds string1 string2
+
+     -C      Complement the set of characters in string1, that is "-C ab"
+     -c      Same as -C but complement the set of values in string1.
+     -d      Delete characters in string1 from the input.
+     -s      Squeeze multiple occurrences of the characters listed in the last
+     -u      Guarantee that any output is unbuffered.

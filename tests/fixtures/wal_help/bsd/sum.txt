@@ -1,0 +1,5 @@
+SYNOPSIS
+     cksum [-o 1 | 2 | 3] [file ...]
+     sum [file ...]
+
+     -o      Use historic algorithms instead of the (superior) default one.

@@ -1,0 +1,7 @@
+SYNOPSIS
+     comm [-123i] file1 file2
+
+     -1      Suppress printing of column 1, lines only in file1.
+     -2      Suppress printing of column 2, lines only in file2.
+     -3      Suppress printing of column 3, lines common to both.
+     -i      Case insensitive comparison of lines.

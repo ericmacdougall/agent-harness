@@ -31,8 +31,35 @@ UNDOCUMENTED = {
                         '--no-run-if-empty': 'man lists it beside -r', '--max-chars': 'man lists it beside -s',
                         '--verbose': 'man lists it beside -t', '--exit': 'man lists it beside -x'},
 }
-# documented words that are not options of the spec's table: a lone `-` is a spec's `dash` or an operand
-NOT_OPTIONS = {'-', '--', '-arch_name'}
+# documented words that are not options of the spec's table: a lone `-` is a spec's `dash` or an operand; `-NUM` is
+# a spec's numeric= or digits=
+NOT_OPTIONS = {'-', '--', '-arch_name', '-NUM', '--GTYPE-group-format', '--LTYPE-line-format'}
+_DIFF_FORMATS = {o: (REQ, "the help's GTYPE/LTYPE placeholder") for o in (
+    '--old-group-format', '--new-group-format', '--changed-group-format', '--unchanged-group-format',
+    '--old-line-format', '--new-line-format', '--unchanged-line-format')}
+# (program, reading): {option: (arity, reason)} where this module's reading of the document is wrong
+ARITY_EXCEPTIONS = {
+    ('sort', ws.GNU): {'-C': (NO, '`-C, --check=quiet, --check=silent` spells values of --check'),
+                       '--check': (OPT, '`--check, --check=diagnose-first`: the value is optional')},
+    ('tr', ws.BSD): {'-d': (NO, 'the synopsis word after -d is the operand string1'),
+                     '-s': (NO, 'the synopsis word after -s is the operand string1')},
+    ('shasum', ws.ANY): {'-a': (REQ, 'the help gives the values (1, 224, ...) in the description'),
+                         '--algorithm': (REQ, 'the help gives the values in the description')},
+    ('file', ws.ANY): {'-P': (REQ, 'file(1): -P name=value; the help omits the argument'),
+                       '--parameter': (REQ, 'file(1): --parameter name=value')},
+    ('jq', ws.ANY): {'--slurpfile': (REQ, 'its help line runs `name file` into the description')},
+    ('xargs', ws.GNU): {'-e': (OPT, "findutils' getopt string has e:: (as --eof[=END])"),
+                        '-i': (OPT, "findutils' getopt string has i:: (as --replace[=R])")},
+    ('diff', ws.GNU): _DIFF_FORMATS,
+    ('strings', ws.GNU): {'-a': (NO, '`-a - --all`: the lone dash is a third spelling'),
+                          '-t': (REQ, '`-t --radix={o,d,x}`: the value list is in lower case'),
+                          '-e': (REQ, 'its line runs the value list into the description'),
+                          '--encoding': (REQ, 'its line runs the value list into the description'),
+                          '-w': (NO, 'its line runs the description into the option'),
+                          '--include-all-whitespace': (NO, 'its line runs the description into the option')},
+    ('diff', ws.BSD): {'--unified': (OPT, 'diff(1) gives it as the synonym of -u and of -U number'),
+                       '--context': (OPT, 'diff(1) gives it as the synonym of -c and of -C number')},
+}
 # programs with a spec and no fixture, and why
 NO_FIXTURE = {
     ('time', ws.GNU): 'GNU time is not installed on t2-dev; the spec follows time(1) of GNU time 1.9',
@@ -49,32 +76,57 @@ def _merge(table, name, takes):
     table[name] = max(table.get(name, NO), takes, key=_STRENGTH.get)
 
 
-def option_lines(text, long_only=False):
+def _marker(rest):
+    """The arity a token's own text gives its option: None (no marker), OPT, REQ, or 'prose' (not an option)."""
+    if rest == '':
+        return None
+    if re.fullmatch(r'\[=[^\]]*\]|\[[^\]=\s]+\]|\s+\[[^\]\s]+\]', rest):
+        return OPT    # --follow[=HOW], -l[MAX-LINES], --all-repeated [septype]
+    if re.fullmatch(r'=\S+|\s+(<[^>]+>|\S+)(\.\.\.)?|\s+[a-z]+\s+[a-z]+', rest):
+        return REQ    # --lines=NUM, -E END, --class <class>, --pid <pid>..., jq's --arg name value
+    return 'prose'
+
+
+def option_lines(text, long_only=False, placeholder=r'[A-Z<]'):
     """{option: arity} from GNU `--help` lines and man-page option lines: the option part of a line is everything
-    before two spaces or a tab, as `-n, --lines=NUM`, `-c, --class <class>`, `-l[MAX-LINES]`, `-E END`."""
+    before two spaces or a tab, as `-n, --lines=NUM`, `-c, --class <class>`, `-l[MAX-LINES]`, `-E END`. Each token's
+    own marker wins. A one-letter option without one takes the marker of the token right after it when that is a
+    required value (coreutils: mandatory arguments to long options are mandatory for short ones too) or an optional
+    one in the util-linux `<x>` style; otherwise it takes none, so BSD sort's `-g, ..., --sort=general-numeric` gives
+    -g nothing. A name given both bare and with `=VALUE` (sort's `--check, --check=diagnose-first`) takes an optional
+    value. ARITY_EXCEPTIONS corrects the few documents this reads wrongly."""
     table = {}
     for line in text.splitlines():
-        m = re.match(r'^[ ]{1,8}(-\S.*?)(?:[ ]{2,}|\t|$)', line)
+        line = re.sub(r'^(\s*-\w)\s{2,}(--)', r'\1, \2', line)   # GNU stat: `-c  --format=FORMAT`
+        line = re.sub(r'^(\s*-.*?<[^>]+>(?:\.\.\.)?) (?=\S)', r'\1  ', line)   # chrt: `--sched-deadline <ns> deadline`
+        m = re.match(r'^[ ]{1,7}(-\S.*?),?(?:[ ]{2,}|\t|$)', line)   # deeper lines are descriptions (rg: 8)
         if not m:
             continue
-        part = m.group(1)
-        tokens = [t.strip() for t in re.split(r',\s+', part)]
-        names, kind = [], NO
-        for t in tokens:
-            tm = re.match(r'^(--?[A-Za-z0-9][A-Za-z0-9_-]*|-)(.*)$', t)
-            if not tm:
-                names = []
+        group = []
+        if re.search(r'\b(and|or|the|options?)\b|(?<!\.)\.$', m.group(1)):
+            continue   # prose that starts with a dash (BSD wc: `-c, -l and -w options.`)
+        part = re.sub(r'(?<=[^,\s]) (?=--?[A-Za-z])', ', ', m.group(1))   # BSD diff: `-a --text`
+        for t in (t.strip() for t in re.split(r',\s+', part)):
+            tm = re.match(r'^(--?[A-Za-z0-9][A-Za-z0-9_-]*|-\.|-)(.*)$', t)   # rg: `-., --hidden`
+            kind = _marker(tm.group(2)) if tm else 'prose'
+            if kind == 'prose':
+                group = []   # prose that starts with a dash: not an option line
                 break
-            name, rest = tm.groups()
-            if rest.startswith('[=') or (rest.startswith('[') and not name.startswith('--')):
-                kind = OPT
-            elif rest.startswith('=') or re.match(r'^\s+(<|[A-Za-z\[])', rest):
-                kind = max(kind, REQ, key=_STRENGTH.get) if kind != OPT else OPT
-            elif rest and not rest.startswith('...'):
-                names = []   # not an option line (prose that starts with a dash)
-                break
-            names.append(name)
-        for name in names:
+            group.append((tm.group(1), kind, tm.group(2)))
+        own = {}
+        for name, kind, rest in group:
+            if name in own and {own[name][0], kind} == {None, REQ}:
+                own[name] = (OPT, '')   # given bare and with =VALUE
+            elif name not in own:
+                own[name] = (kind, rest)
+        names = list(own)
+        for k, name in enumerate(names):
+            kind = own[name][0]
+            if kind is None:
+                nxt_name = names[k + 1] if k + 1 < len(names) else ''
+                nxt = own.get(nxt_name, (None, ''))
+                inherits = len(name) == 2 and nxt_name.startswith('--') and re.search(placeholder, nxt[1])
+                kind = nxt[0] if inherits and (nxt[0] == REQ or (nxt[0] == OPT and '<' in nxt[1])) else NO
             _merge(table, name, kind)
     return table
 
@@ -94,11 +146,14 @@ def synopsis(text, long_only=False):
         _merge(table, name, REQ)
     syn = re.sub(r'--[\w-]+(\[=\w+\]|=\w+)', ' ', syn)
     tokens = re.findall(r'\[|\]|\||\.\.\.|[^\s\[\]|]+', syn)
+    depth = 0
     for k, t in enumerate(tokens):
+        depth += 1 if t == '[' else -1 if t == ']' else 0
         if not t.startswith('-') or t in ('-', '--'):
             continue
         nxt = tokens[k + 1] if k + 1 < len(tokens) else ']'
-        value = nxt not in ('[', ']', '|', '...') and not nxt.startswith('-')
+        # a value only inside the option's brackets: `[-u name]`, not `rg [OPTIONS] --help` then the next line
+        value = depth > 0 and nxt not in ('[', ']', '|', '...') and not nxt.startswith('-')
         if t.startswith('--'):
             _merge(table, t, REQ if value else NO)
         elif long_only or len(t) == 2:
@@ -110,11 +165,26 @@ def synopsis(text, long_only=False):
 
 
 def documented(text, reading, long_only=False):
-    table = option_lines(text, long_only)
+    # GNU texts write placeholders in capitals (--lines=NUM) and examples in lower case (-p, --indicator-style=slash)
+    table = option_lines(text, long_only, r'[A-Z<]' if reading != ws.BSD else r'\S')
     if reading != ws.GNU:   # GNU --help lists every option on its own line; its usage line only says [OPTION]
         for name, takes in synopsis(text, long_only).items():
             _merge(table, name, takes)
+    # a negation the prose names (rg: `This flag can be disabled with --no-heading`, `the --no-pre flag`): a flag, when
+    # the option it negates is documented
+    for name in set(re.findall(r'(?<![\w-])(--no-[a-z0-9][a-z0-9-]*[a-z0-9])', text)):
+        if name not in table and '--' + name[5:] in table:
+            _merge(table, name, NO)
     return {n: t for n, t in table.items() if n not in NOT_OPTIONS}
+
+
+def documented_for(name, reading, long_only=False):
+    """The documented arity table of one program's fixture, with ARITY_EXCEPTIONS applied."""
+    path = FIXTURES / reading / (name + '.txt')
+    doc = documented(path.read_text(encoding='utf-8'), reading, long_only)
+    for opt, (takes, _) in ARITY_EXCEPTIONS.get((name, reading), {}).items():
+        doc[opt] = takes
+    return doc
 
 
 def spec_table(s):
@@ -206,7 +276,7 @@ class HelpContract(unittest.TestCase):
                 path = FIXTURES / s.reading / (name + '.txt')
                 if not path.exists():
                     continue
-                doc = documented(path.read_text(encoding='utf-8'), s.reading, s.long_only)
+                doc = documented_for(name, s.reading, s.long_only)
                 have = spec_table(s)
                 extra = UNDOCUMENTED.get((name, s.reading), {})
                 where = '%s (%s)' % (name, s.reading)

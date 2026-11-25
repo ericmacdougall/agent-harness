@@ -1,0 +1,18 @@
+SYNOPSIS
+     date [-nRu] [-z output_zone] [-I[FMT]] [-r filename] [-r seconds]
+	  [-v[+|-]val[y|m|w|d|H|M|S]] [+output_fmt]
+     date [-jnRu] [-z output_zone] [-I[FMT]] [-v[+|-]val[y|m|w|d|H|M|S]]
+	  [[[mm]dd]HH]MM[[cc]yy][.SS] [+output_fmt]
+     date [-jnRu] [-z output_zone] [-I[FMT]] [-v[+|-]val[y|m|w|d|H|M|S]]
+	  -f input_fmt new_date [+output_fmt]
+
+     -f input_fmt
+     -I[FMT]
+     -j      Do not try to set the date.  This allows you to use the -f flag
+     -n      Obsolete flag, accepted and ignored for compatibility.
+     -R      Use RFC 2822 date and time output format.	This is equivalent to
+     -r seconds
+     -r filename
+     -u      Display or set the date in UTC (Coordinated Universal) time.  By
+     -z output_zone
+     -v [+|-]val[y|m|w|d|H|M|S]

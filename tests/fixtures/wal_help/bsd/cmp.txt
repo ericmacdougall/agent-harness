@@ -1,0 +1,12 @@
+SYNOPSIS
+     cmp [-l | -s | -x] [-bhz] [--ignore-initial=num1[:num2]] [--bytes=num]
+	 file1 file2 [skip1 [skip2]]
+
+     -b, --print-bytes
+     -h      Do not follow symbolic links.
+     -i num1[:num2], --ignore-initial=num1[:num2]
+     -l, --verbose
+     -n num, --bytes=num
+     -s, --silent, --quiet
+     -x      Like -l but prints in hexadecimal and using zero as index for the
+     -z      For regular files compare file sizes first, and fail the

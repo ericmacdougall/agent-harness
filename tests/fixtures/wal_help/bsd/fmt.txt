@@ -1,0 +1,13 @@
+SYNOPSIS
+     fmt [-cmnps] [-d chars] [-l num] [-t num]
+	 [goal [maximum] | -width | -w width] [file ...]
+
+     -72", and "fmt 72 72" all produce identical output.  The spacing at the
+     -c      Center the text, line by line.  In this case, most of the other
+     -m      Try to format mail header lines contained in the input sensibly.
+     -n      Format lines beginning with a `.' (dot) character.
+     -p      Allow indented paragraphs.  Without the -p flag, any change in
+     -s      Collapse whitespace inside lines, so that multiple whitespace
+     -d chars
+     -l number
+     -t number

@@ -1,0 +1,50 @@
+SYNOPSIS
+     ls [-@ABCFGHILOPRSTUWabcdefghiklmnopqrstuvwxy1%,] [--color=when]
+	[-D format] [file ...]
+
+     -@      Display extended attribute keys and sizes in long (-l) output.
+     -A      Include directory entries whose names begin with a dot (`.')
+     -B      Force printing of non-printable characters (as defined by
+     -C      Force multi-column output; this is the default when output is to
+     -D format
+     -F      Display a slash (`/') immediately after each pathname that is a
+     -G      Enable colorized output.  This option is equivalent to defining
+     -H      Symbolic links on the command line are followed.  This option is
+     -I      Prevent -A from being automatically set for the super-user.  This
+     -L      Follow all symbolic links to final target and list the file or
+     -O      Include the file flags in a long (-l) output.  This option is
+     -P      If argument is a symbolic link, list the link itself rather than
+     -R      Recursively list subdirectories encountered.
+     -S      Sort by size (largest file first) before sorting the operands in
+     -T      When printing in the long (-l) format, display complete time
+     -U      Use time when file was created for sorting or printing.  This
+     -W      Display whiteouts when scanning directories.  This option is not
+     -X      When listing recursively, do not descend into directories that
+     -a      Include directory entries whose names begin with a dot (`.').
+     -b      As -B, but use C escape codes whenever possible.  This option is
+     -c      Use time when file status was last changed for sorting or
+     --color=when
+     -d      Directories are listed as plain files (not searched recursively).
+     -e      Print the Access Control List (ACL) associated with the file, if
+     -f      Output is not sorted.  This option turns on -a.  It also negates
+     -g      This option has no effect.  It is only available for
+     -h      When used with the -l option, use unit suffixes: Byte, Kilobyte,
+     -i      For each file, print the file's file serial number (inode
+     -k      This has the same effect as setting environment variable
+     -l      (The lowercase letter "ell".) List files in the long format, as
+     -m      Stream output format; list files across the page, separated by
+     -n      Display user and group IDs numerically rather than converting to
+     -o      List in long format, but omit the group id.
+     -p      Write a slash (`/') after each filename if that file is a
+     -q      Force printing of non-graphic characters in file names as the
+     -r      Reverse the order of the sort.
+     -s      Display the number of blocks used in the file system by each
+     -t      Sort by descending time modified (most recently modified first).
+     -u      Use time of last access, instead of time of last modification of
+     -v      Force unedited printing of non-graphic characters; this is the
+     -w      Force raw printing of non-printable characters.  This is the
+     -x      The same as -C, except that the multi-column output is produced
+     -y      When the -t option is set, sort the alphabetical output in the
+     -%      Distinguish dataless files and directories with a '%' character
+     -1      (The numeric digit "one".) Force output to be one entry per line.
+     -,      (Comma) When the -l option is set, print file sizes grouped and

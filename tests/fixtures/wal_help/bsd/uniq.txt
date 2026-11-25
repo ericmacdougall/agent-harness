@@ -1,0 +1,10 @@
+SYNOPSIS
+     uniq [-cdiu] [-D[septype]] [-f num] [-s chars] [input_file [output_file]]
+
+     -c, --count
+     -d, --repeated
+     -D, --all-repeated [septype]
+     -f num, --skip-fields num
+     -i, --ignore-case
+     -s chars, --skip-chars chars
+     -u, --unique

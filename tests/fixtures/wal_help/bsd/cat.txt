@@ -1,0 +1,11 @@
+SYNOPSIS
+     cat [-belnstuv] [file ...]
+
+     -b      Number the non-blank output lines, starting at 1.
+     -e      Display non-printing characters (see the -v option), and display
+     -l      Set an exclusive advisory lock on the standard output file
+     -n      Number the output lines, starting at 1.
+     -s      Squeeze multiple adjacent empty lines, causing the output to be
+     -t      Display non-printing characters (see the -v option), and display
+     -u      Disable output buffering.
+     -v      Display non-printing characters so they are visible.  Control

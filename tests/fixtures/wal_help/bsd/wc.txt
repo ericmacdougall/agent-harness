@@ -1,0 +1,10 @@
+SYNOPSIS
+     wc [--libxo] [-Lclmw] [file ...]
+
+     --libxo
+     -L      Write the length of the line containing the most bytes (default)
+     -c      The number of bytes in each input file is written to the standard
+     -l      The number of lines in each input file is written to the standard
+     -m      The number of characters in each input file is written to the
+     -w      The number of words in each input file is written to the standard
+     -c, -l and -w options.

@@ -1,0 +1,108 @@
+SYNOPSIS
+     diff [-aBbdipTtw] [-c | -e | -f | -n | -q | -u | -y]
+	  [-A algo | --algorithm algo] [--brief] [--color=when]
+	  [--changed-group-format GFMT] [--ed] [--expand-tabs] [--forward-ed]
+	  [--ignore-all-space] [--ignore-case] [--ignore-space-change]
+	  [--initial-tab] [--minimal] [--no-dereference]
+	  [--no-ignore-file-name-case] [--normal] [--rcs] [--show-c-function]
+	  [--starting-file] [--speed-large-files] [--strip-trailing-cr]
+	  [--tabsize number] [--text] [--unified]
+	  [-I pattern | --ignore-matching-lines pattern]
+	  [-F pattern | --show-function-line pattern]
+	  [-L label | --label label] file1 file2
+     diff [-aBbdilpTtw] [-A algo | --algorithm algo]
+	  [-I pattern | --ignore-matching-lines pattern]
+	  [-F pattern | --show-function-line pattern]
+	  [-L label | --label label] [--brief] [--color=when]
+	  [--changed-group-format GFMT] [--ed] [--expand-tabs] [--forward-ed]
+	  [--ignore-all-space] [--ignore-case] [--ignore-space-change]
+	  [--initial-tab] [--minimal] [--no-dereference]
+	  [--no-ignore-file-name-case] [--normal] [--paginate] [--rcs]
+	  [--show-c-function] [--speed-large-files] [--starting-file]
+	  [--strip-trailing-cr] [--tabsize number] [--text]
+	  -C number | --context number file1 file2
+     diff [-aBbdiltw] [-A algo | --algorithm algo]
+	  [-I pattern | --ignore-matching-lines pattern] [--brief]
+	  [--color=when] [--changed-group-format GFMT] [--ed] [--expand-tabs]
+	  [--forward-ed] [--ignore-all-space] [--ignore-case]
+	  [--ignore-space-change] [--initial-tab] [--minimal]
+	  [--no-dereference] [--no-ignore-file-name-case] [--normal]
+	  [--paginate] [--rcs] [--show-c-function] [--speed-large-files]
+	  [--starting-file] [--strip-trailing-cr] [--tabsize number] [--text]
+	  -D string | --ifdef string file1 file2
+     diff [-aBbdilpTtw] [-A algo | --algorithm algo]
+	  [-I pattern | --ignore-matching-lines pattern]
+	  [-F pattern | --show-function-line pattern]
+	  [-L label | --label label] [--brief] [--color=when]
+	  [--changed-group-format GFMT] [--ed] [--expand-tabs] [--forward-ed]
+	  [--ignore-all-space] [--ignore-case] [--ignore-space-change]
+	  [--initial-tab] [--minimal] [--no-dereference]
+	  [--no-ignore-file-name-case] [--normal] [--paginate] [--rcs]
+	  [--show-c-function] [--speed-large-files] [--starting-file]
+	  [--strip-trailing-cr] [--tabsize number] [--text]
+	  -U number | --unified number file1 file2
+     diff [-aBbdilNPprsTtw] [-c | -e | -f | -n | -q | -u]
+	  [-A algo | --algorithm algo] [--brief] [--color=when]
+	  [--changed-group-format GFMT] [--context] [--ed] [--expand-tabs]
+	  [--forward-ed] [--ignore-all-space] [--ignore-case]
+	  [--ignore-space-change] [--initial-tab] [--minimal] [--new-file]
+	  [--no-dereference] [--no-ignore-file-name-case] [--normal]
+	  [--paginate] [--rcs] [--recursive] [--report-identical-files]
+	  [--show-c-function] [--speed-large-files] [--strip-trailing-cr]
+	  [--tabsize number] [--text] [--unidirectional-new-file] [--unified]
+	  [-I pattern | --ignore-matching-lines pattern]
+	  [-F pattern | --show-function-line pattern]
+	  [-L label | --label label] [-S name | --starting-file name]
+	  [-X file | --exclude-from file] [-x pattern | --exclude pattern]
+	  dir1 dir2
+     diff [-aBbditwW] [--color=when] [--expand-tabs] [--ignore-all-space]
+	  [--ignore-blank-lines] [--ignore-case] [--minimal]
+	  [--no-dereference] [--no-ignore-file-name-case]
+	  [--strip-trailing-cr] [--suppress-common-lines] [--tabsize number]
+	  [--text] [--width] -y | --side-by-side file1 file2
+     diff [--help] [--version]
+
+     -C number --context number
+     -c      Produces a diff with 3 lines of context.  With -c the output
+     -D string --ifdef string
+     -e --ed
+     -f --forward-ed
+     --help  This option prints a summary to stdout and exits with status 0.
+     -n      Produces a script similar to that of -e, but in the opposite
+     -q --brief
+     -U number --unified number
+     -u      Produces a unified diff with 3 lines of context.  A unified diff
+     --version
+     -y --side-by-side
+     -A algo, --algorithm algo
+     -a --text
+     -B --ignore-blank-lines
+     -b --ignore-space-change
+     --color=[when]
+     -d --minimal
+     -F pattern, --show-function-line pattern
+     -I pattern --ignore-matching-lines pattern
+     -i --ignore-case
+     -l --paginate
+     -L label --label label
+     -p --show-c-function
+     -T --initial-tab
+     -t --expand-tabs
+     -w --ignore-all-space
+     -W number --width number
+     --changed-group-format GFMT
+     --ignore-file-name-case
+     --no-dereference
+     --no-ignore-file-name-case
+     --normal
+     --speed-large-files
+     --strip-trailing-cr
+     --suppress-common-lines
+     --tabsize number
+     -N --new-file
+     -P --unidirectional-new-file
+     -r --recursive
+     -S name --starting-file name
+     -s --report-identical-files
+     -X file --exclude-from file
+     -x pattern --exclude pattern

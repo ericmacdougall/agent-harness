@@ -1,0 +1,12 @@
+SYNOPSIS
+     join [-a file_number | -v file_number] [-e string] [-o list] [-t char]
+	  [-1 field] [-2 field] file1 file2
+
+     -a file_number
+     -e string
+     -o list
+     -t char
+     -v file_number
+     -1 field
+     -2 field
+     -b option, on the fields on which they are to be joined, otherwise join

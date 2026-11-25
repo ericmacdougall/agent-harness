@@ -1,0 +1,16 @@
+SYNOPSIS
+     stat [-FLnq] [-f format | -l | -r | -s | -x] [-t timefmt] [file ...]
+     readlink [-fn] [file ...]
+
+     -F      As in ls(1), display a slash (`/') immediately after each
+     -L      Use stat(2) instead of lstat(2).  The information reported by
+     -f format
+     -l      Display output in ls -lT format.
+     -n      Do not force a newline to appear at the end of each piece of
+     -q      Suppress failure messages if calls to stat(2) or lstat(2) fail.
+     -r      Display raw information.  That is, for all the fields in the stat
+     -s      Display information in "shell output" format, suitable for
+     -t timefmt
+     -x      Display information in a more verbose way as known from some
+     +	     Asserts that a sign indicating whether a number is positive or
+     -	     Aligns string output to the left of the field, instead of to the

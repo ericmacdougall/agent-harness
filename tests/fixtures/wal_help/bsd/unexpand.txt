@@ -1,0 +1,6 @@
+SYNOPSIS
+     expand [-t tab1,tab2,...,tabn] [file ...]
+     unexpand [-a | -t tab1,tab2,...,tabn] [file ...]
+
+     -a      (unexpand only.)  By default, only leading blanks and tabs are
+     -t -Sm tab1, tab2, ..., tabn Sm

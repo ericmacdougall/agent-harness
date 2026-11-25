@@ -1,0 +1,7 @@
+SYNOPSIS
+     column [-tx] [-c columns] [-s sep] [file ...]
+
+     -c      Output is formatted for a display columns wide.
+     -s      Specify a set of characters to be used to delimit columns for the
+     -t      Determine the number of columns the input contains and create a
+     -x      Fill columns before filling rows.

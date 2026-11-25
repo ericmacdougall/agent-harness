@@ -89,17 +89,23 @@ class Spec(NamedTuple):
     dash: Optional[str] = None  # the role of a lone `-` word, when it is not an operand
     implicit: Tuple = ()        # (path text, role) writes the program makes without naming them (nohup.out)
     note: str = ''
+    options: bool = True        # False: every word is an operand (echo, test: a word that starts with `-` is text)
+    evaluates: bool = False     # the builtin evaluates its words (an array subscript, arithmetic): a word holding a
+                                # literal `$(`, `$[` or backquote runs that text, so the parse is unresolved
 
 
 def opts(**groups) -> Dict[str, Opt]:
-    """Build an option table. Keywords: flags= (no value); a role name (arg=, read=, write=, ...) for options that
-    require a value with that role; opt_<role>= for an optional attached value. modes= maps an option to a mode.
-    Each keyword's value is a whitespace-separated list of option names."""
+    """Build an option table. Keywords: flags= (no value); opaque_flags= (no value, and the guard does not model what
+    it does: file -C); a role name (arg=, read=, write=, ...) for options that require a value with that role;
+    opt_<role>= for an optional attached value. modes= maps an option to a mode. Each keyword's value is a
+    whitespace-separated list of option names."""
     modes = groups.pop('modes', {})
     table: Dict[str, Opt] = {}
     for key, names in groups.items():
         if key == 'flags':
             takes, role = NO, ARG
+        elif key == 'opaque_flags':
+            takes, role = NO, OPAQUE
         elif key.startswith('opt_'):
             takes, role = OPT, key[4:].replace('_', '-')
         else:
@@ -196,6 +202,12 @@ def _long_match(spec: Spec, name: str):
     return hits[0], None
 
 
+# a command substitution or old-style arithmetic left literal in a word (the shell's own `$(...)` reaches a program as
+# its output, so a literal one was quoted): bash and zsh run it when a builtin evaluates the word as an array subscript
+# or arithmetic (`let 'x[$(cmd)]=1'`, `read 'x[$(cmd)]'`; N17)
+_EVALUATED = re.compile(r'\$\(|\$\[|`')
+
+
 def wal_getopt(spec: Spec, texts: List[str], permute: Optional[bool] = None) -> Parse:
     """Parse `texts` (a program's argument words, without its name) the way `spec`'s program does."""
     permute = spec.permute if permute is None else permute
@@ -206,14 +218,17 @@ def wal_getopt(spec: Spec, texts: List[str], permute: Optional[bool] = None) -> 
     k, n = 0, len(texts)
 
     def take(opt, value_index, offset, text):
-        if opt.takes == NO:
-            items.append(Item(value_index, 0, ARG, opt.name, texts[value_index]))
+        if opt.takes == NO:   # a flag names nothing; an opaque one makes the parse unresolved below
+            items.append(Item(value_index, 0, OPAQUE if opt.role == OPAQUE else ARG, opt.name, texts[value_index]))
         else:
             items.append(Item(value_index, offset, opt.role, opt.name, text))
             values[opt.name] = text
         if opt.mode:
             modes.add(opt.mode)
 
+    if not spec.options:
+        operands = list(enumerate(texts))
+        k = n
     while k < n:
         t = texts[k]
         if t == '--' and not spec.long_only:
@@ -295,8 +310,14 @@ def wal_getopt(spec: Spec, texts: List[str], permute: Optional[bool] = None) -> 
                 command_at = index
                 break
             items.append(Item(index, 0, role, '', text))
-        if any(i.role == OPAQUE for i in items):
-            unresolved = 'option %s is not modelled' % next(i.option for i in items if i.role == OPAQUE)
+        opaque = next((i for i in items if i.role == OPAQUE), None)
+        if opaque is not None:
+            unresolved = ('option %s is not modelled' % opaque.option if opaque.option else
+                          'operand %r is not modelled' % opaque.text[:40])
+    if unresolved is None and spec.evaluates:
+        held = next((t for t in texts if _EVALUATED.search(t)), None)
+        if held is not None:
+            unresolved = '%s evaluates %r, which runs a command' % (spec.name, held[:40])
     for path, role in spec.implicit:
         items.append(Item(-1, 0, role, '', path))
     return Parse(spec, tuple(sorted(items, key=lambda i: (i.index, i.offset))), frozenset(modes), command_at,

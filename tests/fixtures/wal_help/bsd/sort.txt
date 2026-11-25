@@ -1,0 +1,42 @@
+SYNOPSIS
+     sort [-bcCdfghiRMmnrsuVz] [-k field1[,field2]] [-S memsize] [-T dir] [-t
+	  char] [-o output] [file ...]
+     sort --help
+     sort --version
+
+     -c, --check, -C, --check=silent|quiet
+     -m, --merge
+     -o output, --output=output
+     -S size, --buffer-size=size
+     -T dir, --temporary-directory=dir
+     -u, --unique
+     -s      Stable sort.  This option maintains the original record order of
+     --version
+     --help  Print the help text and silently exits.
+     -b, --ignore-leading-blanks
+     -d, --dictionary-order
+     -f, --ignore-case
+     -g, --general-numeric-sort, --sort=general-numeric
+     -h, --human-numeric-sort, --sort=human-numeric
+     -i, --ignore-nonprinting
+     -M, --month-sort, --sort=month
+     -n, --numeric-sort, --sort=numeric
+     -R, --random-sort, --sort=random
+     -r, --reverse
+     -V, --version-sort
+     -b, --ignore-leading-blanks
+     -k field1[,field2], --key=field1[,field2]
+     -t char, --field-separator=char
+     -z, --zero-terminated
+     --batch-size=num
+     --compress-program=PROGRAM
+     --random-source=filename
+     --debug
+     --parallel
+     --files0-from=filename
+     --radixsort
+     --mergesort
+     --qsort
+     --heapsort
+     --mmap  Try to use file memory mapping system call.  It may increase
+     +v-1.x-1 -w.0.  The obsolete +pos1 -pos2 option is still supported,

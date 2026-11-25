@@ -1,0 +1,26 @@
+SYNOPSIS
+     df [--libxo] [-b | -g | -H | -h | -k | -m | -P] [-acIilntY] [-,]
+	[-T type] [file | filesystem ...]
+
+LEGACY SYNOPSIS
+     df [--libxo] [-b | -g | -H | -h | -k | -m | -P] [-acIilnY] [-,] [-T type]
+     [-t type] [file | filesystem ...]
+
+     --libxo
+     -a      Show all mount points, including those that were mounted with the
+     -b      Explicitly use 512 byte blocks, overriding any BLOCKSIZE
+     -c      Display a grand total.
+     -g      Use 1073741824 byte (1 Gibibyte) blocks rather than the default.
+     -h      "Human-readable" output.  Use unit suffixes: Byte, Kibibyte,
+     -H, --si
+     -I      Suppress inode counts.  See -i below.
+     -i      Include statistics on the number of free and used inodes.	In
+     -k      Use 1024 byte (1 Kibibyte) blocks rather than the default.  This
+     -l      Select locally-mounted file system for display.  If used in
+     -m      Use 1048576 byte (1 Mebibyte) blocks rather than the default.
+     -n      Print out the previously obtained statistics from the file
+     -P      Explicitly use 512 byte blocks, overriding any BLOCKSIZE
+     -T type
+     -t      If used with no arguments, this option is a no-op (macOS already
+     -Y      Include file system type.
+     -,      (Comma) Print sizes grouped and separated by thousands using the

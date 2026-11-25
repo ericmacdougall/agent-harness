@@ -1,0 +1,11 @@
+SYNOPSIS
+     tail [-F | -f | -r] [-qv] [-b number | -c number | -n number] [file ...]
+
+     -b number, --blocks=number
+     -c number, --bytes=number
+     -f      The -f option causes tail to not stop when end of file is
+     -F      The -F option implies the -f option, but tail will also check to
+     -n number, --lines=number
+     -q, --quiet, --silent
+     -r      The -r option causes the input to be displayed in reverse order,
+     -v, --verbose

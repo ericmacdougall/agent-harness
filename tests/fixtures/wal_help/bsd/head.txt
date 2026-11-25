@@ -1,0 +1,5 @@
+SYNOPSIS
+     head [-n count | -c bytes] [file ...]
+
+     -c bytes, --bytes=bytes
+     -n count, --lines=count

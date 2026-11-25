@@ -1,0 +1,3 @@
+SYNOPSIS
+       strings [ - ] [ -a ] [ -o ] [ -t format ] [ -number ] [ -n number ]
+       [--] [file ...]

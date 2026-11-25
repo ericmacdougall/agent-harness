@@ -1,0 +1,15 @@
+SYNOPSIS
+     nl [-p] [-b type] [-d delim] [-f type] [-h type] [-i incr] [-l num]
+	[-n format] [-s sep] [-v startnum] [-w width] [file]
+
+     -b type		Specify the logical page body lines to be numbered.
+     -d delim		Specify the delimiter characters used to indicate the
+     -f type		Specify the same as -b type except for logical page
+     -h type		Specify the same as -b type except for logical page
+     -i incr		Specify the increment value used to number logical
+     -l num		If numbering of all lines is specified for the current
+     -n format		Specify the line numbering output format.  Recognized
+     -p 		Specify that line numbering should not be restarted at
+     -s sep		Specify the characters used in separating the line
+     -v startnum	Specify the initial value used to number logical page
+     -w width		Specify the number of characters to be occupied by the

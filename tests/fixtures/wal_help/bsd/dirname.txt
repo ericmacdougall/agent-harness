@@ -1,0 +1,4 @@
+SYNOPSIS
+     basename string [suffix]
+     basename [-a] [-s suffix] string [...]
+     dirname string [...]
