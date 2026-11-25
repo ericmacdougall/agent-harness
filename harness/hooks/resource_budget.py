@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Resource-budget gate: every plan and spec declares what it will consume and where.
 
-    resource_budget.py check --host mac|dev2 --packet plan.md [--capacity-json cap.json]
-    resource_budget.py capacity --host mac|dev2
+    resource_budget.py check --host mac|t2-dev --packet plan.md [--capacity-json cap.json]
+    resource_budget.py capacity --host mac|t2-dev
 
 A plan packet or spec needs a `## Resource budget` section:
 
     ## Resource budget
-    Host: dev2
+    Host: t2-dev
     Fan-out: agents=2 jobs=1 processes=8 browser_pages=0 test_workers=4
     Peak memory: 6 GB (method: measured RSS of the previous run x1.5)
     CPU: 8 cores (method: nproc used by the test runner)
@@ -20,7 +20,7 @@ A plan packet or spec needs a `## Resource budget` section:
 
 `check` rejects (exit 2) a packet that omits the section or a field, whose numbers exceed the
 target host's live headroom, or that omits checkpointing for a job over 10 minutes or 4 GB.
-The same budget can pass for dev2 and fail for the Mac. Big jobs are welcome on dev2; the gate
+The same budget can pass for t2-dev and fail for the Mac. The gate
 only asks that the numbers exist and fit. Stdlib only, Python 3.9 compatible.
 """
 from __future__ import annotations
@@ -29,6 +29,7 @@ import argparse
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 
@@ -38,9 +39,10 @@ CHECKPOINT_WALL_MIN = 10
 CHECKPOINT_MEM_GB = 4
 FANOUT_KEYS = ("agents", "jobs", "processes", "browser_pages", "test_workers")
 # Per-host ceilings on top of live headroom: the Mac is the fragile host.
+LINUX_LIMITS = {"processes": 64, "browser_pages": 16, "test_workers": 32, "agents": 8, "jobs": 16, "mem_fraction": 0.7}
 HOST_LIMITS = {
     "mac": {"processes": 8, "browser_pages": 4, "test_workers": 4, "agents": 8, "jobs": 2, "mem_fraction": 0.4},
-    "dev2": {"processes": 64, "browser_pages": 16, "test_workers": 32, "agents": 8, "jobs": 16, "mem_fraction": 0.7},
+    "t2-dev": dict(LINUX_LIMITS, test_workers=12),
 }
 SECTION = re.compile(r"(?ms)^##[ \t]+Resource budget[ \t]*\n(.*?)(?=^##[ \t]|\Z)")
 FIELD = re.compile(r"(?m)^[ \t]*(?:[-*][ \t]+)?([A-Za-z][A-Za-z -]+?)[ \t]*:[ \t]*(.+?)[ \t]*$")
@@ -129,7 +131,7 @@ def lint_budget(text: str):
     host = fields.get("host", "").split()[0].lower() if fields.get("host") else ""
     parsed = {"host": host}
     if host not in HOST_LIMITS and not VM_HOST.match(host):
-        problems.append("Resource budget: `Host:` must be mac, dev2 or vm:<name>")
+        problems.append("Resource budget: `Host:` must be mac, t2-dev or vm:<name>")
     parsed["capacity"] = None
     if VM_HOST.match(host):
         cap_text = fields.get("capacity", "")
@@ -205,10 +207,25 @@ def capacity(host: str):
                 "load1": float(_run(["sysctl", "-n", "vm.loadavg"]).strip("{} \n").split()[0]),
                 "disk_free_gb": round(int(disk[3]) / 2 ** 20, 1),
                 "pressure_free_pct": int(pressure.group(1)) if pressure else None}
-    script = ("free -m | awk '/Mem:/{print $7}'; nproc; cut -d' ' -f1 /proc/loadavg; df -k $HOME | awk 'END{print $4}'")
-    out = _run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "dev2", script], 30).split()
-    return {"host": host, "mem_available_gb": round(int(out[0]) / 1024, 2), "cores": int(out[1]), "load1": float(out[2]),
-            "disk_free_gb": round(int(out[3]) / 2 ** 20, 1), "pressure_free_pct": None}
+    if host != "t2-dev":
+        raise ValueError("Unsupported live capacity host")
+    script = ("hostname -s; free -m | awk '/Mem:/{print $7}'; nproc; "
+              "cut -d' ' -f1 /proc/loadavg; df -k \"$HOME\" | awk 'END{print $4}'")
+    if socket.gethostname().split(".", 1)[0] == host:
+        command = ["sh", "-c", script]
+    else:
+        command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+                   "-o", "StrictHostKeyChecking=yes", "-o", "UpdateHostKeys=no"]
+        fleet_config = os.path.expanduser("~/.ssh/config_fleetops")
+        if os.path.isfile(fleet_config):
+            command += ["-F", fleet_config]
+        command += [host, script]
+    out = _run(command, 30).split()
+    if len(out) != 5 or out[0] != host:
+        raise ValueError("Invalid t2-dev capacity response")
+    _, available, cores, load, disk = out
+    return {"host": host, "mem_available_gb": round(int(available) / 1024, 2), "cores": int(cores),
+            "load1": float(load), "disk_free_gb": round(int(disk) / 2 ** 20, 1), "pressure_free_pct": None}
 
 
 def _which(name):
@@ -217,7 +234,7 @@ def _which(name):
 
 
 def headroom(cap: dict):
-    limits = HOST_LIMITS.get(cap["host"], HOST_LIMITS["dev2"])
+    limits = HOST_LIMITS.get(cap["host"], LINUX_LIMITS)
     pressure = cap.get("pressure_free_pct")
     mem = cap["mem_available_gb"] * limits["mem_fraction"]
     if pressure is not None and pressure < 20:
@@ -284,11 +301,11 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
     one = sub.add_parser("check")
-    one.add_argument("--host", choices=("mac", "dev2"))
+    one.add_argument("--host", choices=tuple(HOST_LIMITS))
     one.add_argument("--packet", required=True)
     one.add_argument("--capacity-json", help="use this capacity instead of reading the live host (tests)")
     cap_cmd = sub.add_parser("capacity")
-    cap_cmd.add_argument("--host", choices=("mac", "dev2"), required=True)
+    cap_cmd.add_argument("--host", choices=tuple(HOST_LIMITS), required=True)
     args = parser.parse_args(argv)
     if args.command == "capacity":
         print(json.dumps(dict(capacity(args.host), headroom={k: v for k, v in headroom(capacity(args.host)).items()

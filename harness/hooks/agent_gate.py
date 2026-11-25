@@ -7,7 +7,7 @@ record, no `subagent_stop`, and its WAL showed activity inside LIVE_WINDOW_S (th
 hook does not fire for every agent, so recent activity is the liveness signal).
 Thresholds live in resource_limits.json beside this file: warn at {"warn_agents": 12} concurrent agents
 (advisory context, the spawn proceeds) and deny at {"max_agents": 20}. HARNESS_MAX_AGENTS overrides the deny limit.
-The denial tells the caller to queue the work or move it to dev2 (where heavy jobs
+The denial tells the caller to queue the work or use t2-dev (where heavy jobs
 belong). Fails OPEN on any error; register WITHOUT onFailure=block. Only acts on macOS
 (HARNESS_HEAVY_GUARD_FORCE=1 overrides for tests). Stdlib only, Python 3.9 compatible.
 """
@@ -159,11 +159,11 @@ def decide(session_id: str, now: float = None, wal_root: str = None, max_agents:
         return {"action": "deny", "live": total, "max": ceiling,
                 "message": (f"Agent gate: {total} agents are already live in this session (limit {ceiling}). Queue this work "
                             "until one finishes, resume an existing owner with SendMessage instead of spawning, or move heavy "
-                            "work to dev2. The Mac is the fragile host: unbounded fan-out reset it on 2026-11-04.")}
+                            "tests through the t2-dev broker. The Mac is the fragile host: unbounded fan-out reset it on 2026-11-04.")}
     if total >= warn_at:
         return {"action": "warn", "live": total, "max": ceiling,
                 "message": (f"Agent gate (warning): {total} agents are live in this session (deny at {ceiling}). Prefer resuming an "
-                            "existing owner with SendMessage, queue independent work, and run heavy jobs on dev2.")}
+                            "existing owner with SendMessage, queue independent work, and run heavy tests through the t2-dev broker.")}
     return {"action": "allow", "live": total}
 
 
