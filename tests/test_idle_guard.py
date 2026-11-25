@@ -1,6 +1,7 @@
 """Main-idle guard (GoodQA goodqa#15943). These tests fail against main c82ad2a: there is no idle_guard module, no
 agents_active_1h, no ask ownership check and no idle-guard ops-watch check."""
 import json
+import shutil
 import os
 import sys
 import tempfile
@@ -135,16 +136,16 @@ class StopHookTests(Base):
         body.update(payload)
         return self.ig.cmd_stop(body, now=NOW)
 
-    def test_blocks_with_named_streams_then_is_bounded(self):  # AC-3, NEG-4
+    def test_one_advisory_line_with_named_streams_only_on_a_change(self):  # AC-3, NEG-4
         self.park_tick_on_ticket()
         out = self.stop()
-        self.assertEqual(out["decision"], "block")
-        self.assertIn("tick", out["reason"])
-        self.assertIn("done1", out["reason"])
-        self.assertIn(self.ig.REMINDER, out["reason"])
-        self.assertEqual(self.stop()["decision"], "block")  # second block of the bound
-        self.assertNotIn("decision", self.stop())  # bound reached: message only
-        self.assertNotIn("decision", self.stop(stop_hook_active=True))
+        self.assertNotIn("decision", out)  # advisory since 2026-11-24: one line, never a block
+        self.assertNotIn("\n", out["systemMessage"])
+        self.assertIn("tick", out["systemMessage"])
+        self.assertIn("done1", out["systemMessage"])
+        self.assertIn(self.ig.REMINDER, out["systemMessage"])
+        self.assertEqual(self.stop(), {})  # the same problem is not repeated
+        self.assertEqual(self.stop(stop_hook_active=True), {})
 
     def test_silent_when_all_needs_the_user(self):  # NEG-1
         self.park_tick_on_ask()
@@ -165,9 +166,9 @@ class StopHookTests(Base):
         jl(self.w / "main.jsonl", [{"at": iso(NOW - 60), "event": "commit", "note": "fresh progress"}])
         self.assertFalse(self.assess()["idle"])
         out = self.stop()
-        self.assertEqual(out["decision"], "block")
-        self.assertIn("done1", out["reason"])
-        self.assertIn("waits on a user ask", out["reason"])
+        self.assertNotIn("decision", out)
+        self.assertIn("done1", out["systemMessage"])
+        self.assertIn("waits on a user ask", out["systemMessage"])
 
     def test_rejection_this_turn_with_independent_work_blocks(self):  # AC-7 (Stop side)
         self.park_tick_on_ask()
@@ -181,8 +182,8 @@ class StopHookTests(Base):
         jl(self.w / "agent-done1.jsonl", [{"at": iso(NOW - 30), "event": "result", "note": "again"}])
         self.dispose("done1", "waiting", "done1-wait-1", until=iso(NOW + HOUR), ref="GoodQA goodqa#15944")
         out = self.stop(transcript_path=str(t))
-        self.assertEqual(out["decision"], "block")
-        self.assertIn("rejected", out["reason"])
+        self.assertNotIn("decision", out)
+        self.assertIn("rejected", out["systemMessage"])
 
 
 class TurnBoundaryTests(Base):
@@ -208,6 +209,7 @@ class TurnBoundaryTests(Base):
             t.unlink()
         jl(t, [{"type": "user", "origin": {"kind": "human"}, "message": {"role": "user", "content": "go"}},
                self.REJECT, *records])
+        shutil.rmtree(self.home / ".agent-harness" / "state" / "context", ignore_errors=True)  # each case is a fresh turn
         return self.ig.cmd_stop({"session_id": SESSION, "stop_hook_active": False, "transcript_path": str(t)}, now=NOW)
 
     def test_a_text_block_human_prompt_ends_the_rejected_turn(self):
@@ -361,8 +363,8 @@ class LaterResultTests(Base):
         self.assertIn("done1", {s["agent"] for s in a["returned"]})
         self.assertTrue(a["all_waiting_on_user"])
         out = self.ig.cmd_stop({"session_id": SESSION, "stop_hook_active": False}, now=NOW)
-        self.assertEqual(out.get("decision"), "block")
-        self.assertIn("done1", out["reason"])
+        self.assertIn("systemMessage", out)
+        self.assertIn("done1", out["systemMessage"])
 
     def test_earlier_resume_does_not_acknowledge_a_later_result(self):
         self.resume_then_new_result("resumed")
@@ -412,8 +414,8 @@ class OwnWaitHandoffTests(Base):
         self.assertIn("done1", {s["agent"] for s in a["streams"]})
         self.assertTrue(a["idle"])
         out = self.stop()
-        self.assertEqual(out.get("decision"), "block")
-        self.assertIn("done1", out["reason"])
+        self.assertIn("systemMessage", out)
+        self.assertIn("done1", out["systemMessage"])
         self.assertEqual([x["key"] for x in self.alerts()], ["idle-guard:" + SESSION[:8]])
 
     def test_own_wait_does_not_suppress_a_fresh_handoff_either(self):  # before HANDOFF_ACK_S: attention, not a drop
@@ -447,7 +449,7 @@ class OwnWaitHandoffTests(Base):
             self.dispose("done1", "waiting", "done1-own-wait2", until=iso(NOW + 3 * HOUR), ref="wa5b00000003")
         self.assertIn("result-unacked", self.row()["attention"])
         self.assertIn("done1", {s["agent"] for s in self.assess()["returned"]})
-        self.assertEqual(self.stop().get("decision"), "block")
+        self.assertIn("systemMessage", self.stop())
 
 
 class OwnersAgreementPropertyTests(Base):
