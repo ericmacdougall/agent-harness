@@ -791,19 +791,25 @@ class WalInjectionTests(Base):
                               capture_output=True, env={**os.environ, "HOME": str(self.home),
                                                         "HARNESS_PROVENANCE_OFFLINE": "1"})
 
-    def test_prompt_and_subagent_carry_active_alerts(self):
-        r = self.invoke("prompt", {"session_id": "s1", "prompt": "hi"})
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertNotIn("OPS ALERTS", r.stdout)
+    def test_alerts_reach_a_session_once_and_never_a_subagent(self):  # context budget, 2026-11-24
+        def ctx(r):
+            self.assertEqual(r.returncode, 0, r.stderr)
+            return json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"] if r.stdout.strip() else ""
+        self.assertNotIn("ops alert", ctx(self.invoke("session", {"session_id": "s1", "source": "startup"})).lower())
         ow.emit({"host": "dev2", "source": "ops-watch", "event": "raise", "severity": "critical",
                  "key": "disk:volume:/", "message": "/ 97% used"}, home=self.home)
-        for event, data in (("prompt", {"session_id": "s1", "prompt": "hi"}),
-                            ("subagent", {"session_id": "s1", "agent_id": "a1", "agent_type": "task-owner"}),
-                            ("session", {"session_id": "s1", "source": "startup"})):
-            r = self.invoke(event, data)
-            self.assertEqual(r.returncode, 0, r.stderr)
-            ctx = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
-            self.assertIn("[critical] dev2 disk:volume:/: / 97% used", ctx, event)
+        ow.emit({"host": ow.default_host(), "source": "ops-watch", "event": "raise", "severity": "critical",
+                 "key": "disk:volume:/System/Volumes/Data", "message": "98% used"}, home=self.home)
+        first = ctx(self.invoke("prompt", {"session_id": "s1", "prompt": "hi"}))
+        self.assertIn("[critical] disk:volume:/_/Volumes/Data: ", first)  # new, critical, this machine's disk
+        self.assertNotIn("dev2", first)  # another host's disk is not this session's to act on
+        self.assertEqual(ctx(self.invoke("prompt", {"session_id": "s1", "prompt": "again"})), "")
+        sub = ctx(self.invoke("subagent", {"session_id": "s1", "agent_id": "a1", "agent_type": "task-owner"}))
+        self.assertNotIn("critical", sub)
+        start = ctx(self.invoke("session", {"session_id": "s2", "source": "startup"}))
+        self.assertIn("2 active (2 critical)", start)
+        self.assertIn("[critical] disk:volume:/_/Volumes/Data", start)
+        self.assertIn("ops_watch.py status", start)
 
     def test_corrupt_ring_never_blocks_prompt(self):
         p = ow.ring_path(self.home)

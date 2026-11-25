@@ -285,9 +285,7 @@ class GateTests(Base):
     def test_block_count_is_bounded_per_signature(self):
         blocks = sum(1 for _ in range(6) if self.stop().get("decision") == "block")
         self.assertEqual(blocks, dropped_gate.MAX_STOP_BLOCKS)
-        out = self.stop()
-        self.assertNotEqual(out.get("decision"), "block")
-        self.assertIn("dropowner", out.get("systemMessage", ""))  # still named, never silent
+        self.assertEqual(self.stop(), {})  # said once for this set: no repeated text (context budget, 2026-11-24)
         # a new signature (another owner dropped) gets its own bound
         w = self.home / ".claude" / "wals" / SESSION
         jl(w / "main.jsonl", [{"at": iso(NOW - 9000), "event": "subagent", "agent_id": "dropowner2", "agent_type": "task-owner"},
@@ -295,11 +293,26 @@ class GateTests(Base):
         jl(w / "agent-dropowner2.jsonl", [{"at": iso(NOW - 4000), "event": "intent", "note": "second"}])
         self.assertEqual(self.stop().get("decision"), "block")
 
-    def test_stop_hook_active_passes_through_with_a_message(self):
+    def test_stop_hook_active_passes_through_silently(self):
         payload = {"session_id": SESSION, "hook_event_name": "Stop", "stop_hook_active": True}
         out = dropped_gate.cmd_stop(payload, now=NOW)
-        self.assertNotEqual(out.get("decision"), "block")
-        self.assertIn("dropowner", out.get("systemMessage", ""))
+        self.assertEqual(out, {})  # a repeated Stop is never blocked and never repeats the message
+
+    def test_an_unacknowledged_handoff_alone_is_one_advisory_line(self):  # context budget, 2026-11-24
+        data = {"undisposed": ["handed01"], "owners": [{"agent_id": "handed01", "flags": ["handoff-unacked"],
+                                                       "idle_s": 4000}]}
+        with mock.patch.object(ah, "owners", return_value=data), \
+                mock.patch.object(dropped_gate, "grandfather", return_value=[]):
+            out = dropped_gate.cmd_stop({"session_id": SESSION, "stop_hook_active": False}, now=NOW)
+            self.assertNotIn("decision", out)
+            self.assertIn("handed off", out["systemMessage"])
+            self.assertLessEqual(len(out["systemMessage"]), 640)
+            self.assertEqual(dropped_gate.cmd_stop({"session_id": SESSION, "stop_hook_active": False}, now=NOW), {})
+
+    def test_the_kept_block_is_short(self):
+        out = self.stop()
+        self.assertEqual(out.get("decision"), "block")
+        self.assertLessEqual(len(out["reason"]), 600)
 
 
 class ReassignInheritsTargetWait(Base):
@@ -441,16 +454,15 @@ class SubagentStopGate(Base):
         payload = {"session_id": SESSION, "hook_event_name": "SubagentStop", "agent_id": agent, "stop_hook_active": active}
         return dropped_gate.cmd_subagent_stop(payload, now=now)
 
-    def test_pending_intent_blocks_once_then_marks_dropped_without_grace(self):
+    def test_pending_intent_says_one_line_and_marks_dropped_without_grace(self):
         w = self.home / ".claude" / "wals" / SESSION
         jl(w / "main.jsonl", [{"at": iso(NOW - 600), "event": "subagent", "agent_id": "pendingowner", "agent_type": "task-owner"}])
         jl(w / "agent-pendingowner.jsonl", [{"at": iso(NOW - 30), "event": "intent", "note": "running the dev2 suite"}])
         first = self.sstop("pendingowner")
-        self.assertEqual(first.get("decision"), "block")
-        self.assertIn("pending work", first["reason"])
-        second = self.sstop("pendingowner", active=True)
-        self.assertNotEqual(second.get("decision"), "block")
-        self.assertIn("DROPPED", second.get("systemMessage", ""))
+        self.assertNotIn("decision", first)  # advisory since 2026-11-24: one line, never a block
+        self.assertIn("pending work", first["systemMessage"])
+        self.assertIn("DROPPED", first["systemMessage"])
+        self.assertEqual(self.sstop("pendingowner"), {})  # once per agent
         # the stop arrives in main.jsonl; the owner is DROPPED at once, not "finishing" for 30 min
         jl(w / "main.jsonl", [{"at": iso(NOW), "event": "subagent_stop", "agent_id": "pendingowner", "agent_type": "task-owner"}])
         by = {r["agent_id"]: r for r in self.owners(now=NOW + 5)["owners"]}
@@ -464,7 +476,7 @@ class SubagentStopGate(Base):
         jl(w / "agent-pretoolowner.jsonl", [{"at": iso(NOW - 60), "event": "intent", "note": "running the suite"},
                                             {"at": iso(NOW - 30), "event": "pretool", "tool": "Bash", "agent_id": "pretoolowner"}])
         with mock.patch.object(dropped_gate, "armed_waiter", return_value=False):
-            self.assertEqual(self.sstop("pretoolowner").get("decision"), "block")
+            self.assertIn("pending work", self.sstop("pretoolowner").get("systemMessage", ""))
         jl(w / "agent-handedowner.jsonl", [{"at": iso(NOW - 60), "event": "handoff", "note": "to main"},
                                            {"at": iso(NOW - 30), "event": "pretool", "tool": "Bash"}])
         self.assertEqual(self.sstop("handedowner"), {})
@@ -500,7 +512,7 @@ class SubagentStopGate(Base):
         w = self.home / ".claude" / "wals" / SESSION
         jl(w / "agent-msgowner.jsonl", [{"at": iso(NOW - 60), "event": "intent", "note": "running the suite"}])
         with mock.patch.object(dropped_gate, "armed_waiter", return_value=False):
-            text = self.sstop("msgowner").get("reason") or ""
+            text = self.sstop("msgowner").get("systemMessage") or ""
         self.assertIn("ah task dispose", text)
         self.assertNotIn("ah job", text)
         commands = [c for c in _re.findall(r"`([^`]+)`", text) if c.startswith("ah ")]
@@ -518,7 +530,7 @@ class SubagentStopGate(Base):
         with mock.patch.object(dropped_gate, "armed_waiter", return_value=True):
             self.assertEqual(self.sstop("jobowner"), {})
         with mock.patch.object(dropped_gate, "armed_waiter", return_value=False):
-            self.assertEqual(self.sstop("jobowner").get("decision"), "block")
+            self.assertIn("pending work", self.sstop("jobowner").get("systemMessage", ""))
 
 
 class RealWalRows(Base):
@@ -549,9 +561,8 @@ class RealWalRows(Base):
                               "tool_input": {"file_path": "/tmp/x"}})
         with mock.patch.object(dropped_gate, "armed_waiter", return_value=False):
             first = dropped_gate.cmd_subagent_stop({"session_id": SESSION, "agent_id": agent, "stop_hook_active": False})
-            self.assertEqual(first.get("decision"), "block", first)
-            second = dropped_gate.cmd_subagent_stop({"session_id": SESSION, "agent_id": agent, "stop_hook_active": True})
-            self.assertIn("DROPPED", second.get("systemMessage", ""))
+            self.assertIn("DROPPED", first.get("systemMessage", ""))
+            self.assertNotIn("decision", first)
         self.hook("subagent_stop", {"session_id": SESSION, "agent_id": agent, "agent_type": "task-owner"})
         # finding 2: wal.py stamps microseconds and the stop is seconds later; zero grace must still apply
         by = {r["agent_id"]: r for r in ah.owners(self.home, SESSION, now=time.time() + 5)["owners"]}

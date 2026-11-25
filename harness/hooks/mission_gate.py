@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mission gate: a Stop hook that blocks the main agent's turn from ending while any active mission goal is UNCOVERED
+"""Mission gate: a Stop hook that says, in one advisory line, when an active mission goal is UNCOVERED
 (GoodQA goodqa#15565; the rule lives in mission_coverage.py), and the PreToolUse(Bash) hook that stamps main's own
 main-only mission commands (`mission_gate.py pretool`): one stamp per command that runs mission_coverage.py at shell
 command position, keyed by its exact argument list; echoed, quoted, grepped or here-document text is never stamped.
@@ -21,9 +21,8 @@ Scope and safety:
     forged or overrun owner list never counts as coverage: the turn may end with "owner list unavailable" and a high
     `mission:scan:unavailable` alert;
   - an unreadable, hostile or tampered goals file blocks safe-loud with one clear line;
-  - bounded: at most MAX_STOP_BLOCKS blocks per problem signature (the sorted uncovered goal ids), then the turn may
-    end, the message still names the goals, and a high `mission:gate-valve` alert goes to the ops ring;
-    a repeated Stop (`stop_hook_active`) is never blocked again in the same turn;
+  - advisory since 2026-11-24 (context budget): it never blocks; one line names the uncovered goals, and only when that
+    set changed since it last spoke (an "owner list unavailable" line at most once per 30 min);
   - its own errors and an unavailable owner list fail open with a message, never a silent pass or a trapped turn.
 """
 from __future__ import annotations
@@ -40,7 +39,6 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-MAX_STOP_BLOCKS = 25
 OWNER_SCAN_BUDGET_S = 9  # the hook has 15 s; `ah owners` took ~24 s on a 2,089-owner session (2026-11-10)
 VALVE_KEY = "mission:gate-valve"
 SCAN_KEY = "mission:scan:unavailable"
@@ -302,43 +300,42 @@ def cmd_stop(payload: dict, now: float | None = None) -> dict:
         why = mc.clean(a.get("error"), 160)
         ring(home, "raise", f"mission gate: owner list unavailable, coverage not checked: {why}",
              {"session": session[:8], "stop_block": False}, key=SCAN_KEY)
+        state = load_state(home, session)
+        if time.time() - float(state.get("unavailable_said") or 0) < 1800:
+            return {}  # at most once per 30 min
+        state["unavailable_said"] = time.time()
+        save_state(home, session, state)
         return {"systemMessage": f"mission gate: owner list unavailable ({why}); coverage was NOT checked this turn. "
                                  f"Run `{mc.SCRIPT} report` (ops-watch refreshes the signed owner list every 10 min)."}
     ring(home, "clear", "mission gate: owner list available again", {}, key=SCAN_KEY)
     if a["state"] in ("error", "tampered"):
         problem = mc.clean(a.get("error") or "goals file unreadable", 200)
         sig_src = "file:" + a["state"]
-        text = (f"Mission coverage (goodqa#15565) cannot check the mission goals: {problem}.\n"
-                f"  Inspect: {mc.SCRIPT} verify ; restore ~/.agent-harness/mission/goals.json from the audit trail, or "
-                f"(main) record a deliberate change with `{mc.SCRIPT} reseal --reason <what changed and why>`.")
         names = [problem]
+        detail = f"{mc.SCRIPT} verify"
     else:
         uncovered = [r for r in a["results"] if r["state"] == "UNCOVERED"]
         if not uncovered:
             ring(home, "clear", "mission gate: every goal is covered again", {})
             state = load_state(home, session)
-            if state.get("blocks"):
-                state["blocks"] = {}
+            if state.get("last_sig"):
+                state["last_sig"] = None  # a set that clears and returns is said again
                 save_state(home, session, state)
             return {}
-        text = mc.gate_message(a["results"], a.get("advice") or "")
-        if a.get("owners_note") and len(text) + len(a["owners_note"]) < mc.GATE_MAX_CHARS:
-            text += "\n" + mc.clean(a["owners_note"], 120)
         names = [f"{r['id']} ({r['ticket'] or 'no ticket'})" for r in mc.sort_report(uncovered)]
+        detail = f"{mc.SCRIPT} report"
         sig_src = ",".join(sorted(r["id"] for r in uncovered))
     sig = hashlib.sha256(sig_src.encode()).hexdigest()[:16]
-    state = load_state(home, session)
-    count = int((state.get("blocks") or {}).get(sig, 0)) if isinstance(state.get("blocks"), dict) else 0
     shown = ", ".join(names[:5]) + (f" and {len(names) - 5} more" if len(names) > 5 else "")
-    if payload.get("stop_hook_active") or count >= MAX_STOP_BLOCKS:
-        if count >= MAX_STOP_BLOCKS:
-            ring(home, "raise", f"mission gate valve open after {count} blocks: uncovered {shown}",
-                 {"session": session[:8], "goals": names[:20], "blocks": count, "stop_block": True})
-        return {"systemMessage": f"mission gate: still uncovered after {count} block(s): {shown}. " + text}
-    state["blocks"] = {sig: count + 1}  # a signature that cleared starts again from zero
+    # Advisory since 2026-11-24 (context budget): one line, only when the uncovered set changed; never a block.
+    state = load_state(home, session)
+    if payload.get("stop_hook_active") or state.get("last_sig") == sig:
+        return {}
+    state["last_sig"] = sig
     state["last"] = now or time.time()
     save_state(home, session, state)
-    return {"decision": "block", "reason": text}
+    what = "cannot check the mission goals" if sig_src.startswith("file:") else "uncovered goal(s)"
+    return {"systemMessage": f"mission gate: {what}: {shown}. Detail: {detail}."[:600]}
 
 
 def main(argv=None) -> int:

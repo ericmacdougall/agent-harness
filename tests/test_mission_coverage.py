@@ -134,9 +134,22 @@ class Base(unittest.TestCase):
         p.update(extra)
         return p
 
-    def stop(self, rows=(), now=NOW, **extra):
+    def stop(self, rows=(), now=NOW, fresh=True, **extra):
+        """The gate's Stop output. Since 2026-11-24 it is one advisory line, said once per uncovered set; `fresh`
+        forgets what it said, so each call judges the goals as a new turn would."""
+        if fresh:
+            state = mission_gate.load_state(self.home, SESSION)
+            if state.get("last_sig"):
+                state["last_sig"] = None
+                mission_gate.save_state(self.home, SESSION, state)
         with mock.patch.object(mc, "owner_rows", return_value=list(rows)):
             return mission_gate.cmd_stop(self.payload(**extra), now=now)
+
+    def gate_text(self, rows=(), now=NOW):
+        """The advice the gate used to put in its block reason: still what `mission_coverage.py report` says."""
+        with mock.patch.object(mc, "owner_rows", return_value=list(rows)):
+            a = mc.assess(self.home, SESSION, now, deadline_s=9, prefer_snapshot=True)
+        return mc.gate_message(a["results"], a.get("advice") or "")
 
 
 class Coverage(Base):
@@ -329,13 +342,17 @@ class Stalled(Base):
 
 
 class Gate(Base):
-    def test_uncovered_goal_blocks_main_and_names_the_fix(self):
+    def test_uncovered_goal_gets_one_advisory_line_and_the_report_names_the_fix(self):
         self.write_goals([goal()])
         out = self.stop()
-        self.assertEqual(out.get("decision"), "block")
+        self.assertNotIn("decision", out)  # advisory since 2026-11-24
+        for text in ("leads", "goodqa#15095", "mission_coverage.py report"):
+            self.assertIn(text, out["systemMessage"])
+        self.assertNotIn("\n", out["systemMessage"])
+        self.assertEqual(self.stop(fresh=False), {})  # the same uncovered set is said once
         for text in ("leads", "goodqa#15095", "defer --goal ID --ask", "bind --goal ID --agent FULL_AGENT_ID",
                      "--user-source", "done --goal ID", "start an owner", "mission_coverage.py report"):
-            self.assertIn(text, out["reason"])
+            self.assertIn(text, self.gate_text())
 
     def test_covered_goal_does_not_block(self):
         self.write_goals([goal()])
@@ -355,25 +372,14 @@ class Gate(Base):
         path = mc.goals_path(self.home)
         path.write_text("{not json")
         out = self.stop()
-        self.assertEqual(out.get("decision"), "block")
-        self.assertIn("goals file unreadable", out["reason"])
-        self.assertEqual(out["reason"].count("goals file unreadable"), 1)
-
-    def test_valve_lets_the_turn_end_after_25_blocks_and_rings_high(self):
-        self.write_goals([goal()])
-        for i in range(25):
-            self.assertEqual(self.stop(now=NOW + i).get("decision"), "block", i)
-        out = self.stop(now=NOW + 30)
         self.assertNotIn("decision", out)
-        self.assertIn("leads", out.get("systemMessage", ""))
-        ring = [e for e in ow.read_ring(ow.ring_path(self.home)) if e.get("key") == "mission:gate-valve"]
-        self.assertTrue(ring and ring[-1]["event"] == "raise" and ring[-1]["severity"] == "high")
+        self.assertIn("goals file unreadable", out["systemMessage"])
+        self.assertEqual(out["systemMessage"].count("goals file unreadable"), 1)
 
     def test_repeated_stop_hook_active_does_not_loop(self):
         self.write_goals([goal()])
         out = self.stop(stop_hook_active=True)
-        self.assertNotIn("decision", out)
-        self.assertIn("leads", out.get("systemMessage", ""))
+        self.assertEqual(out, {})
 
     def test_tampered_goals_file_blocks_loudly(self):
         self.write_goals([goal(), goal("tokens", ticket="goodqa#15561", priority=2)])
@@ -382,8 +388,8 @@ class Gate(Base):
         data["goals"] = [g for g in data["goals"] if g["id"] != "leads"]
         path.write_text(json.dumps(data))  # an agent drops a goal by hand
         out = self.stop([row("a1111111", ticket="GoodQA #15561")])
-        self.assertEqual(out.get("decision"), "block")
-        self.assertIn("outside mission_coverage.py", out["reason"])
+        self.assertNotIn("decision", out)
+        self.assertIn("outside mission_coverage.py", out["systemMessage"])
 
     def test_cap_full_message_names_a_victim_and_the_queue_option(self):
         goals = [goal(), goal("g2", ticket="goodqa#2", priority=2), goal("g9", ticket="goodqa#9", priority=9)]
@@ -392,11 +398,10 @@ class Gate(Base):
         rows = [row(f"a000000{i}", ticket=f"GoodQA #{i}", last=NOW - (3000 if i == 3 else 60))
                 for i in range(1, 9)]  # 8 live owners, cap 8; a0000003 is the most idle owner on no goal
         with mock.patch.object(mc, "owner_cap", return_value=8):
-            out = self.stop(rows)
-        self.assertEqual(out.get("decision"), "block")
-        self.assertIn("owner cap full (8/8)", out["reason"])
-        self.assertIn("a0000003", out["reason"])  # owner of goodqa#3: on no mission goal, so freed first
-        self.assertIn("queue", out["reason"])
+            out = self.gate_text(rows)
+        self.assertIn("owner cap full (8/8)", out)
+        self.assertIn("a0000003", out)  # owner of goodqa#3: on no mission goal, so freed first
+        self.assertIn("queue", out)
         advice = mc.cap_advice(mc.evaluate([goal(), goal("g9", ticket="goodqa#9", priority=9)],
                                            [row(f"a000000{i}", ticket=f"GoodQA #{i}") for i in (9,)] +
                                            [row(f"b000000{i}", ticket="GoodQA #9") for i in range(1, 8)],
@@ -408,8 +413,8 @@ class Gate(Base):
     def test_cap_not_full_says_nothing_about_the_cap(self):
         self.write_goals([goal()])
         with mock.patch.object(mc, "owner_cap", return_value=8):
-            out = self.stop([row("a0000001", ticket="GoodQA #1")])
-        self.assertNotIn("owner cap full", out["reason"])
+            out = self.gate_text([row("a0000001", ticket="GoodQA #1")])
+        self.assertNotIn("owner cap full", out)
 
 
 class Hostile(Base):
@@ -893,7 +898,7 @@ class RedTeam179(Base):
         tr.write_text("{}\n")
         out = self.stop(session_id=other, transcript_path=str(tr))
         self.assertNotIn("decision", out)
-        self.assertEqual(self.stop().get("decision"), "block")
+        self.assertIn("systemMessage", self.stop())
 
     def test_no_mission_session_means_no_block(self):
         mc.add_goal(self.home, "leads", "Leads", "goodqa#15095", 1)
@@ -911,7 +916,7 @@ class RedTeam179(Base):
         text = json.dumps(out)
         self.assertNotIn("SYSTEM", text)
         self.assertNotIn("approved", text)
-        self.assertEqual(out.get("decision"), "block")
+        self.assertIn("systemMessage", out)
 
     def test_reason_text_is_sanitized_and_capped(self):
         self.assertEqual(mc.clean("a\nb\x1b[31mc" + "x" * 200), ("a b [31mc" + "x" * 200)[:80])
@@ -952,13 +957,12 @@ class RedTeam179(Base):
         self.assertLess(time.monotonic() - t0, 3)
 
     # minor 4: the valve resets once its problem clears
-    def test_valve_resets_when_the_signature_clears(self):
+    def test_said_again_when_the_set_clears_and_returns(self):
         self.write_goals([goal()])
-        for i in range(25):
-            self.stop(now=NOW + i)
-        self.assertNotIn("decision", self.stop(now=NOW + 30))
-        self.assertEqual(self.stop([row("a1111111")], now=NOW + 40), {})
-        self.assertEqual(self.stop(now=NOW + 50).get("decision"), "block")
+        self.assertIn("systemMessage", self.stop(now=NOW))
+        self.assertEqual(self.stop(now=NOW + 30, fresh=False), {})
+        self.assertEqual(self.stop([row("a1111111")], now=NOW + 40, fresh=False), {})
+        self.assertIn("systemMessage", self.stop(now=NOW + 50, fresh=False))
 
     # minor 6 / M18: ops-watch uses mission_session, keeps alerts when the scan is unavailable, clears when covered
     def test_ops_watch_keeps_alerts_when_the_scan_is_unavailable(self):
@@ -1062,7 +1066,7 @@ class RedTeam179(Base):
         statuses = {g["id"]: g["status"] for g in mc.load_goals(self.home)["goals"]}
         self.assertEqual(statuses["leads"], "active")
         self.assertEqual(statuses["tokens"], "imported")
-        self.assertEqual(self.stop().get("decision"), "block")
+        self.assertIn("systemMessage", self.stop())
 
     # M14 / M17
     def test_rows_written_by_others_are_not_the_owners_progress(self):
@@ -1119,7 +1123,7 @@ class RedTeam179Delta(Base):
     # M1: once a mission session is set, only that main runs main-only commands
     def test_another_top_level_session_cannot_take_over_or_change_the_mission(self):
         self.write_goals([goal(), goal("tokens", ticket="goodqa#15561")])
-        self.assertEqual(self.stop().get("decision"), "block")
+        self.assertIn("systemMessage", self.stop())
         attempts = [["set-session"], ["set-session", "--session", OTHER],
                     ["set", "--goal", "leads", "--ticket", "goodqa#555"],
                     ["bind", "--goal", "leads", "--agent", "a1111111aaaaaaaaa", "--source", "ticket:goodqa#15095"],
@@ -1132,7 +1136,7 @@ class RedTeam179Delta(Base):
         self.assertEqual(mc.mission_session_of(self.home), SESSION)
         self.assertEqual(self.ticket_of("leads"), "goodqa#15095")
         self.assertEqual({g["id"]: g["status"] for g in mc.load_goals(self.home)["goals"]}["tokens"], "active")
-        self.assertEqual(self.stop().get("decision"), "block")  # the real main is still held
+        self.assertIn("systemMessage", self.stop())  # the real main is still held
 
     def test_mission_main_hands_over_and_a_new_session_needs_the_users_words_in_it(self):
         self.write_goals([goal()])
@@ -1498,14 +1502,13 @@ class MutantKills(Base):
         g = goal(status="retired", retire={"source": f'user:{SESSION}/{USER_UUID} "drop the tokens goal"'})
         self.assertEqual(self.results([g], verify_source=always)["leads"]["state"], "UNCOVERED")
 
-    def test_valve_count_restarts_after_the_signature_changes(self):  # M39
+    def test_a_changed_uncovered_set_is_said_again(self):  # M39, advisory form
         self.write_goals([goal(), goal("tokens", ticket="goodqa#15561", priority=2)])
         tokens = row("a2222222aaaaaaaa", ticket="GoodQA #15561")
-        for i in range(25):
-            self.stop([tokens], now=NOW + i)
-        self.assertNotIn("decision", self.stop([tokens], now=NOW + 26))
-        self.assertEqual(self.stop([], now=NOW + 27).get("decision"), "block")  # both uncovered: another signature
-        self.assertEqual(self.stop([tokens], now=NOW + 28).get("decision"), "block")  # leads alone again: from zero
+        self.assertIn("systemMessage", self.stop([tokens], now=NOW))
+        self.assertEqual(self.stop([tokens], now=NOW + 26, fresh=False), {})
+        self.assertIn("systemMessage", self.stop([], now=NOW + 27, fresh=False))  # both uncovered: another signature
+        self.assertIn("systemMessage", self.stop([tokens], now=NOW + 28, fresh=False))  # leads alone again
 
     def test_tampered_file_cannot_move_the_gate_to_another_session(self):  # M41
         self.write_goals([goal()])
@@ -1513,7 +1516,7 @@ class MutantKills(Base):
         doc = json.loads(path.read_text())
         doc["mission_session"] = "99999999-0000-4000-8000-000000000000"
         path.write_text(json.dumps(doc))
-        self.assertEqual(self.stop().get("decision"), "block")
+        self.assertIn("systemMessage", self.stop())
 
 
 class Install(unittest.TestCase):

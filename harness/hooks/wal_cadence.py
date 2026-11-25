@@ -14,10 +14,10 @@ At Stop that worktree is the cwd, and only when the cwd is a linked worktree (th
 is the user's). For a subagent it is only a worktree under its own work folder
 ~/.agent-harness/work/<session>/agent-<id>/, never its cwd. If that agent's WAL (main.jsonl, or
 agent-<id>.jsonl) has no human entry (a wal_note.py row with a note) in the last WAL_STALE_S
-seconds, the hook blocks once with exit 2 and tells the agent what to record.
+seconds, the hook prints one advisory line (never a block, 2026-11-24) naming the one command that records it.
 
 Bounded like Hawkeye's original:
-- at most one nudge per agent per distinct diff fingerprint;
+- at most one nudge per agent per distinct diff fingerprint, and at most one per agent per 30 minutes;
 - never on a repeated stop (stop_hook_active);
 - HARNESS_WAL_CADENCE=off disables it;
 - every internal error fails open, because a broken nudge must never wedge a session.
@@ -222,17 +222,24 @@ def remember(session: str, key: str, now: float) -> None:
 
 
 def message(found, wal: Path, age) -> str:
+    """One advisory line (2026-11-24 context budget): what is uncommitted and the one command that records it."""
     fp, files, changed, top = found
-    shown = "\n    ".join(files[:10]) + ("" if len(files) <= 10 else "\n    ... and %d more" % (len(files) - 10))
-    when = ("there is no human-readable entry in your WAL" if age is None
-            else "your last human-readable WAL entry is %d minutes old" % int(age // 60))
-    return ("NO DURABLE RECORD OF THIS WORK YET (rule W04): %d file(s), about %d changed lines uncommitted in %s, "
-            "and %s.\n    %s\n\nHook metadata is not a record of what was verified. Before stopping, append what you "
-            "have actually done and checked (files, branch, the check command and its real result, next step):\n"
-            "  python3 ~/.claude/hooks/wal_note.py --wal %s --event status --note '<files, branch, check and result, "
-            "next step>'\nThis asks once per distinct diff; stopping again on the same work is not blocked, and any "
-            "WAL note clears it. HARNESS_WAL_CADENCE=off disables it."
-            % (len(files), changed, top, when, shown, wal))
+    shown = ", ".join(files[:3]) + ("" if len(files) <= 3 else " +%d more" % (len(files) - 3))
+    when = "no human WAL entry" if age is None else "last human WAL entry %d min ago" % int(age // 60)
+    return ("NO DURABLE RECORD OF THIS WORK YET (W04): %d file(s), ~%d changed lines uncommitted in %s (%s); %s. "
+            "Record it: python3 ~/.claude/hooks/wal_note.py --wal %s --event status --note '<files, check and result, "
+            "next step>'" % (len(files), changed, top, shown, when, wal))[:600]
+
+
+NUDGE_EVERY_S = 30 * 60
+
+
+def recently_nudged(session: str, agent: str, now: float) -> bool:
+    """At most one nudge per agent per NUDGE_EVERY_S, whatever the diff."""
+    asked = _load_state(session).get("asked") or {}
+    prefix = (agent or "main") + ":"
+    return any(k.startswith(prefix) and isinstance(v, (int, float)) and 0 <= now - v < NUDGE_EVERY_S
+               for k, v in asked.items())
 
 
 def evaluate(ev, now=None):
@@ -270,7 +277,7 @@ def evaluate(ev, now=None):
         if age is not None and age < WAL_STALE_S:
             return None
         key = "%s:%s" % (agent or "main", found[0])
-        if already_asked(session, key):
+        if already_asked(session, key) or recently_nudged(session, agent, now):
             continue
         return key, message(found, wal, age), session
     return None
@@ -287,8 +294,8 @@ def main() -> int:
         remember(session, key, time.time())
     except Exception:  # noqa: BLE001 - a broken nudge must never wedge a session
         return 0
-    sys.stderr.write(text + "\n")
-    return 2
+    sys.stdout.write(json.dumps({"systemMessage": text}) + "\n")  # advisory: never blocks the stop
+    return 0
 
 
 if __name__ == "__main__":
