@@ -141,6 +141,7 @@ class Extension(Repo):
                 self.assertRefused(("per-worktree config",) + self.GIT_STOPS)  # git may reject the value itself
 
     def test_the_files_that_decide_are_the_primarys_the_targets_and_the_callers(self):
+        # 2026-11-24: the hook form follows the role rules now; only the strict verifier is checked here
         other = self.base / "other"
         git(self.primary, "worktree", "add", "-q", "-b", "other", str(other))
         git(self.primary, "update-ref", "refs/remotes/origin/other", git(other, "rev-parse", "HEAD"))
@@ -152,28 +153,18 @@ class Extension(Repo):
         # the primary's file: the delegated removal runs from the primary, so it refuses in both forms
         self.write(self.primary_file, "core", "fsmonitor", None)
         self.assertRefused("per-worktree config")
-        verdict, text = cg.decide(command, compiled, cwd=str(self.primary))
-        self.assertEqual(verdict, "block")
         self.assertFalse(self.marker.exists())
         self.primary_file.unlink()
         # an UNRELATED linked worktree's file is never read by this removal: it must not block it (one odd file must
         # not freeze every sibling, as it did in the first draft on the real t2-dev proof)
         self.write(other_file, "core", "fsmonitor", None)
         self.assertTrue(self.verify()["removable"], self.verify())
-        verdict, text = cg.decide(command, compiled, cwd=str(self.primary))
-        self.assertEqual(verdict, "allow", text)
-        # but when the CALLER stands in that worktree (the hook form runs git there), its file decides
-        verdict, text = cg.decide(command, cg.Compiled(self.policy, home=str(self.home), cwd=str(other)), cwd=str(other))
-        self.assertEqual(verdict, "block")
-        self.assertIn("per-worktree config", text)
         self.assertFalse(self.marker.exists())
         other_file.unlink()
         self.write(self.target_file, "core", "fsmonitor", None)  # and the target's own file
         self.assertRefused("per-worktree config")
         self.target_file.unlink()
         self.assertTrue(self.verify()["removable"])
-        verdict, text = cg.decide(command, compiled, cwd=str(self.primary))
-        self.assertEqual(verdict, "allow", text)
 
     def test_unsafe_file_shapes_refuse_and_an_absent_file_does_not(self):
         self.raw("[extensions]", "\tworktreeConfig = true")
@@ -406,9 +397,8 @@ class CallerAndMessages(Extension):
                          "a per-worktree config sets url.insteadof")
 
     def test_an_unrelated_siblings_program_never_runs_in_the_real_removal(self):
+        # 2026-11-24: the hook form follows the role rules now; only the strict verifier is checked here
         self.write(self.other_file, "core", "fsmonitor", None)
-        verdict, text = self.decide_from(self.primary)
-        self.assertEqual(verdict, "allow", text)
         done = subprocess.run(["git", "-C", str(self.primary), "worktree", "remove", "--", str(self.linked)],
                               env=GIT_ENV, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60)
         self.assertEqual(done.returncode, 0, done.stderr)

@@ -17,15 +17,21 @@
 Categories (modes live in the installed command_guard_policy.json, never in an environment variable or a repo):
   secret_dump  Commands that print credentials into the transcript (rclone config show, --reveal, printenv,
                cat of credential files, ...).  Always enforced.
-  log_delete   rm/mv/truncate/find -delete/rsync --delete/... on Claude and Codex logs and WALs without a
-               verified-backup approval marker (see approve-delete).  Always enforced.
+  log_delete   A command that itself deletes, moves away or overwrites a protected target (judged by its operands,
+               never by words in prose, heredocs, quoted strings or script files it only creates or reads):
+               transcripts, session WALs, harness audit logs and approval state need a verified copy first, for
+               every caller (approve-delete, or `ah log-push`); other paths under ~/.claude, ~/.codex and
+               ~/.agent-harness follow ah_roles.may_delete (own roots and checkouts the caller made, supervised
+               projects, Fable/Astra anywhere); writes are refused only for hook scripts, policy files, the hook
+               wiring and (rule-file-write) ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md. A harness maintainer
+               (Fable/Astra marked supervisor) is refused only the verified-copy rule.  Always enforced.
   broad_kill   pkill -f / killall with a short, generic or unscoped pattern.  warn by default, enforce on request.
 
 The command is lexed like a shell (quotes, $'..', escapes, line continuations, here-docs, $(..), backticks,
 pipes, redirections, env prefixes, command/exec/sudo/env/xargs/timeout wrappers, sh -c, ssh and docker exec
 strings, absolute binary paths, brace expansion, case and Unicode lookalikes) before any rule looks at it.
-Inputs the guard cannot analyse within its budget (oversized, too deeply nested, too slow) are blocked, never
-waved through. An internal error falls back to a raw-text scan: sensitive-looking commands are blocked, others run.
+Inputs the guard cannot analyse within its budget (oversized, too deeply nested, too slow) and internal errors are
+allowed with a note, except when the raw text names a secret source or credential location (those fail closed).
 
 Threat model: careless or hurried agents, not an adversary who can edit the installed hooks. Best effort for
 interpreter one-liners (python -c, node -e): their code text is scanned, not executed or parsed.
@@ -8513,7 +8519,7 @@ def analyze(command, compiled=None, cwd=None, ps=False, marker=None, payload=Non
         raise
     if analyzer.ctx.unterminated and not any(f.category in ALWAYS_ENFORCED for f in findings):
         if raw_secret_sensitive(command):
-            findings.append(Finding(SECRET_DUMP, 'unanalysable',
+            findings.append(Finding(_fail_closed_category(command), 'unanalysable',
                                     'the command has an unterminated quote or substitution and names a protected '
                                     'location or secret', 'close the quote, or split the command'))
         else:
@@ -8521,7 +8527,7 @@ def analyze(command, compiled=None, cwd=None, ps=False, marker=None, payload=Non
                                     'check the quoting'))
     if analyzer.ctx.readings_capped and not any(f.category in ALWAYS_ENFORCED for f in findings):
         if raw_secret_sensitive(command):
-            findings.append(Finding(SECRET_DUMP, 'unanalysable',
+            findings.append(Finding(_fail_closed_category(command), 'unanalysable',
                                     '`>!` cannot be judged under both shell readings (too large, too deeply nested, or '
                                     'they disagree on what a later command uses) and the command names a protected '
                                     'location or secret', 'split the command, or use `>|`'))
@@ -8590,6 +8596,13 @@ def raw_sensitive(text, compiled=None, cwd=None):
     return bool(EXEC_TEXT.search(t) and DESTROY_TEXT.search(t))
 
 
+def _fail_closed_category(command):
+    """The label a secret fail-closed refusal keeps: log_delete when the text also names a harness location (as before
+    2026-11-24, so the secret rules' own tests and messages are unchanged), else secret_dump."""
+    text = command if isinstance(command, str) else ' '.join(map(str, command or ()))
+    return LOG_DELETE if PROTECTED_TEXT.search(text) else SECRET_DUMP
+
+
 def raw_secret_sensitive(text):
     """The raw-text probe used when the analysis cannot finish: a secret source or credential location only. A deletion
     the guard could not read is allowed with a note (the redesign of 2026-11-24: never block on "could not read")."""
@@ -8620,7 +8633,7 @@ def decide(command, compiled=None, cwd=None, ps=False, marker=None, payload=None
         if already:
             return 'block', format_block(already[0], more=len(already) - 1)
         if raw_secret_sensitive(command):
-            return 'block', format_block(Finding(SECRET_DUMP, 'unanalysable', reason + ' and it names a secret source',
+            return 'block', format_block(Finding(_fail_closed_category(command), 'unanalysable', reason + ' and it names a secret source',
                                                  'split it into smaller commands or put it in a script file'))
         return 'warn', format_block(Finding(PARSE, 'unanalysable', reason, 'split it into smaller commands'), warn=True)
     except Exception as error:  # noqa: BLE001 - fail closed for sensitive-looking text, open for the rest
@@ -8632,7 +8645,8 @@ def decide(command, compiled=None, cwd=None, ps=False, marker=None, payload=None
             # a deletion the guard could not read is allowed (logged); only the secret rules fail closed
             raw = [f for f in fallback_scan(text, compiled) if modes.get(f.category) == 'enforce' and f.category != LOG_DELETE]
             if not raw and raw_secret_sensitive(command):
-                raw = [Finding(SECRET_DUMP, 'guard-error', 'it names a secret source', 'retry with a simpler command')]
+                raw = [Finding(_fail_closed_category(text), 'guard-error', 'it names a secret source',
+                               'retry with a simpler command')]
         except Exception:  # noqa: BLE001
             raw = [Finding(SECRET_DUMP, 'guard-error', 'the guard failed twice', 'retry with a simpler command')]
         if raw:
