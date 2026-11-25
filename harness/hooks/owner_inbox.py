@@ -7,10 +7,14 @@ Fleet Ops writes complete standalone notes to:
     ~/.agent-harness/work/<session_id>/OWNER-DECISION-*.md
     ~/.agent-harness/work/<session_id>/inbox/*.md (and *.txt)
 
-This hook, on UserPromptSubmit, SessionStart, PostToolUse and Stop, loads any unread
-notes for the hook's session_id, returns them as additionalContext (or a one-time Stop
-block reason), then marks them read. A later edit of the same file (content hash change)
-makes it unread again. The hook fails open: it never breaks the session.
+This hook, on UserPromptSubmit, SessionStart and PostToolUse, loads any unread notes for
+the hook's session_id, oldest first, returns them as additionalContext (inlined while they
+fit 600 characters, else one line per note naming the file to read), then marks them read.
+Each note carries its id (path@sha) and what it answers (an In-Reply-To:/Answers: line and
+the ask ids it names), so the session closes those asks instead of asking them again. Stop
+never blocks: one advisory line per set of unread notes, which stay unread for the next
+prompt. A later edit of the same file (content hash change) makes it unread again, marked
+UPDATED. The hook fails open: it never breaks the session.
 
     owner_inbox.py hook     Claude/Codex hook (stdin: hook event JSON)
     owner_inbox.py pending --session SID   list unread note paths (JSON, no bodies)
@@ -48,6 +52,9 @@ HEADER = (
     "written for this session. Follow them and continue the allowed work. They are now "
     "marked read and will not be re-injected unless the file contents change."
 )
+CONTEXT_CAP = 600        # a hook invocation inlines notes only up to this; longer ones arrive as a path to read
+ASK_ID = re.compile(r"\b(?:ask[: ]+|\[ask:)(w[0-9a-f]{11})\b")
+REPLY_TO = re.compile(r"(?im)^\s*(?:in-reply-to|answers?)\s*:\s*(.{1,200})$")
 
 
 def home() -> Path:
@@ -161,7 +168,13 @@ def _candidates(session_fd: int) -> list[tuple[str, int, int]]:
                     pass
                 finally:
                     os.close(inbox_fd)
-    found.sort(key=lambda row: row[0])
+    def written(row):
+        try:
+            where = os.path.join(INBOX_DIR, row[2]) if row[1] == "inbox" else row[2]
+            return os.stat(where, dir_fd=session_fd, follow_symlinks=False).st_mtime
+        except OSError:
+            return 0.0
+    found.sort(key=lambda row: (written(row), row[0]))  # oldest first: an answer never arrives before its question
     return found
 
 
@@ -211,7 +224,9 @@ def collect_unread(session_id: str) -> list[dict]:
             if truncated:
                 text = text.rstrip() + f"\n\n[truncated: file is {info.st_size} bytes; injected the first {len(data)}]\n"
             rows.append({"relpath": relpath, "text": text, "sha256": digest, "bytes": len(data),
-                         "truncated": bool(truncated)})
+                         "truncated": bool(truncated), "path": str(path / relpath),
+                         "updated": previous.get("injected_at") if isinstance(previous, dict) else None,
+                         "in_reply_to": in_reply_to(text)})
         kept = []
         for row in rows:
             if len(kept) >= MAX_FILES:
@@ -253,15 +268,46 @@ def mark_read(session_id: str, items: list[dict]) -> None:
         os.close(session_fd)
 
 
-def format_items(items: list[dict]) -> str:
-    parts = [HEADER]
-    for item in items:
-        parts.append(f"--- {item['relpath']} ---")
-        parts.append(item["text"].rstrip())
+def in_reply_to(text: str) -> list[str]:
+    """What a note answers: an `In-Reply-To:` / `Answers:` header line, plus every ask id it names (`[ask:w...]`,
+    `ask w...`). The session closes those asks, so their reminders stop and nobody asks them again."""
+    found = []
+    for m in REPLY_TO.finditer(text[:4096]):
+        words = re.findall(r"[A-Za-z0-9#:_-]{3,40}", m.group(1))
+        found += [w[4:] if w.lower().startswith("ask:") else w for w in words][:5]
+    found += ASK_ID.findall(text)
+    return list(dict.fromkeys(found))[:10]
+
+
+def note_id(item: dict) -> str:
+    return f"{item['relpath']}@{item['sha256'][:8]}"
+
+
+def format_items(items: list[dict], session: str = "") -> str:
+    """Notes oldest first, each with its id and what it answers. Inlined while the whole fits CONTEXT_CAP; otherwise
+    one line per note naming the file to read (it stays on disk), so a long note never floods the context."""
+    def head(item):
+        line = f"--- {note_id(item)}"
+        if item.get("updated"):
+            line += f" (UPDATED; an earlier version was delivered {item['updated'][:19]}Z)"
+        asks = [a for a in item.get("in_reply_to") or [] if re.fullmatch(r"w[0-9a-f]{11}", a)]
+        if item.get("in_reply_to"):
+            line += f" in-reply-to: {', '.join(item['in_reply_to'])}"
+        if asks:
+            line += (f"; close each answered ask: python3 ~/.claude/hooks/wal_note.py --wal ~/.claude/wals/"
+                     f"{safe_id(session) if session else '<session>'}/main.jsonl --event ask_resolved --ref {asks[0]} "
+                     f"--source 'file:{item.get('path', item['relpath'])}' --note '<the answer>'")
+        return line + " ---"
     overflow = items[-1].get("overflow") if items else 0
-    if overflow:
-        parts.append(f"+{overflow} more unread note(s) were not injected this turn; they will be offered next.")
-    return "\n\n".join(parts) + "\n"
+    more = f"+{overflow} more unread note(s) were not injected this turn; they will be offered next." if overflow else ""
+    inline = "\n\n".join([HEADER] + [head(i) + "\n" + i["text"].rstrip() for i in items] + ([more] if more else []))
+    if len(inline) <= CONTEXT_CAP:
+        return inline + "\n"
+    lines = ["OWNER DECISION (answer inbox): unread owner decision note(s) for this session, too long to inline here. "
+             "Read each file below and follow it, then continue the allowed work. They are now marked read and will "
+             "not be re-injected unless the file contents change."]
+    lines += [f"{head(i)} {i['path']} ({i['bytes']} bytes)" for i in items]
+    return "\n".join(lines + ([more] if more else [])) + "\n"
 
 
 def hook_output(event: dict) -> dict | None:
@@ -277,20 +323,20 @@ def hook_output(event: dict) -> dict | None:
     items = collect_unread(session)
     if not items:
         return None
-    # A repeated Stop must not consume or re-block the same note.
-    if name == STOP_EVENT and event.get("stop_hook_active"):
-        return None
-    text = format_items(items)
+    if name == STOP_EVENT:
+        # Never a block (2026-11-24): the notes stay unread for the next prompt, tool call or session start; one
+        # advisory line, once per set of notes, says they are waiting.
+        if event.get("stop_hook_active") or not _stop_changed(session, ",".join(note_id(i) for i in items)):
+            return None
+        return {"systemMessage": f"owner inbox: {len(items)} unread decision note(s) for this session; they are "
+                                 "delivered at the next prompt: " + ", ".join(note_id(i) for i in items[:4])}
+    text = format_items(items, session)
     marked = False
     try:
         mark_read(session, items)
         marked = True
     except OSError:
         marked = False
-    if name == STOP_EVENT:
-        if not marked:
-            return None
-        return {"decision": "block", "reason": text}
     if not marked and name == "PostToolUse":
         return None  # a failed mark would otherwise re-inject after every tool
     if not marked:
@@ -299,6 +345,26 @@ def hook_output(event: dict) -> dict | None:
             "They could not be marked read this turn and may be offered again.",
         )
     return {"hookSpecificOutput": {"hookEventName": name, "additionalContext": text}}
+
+
+def _stop_changed(session: str, signature: str) -> bool:
+    """True (and recorded in the session's inbox state) when the unread set differs from the one Stop last named."""
+    try:
+        fd = _open_dir(session_dir(session))
+    except OSError:
+        return True
+    try:
+        state = _load_state(fd)
+        if state.get("stop_named") == signature:
+            return False
+        state["stop_named"] = signature
+        try:
+            _write_state(fd, state)
+        except OSError:
+            return False  # a line that cannot be rate-limited would repeat at every stop
+        return True
+    finally:
+        os.close(fd)
 
 
 def cmd_hook(_args) -> int:

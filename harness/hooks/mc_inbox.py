@@ -18,8 +18,10 @@ delivered (claimed by `wait` or `read`, no final reply). Claiming never hides a 
 nobody saw is surfaced again by the next `wait` and by the hooks.
 
 The hooks act only for a session that registered with `wait`. UserPromptSubmit names every unread id (up to 50,
-then '+K more') and counts unread messages for other sessions. Stop blocks at most once per message, with a
-cooldown and an hourly cap. Both are fixed pointers: dashboard text never appears in hook output.
+then '+K more') when that set changed since it last named it. Stop never blocks: one advisory line at most once per
+message, with a cooldown and an hourly cap. Both are fixed pointers: dashboard text never appears in hook output.
+Delivery (`wait`, `read`) is oldest first; a message its thread already answered, or a decision on an ask the WAL
+already closed, arrives together with that answer as one block marked ANSWERED (mc_chat.deliver_block).
 """
 
 from __future__ import annotations
@@ -89,7 +91,7 @@ def cmd_wait(args) -> int:
                 print(_summary(rows, others))
                 print("Answer each with `python3 ~/.claude/hooks/mc_inbox.py reply ID` (a message stays unread "
                       "until its reply), then re-arm the waiter.\n")
-                print("\n\n".join(mc_chat.frame(r) for r in shown[:mc_chat.LIST_MAX]))
+                print(mc_chat.deliver_block(shown[:mc_chat.LIST_MAX]))
                 if len(shown) > mc_chat.LIST_MAX:
                     print(f"\n+{len(shown) - mc_chat.LIST_MAX} more not printed: show each with "
                           f"`python3 ~/.claude/hooks/mc_inbox.py read ID`.")
@@ -121,7 +123,8 @@ def cmd_read(args) -> int:
               file=sys.stderr)
         return 2
     try:
-        print(deliver(record))
+        deliver(record)
+        print(mc_chat.deliver_block([record]))
     except mc_chat.ChatError as exc:
         print(f"mc_inbox: refused ({exc.code}): {exc}", file=sys.stderr)
         return 2
@@ -154,21 +157,30 @@ def cmd_detach(args) -> int:
 
 
 def hook_output(event: dict) -> dict | None:
-    """The hook decision for one Claude Code hook event, or None. Never contains dashboard text."""
+    """The hook decision for one Claude Code hook event, or None. Never contains dashboard text.
+
+    Context budget (2026-11-24): the prompt pointer names this session's unread ids only when that set changed since
+    the pointer last named it (never other sessions' counts), and Stop never blocks: one advisory line per new
+    message, under the existing cooldown and hourly cap."""
     name = event.get("hook_event_name")
     session = event.get("session_id")
-    if name not in ("Stop", "UserPromptSubmit") or not isinstance(session, str):
-        return None  # SubagentStop and everything else never act
+    if name not in ("Stop", "UserPromptSubmit") or not isinstance(session, str) or event.get("agent_id"):
+        return None  # SubagentStop, sub-agents and everything else never act
     if not mc_chat.SESSION_RE.match(session) or not mc_chat.target_registered(session):
         return None
-    rows, others = mc_chat.unread("claude", session)
+    rows, _others = mc_chat.unread("claude", session)
+    ids = [r["record"]["id"] for r in rows]
     # Self-heal: this session is the chat target but nothing is listening. A fixed pointer, only when there is no
     # delivery pointer to give (that one already says to re-arm), at most once per NUDGE_EVERY_S.
     nudge = (name == "UserPromptSubmit" and not rows and not mc_chat.waiter_live(session)
              and mc_chat.nudge_allowed(session))
-    if not rows and not (others and name == "UserPromptSubmit") and not nudge:
-        return None  # other sessions' messages are reported on the next prompt but never block this session
-    pointer = f"Mission Control: {_summary(rows, others)}." if rows or others else "Mission Control:"
+    if not rows and not nudge:
+        return None
+    if rows and name == "UserPromptSubmit" and not _changed(session, ",".join(ids)):
+        rows = []
+        if not nudge:
+            return None
+    pointer = f"Mission Control: {_summary(rows, 0)}." if rows else "Mission Control:"
     if nudge:
         pointer += (f" This session is the dashboard chat target but no `mc_inbox.py wait` is running, so dashboard "
                     f"messages and decisions wait until your next stop. Re-arm `python3 ~/.claude/hooks/mc_inbox.py "
@@ -179,9 +191,25 @@ def hook_output(event: dict) -> dict | None:
                     f"`mc_inbox.py wait --session {session}` in the background.")
     if name == "UserPromptSubmit":
         return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": pointer}}
-    if mc_chat.stop_block_allowed(session, [r["record"]["id"] for r in rows]):
-        return {"decision": "block", "reason": pointer}
+    if mc_chat.stop_block_allowed(session, ids):
+        return {"systemMessage": pointer}
     return None
+
+
+def _changed(session: str, signature: str) -> bool:
+    """True (and recorded) when the unread set differs from the one the prompt pointer last named. Kept beside the
+    chat store (chat/pointers/<session>.json); a pointer that cannot be recorded is repeated, never lost."""
+    path = mc_chat.chat_dir() / "pointers" / (session + ".json")
+    last = mc_chat.read_json(path)
+    if isinstance(last, dict) and last.get("ids") == signature:
+        return False
+    try:
+        path.parent.mkdir(mode=0o700, exist_ok=True)
+        if not path.parent.is_symlink():
+            mc_chat.write_json(path, {"ids": signature, "at": time.time()})
+    except OSError:
+        pass
+    return True
 
 
 def cmd_hook(_args) -> int:
