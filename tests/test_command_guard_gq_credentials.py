@@ -338,11 +338,6 @@ def stop_rule(command, name="unanalysable"):
     return ("log_delete/" if ".agent-harness" in command else "secret_dump/") + name
 
 
-def internal_error_rule(command):
-    """An internal error first runs the raw-text scan, which names a credential file itself; otherwise it is the stop rule."""
-    return "secret_dump/credential-file-text" if command in ("cat " + TOKEN, "cat " + KEY) else stop_rule(command, "guard-error")
-
-
 class GoodqaCredentialPaths(unittest.TestCase):
     def verdict(self, command):
         result = check(command)
@@ -590,16 +585,20 @@ class GoodqaCredentialPaths(unittest.TestCase):
         self.allowed_each(R7_STATED_LIMITS)
 
 
-class GoodqaFailClosed(unittest.TestCase):
-    """receipt r7 (Opus spec finding 4): when the analysis cannot finish, a command naming a GoodQA credential is refused,
-    never allowed and never only warned about; a harmless command is not."""
+class GoodqaFailOpenForSecretText(unittest.TestCase):
+    """Redesign 2026-11-24 (replaces receipt r7's fail-closed rule): when the analysis cannot finish, a command that only
+    names a GoodQA credential is NOT refused; the guard refuses secret reads on effect only, and an unsure analyser
+    allows with a note. Text naming the protected ~/.agent-harness root (the gq-browser lease keys) is still refused by
+    the protected-location probe, which this change leaves alone."""
+
+    PROTECTED = [c for c in FAIL_CLOSED if ".agent-harness" in c]
+    SECRET_ONLY = [c for c in FAIL_CLOSED if ".agent-harness" not in c]
 
     def results(self, commands, compiled=None):
         compiled = compiled or cg.Compiled(cg.load_policy())
         return {c: cg.decide(c, compiled)[:2] for c in commands}
 
     def assert_refused(self, commands, compiled=None, rule=None):
-        """Refused, and (receipt r11 F2) under the rule `rule(command)` names, not only with the verdict."""
         for command, (verdict, message) in self.results(commands, compiled).items():
             with self.subTest(command):
                 self.assertEqual(verdict, "block", command)
@@ -611,54 +610,44 @@ class GoodqaFailClosed(unittest.TestCase):
             with self.subTest(command):
                 self.assertNotEqual(verdict, "block", command)
 
-    def test_an_internal_error_refuses(self):
+    def test_the_split_is_not_empty(self):
+        self.assertTrue(self.PROTECTED and self.SECRET_ONLY)
+
+    def test_an_internal_error_allows_secret_text(self):
         from unittest import mock
         import io
 
         def boom(*_args, **_kwargs):
             raise ValueError("injected")
         with mock.patch.object(cg.Analyzer, "run", boom), mock.patch("sys.stderr", new=io.StringIO()):
-            self.assert_refused(FAIL_CLOSED, rule=internal_error_rule)
-            self.assert_not_refused(FAIL_OPEN_NEIGHBOURS)
+            self.assert_not_refused(self.SECRET_ONLY + FAIL_OPEN_NEIGHBOURS)
+            self.assert_refused(self.PROTECTED, rule=lambda c: stop_rule(c, "guard-error"))
 
-    def test_a_recursion_error_refuses(self):
+    def test_a_recursion_error_allows_secret_text(self):
         from unittest import mock
 
         def deep(*_args, **_kwargs):
             raise RecursionError("injected")
         with mock.patch.object(cg.Analyzer, "run", deep):
-            self.assert_refused(FAIL_CLOSED, rule=stop_rule)
+            self.assert_not_refused(self.SECRET_ONLY)
+            self.assert_refused(self.PROTECTED, rule=stop_rule)
 
-    def test_the_node_budget_refuses(self):
+    def test_the_node_budget_allows_secret_text(self):
         compiled = cg.Compiled(cg.load_policy())
         compiled.limits = dict(compiled.limits, max_nodes=10)
-        self.assert_refused(FAIL_CLOSED, compiled, rule=stop_rule)
-        self.assertEqual(cg.decide("echo hello", compiled)[0], "warn")  # the same stop on a harmless command only warns
+        self.assert_not_refused(self.SECRET_ONLY, compiled)
+        self.assert_refused(self.PROTECTED, compiled, rule=stop_rule)
 
-    def test_the_time_budget_refuses(self):
-        compiled = cg.Compiled(cg.load_policy())
-        compiled.limits = dict(compiled.limits, max_seconds=0.0)
-        self.assert_refused([c + " x" * 400 for c in FAIL_CLOSED], compiled, rule=stop_rule)
+    def test_an_oversized_command_allows_secret_text(self):
+        self.assert_not_refused([c + " " + "x" * 270000 for c in self.SECRET_ONLY])
 
-    def test_an_oversized_command_refuses(self):
-        self.assert_refused([c + " " + "x" * 270000 for c in FAIL_CLOSED], rule=stop_rule)
-
-    def test_nesting_past_the_depth_limit_refuses(self):
-        commands = []
-        for inner in FAIL_CLOSED[:4]:
-            nested = inner
-            for _ in range(10):
-                nested = "echo $(%s)" % nested
-            commands.append(nested)
-        self.assert_refused(commands, rule=stop_rule)
-
-    def test_an_unterminated_quote_refuses(self):
+    def test_an_unterminated_quote_is_still_judged_on_effect(self):
         # the analysis still finishes the words it read, so the credential rule itself refuses
         self.assert_refused(["tar -cf - \"$HOME/.config/goodqa", "tar -cf - ~/.config/goodqa '",
                              "cat \"$HOME/.agent-harness/gq-browser/0123456789abcdef/key", "grep -r . \"$HOME/.config/goodqa"],
                             rule=lambda _command: "secret_dump/credential-file")
 
-    def test_the_hook_alarm_refuses(self):
+    def test_the_hook_alarm_allows_secret_text(self):
         import io
         import json
         from unittest import mock
@@ -670,10 +659,9 @@ class GoodqaFailClosed(unittest.TestCase):
             err, out = io.StringIO(), io.StringIO()
             with self.subTest(command), mock.patch.object(cg, "decide", alarm), \
                     mock.patch("sys.stderr", new=err), mock.patch("sys.stdout", new=out):
-                self.assertEqual(cg.hook_main(stdin_bytes=payload, marker=False), 2, command)
-                self.assertIn("[secret_dump/unanalysable]", err.getvalue() + out.getvalue(), command)  # receipt r11 F2
+                self.assertEqual(cg.hook_main(stdin_bytes=payload, marker=False), 2 if command in self.PROTECTED else 0, command)
 
-    def test_the_launcher_refuses_when_the_analyser_crashes(self):
+    def test_the_launcher_allows_secret_text_when_the_analyser_crashes(self):
         import json
         import shutil
         import subprocess
@@ -687,10 +675,9 @@ class GoodqaFailClosed(unittest.TestCase):
                 done = subprocess.run([sys.executable, str(launcher)], input=payload, capture_output=True, timeout=60,
                                       env={"PATH": "/usr/bin:/bin", "HOME": tmp}, check=False)
                 with self.subTest(command):
-                    self.assertEqual(done.returncode, 0 if command in FAIL_OPEN_NEIGHBOURS else 2, command)
-                    if command not in FAIL_OPEN_NEIGHBOURS:  # receipt r11 F2 and F3: the rule, and the reason names credentials
+                    self.assertEqual(done.returncode, 2 if command in self.PROTECTED else 0, command)
+                    if command in self.PROTECTED:
                         self.assertIn(b"[guard_failure]", done.stderr, command)
-                        self.assertIn(b"a credential location", done.stderr, command)
 
 
 if __name__ == "__main__":

@@ -15,8 +15,11 @@
     command_guard.py scan-wal PATH...              report secret shapes in WAL/transcript files (never prints values)
 
 Categories (modes live in the installed command_guard_policy.json, never in an environment variable or a repo):
-  secret_dump  Commands that print credentials into the transcript (rclone config show, --reveal, printenv,
-               cat of credential files, ...).  Always enforced.
+  secret_dump  Commands that would read a secret OUT into the transcript, a pipe or the network (rclone config
+               show, --reveal, printenv, cat of credential files, ...), judged on effect: text that only names a
+               credential (sample text, fixtures, patterns, comments, --help) is not refused, and secret text alone
+               never refuses when the analysis cannot finish.  Fable and Astra are exempt (one audit line in
+               ~/.agent-harness/logs/secret-access.jsonl); everyone else is pointed at `ah secret` (docs/secrets.md).
   log_delete   rm/mv/truncate/find -delete/rsync --delete/... on Claude and Codex logs and WALs without a
                verified-backup approval marker (see approve-delete).  Always enforced.
   broad_kill   pkill -f / killall with a short, generic or unscoped pattern.  warn by default, enforce on request.
@@ -355,117 +358,11 @@ def _pw_home():
         return None
 
 
-# --------------------------------------------------------------------------- one-off pinned routes
-
-# One-off credential routes the user chose to allow. A route is the whole command string, a file with this exact SHA-256
-# at this exact path, and a time before that route's own expiry. This is a fixed table on purpose: no policy file, flag or
-# environment variable can add to it, and a later change removes it.
-# Paths are relative to HOME so no home name is published. The tools check their own names and values, so the argument
-# shapes only need to rule out shell syntax.
-# Entry: (path relative to HOME, sha256, exact command shape with {path}, expiry as a UNIX time).
-DEV_DECOM_EXPIRES = 1794182400  # 2026-11-09T00:00:00Z, the day the host the pve evacuation routes served shut down
-FABRIC_DO_AUTH_EXPIRES = 1795219200  # 2026-11-21T00:00:00Z, seven days after the user approved it
-TIMBAR_STAGING_DNS_EXPIRES = 1795305600  # 2026-11-22T00:00:00Z, under four days after the user approved it
-PINNED_ROUTES = (
-    # The pve evacuation (GoodQA goodqa#14518).
-    ('.agent-harness/work/dev-decom/unit-mig/t2-rclone/user-run-store-dropbox-secret.sh',
-     '92438a47d6b8083266e42922a2d151d0d0d65475fcc20744ea54359f2af501f3',
-     # -p (privileged mode): bash then runs no $BASH_ENV or $ENV file and imports no exported function before the script,
-     # which sets its own PATH and calls tools by absolute path
-     r'/bin/bash -p {path}',
-     DEV_DECOM_EXPIRES),
-    ('.agent-harness/work/dev-decom/unit-mig/cf-dns/cf_dns_prod_move.py',
-     '30c688923554c09f93128a7d9b89831557acd06d1f04949c235b09ea05cf89a6',
-     r'/usr/bin/python3 -I {path} (?:list'
-     r'|set-ttl --name [a-z.]{{1,40}} --ttl [0-9]{{1,5}} --expect-ttl [0-9]{{1,5}}'
-     r'|set-content --name [a-z.]{{1,40}} --content [0-9.]{{7,15}} --expect-content [0-9.]{{7,15}})',
-     DEV_DECOM_EXPIRES),
-    # Fabric droplet (GoodQA goodqa#15976): write a doctl config on t2-dev from GCP Secret Manager without the token
-    # passing through argv, an environment variable, a log or this machine. No arguments.
-    # Source: answer:baab765b-d85c-46b4-b7b9-588eb912c770/1259f6f0-b88d-40f3-834a-4275dbf8ec01 (ask we0224a94f24).
-    ('.agent-harness/work/baab765b-d85c-46b4-b7b9-588eb912c770/agent-ad1ff08b576984a4d/do-auth/doctl-auth-fabric.sh',
-     '419863b6538f16b6d66c03faf06ecc42f76d8aa765069a447d28f36959f7985f',
-     r'/bin/bash -p {path}',
-     FABRIC_DO_AUTH_EXPIRES),
-    # TIMBAR staging (GoodQA goodqa#16393): create the one record A timbar-staging.transition2.ai -> 159.203.13.118 (DNS
-    # only) with the Cloudflare token read from GCP Secret Manager into memory. No arguments: the zone, name, address and
-    # secret name are constants in the file, which prints fixed text only and writes nothing when the name is taken.
-    # Source: user:3410ce93-bee1-4ffb-b94b-1e852bc94483/d65a6c83-177c-4959-8e8e-f08fc483160b "you do it, get the
-    # secret/key from gcloud and set it" and, after the guard refused the first draft,
-    # user:3410ce93-bee1-4ffb-b94b-1e852bc94483/86b906f7-44bb-4d30-9a5e-ed10a45e60c1 "fix the command guard".
-    ('.agent-harness/work/3410ce93-bee1-4ffb-b94b-1e852bc94483/cf_dns.py',
-     '3fc503e96c61aa8ffb4705a858f8ded2515ae0ecd563142ce25d6c7c30f26420',
-     r'/usr/bin/python3 -I {path}',
-     TIMBAR_STAGING_DNS_EXPIRES),
-)
-# Existing scripts keep only log deletion and the credential-read rules (SCRIPT_CREDENTIAL_RULES); other printing rules
-# inside them still pass (goodqa#14993 follow-up). This also refuses
-# scripts whose own text, outside comment lines, names the rclone config or the token secret or dumps the config. Text only.
-# Python prose does not count as a dump: there the command must open a string or be an argument list. It runs as its own
-# pass after main's analysis (credential_findings), so it only ever adds a finding and cannot use main's time. It does
-# not run inside scripts on disk, whose own commands keep only log deletion and credential reads. It does not catch a
-# script that builds the name at runtime or calls another script, a name past the read limit, a path the guard cannot
-# resolve, a runner it does not unwrap (`uv run`, `tmux`, `python3 -m cProfile`), a test in a folder named tests, or one of
-# the guard's own files.
-_CREDENTIAL_NAMES = (rb'\.config/rclone/?(?=["\'\s;|&)*$]|\Z)'  # the config directory as a whole word, or a glob or variable
-                     rb'|/rclone/rclone\.conf(?![\w.-])'  # the file under any base, such as $XDG_CONFIG_HOME
-                     rb'|["\']rclone\.conf["\']'  # the quoted file name: os.path.join, pathlib, read("...")
-                     rb'|\bGOODQA_CLOUDFLARE_API_TOKEN\b'
-                     rb'|\bDIGITALOCEAN_API_TOKEN\b')  # goodqa#15976: only its pinned route may read it
-# The option count is bounded: an unbounded loop here is quadratic, and a padded script could then outlast the time limit.
-_RCLONE_DUMP = rb'rclone(?:\s|\\)+(?:-\S+(?:\s+"?\$?\{?\w+\}?"?)?\s+){0,8}config(?:\s|\\)+"?(?:show|dump)\b'
-CREDENTIAL_SHELL_TEXT = re.compile(_CREDENTIAL_NAMES + rb'|\b' + _RCLONE_DUMP)
-CREDENTIAL_PYTHON_TEXT = re.compile(_CREDENTIAL_NAMES + rb'|[f]?["\'](?:[^"\'\s]*/)?' + _RCLONE_DUMP
-                                    + rb'|["\']rclone["\']\s*,\s*["\']config["\']\s*,\s*["\'](?:show|dump)["\']')
-CREDENTIAL_SCRIPT_READ = 1048576
-# The check's own pass starts no new read after this long. Main's analysis (at most its 3 s limit) plus this stays under
-# the hook's 7 s alarm; a single read that stalls past the alarm ends the pass, and main's verdict stands.
-CREDENTIAL_PASS_SECONDS = 1.5
-CREDENTIAL_SCRIPT_SUFFIXES = ('.sh', '.bash', '.zsh', '.py')
-CREDENTIAL_DATA_SUFFIXES = ('.json', '.jsonl', '.md')
-CREDENTIAL_SCRIPT_SHEBANG = re.compile(rb'#![^\n]*\b(?:ba|z|k|da|)sh\b|#![^\n]*\bpython')
-GUARD_OWN_FILES = ('command_guard.py', 'command_guard_hook.py', 'command_guard_corpus.py', 'live_guard_canary.py',
-                   'holds_guard.py')
-ROUTE_HOME = re.compile(r'/[A-Za-z0-9_./-]+')  # HOME goes into a command string, so it must not hold shell syntax
-PYTHON_NAME = re.compile(r'(?:python|pypy)(?:[0-9.]+t?(?:-intel64)?|w)?')
-SHELL_LONG_OPTS = frozenset(('norc', 'noprofile', 'login', 'posix', 'verbose', 'version', 'help', 'restricted', 'noediting',
-                             'debugger', 'dump-strings', 'dump-po-strings', 'rpm-requires'))
-SHELL_LONG_VALUE_OPTS = frozenset(('rcfile', 'init-file'))
-
-
-def shell_script_word(texts):
-    """Index of the script a POSIX shell would run, or None for -c, -n or no script. Used only to add a credential check,
-    so a misreading here can miss a script but cannot weaken any other rule."""
-    i, on = 0, set()
-    while i < len(texts):
-        t = texts[i]
-        if t in ('-', '--'):
-            i += 1
-            break
-        if t[:1] not in ('-', '+'):
-            break
-        i += 1
-        word = t.lstrip('-')
-        if t[0] == '-' and word in SHELL_LONG_OPTS:
-            continue
-        if t[0] == '-' and word in SHELL_LONG_VALUE_OPTS:
-            i += 1
-            continue
-        if t.startswith('--'):
-            on.update('c' if word.startswith('command') else '')
-            continue
-        for ch in t[1:]:
-            if ch in 'oO':
-                i += 1
-            elif t[0] == '-':
-                on.add(ch)
-            else:
-                on.discard(ch)
-    return i if i < len(texts) and not on & {'c', 'n'} else None
+PYTHON_LIKE = re.compile(r'(?:python|pypy)(?:[0-9.]+t?(?:-intel64)?|w)?')
 
 
 def python_script_word(texts):
-    """Index of the script Python would run, or None for -c, -m, stdin or no script. Same use as shell_script_word."""
+    """Index of the script Python would run, or None for -c, -m, stdin or no script."""
     i = 0
     while i < len(texts):
         t = texts[i]
@@ -486,39 +383,6 @@ def python_script_word(texts):
                 i += 1 if pos == len(t) - 1 else 0
                 break
     return None
-
-
-def _read_prefix(path, limit):
-    """Read a regular file without blocking: a FIFO swapped in after a check would otherwise hang until the alarm."""
-    fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0))
-    with os.fdopen(fd, 'rb') as handle:
-        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-            raise OSError('not a regular file')
-        return handle.read(limit)
-
-
-def pinned_route(command, now=None):
-    """True only for the exact command string of an unexpired route whose file is a regular file with the pinned hash."""
-    if not isinstance(command, str):
-        return False
-    home = os.environ.get('HOME')
-    if not home or not ROUTE_HOME.fullmatch(home):
-        return False
-    now = time.time() if now is None else now
-    for rel, digest, shape, expires in PINNED_ROUTES:
-        path = os.path.join(home, rel)
-        if not re.fullmatch(shape.format(path=re.escape(path)), command):
-            continue
-        if now >= expires:
-            return False
-        try:
-            if not stat.S_ISREG(os.lstat(path).st_mode):
-                return False
-            data = _read_prefix(path, CREDENTIAL_SCRIPT_READ + 1)
-        except (OSError, ValueError):
-            return False
-        return len(data) <= CREDENTIAL_SCRIPT_READ and hashlib.sha256(data).hexdigest() == digest
-    return False
 
 
 # --------------------------------------------------------------------------- budget and data model
@@ -3696,8 +3560,9 @@ def _build_fallback(c):
         if core.endswith('$'):
             core = core[:-1]
         cred_alts.append(lead + core + r'(?=$|[\s\'")\],;|&])')
+    c.cred_text = None
     if cred_alts:
-        cred = re.compile('|'.join(cred_alts), re.I)
+        cred = c.cred_text = re.compile('|'.join(cred_alts), re.I)
         reader = re.compile(r'\b(?:cat|head|tail|less|more|type|get-content|gc|strings|xxd|od|base64|print|read|open|sed|awk|grep|'
                             r'cut|bat|nl|tac|readfile|read_text|read_bytes|file_get_contents|readfilesync|dump|echo)\b')
         add((S, 'credential-file-text', ('and', cred, reader),
@@ -3849,6 +3714,27 @@ def blank_regex_patterns(code):
     return raw.decode('utf-8', 'replace')
 
 
+# SECRET_DUMP rules that are not a secret read: a hidden program, an input the guard cannot judge. A --help, the
+# top rung's permission and the supervisor's permission never lift these.
+NOT_SECRET_READ_RULES = frozenset(('obfuscated-shell-input', 'obfuscated-eval', 'oversized-input', 'unanalysable',
+                                   'guard-error', 'unparsable-payload'))
+
+
+def secret_read_finding(f):
+    return f.category == SECRET_DUMP and f.rule not in NOT_SECRET_READ_RULES
+
+
+# interpreter code (code_secret_effect): a print, a file read and a secret-named environment read, on the casefolded line
+CODE_PRINTER = re.compile(r'\bp?print\s*\(|\bprint\s+[^\s=(]|\bputs\b|\bsay\b|console\.(?:log|error|info|warn|dir)\s*\(|'
+                          r'\bstd(?:out|err)\.write\s*\(|\bprintf?\s*\(|\bp\s+env\b|\becho\b')
+CODE_READER = re.compile(r'\bopen\s*\(|\.read(?:_text|_bytes|lines)?\s*\(|readfile(?:sync)?\s*\(|file_get_contents\s*\('
+                         r'|\bslurp\b|\bfile\.read\b')
+CODE_RUNNER = re.compile(r'\bsubprocess\.|\bos\.(?:system|popen|exec\w*|spawn\w*)\s*\(|\bexec(?:file)?sync\s*\(|'
+                         r'\bspawn(?:sync)?\s*\(|\bsystem\s*\(|\bcheck_output\s*\(|`[^`]+`|\bqx\b|%x[({]')
+CODE_SECRET_ENV = re.compile(r'(?:\benviron(?:\.get)?|\bgetenv|\bprocess\.env|\$env:|\benv\b(?:\.fetch)?|%env)\W{0,4}'
+                             r'[a-z0-9_]*(?:secret|token|key|password|passwd|credential)')
+
+
 def fallback_scan(text, ctx):
     """Raw-text rules for unresolved indirection, interpreter code, oversized input and internal errors."""
     findings = []
@@ -3988,20 +3874,12 @@ MAX_READING_FORKS = 3
 # credential material wholesale, which repository tooling has no routine reason to do. Lookups that tooling does use
 # (env dumps, `gh auth token`, one keychain password, ${!name}, git config listings, obfuscation) stay exempt there.
 SCRIPT_CREDENTIAL_RULES = frozenset((
-    'credential-file', 'credential-stdin', 'credential-script', 'find-exec-credentials', 'keychain-dump',
+    'credential-file', 'credential-stdin', 'find-exec-credentials', 'keychain-dump',
     'docker-credential', 'git-credential', 'git-credential-helper', 'goodqa-reveal', 'rclone-dump', 'rclone-authorize',
 ))
 
 
 class Analyzer:
-    # The credential-script check (goodqa#14518) runs only in its own second pass, credential_findings(), so the analysis
-    # that decides everything else is exactly main's. disk_depth counts scripts on disk being analysed: their
-    # commands are judged only for log deletion and credential reads (SCRIPT_CREDENTIAL_RULES), so the
-    # check skips them rather than spend its time there.
-    credential_pass = False
-    credential_candidate = False
-    disk_depth = 0
-
     def __init__(self, compiled, cwd=None, ps=False, marker=None):
         self.ctx = Ctx(compiled, cwd, ps, marker)
         self.c = compiled
@@ -4185,7 +4063,6 @@ class Analyzer:
                                     tail_visible=True)
                     elif pname == 'cat':
                         for w in _nondash(prev[1:])[:4]:
-                            self.credential_entry(None, '.', [w], [w], [w.text])
                             self.script_file(w, depth)
         # `... | xargs rm`: the operands come from the earlier stages, so judge what those stages name
         for idx, cmd in enumerate(pl.cmds):
@@ -4628,8 +4505,23 @@ class Analyzer:
                 ctx.findings.append(f)
             for w in words:
                 pass
+        before = len(ctx.findings)
         for name in names:
             self.apply(name, words, cmd, pl, idx, depth)
+        if len(ctx.findings) > before and self._asks_help(names, words):
+            # `rclone config show --help`, `gh auth token --help`: the tool prints its help, not a secret
+            ctx.findings[before:] = [f for f in ctx.findings[before:] if not secret_read_finding(f)]
+
+    @staticmethod
+    def _asks_help(names, words):
+        """The command asks for its own help: `--help` among literal arguments of a command that is not a file reader,
+        search, transfer or archive tool (there an option value `--help` can still print a file). Not `-h`: it is a
+        host or a value flag for many tools (`gh config get -h github.com oauth_token`)."""
+        if any(n in PRINT_FILE_CMDS or n in GREP_CMDS or n in EXFIL_CMDS or n in ARCHIVE_CMDS for n in names):
+            return False
+        if any(w.subs or w.dynamic for w in words):
+            return False
+        return any(w.text == '--help' for w in words[1:])
 
     def _which_name(self, head):
         """`$(which rm)`, `$(command -v rm)`, `` `type -p rm` ``: the named command."""
@@ -4659,7 +4551,6 @@ class Analyzer:
         ctx = self.ctx
         args = words[1:]
         texts = [a.text for a in args]
-        self.credential_entry(cmd, name, words, args, texts)
         if ctx.ps:
             name = {'remove-item': 'rm', 'ri': 'rm', 'del': 'rm', 'erase': 'rm', 'rd': 'rm', 'move-item': 'mv',
                     'mi': 'mv', 'move': 'mv', 'gc': 'cat', 'get-content': 'cat', 'type': 'cat', 'clear-content': 'truncate',
@@ -4677,6 +4568,8 @@ class Analyzer:
             return
         if name in ('cd', 'pushd', 'set-location', 'sl', 'chdir'):
             self.chdir(args)
+            return
+        if self.ah_secret(name, args, cmd, pl, idx, depth):
             return
         if name in ('read', 'mapfile', 'readarray'):
             # `... | while read f`: the variable holds whatever the upstream stage printed
@@ -4796,82 +4689,33 @@ class Analyzer:
         if name in KILLERS:
             self.kill_cmd(name, args, texts)
 
-    def credential_entry(self, cmd, name, words, args, texts):
-        """Add a refusal when this command runs an existing script that names a credential (goodqa#14518). Only ever adds a
-        finding, and any failure here means no finding, so no other rule's verdict changes."""
-        if self.disk_depth:
-            return
-        if not self.credential_pass:
-            # main's pass only notes that a script is run, so the check's pass is skipped for commands that run none.
-            # Nothing here reads a file or adds a finding, and the alarm's TimeoutError is not caught.
-            if not self.credential_candidate:
-                try:
-                    self.credential_candidate = any(w is not None and not w.dynamic and w.text
-                                                    for w, _ in self._credential_words(cmd, name, words, args, texts))
-                except (IndexError, AttributeError, TypeError, ValueError):
-                    self.credential_candidate = True
-            return
-        try:
-            for word, runner in self._credential_words(cmd, name, words, args, texts):
-                if word is not None and not word.dynamic and word.text:
-                    self.credential_script(norm_path(word.text, self.ctx), runner)
-        except Blocked:
-            raise
-        except Exception:  # noqa: BLE001
-            return
-
-    def _credential_words(self, cmd, name, words, args, texts):
-        if self.ctx.ps:
-            return
-        if name in ('.', 'source'):
-            nd = _nondash(args)
-            yield (nd[0] if nd else None), 'shell'
-        if '/' in name or '/' in words[0].text:
-            yield words[0], None
-        if name in SHELLS:
-            at = shell_script_word(texts)
-            yield (args[at] if at is not None else None), 'shell'
-            for r in cmd.redirs:
-                if r.op == '<' and r.fd in (None, '0') and not any(t.startswith('-') and 'c' in t for t in texts):
-                    yield r.target, 'shell'
-        if PYTHON_NAME.fullmatch(name):
+    def ah_secret(self, name, args, cmd, pl, idx, depth):
+        """`ah secret ...` (also `python3 .../ah.py secret ...` and `ah_secret.py ...`): the clean path for secrets, open
+        to every agent because no value reaches the transcript. `rm` deletes a stored secret: refused here, and lifted
+        for the top rung and for a supervisor in decide(). `exec ... -- CMD`: CMD is judged like any command."""
+        texts = [a.text for a in args]
+        rest = None
+        if name == 'ah' and texts[:1] == ['secret']:
+            rest = 1
+        elif PYTHON_LIKE.fullmatch(name):
             at = python_script_word(texts)
-            yield (args[at] if at is not None else None), 'python'
-
-    def credential_script(self, path, runner=None):
-        """`runner` is 'shell' or 'python' when one was named to run this file, so its name says nothing about what it is."""
-        lower = path.lower()
-        base = os.path.basename(path)
-        in_tests = os.path.basename(os.path.dirname(path)) == 'tests' and base.startswith('test_') and base.endswith('.py')
-        if base in GUARD_OWN_FILES or in_tests or lower.endswith(CREDENTIAL_DATA_SUFFIXES):
-            return  # these hold the names as data
-        # Each (path, runner) is read once per pass, so the second shell reading of `>!` repeats no read.
-        seen = self.__dict__.setdefault('credential_seen', {})
-        if (path, runner) in seen:
-            if seen[(path, runner)]:
-                self._credential_finding()
-            return
-        seen[(path, runner)] = False
-        if time.monotonic() > self.ctx.budget.deadline:
-            return  # the pass is out of time: start no new read
-        try:
-            if not os.path.isfile(path):
-                return
-            data = _read_prefix(path, CREDENTIAL_SCRIPT_READ)
-            shebang = CREDENTIAL_SCRIPT_SHEBANG.match(data)
-            if b'\0' in data or (runner is None and not lower.endswith(CREDENTIAL_SCRIPT_SUFFIXES) and not shebang):
-                return  # a data file or a binary, not a script
-            python = runner == 'python' or (runner is None and (lower.endswith('.py') or (shebang and b'python' in shebang.group())))
-            code = b'\n'.join(line for line in data.split(b'\n') if not line.lstrip().startswith(b'#'))
-            if (CREDENTIAL_PYTHON_TEXT if python else CREDENTIAL_SHELL_TEXT).search(code):
-                seen[(path, runner)] = True
-                self._credential_finding()
-        except (OSError, ValueError):
-            return
-
-    def _credential_finding(self):
-        self.ctx.add(SECRET_DUMP, 'credential-script', 'this script names a credential file or secret, and only a '
-                     'pinned route may run one', 'read the task for a pinned route, or take a path that does not need this credential')
+            if at is not None and not args[at].dynamic:
+                base = posixpath.basename(texts[at])
+                if base == 'ah.py' and texts[at + 1:at + 2] == ['secret']:
+                    rest = at + 2
+                elif base == 'ah_secret.py':
+                    rest = at + 1
+        if rest is None:
+            return False
+        sub = texts[rest] if rest < len(texts) else ''
+        if sub == 'rm':
+            self.ctx.add(SECRET_DUMP, 'secret-rm', 'deleting a stored secret is for Fable/Astra or a supervisor session',
+                         'leave it, or ask a supervisor session to run `ah secret rm NAME`')
+        elif sub == 'exec' and '--' in texts[rest:]:
+            inner = args[texts.index('--', rest) + 1:]
+            if inner:
+                self.dispatch(inner, cmd, pl, idx, depth + 1)
+        return True
 
     def script_file(self, word, depth, require_shell=False, invocation=None, command=None):
         """Analyse a shell script named on the command line (or written earlier in this command)."""
@@ -5008,7 +4852,6 @@ class Analyzer:
         before = len(ctx.findings)
         keep = {k: (v.copy() if isinstance(v, (set, dict, list)) else v) for k, v in vars(ctx).items()
                 if k not in ('findings', 'budget', 'c', 'marker', 'files_read', 'unterminated', 'readings_capped')}
-        self.disk_depth += 1
         try:
             if modeled:
                 # Only this pinned script's exact dedicated atomic publication.
@@ -5016,7 +4859,6 @@ class Analyzer:
                 ctx.why_note_publish = (modeled[1] + '.tmp', modeled[1])
             self.script(text, depth + 1, tail_visible=True)
         finally:
-            self.disk_depth -= 1
             if modeled:
                 del ctx.why_note_publish
             for k, v in keep.items():
@@ -6582,6 +6424,8 @@ class Analyzer:
         An uncertain search also judges the working directory whatever its operands."""
         ctx = self.ctx
         texts = [a.text for a in args]
+        if name in ('jq', 'yq', 'gojq') and self._key_names_only(args):
+            return  # `jq 'keys' FILE` prints the key names, never a value
         words = list(args)
         uncertain, count_only = False, False
         exempt_name, exempt_dir, counted = set(), set(), set()
@@ -6679,6 +6523,22 @@ class Analyzer:
                             'check existence with `test -s FILE` or `ls -l FILE`; use the owning tool\'s own config flag; to count entries use `grep -c`')
                     return
 
+    KEY_NAME_FILTERS = frozenset(('keys', 'keys[]', '.|keys', 'keys_unsorted', 'keys_unsorted[]', 'length', 'type',
+                                  '[paths]', 'paths', 'map(keys)', 'to_entries|map(.key)', '[.[]|keys]'))
+
+    def _key_names_only(self, args):
+        """jq/yq given only output-format flags and a filter that prints key names, lengths or types."""
+        filters = []
+        for a in args:
+            if a.dynamic or a.subs:
+                return False
+            if a.text.startswith('-'):
+                if a.text not in ('-r', '-c', '-S', '-M', '-C', '-j', '--raw-output', '--compact-output', '--sort-keys'):
+                    return False
+            elif not filters:
+                filters.append(a.text)
+        return bool(filters) and re.sub(r'\s+', '', filters[0]) in self.KEY_NAME_FILTERS
+
     def _grep_path_dirs(self):
         """ugrep opens `-f FILE` under $GREP_PATH when FILE is not in the working directory: the directories GREP_PATH names
         in the command text or this environment, or [''] (any directory) when the command sets it to something unreadable."""
@@ -6739,6 +6599,8 @@ class Analyzer:
         # destroyer words inside a regex pattern are data: the log-delete text rule reads the code without them
         blanked = blank_regex_patterns(code) if read_only_pattern_script(code) else code
         for f in fallback_scan(code, ctx.c):
+            if f.category == SECRET_DUMP:
+                continue  # words in code are data (a test generator's sample text): code_secret_effect judges effect
             if f.category == LOG_DELETE and blanked != code and not any(
                     g.rule == f.rule and g.category == LOG_DELETE for g in fallback_scan(blanked, ctx.c)):
                 continue
@@ -6752,12 +6614,40 @@ class Analyzer:
                      r'print\s+join\s*\([^)]*%env|\bkeys\s*%env\b|print[^;]*%env\b|'
                      r'for\s*\(\s*\w+\s+in\s+environ\s*\)|getenvironmentvariables\s*\(', low):
             ctx.add(SECRET_DUMP, 'interpreter-env-dump', 'script code prints the whole environment', 'print only specific non-secret names')
+        self.code_secret_effect(code)
         for sample in ctx.c.state_files:
             if sample in low.replace('\\', '/') and re.search(r'open|write|copy|rename|replace|echo|dump', low):
                 ctx.add(LOG_DELETE, 'state-forgery', 'writes the delete-approval marker or key directly', 'use command_guard.py approve-delete')
         if '.claude/projects' in low.replace('\\', '/') and TRANSCRIPT_CODE_WRITE.search(low):
             ctx.add(LOG_DELETE, 'transcript-forgery', 'script code writes under ~/.claude/projects (session '
                     'transcripts)', 'only Claude Code writes transcripts')
+
+    def code_secret_effect(self, code):
+        """Interpreter code that PRINTS a credential file's content or a secret variable, judged one line at a time: a
+        print call on a line that also reads a named credential file, or a secret-named environment variable. A line
+        that only names a credential (sample text, a fixture, a pattern) or reads one without printing it is not refused.
+        A line that runs a shell command (subprocess, os.system, execSync, system) is judged by the secret-command text
+        rules, since what it runs prints to the same output. Best effort: a value carried to a print on another line is
+        not followed."""
+        ctx = self.ctx
+        cred = getattr(ctx.c, 'cred_text', None)
+        for line in code[:2_000_000].splitlines():
+            low = line.casefold()
+            if CODE_RUNNER.search(low):
+                for f in fallback_scan(line, ctx.c):
+                    if f.category == SECRET_DUMP:
+                        ctx.findings.append(f)
+                        return
+            if not CODE_PRINTER.search(low):
+                continue
+            if CODE_SECRET_ENV.search(low):
+                ctx.add(SECRET_DUMP, 'interpreter-secret-print', 'script code prints a secret environment variable',
+                        'pass it to the program that needs it; never print the value')
+                return
+            if cred is not None and CODE_READER.search(low) and cred.search(_scan_text(line)):
+                ctx.add(SECRET_DUMP, 'interpreter-credential-print', 'script code prints the content of a credential file',
+                        'let the program read the file itself; never print it')
+                return
 
     # ---- destructive
     #
@@ -7934,8 +7824,6 @@ def analyze(command, compiled=None, cwd=None, ps=False, marker=None):
         command = ' '.join(_quote_for_rebuild(str(c)) for c in command)
     if len(command.encode('utf-8', 'replace')) > int(compiled.limits['max_command_bytes']):
         raise Blocked('command is larger than %d bytes' % int(compiled.limits['max_command_bytes']))
-    if pinned_route(command):
-        return []
     analyzer = Analyzer(compiled, cwd=cwd, ps=ps, marker=marker)
     try:
         findings = analyzer.run(command)
@@ -7960,58 +7848,21 @@ def analyze(command, compiled=None, cwd=None, ps=False, marker=None):
             findings.append(Finding(PARSE, 'readings-capped', '`>!` cannot be judged under both shell readings (too large, too '
                                     'deeply nested, or they disagree on what a later command uses)',
                                     'split the command, or use `>|`'))
-    modes = compiled.policy['modes']
-    if analyzer.credential_candidate and not any(modes.get(f.category) == 'enforce' for f in findings):
-        findings = findings + credential_findings(command, compiled, cwd=cwd, ps=ps)
     return findings
 
 
-def credential_findings(command, compiled, cwd=None, ps=False):
-    """The credential-script check (goodqa#14518) as a separate pass, run after main's analysis has finished with its own
-    budget untouched. It has its own time cap and adds only credential-script findings. Any stop here, including the
-    hook's alarm, keeps what it found before the stop and adds nothing more, so the verdict is never looser than main's.
-    The pass is skipped when main already blocks, since a further finding changes nothing, and when main's pass saw no
-    script being run."""
-    analyzer = Analyzer(compiled, cwd=cwd, ps=ps, marker=None)
-    analyzer.credential_pass = True
-    budget = analyzer.ctx.budget
-    budget.deadline = time.monotonic() + min(CREDENTIAL_PASS_SECONDS, float(compiled.limits['max_seconds']))
-    try:
-        analyzer.run(command)
-    except Exception:  # noqa: BLE001 - a budget stop, the alarm's TimeoutError or a bug: main's verdict stands
-        pass
-    return [f for f in analyzer.ctx.findings if f.rule == 'credential-script']
-
-
-SECRET_TEXT = re.compile(r'(?i)\brclone\b|\bauth\s+token\b|--show-token|\bprintenv\b|(?:^|[;&|(\s])(?:env|set|export'
-                         r'|declare|typeset)(?:\s+-[px])?\s*(?:$|[;&|)])|credentials|\bid_(?:rsa|dsa|ecdsa|ed25519)\b'
-                         r'|\.env\b|auth\.json|\.npmrc|\.netrc|\.pgpass|hosts\.yml|rclone\.conf|find-(?:generic|'
-                         r'internet)-password|dump-keychain|/environ\b|(?:TOKEN|SECRET|PASSWORD|API_?KEY)\b')
-
-
-# credential locations for the raw-text fallback (receipt r7, fail closed): when the analysis cannot finish (an internal
-# error, the time or node budget, nesting past max_depth, the hook's alarm or a crash of the analyser) a command naming
-# one is refused, never allowed or only warned about. Matched on the text and on the text with quotes and backslashes
-# removed (`~/.config/"goodqa"`, `goo\dqa`): a path segment `goodqa` (`~/.config/goodqa`, `~/.conf*/goodqa`), the lease
-# keys, a glob or brace right under ~/.config, and the policy's other credential directories. command_guard_hook.py keeps
-# an identical copy (it must not import this module).
-CRED_TEXT = re.compile(r'(?i)/goodqa(?![\w.-])|gq-browser|goodqa-hive|\.config/+[^\s/;&|<>()]*[*?\[{]'
-                       r'|(?:^|[\s/=~:])\.(?:ssh|aws|gnupg|kube|docker)(?![\w-])|\.config/+(?:gh|gcloud|rclone)(?![\w-])'
-                       r'|\.vault-token|\.git-credentials')
-
-
-def raw_credential(text):
-    """The raw text names a credential location (`CRED_TEXT`), as written or with quotes and backslashes removed."""
-    return bool(CRED_TEXT.search(text) or CRED_TEXT.search(re.sub(r'[\'"\\]', '', text)))
+# Secret and credential text is not part of the raw probe (harness redesign, 2026-11-24): when the analysis cannot finish,
+# a command that only NAMES a secret source or a credential location is allowed with a note. The analyser judges effect;
+# its fallback must not refuse on words. The protected-location and exec-plus-destroy probes below are unchanged.
 
 
 def raw_sensitive(text, compiled=None, cwd=None):
-    """Cheap raw-text probe: does this text name a protected location, a credential location or a secret source? A
-    destructive verb run from a working directory inside a harness root counts too (`cd ~/.claude` then `rm -rf projects`)."""
+    """Cheap raw-text probe: does this text name a protected location? A destructive verb run from a working directory
+    inside a harness root counts too (`cd ~/.claude` then `rm -rf projects`). Secret text alone does not count."""
     if not isinstance(text, str):
         text = ' '.join(map(str, text))
     t = text[:4_000_000]
-    if PROTECTED_TEXT.search(t) or SECRET_TEXT.search(t) or raw_credential(t):
+    if PROTECTED_TEXT.search(t):
         return True
     if cwd and DESTROY_TEXT.search(t):
         for place in (cwd, _realpath(cwd) or cwd):
@@ -8026,8 +7877,69 @@ EXEC_TEXT = re.compile(r'(?i)\|\s*(?:sudo\s+)?(?:ba|z|k|da|)sh\b|\beval\b|\b(?:b
 DESTROY_TEXT = re.compile(r'(?i)\b(?:rm|rmdir|unlink|shred|truncate|mv|rmtree|remove|unlinksync|rmsync|dd|find)\b')
 
 
-def decide(command, compiled=None, cwd=None, ps=False, marker=None):
-    """('allow'|'warn'|'block', message). Never raises: budget failures block, bugs fall back to a raw-text scan."""
+SECRET_PATH = ('to use a stored secret without printing it: `ah secret exec --env VAR=NAME -- <command>`; to store one '
+               'from the clipboard: `ah secret put NAME` (see docs/secrets.md)')
+
+
+def _audit_secret_access(lifted, payload, why):
+    """One line per lifted refusal in ~/.agent-harness/logs/secret-access.jsonl: rule ids, tool, caller. Never the command
+    (it may carry a value). True when the line was written; a lift without its line does not happen."""
+    try:
+        import ah_roles
+        model = ah_roles.caller_model(payload)
+    except Exception:  # noqa: BLE001
+        model = ''
+    record = {'at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'rules': sorted({f.rule for f in lifted}),
+              'tool': str(payload.get('tool_name') or payload.get('toolName') or '')[:40], 'by': why,
+              'model': str(model)[:80], 'session': str(payload.get('session_id') or '')[:64],
+              'agent': str(payload.get('agent_id') or '')[:64]}
+    try:
+        directory = Path(os.path.expanduser('~')) / '.agent-harness' / 'logs'
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(str(directory / 'secret-access.jsonl'), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, (json.dumps(record, separators=(',', ':')) + '\n').encode())
+        finally:
+            os.close(fd)
+        return True
+    except OSError:
+        return False
+
+
+def lift_secret_refusals(findings, payload):
+    """The owner's rule (2026-11-24): Fable and Astra may handle secrets, so their secret-read findings are dropped; a
+    supervisor may also run `ah secret rm`. Everything else stays. `payload` is the hook input (None: no lift)."""
+    if not isinstance(payload, dict) or not findings:
+        return findings
+    readable = [f for f in findings if secret_read_finding(f)]
+    if not readable:
+        return findings
+    try:
+        import ah_roles
+        if ah_roles.may_handle_secrets(payload):
+            lifted, why = readable, 'top rung'
+        elif any(f.rule == 'secret-rm' for f in readable) and ah_roles.is_supervisor(payload):
+            lifted, why = [f for f in readable if f.rule == 'secret-rm'], 'supervisor'
+        else:
+            return findings
+    except Exception:  # noqa: BLE001 - roles unreadable: least privilege
+        return findings
+    if not _audit_secret_access(lifted, payload, why):
+        return findings
+    gone = {id(f) for f in lifted}
+    return [f for f in findings if id(f) not in gone]
+
+
+def _secret_path(f):
+    """A secret-read refusal names the path that proceeds."""
+    if secret_read_finding(f) and 'ah secret' not in f.alternative:
+        return Finding(f.category, f.rule, f.reason, '%s; %s' % (f.alternative, SECRET_PATH))
+    return f
+
+
+def decide(command, compiled=None, cwd=None, ps=False, marker=None, payload=None):
+    """('allow'|'warn'|'block', message). Never raises: budget failures block, bugs fall back to a raw-text scan.
+    `payload` (the hook input) lets the caller's role lift secret-read refusals (lift_secret_refusals)."""
     compiled = compiled or Compiled(load_policy(), cwd=cwd)
     modes = compiled.policy['modes']
     if approval_env_override(command):
@@ -8038,9 +7950,10 @@ def decide(command, compiled=None, cwd=None, ps=False, marker=None):
         findings = analyze(command, compiled, cwd=cwd, ps=ps, marker=marker)
     except (Blocked, RecursionError) as stop:
         reason = str(stop) if isinstance(stop, Blocked) else 'command nesting is too deep'
-        already = [f for f in getattr(stop, 'findings', []) if modes.get(f.category) == 'enforce']
+        already = lift_secret_refusals([f for f in getattr(stop, 'findings', []) if modes.get(f.category) == 'enforce'],
+                                       payload)
         if already:
-            return 'block', format_block(already[0], more=len(already) - 1)
+            return 'block', format_block(_secret_path(already[0]), more=len(already) - 1)
         if raw_sensitive(command, compiled, cwd=cwd):
             category = LOG_DELETE if PROTECTED_TEXT.search(command if isinstance(command, str) else ' '.join(command)) \
                 else SECRET_DUMP
@@ -8048,12 +7961,14 @@ def decide(command, compiled=None, cwd=None, ps=False, marker=None):
                                                  'or secret', 'split it into smaller commands or put it in a script file'))
         return 'warn', format_block(Finding(PARSE, 'unanalysable', reason, 'split it into smaller commands'), warn=True)
     except Exception as error:  # noqa: BLE001 - fail closed for sensitive-looking text, open for the rest
-        already = [f for f in getattr(error, 'findings', []) if modes.get(f.category) == 'enforce']
+        already = lift_secret_refusals([f for f in getattr(error, 'findings', []) if modes.get(f.category) == 'enforce'],
+                                       payload)
         if already:
-            return 'block', format_block(already[0], more=len(already) - 1)
+            return 'block', format_block(_secret_path(already[0]), more=len(already) - 1)
         try:
             text = command if isinstance(command, str) else ' '.join(map(str, command))
-            raw = [f for f in fallback_scan(text, compiled) if modes.get(f.category) == 'enforce']
+            # secret text alone never refuses here: the raw scan sees words, not effect
+            raw = [f for f in fallback_scan(text, compiled) if modes.get(f.category) == 'enforce' and f.category != SECRET_DUMP]
             if not raw and raw_sensitive(command, compiled, cwd=cwd):
                 raw = [Finding(LOG_DELETE if PROTECTED_TEXT.search(text) else SECRET_DUMP, 'guard-error',
                                'it names a protected location or secret', 'retry with a simpler command')]
@@ -8065,12 +7980,17 @@ def decide(command, compiled=None, cwd=None, ps=False, marker=None):
         print('command_guard: internal error (%s); raw text looked clean, allowed' % type(error).__name__, file=sys.stderr)
         return 'allow', ''
     enforce = [f for f in findings if modes.get(f.category) == 'enforce']
+    kept = lift_secret_refusals(enforce, payload)
+    if len(kept) < len(enforce):
+        lifted = {id(f) for f in enforce} - {id(f) for f in kept}
+        findings = [f for f in findings if id(f) not in lifted]
+        enforce = kept
     if not enforce and getattr(marker, 'no_backup', None) and not sole_delete(command, marker.no_backup):
         enforce = [Finding(LOG_DELETE, 'no-backup-compound', 'a no-backup delete approval is used only by a command '
                            'that is just the delete; other segments could create work that exists nowhere else',
                            'run `rm -rf <approved path>` on its own')]
     if enforce:
-        return 'block', format_block(enforce[0], more=len(enforce) - 1)
+        return 'block', format_block(_secret_path(enforce[0]), more=len(enforce) - 1)
     if findings:
         return 'warn', format_block(findings[0], warn=True)
     return 'allow', ''
@@ -9872,7 +9792,7 @@ def hook_main(fmt='exit2', stdin_bytes=None, compiled=None, marker=True):
                 return emit('block', format_block(Finding(LOG_DELETE, 'install-files', refusal.replace('ah install-files: ', ''),
                                                           INSTALL_FILES_FORM)), fmt)
         approvals = Approvals(compiled=c) if marker else None
-        verdict, message = decide(command, c, cwd=cwd, ps=ps, marker=approvals)
+        verdict, message = decide(command, c, cwd=cwd, ps=ps, marker=approvals, payload=payload)
         if verdict != 'block' and approvals is not None and approvals.used and not approvals.consume():
             verdict, message = 'block', format_block(Finding(LOG_DELETE, 'approval-used', 'the delete approval was '
                                                              'already used or changed', 'approve again after a fresh '

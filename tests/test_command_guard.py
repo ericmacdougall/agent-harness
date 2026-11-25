@@ -264,7 +264,8 @@ class PayloadTests(Fixture):
 class FailureModeTests(Fixture):
     def test_unterminated_quote_with_protected_text_blocks(self):
         self.assertEqual(self.decide("rm -rf ~/.claude/projects '")[0], 'block')
-        self.assertEqual(self.decide('echo "rclone config show')[0], 'block')
+        # secret words alone in an unterminated quote are text, not a read (redesign 2026-11-24): a note, not a refusal
+        self.assertEqual(self.decide('echo "rclone config show')[0], 'warn')
 
     def test_unterminated_quote_without_protected_text_warns(self):
         self.assertEqual(self.decide("echo 'hello")[0], 'warn')
