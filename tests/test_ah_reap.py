@@ -667,6 +667,27 @@ class Checkouts(Case):
         self.assertEqual(row["saved"]["refs"], {ref: commit for ref, commit in self.refs().items()})
         self.assertTrue(all("/%s/co-app-" % SESSION in ref for ref in row["saved"]["refs"]), row["saved"])
 
+    def test_the_save_hook_and_the_reaper_use_the_same_names(self):
+        """autosave.py saves after every turn and the reaper saves again before deleting: the same rescue refs, not
+        a second set, also when the session folder is itself a checkout. Both mean the same temp directory."""
+        import autosave  # noqa: PLC0415
+        import session_env  # noqa: PLC0415
+        folder = self.folder()
+        subprocess.run(["git", "init", "-q", str(folder)], check=True)
+        self.commit(folder, "top.txt")
+        self.commit(self.repo(folder / "co" / "app"), "more.txt")
+        self.assertEqual(autosave.run(SESSION), "")
+        hook = self.refs()
+        self.assertEqual(len(hook), 3, hook)   # two heads/main, and a snapshot of the folder's untracked marker
+        self.assertTrue(any("/%s/top-" % SESSION in ref for ref in hook), hook)
+        temp = session_env.make_tmp(folder.name)
+        code, out = self.apply()
+        self.assertEqual(code, 0, out)
+        self.assertFalse(folder.exists())
+        self.assertEqual(self.refs(), hook)
+        self.assertEqual(self.removed("tmp"), [str(temp)])
+        self.assertFalse(temp.exists())
+
     def test_an_edit_git_can_only_see_by_reading_the_file_is_saved_too(self):
         """Same size, same timestamp as the index entry and as the index itself: only the content differs. git reads
         the file in that case because the index is as new as the entry; a copy of the index must not look newer."""
@@ -837,7 +858,7 @@ class Checkouts(Case):
         self.assertFalse(folder.exists())
         refs = self.refs()
         self.assertEqual([c for r, c in refs.items() if "agent-1-" in r and r.endswith("/heads/agent-1")], [work])
-        marker, = [c for r, c in self.refs().items() if "/%s-" % SESSION in r and r.endswith("/snapshot")]
+        marker, = [c for r, c in self.refs().items() if "/%s/top-" % SESSION in r and r.endswith("/snapshot")]
         self.assertIn(workdir.MARKER, self.git(self.rescue, "ls-tree", "--name-only", marker).splitlines())
 
     def test_checkouts_that_depend_on_each_other_in_a_circle_are_kept(self):

@@ -72,8 +72,10 @@ def write_env(env_file, values) -> None:
             handle.write(("" if not old or old.endswith("\n") else "\n") + "".join(line + "\n" for line in new))
 
 
-def context(folder, ah, home, exported=False) -> str:
-    """The one line an agent reads at session start: full paths when they fit, else paths from ~, else plain `ah`."""
+def context(folder, ah, home, exported=False, session=None) -> str:
+    """The one line an agent reads at session start: full paths when they fit, else paths from ~, else plain `ah`.
+    A shell that got no env file (Codex) has no AH_SESSION, which `ah co` needs, so the command carries it."""
+    env = "AH_SESSION=%s " % shlex.quote(session) if session and not exported else ""
     def short(path):
         path, base = str(path), str(home).rstrip("/") + "/"
         return "~/" + path[len(base):] if path.startswith(base) else path
@@ -84,7 +86,8 @@ def context(folder, ah, home, exported=False) -> str:
                 "recreate in its keep/ folder. For a checkout: %s co <owner/repo>."
                 % (show(folder), " ($AH_WORK)" if exported else "", tool))
 
-    for text in (line(str, "python3 %s" % ah), line(short, "python3 %s" % short(ah)), line(short, "ah")):
+    for text in (line(str, "%spython3 %s" % (env, ah)), line(short, "%spython3 %s" % (env, short(ah))),
+                 line(short, env + "ah")):
         if len(text) < MAX_LINE:
             break
     return text[:MAX_LINE - 1]
@@ -129,7 +132,7 @@ def main() -> int:
                 exported = True
             except OSError:
                 pass   # the env file cannot be written: the folder and the context line still stand
-        text = context(folder, Path(__file__).resolve().parent / "ah.py", Path.home(), exported)
+        text = context(folder, Path(__file__).resolve().parent / "ah.py", Path.home(), exported, session)
         extra = quota_line(folder.name)
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart",
                                                  "additionalContext": text + ("\n" + extra if extra else "")}}))

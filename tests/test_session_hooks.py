@@ -193,6 +193,10 @@ class SessionStart(Case):
         self.assertFalse((self.home / ".agent-harness" / "tmp").exists())
         self.assertNotIn("$AH_WORK", self.context(done))
         self.assertIn(" co <owner/repo>.", self.context(done))
+        # `ah co` needs the session, and this shell was given no AH_SESSION: the command carries it
+        self.assertRegex(self.context(done), r"For a checkout: AH_SESSION=%s (python3 \S+/)?ah(\.py)? co <" % SESSION)
+        self.assertLess(len(self.context(done)), 400)
+        self.assertNotIn("AH_SESSION", self.context(self.start()))   # exported through the env file instead
 
     def write_size(self, size, complete=True):
         path = session_env.state_file(SESSION)

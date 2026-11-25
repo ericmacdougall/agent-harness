@@ -23,8 +23,9 @@ does about it. No part of it blocks or delays a tool call, and none of it reads 
 
 Nothing is deleted by these hooks. Deleting is `ah reap run --apply`, which you run or schedule yourself (below).
 
-On Codex the same two hooks run at SessionStart and Stop. Codex has no env file, so `AH_WORK` and `TMPDIR` are not
-set there; the folder, the line of context and the save work the same. Codex asks you to review new hooks in `/hooks`.
+On Codex the same two hooks run at SessionStart and Stop. Codex has no env file, so `AH_SESSION`, `AH_WORK` and
+`TMPDIR` are not set there (the line of context gives `ah co` with `AH_SESSION=<id>` in front); the folder, the line
+and the save work the same. Codex asks you to review new hooks in `/hooks`.
 
 Limits worth knowing:
 
@@ -47,7 +48,8 @@ Set these in `~/.agent-harness/local.json` ([local-config.md](local-config.md)):
 
 On a remote the refs are `refs/rescue/<host>/<session>/<name>-<8 hex>/` followed by `heads/<branch>`, `tags/<tag>`,
 `stash/<n>`, `detached` and `snapshot` (the working tree). `<name>` is the checkout's path inside the session folder
-with `/` written as `-`; the 8 hex characters keep two checkouts of the same name apart.
+with `/` written as `-` (`top` when the session folder is itself the checkout); the 8 hex characters keep two
+checkouts of the same name apart. For a `--path` directory `<session>` is `loose` and `<name>` is the directory's name.
 
 Files that never go into a snapshot are copied to `~/.agent-harness/rescue/held/<host>/<session>/<name>-<8 hex>/`
 (directories 0700, files 0600): secret-shaped names such as `.env`, `*.pem` and `*.key`, files over 20 MB, and ignored
@@ -61,44 +63,56 @@ files that are not rebuildable output. If they total more than 200 MB the checko
 ah co OWNER/REPO [--ref REF] [--name NAME]   # a checkout in <session folder>/co/<name>, origin = the real URL
 ah reap scan [--json] [--loose DIR ...] [--check-remote]   # read only: what is there, who owns it, what is unsaved
 ah reap run                                  # dry run: prints the plan, changes nothing
-ah reap run --apply                          # save, then delete what is eligible
+ah reap run --apply [--idle-hours N]         # save, then delete what is eligible
 ah reap run --apply --if-above 70            # only when the disk is at least 70% full; oldest first
-ah reap run --apply --session ID             # one session folder
+ah reap run --apply --session ID ...         # only these session folders (they must still be idle)
 ah reap run --apply --path /home/me/old-clone   # one named directory outside the work root
 ```
+
+`--session` also lifts the own-folder rule; idleness still applies, so cleaning your own live session needs
+`--idle-hours 0`. `--path` names one real directory exactly (no wildcard); a symlink, the home folder or a folder
+that holds it, and anything under `~/.agent-harness`, `~/.claude` or `~/.codex` is refused.
 
 `ah co` clones against a shared mirror in `~/.agent-harness/cache/git/` and then cuts the link, so the checkout
 depends on no other checkout and "is this pushed?" always has an answer. Prefer it to cloning from a sibling checkout.
 
 `ah reap scan` also lists docker containers and volumes. Label yours so they can be tied to the session:
-`docker run --label ah.session=$AH_SESSION ...`. `--loose DIR` adds checkouts found directly under `DIR`, and
-`--check-remote` also asks each remote what it already holds. A scan never deletes.
+`docker run --label ah.session=$AH_SESSION ...`. `--loose DIR` adds checkouts at most two levels below `DIR`, and
+`--check-remote` asks each remote what it holds (without it the remote-tracking refs answer, and a local-path origin
+shows as unknown). A scan never deletes. On a work root of 200 GB it takes minutes.
 
-Exit codes of `ah reap`: 0 done or nothing to do, 1 something failed, 3 refused (bad arguments, unsafe platform).
+Exit codes of `ah reap`: 0 done or nothing to do (a kept item is not a failure), 1 a deletion, a docker removal or
+the log write failed, 3 refused (bad arguments, unsafe platform).
 
 ## What `ah reap run --apply` removes, and when
 
 A session folder is eligible when it has been idle for `reap_idle_hours` (default 48), or when it holds a `.done` file
 and has been idle for 1 hour. With `--if-above PCT` nothing happens below that disk use; at or above it, folders idle
-for 6 hours go, oldest first, until use is 5 points below `PCT`.
+for 6 hours (or `--idle-hours`) go, oldest first, until use is 5 points below `PCT`.
 
 For an eligible folder, in this order:
 
 1. Rebuildable directories go first, wherever they are: `node_modules`, `.venv`, `venv`, `__pycache__`,
    `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.next`, `.nuxt`, `.turbo`, `.parcel-cache`, `.gradle`, `.tox`,
    `target` beside a `Cargo.toml` or `pom.xml`, `dist` and `build` when git ignores them, and the session's temp
-   directory. This also happens to folders that end up kept.
+   directory. Inside a checkout such a directory goes only when git tracks nothing in it; a kept checkout loses it too.
 2. Every checkout is saved again (children first: a linked worktree before its repository). Only a proven save allows
    its removal. A checkout that a path outside the folder depends on is kept.
-3. The folder is checked once more for use, then deleted, read-only trees included.
-4. Docker containers and volumes labelled for that session are stopped and removed. Images are never pruned.
+3. The folder is checked once more for use, then the saved checkouts are deleted, read-only trees included. Loose
+   files stay, and so does the folder itself unless it is itself a checkout.
+4. Docker containers and volumes tied to that session (label `ah.session`, or a bind mount under the folder) are
+   stopped and removed. Images are never pruned.
 
-Every deletion, and every item kept with its reason, is one JSON line in `~/.agent-harness/logs/reap.jsonl`.
+Every deletion is one JSON line in `~/.agent-harness/logs/reap.jsonl`, written before the deletion starts (no row,
+no deletion). An item kept inside an eligible folder is logged with its reason; folders left alone (not idle, `.keep`,
+in use) are printed, not logged. A folder with a kept checkout is tried again only after another idle period. Without
+`rescue_remote`, a checkout with no remote off this host becomes a bundle under `~/.agent-harness/rescue`, on this disk.
 
 ## What is never removed
 
 - The folder of the session that runs the command, unless named with `--session`.
-- A folder with a `.keep` file. Any `keep/` directory: put paid results and anything costly to recreate there.
+- A folder with a `.keep` file. Any `keep/` directory (a checkout that holds one is kept whole): put paid results
+  and anything costly to recreate there.
 - A folder a live process is using, a folder that is a symlink, and the harness's own protected paths.
 - A checkout whose save could not be proven. Large loose files and unlabelled containers are reported only.
 - Small files left in a reduced folder: those follow the older `python3 ~/.claude/hooks/workdir.py prune` retention.

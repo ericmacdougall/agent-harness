@@ -433,7 +433,7 @@ class _Run:
     def reduce(self, look, borrowed, things) -> None:
         """Steps 1 to 6 for one eligible folder: rebuildable output, then checkouts (save, check again, delete), then
         the session's containers and volumes."""
-        top, session = look["real"], look["owner"] or ("loose" if look["loose"] else look["name"])
+        top, session = look["real"], "loose" if look["loose"] else look["name"]   # the names autosave.py saves under
         why = _recheck(look) if self.apply else None
         for path in [] if why else sorted(look["rebuildable"]) + [look["tmp"]] * bool(look["tmp"]):
             self.remove(look, "tmp" if path == look["tmp"] else "rebuildable", path)
@@ -455,7 +455,7 @@ class _Run:
             elif blocker:
                 kept[repo] = "%s is kept, and it is inside this checkout or depends on it" % blocker
             elif self.apply:
-                name = look["name"] if repo == top else os.path.relpath(repo, top)
+                name = os.path.relpath(repo, top) if repo != top else look["name"] if look["loose"] else "top"
                 saved[repo] = git_save.save(repo, session, name, fresh=True)   # fresh: proven now, not remembered
                 if _unproven(saved[repo], top):
                     kept[repo] = _unproven(saved[repo], top)
