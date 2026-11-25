@@ -4138,6 +4138,9 @@ def main(argv=None) -> int:
     if given[:1] in (["off"], ["on"], ["switch-status"]):  # the harness off switch (ah_switch.py, docs/off-switch.md)
         import ah_switch  # noqa: PLC0415
         return ah_switch.main(["status" if given[0] == "switch-status" else given[0]] + given[1:])
+    if given[:1] == ["secret"]:  # clipboard -> secret store, and use without printing (ah_secret.py, docs/secrets.md)
+        import ah_secret  # noqa: PLC0415
+        return ah_secret.main(given[1:])
     if given[:1] == ["decision"]:  # goodqa#16651: signed central top-rung decisions (central_decisions.py)
         import central_decisions  # noqa: PLC0415
         return central_decisions.main(given[1:])
