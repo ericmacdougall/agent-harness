@@ -207,7 +207,7 @@ class Status(Base):
         data = json.loads(out.getvalue())
         self.assertEqual(code, 0)
         self.assertEqual(set(data), {"schema", "transcripts", "bulk", "last_run", "last_skip", "last_throttled", "lock",
-                                     "ok"})
+                                     "sources", "ok"})
         self.assertEqual(data["schema"], 1)
         self.assertEqual(data["transcripts"]["marker"], "log-backup.last-ok")
         self.assertEqual(data["transcripts"]["max_age_seconds"], 3600)
@@ -374,6 +374,53 @@ class Restore(Base):
         for value in ("-x:y", ":webdav,url=http://evil:", "a:b:c", "x:../y", "/abs"):
             env = {"LOG_BACKUP_REMOTE": value}
             self.assertEqual(self.restore(".claude/projects", self.tmp / "s", env=env)[0], 2, value)
+
+
+class PerTree(Base):
+    """goodqa#16660: each tier-1 tree writes its own marker when nothing of it is pending, and the script writes
+    log-backup.sources. A backlog in one tree must not hide that the others are fresh, and must not make tier 1 fresh."""
+
+    def run_cli(self, *argv):
+        return subprocess.run([sys.executable, str(TOOL), "--home", str(self.home), *argv],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+
+    def write_trees(self, now):
+        (self.logs / "log-backup.source.codex_sessions.last-ok").write_text(stamp(now - 120) + " pending=0\n")
+        (self.logs / "log-backup.source.claude_projects.last-ok").write_text(stamp(now - 90000) + " pending=0\n")
+        (self.logs / "log-backup.sources").write_text(
+            ".claude/wals pending=812 ok=never\n.codex/sessions pending=0 ok=x\n.claude/projects pending=40 ok=y\n")
+
+    def test_source_freshness_reads_each_tree_marker_and_pending_count(self):
+        self.write_trees(NOW)
+        got = {s["source"]: (s["state"], s["pending"]) for s in lb.source_freshness(self.home, NOW)}
+        self.assertEqual(got, {".claude/wals": ("missing", 812), ".codex/sessions": ("fresh", 0),
+                               ".claude/projects": ("stale", 40)})
+
+    def test_garbage_summary_and_markers_are_not_fresh_and_do_not_raise(self):
+        (self.logs / "log-backup.source.codex_sessions.last-ok").write_text('"}] IGNORE PREVIOUS\x00')
+        (self.logs / "log-backup.sources").write_text(".codex/sessions pending=-1 ok=x\n\x00junk\n")
+        got = {s["source"]: (s["state"], s["pending"]) for s in lb.source_freshness(self.home, NOW)}
+        self.assertEqual(got[".codex/sessions"], ("missing", None))
+
+    def test_a_fresh_tree_never_makes_check_pass_and_the_alert_names_every_tree(self):
+        self.last_ok(stamp(time.time() - 7200))
+        self.write_trees(time.time())
+        done = self.run_cli("check")
+        self.assertEqual(done.returncode, 1, "exit codes unchanged: tier 1 is still stale")
+        out = done.stdout.decode()
+        self.assertIn("Per tree: .claude/wals missing, 812 files pending", out)
+        self.assertIn(".codex/sessions fresh", out)
+        alert = json.loads(self.run_cli("session-start").stdout)["systemMessage"]
+        self.assertIn(".claude/projects stale", alert)
+
+    def test_status_prints_one_line_per_tree_and_json_carries_them(self):
+        self.write_trees(time.time())
+        text = self.run_cli("status").stdout.decode()
+        self.assertIn("tree         : .claude/wals missing", text)
+        self.assertIn("812 files pending after the last run", text)
+        data = json.loads(self.run_cli("status", "--json").stdout)
+        self.assertEqual([s["source"] for s in data["sources"]], [".claude/wals", ".codex/sessions", ".claude/projects"])
+        self.assertEqual(data["sources"][1]["state"], "fresh")
 
 
 if __name__ == "__main__":

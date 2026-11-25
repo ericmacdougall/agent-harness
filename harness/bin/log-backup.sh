@@ -23,8 +23,12 @@
 #   LOG_BACKUP_DEADLINE_GRACE_SECONDS / LOG_BACKUP_KILL_GRACE_SECONDS  a copy past its share gets SIGTERM after the
 #                           first (default 10) and SIGKILL after the second more (default 10)
 #   LOG_BACKUP_VERSIONS     exactly 0 turns off versions/STAMP (loud warning); anything else keeps them
-#   LOG_BACKUP_BULK_CHUNK   files per checkpointed bulk copy (default 300 in the lane run, 100 otherwise, 1-99999),
+#   LOG_BACKUP_BULK_CHUNK   files per checkpointed copy, bulk and tier-1 trees (default 300 in the lane run, 100 otherwise, 1-99999),
 #                           never more than fit the time left at about 2 rate-limited operations a file
+#   LOG_BACKUP_RECHECK_DAYS  days between re-checks of everything a tier-1 tree verified (default 7, 0 = every run):
+#                           a file lost or damaged on the remote after it was verified is sent again (goodqa#16660 F2)
+#   LOG_BACKUP_RECHECK_FILES files re-checked per run across all tier-1 trees (default 300), only in time left over
+#                           once a tree has nothing new pending, so a weekly pass spreads over many runs
 #   LOG_BACKUP_BULK_LANE    exactly 1 runs the bulk tier as its own detached run (the bulk lane), so tier 1 can no
 #                           longer use up the bulk tier's time. The lane yields to tier 1 (goodqa#15147): it never
 #                           copies while a tier-1 run holds the run lock, and a copy in flight when one starts is
@@ -41,7 +45,9 @@
 # (.claude/projects or .codex/sessions) held files. log-backup.bulk-last-ok (archived sessions, narrowed work tree)
 # is written only after every tier-2 source copied cleanly. A run skipped because another run holds the lock writes
 # log-backup.last-skip and touches neither marker. With the lane on, the lane run writes bulk-last-ok and its own
-# log-backup.lane.last-run; the scheduled run's last-run then reads bulk=lane.
+# log-backup.lane.last-run; the scheduled run's last-run then reads bulk=lane. Each tier-1 tree also writes its own
+# log-backup.source.KEY.last-ok when nothing of it is pending, and log-backup.sources lists the pending counts
+# (goodqa#16660); neither replaces last-ok.
 set -u
 SELF_DIR=$(cd "$(dirname "$0")" && pwd)
 cd / || exit 1
@@ -70,6 +76,8 @@ LANE=${LOG_BACKUP_BULK_LANE:-0}          # 1: the bulk tier runs as its own deta
 BULK_TPS=${LOG_BACKUP_BULK_TPS:-$TPSLIMIT}   # the lane's rate; it never copies beside tier 1, so no split
 LANE_POLL=${LOG_BACKUP_LANE_POLL_SECONDS:-2}
 LANE_BUDGET=${LOG_BACKUP_LANE_BUDGET_SECONDS:-10800}
+RECHECK_DAYS=${LOG_BACKUP_RECHECK_DAYS:-7}       # each tier-1 tree re-checks everything it verified this often
+RECHECK_FILES=${LOG_BACKUP_RECHECK_FILES:-300}   # at most this many re-checked files per run, in time tier 1 left over
 TIER=${LOG_BACKUP_TIER:-all}             # all: both tiers in this run; live: tier 1 only; bulk: the lane run
 for rate in TPSLIMIT TRANSFERS BULK_TPS; do
   if ! printf '%s' "${!rate}" | grep -Eq '^[1-9][0-9]?$'; then
@@ -97,7 +105,7 @@ if [ -n "$budget_share" ]; then
 fi
 BULK_CHUNK=${LOG_BACKUP_BULK_CHUNK:-}
 [ -z "$BULK_CHUNK" ] || printf '%s' "$BULK_CHUNK" | grep -Eq '^[1-9][0-9]{0,4}$' || { echo "log-backup: LOG_BACKUP_BULK_CHUNK must be 1-99999" >&2; exit 2; }
-for numeric in BUDGET_SECONDS LOG_BACKUP_RETRIES LOG_BACKUP_RETRY_SLEEP BULK_EVERY JITTER DEADLINE_GRACE SLICE_RESERVE KILL_GRACE PERIOD LANE_BUDGET LANE_POLL; do
+for numeric in BUDGET_SECONDS LOG_BACKUP_RETRIES LOG_BACKUP_RETRY_SLEEP BULK_EVERY JITTER DEADLINE_GRACE SLICE_RESERVE KILL_GRACE PERIOD LANE_BUDGET LANE_POLL RECHECK_DAYS RECHECK_FILES; do
   # No leading zeros: bash would read 08 as octal and abort the arithmetic.
   if ! printf '%s' "${!numeric:-0}" | grep -Eq '^(0|[1-9][0-9]{0,4})$'; then
     echo "log-backup: $numeric must be a whole number of at most 5 digits without leading zeros" >&2; exit 2
@@ -324,11 +332,22 @@ ok=0 found=0 primary=0 throttled=0 throttle_src=
 STAGE=${LOG_BACKUP_STAGE:-$HOME/.agent-harness/backup-stage}
 # Live sources (transcripts and WALs grow while uploaded, so Dropbox's hash check would fail) are snapshotted into a
 # local stage first and uploaded from there. Static sources upload in place, skipping files younger than 2 minutes.
-# Smallest first, .claude/projects last (goodqa#15044 N2): the single files and the WAL tree finish in seconds, and
-# the large, always-changing transcript tree then gets all the time that is left instead of a fixed early share.
-LIVE=(.claude/history.jsonl .codex/history.jsonl .agent-harness/work-assignments.json .agent-harness/work-ledger.json
+# The single files go first and finish in seconds. The three trees follow, each with an equal share of the time left
+# (a tree that finishes early leaves its time to the later ones), and the first tree rotates from run to run so no
+# tree is always the one cut short (goodqa#16660).
+LIVE_FILES=(.claude/history.jsonl .codex/history.jsonl .agent-harness/work-assignments.json .agent-harness/work-ledger.json
   .agent-harness/work-ledger.events.jsonl .agent-harness/work-ledger.archive.jsonl .agent-harness/work-ledger.failures.jsonl
-  .agent-harness/work-ledger.spool.jsonl .claude/wals .codex/sessions .claude/projects)
+  .agent-harness/work-ledger.spool.jsonl)
+TREES=(.claude/wals .codex/sessions .claude/projects)
+LIVE_STATE="$LOGDIR/log-backup.live.d"   # tier 1's own checkpoints; the bulk tier's are in log-backup.bulk.d
+LIVE=("${LIVE_FILES[@]}")
+if [ "$TIER" != bulk ]; then
+  rot=$(cat "$LOGDIR/log-backup.rotate" 2>/dev/null)
+  printf '%s' "$rot" | grep -Eq '^(0|[1-9][0-9]{0,8})$' || rot=0
+  # Written whole or not at all (a run killed mid-write must not leave a torn value); an unreadable value starts at 0.
+  echo $(( (rot + 1) % 1000000 )) > "$LOGDIR/log-backup.rotate.tmp.$$" && mv "$LOGDIR/log-backup.rotate.tmp.$$" "$LOGDIR/log-backup.rotate"
+  for i in 0 1 2; do LIVE+=("${TREES[$(( (rot + i) % 3 ))]}"); done
+fi
 DIRECT=(.codex/archived_sessions .agent-harness/work)
 if [ "$TIER" != bulk ]; then   # the stage belongs to tier 1: the lane run must never rebuild or clear it mid-snapshot
 command -v rsync >/dev/null 2>&1 || fail "rsync not found (needed to snapshot live files)" 127
@@ -423,16 +442,130 @@ note_refused() { # note_refused SRC-REL COUNT WHAT
   say "$1: $2 file(s) $3 by the remote by name; not backed up, and the run is not failed for them"
 }
 
-upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
-  local p="$1" rel="$2" dst
+# goodqa#16660 gate 500ce4e F3: the ONLY writer of the files that say "this reached the remote": tier-1 verified, the
+# bulk tier's done, and a bulk generation's sent. They may only gain lines a copy actually sent (its LIST.guarded):
+#   add FILE CHUNK SENT       append the CHUNK lines (path<TAB>size<TAB>mtime) whose path is in SENT
+#   keep FILE LISTING [EXTRA] FILE := the LISTING lines that are in FILE or EXTRA (drops deleted files, never gains)
+#   drop FILE PATHS           remove the lines whose path is in PATHS
+#   reset FILE                empty it
+#   migrate FILE PENDING N    one-time: a bulk generation started before this guard existed records its first N
+#                             pending lines (what its cursor had already passed) as sent, so they are not sent again
+# A static test fails if anything else in this script writes one of these files.
+record_verified() { # record_verified OP FILE ...
+  local op="$1" f="$2"
+  case "${f##*/}" in verified|done|sent) ;; *) say "record_verified: refusing to write $f"; return 1 ;; esac
+  case "$op" in
+    add)
+      [ -f "$3" ] && [ -f "$4" ] || return 1
+      awk -F'\t' -v S="$4" 'BEGIN {while ((getline l < S) > 0) s[l] = 1} ($1 in s)' "$3" >> "$f" ;;
+    keep)
+      [ -f "$3" ] || return 1
+      touch "$f" || return 1
+      awk -v F="$f" -v E="${4:-}" 'BEGIN {while ((getline l < F) > 0) k[l] = 1
+                                          if (E != "") while ((getline l < E) > 0) k[l] = 1} ($0 in k)' "$3" \
+        > "$f.tmp" && mv "$f.tmp" "$f" ;;
+    drop)
+      [ -f "$f" ] || return 0
+      [ -f "$3" ] || return 1
+      awk -F'\t' -v P="$3" 'BEGIN {while ((getline l < P) > 0) d[l] = 1} !($1 in d)' "$f" > "$f.tmp" && mv "$f.tmp" "$f" ;;
+    reset)
+      : > "$f" ;;
+    migrate)
+      [ -f "$3" ] && printf '%s' "$4" | grep -Eq '^[1-9][0-9]*$' || return 1
+      sed -n "1,${4}p" "$3" >> "$f" ;;
+    *) return 1 ;;
+  esac
+}
+fit_for() { echo $(( $(time_left) - ${RESERVE:-0} )); }   # a chunk's time: what is left, less what later work is promised
+
+# goodqa#16660 gates 2e2d0b7 F2 and 500ce4e F3: rclone refuses --files-from-raw mixed with any other filter, and a
+# `copy --files-from-raw --no-traverse` silently skips (exit 0) every entry it cannot resolve: a file gone since the
+# listing, or a name it prints but cannot look up again (a name with the encoder's quote U+201B: probes on rclone
+# 1.60.1 and 1.75.2). So every list goes through this guard, called only from upload(), right before rclone. It
+# predicts exactly what the copy will send and classifies everything else:
+#   1. a path must be relative with no empty, . or .. component, or it is HELD;
+#   2. with an allow-list (the re-check passes its tree's current verified), a path not in it is dropped (GONE);
+#   3. RESOLVED = `lsf --files-from-raw LIST --no-traverse SRC`, the same lookup the copy makes;
+#   4. the current credential excludes (and the source's own exclude files) are applied by rclone itself, as
+#      --exclude-from ahead of `+ /path` rules for the resolved paths and `- **`; the same rules without the excludes
+#      tell an excluded path (EXCLUDED, proven) from one the rules cannot express (HELD);
+#   5. an unresolved path that rclone still lists in the source is HELD (it exists but cannot be sent by list); one it
+#      no longer lists (or the excludes drop) is GONE.
+# Writes LIST.guarded (send exactly this) and LIST.held; sets GUARD_SENT, GUARD_EXCLUDED, GUARD_HELD, GUARD_GONE.
+# Fails closed: on any error it returns 1 and the caller sends nothing.
+guard_rules() { sed -e 's/[][\\*?{}]/\\&/g' -e 's|^|+ /|' "$1" && echo '- **'; }   # anchored include per path
+guard_list() { # guard_list LIST SRC-DIR ALLOW-OR-EMPTY [EXCLUDE-FILE...]
+  local list="$1" src="$2" allow="$3" out="$1.guarded" held="$1.held" x n
+  shift 3
+  GUARD_SENT=0 GUARD_EXCLUDED=0 GUARD_HELD=0 GUARD_GONE=0
+  case "$list" in /*) ;; *) return 1 ;; esac
+  [ -d "$src" ] || return 1
+  local ex=(--exclude-from "$EXCLUDES")
+  for x in "$@"; do ex+=(--exclude-from "$x"); done
+  rm -f -- "$out" "$held" "$list.sane" "$list.res" "$list.in" "$list.unres" "$list.sel" "$list.kept" "$list.kept0" \
+    "$list.usel" "$list.ufound" || return 1
+  : > "$out" && : > "$held" || return 1
+  awk -v H="$held" 'length($0) == 0 || /^\// || /\/\// || /(^|\/)\.\.?(\/|$)/ {print > H; next} {print}' "$list" \
+    > "$list.sane" || return 1
+  if [ -n "$allow" ]; then
+    awk -v A="$allow" 'BEGIN {while ((getline l < A) > 0) {split(l, f, "\t"); a[f[1]] = 1}} ($0 in a)' "$list.sane" \
+      > "$list.sane.tmp" && mv "$list.sane.tmp" "$list.sane" || return 1
+  fi
+  if [ -s "$list.sane" ]; then
+    "$RCLONE" lsf -R --files-only --format p --files-from-raw "$list.sane" --no-traverse -- "$src" </dev/null \
+      > "$list.res" 2>> "$LOG" || return 1
+    awk -v R="$list.res" 'BEGIN {while ((getline l < R) > 0) r[l] = 1} ($0 in r)' "$list.sane" > "$list.in" || return 1
+    awk -v R="$list.res" 'BEGIN {while ((getline l < R) > 0) r[l] = 1} !($0 in r)' "$list.sane" > "$list.unres" || return 1
+    if [ -s "$list.in" ]; then
+      guard_rules "$list.in" > "$list.sel" || return 1
+      "$RCLONE" lsf -R --files-only --format p "${ex[@]}" --filter-from "$list.sel" --ignore-case -- "$src" </dev/null \
+        > "$list.kept" 2>> "$LOG" || return 1
+      "$RCLONE" lsf -R --files-only --format p --filter-from "$list.sel" --ignore-case -- "$src" </dev/null \
+        > "$list.kept0" 2>> "$LOG" || return 1
+      awk -v K="$list.kept" 'BEGIN {while ((getline l < K) > 0) k[l] = 1} ($0 in k)' "$list.in" > "$out" || return 1
+      # Resolved but not selected even without the excludes: the rules cannot express the name, so it is held.
+      awk -v K="$list.kept0" 'BEGIN {while ((getline l < K) > 0) k[l] = 1} !($0 in k)' "$list.in" >> "$held" || return 1
+      GUARD_EXCLUDED=$(awk -v K="$list.kept" -v Z="$list.kept0" 'BEGIN {while ((getline l < K) > 0) k[l] = 1
+        while ((getline l < Z) > 0) z[l] = 1} ($0 in z) && !($0 in k) {n++} END {print n + 0}' "$list.in") || return 1
+    fi
+    if [ -s "$list.unres" ]; then
+      guard_rules "$list.unres" > "$list.usel" || return 1
+      "$RCLONE" lsf -R --files-only --format p "${ex[@]}" --filter-from "$list.usel" --ignore-case -- "$src" </dev/null \
+        > "$list.ufound" 2>> "$LOG" || return 1
+      awk -v U="$list.ufound" 'BEGIN {while ((getline l < U) > 0) u[l] = 1} ($0 in u)' "$list.unres" >> "$held" || return 1
+    fi
+  fi
+  n=$(wc -l < "$list" | tr -d ' ') GUARD_SENT=$(wc -l < "$out" | tr -d ' ') GUARD_HELD=$(wc -l < "$held" | tr -d ' ')
+  rm -f -- "$list.sane" "$list.res" "$list.in" "$list.unres" "$list.sel" "$list.kept" "$list.kept0" "$list.usel" "$list.ufound"
+  printf '%s%s%s%s' "$n" "$GUARD_SENT" "$GUARD_HELD" "$GUARD_EXCLUDED" | grep -Eq '^[0-9]+$' || return 1
+  GUARD_GONE=$(( n - GUARD_SENT - GUARD_HELD - GUARD_EXCLUDED ))
+  [ "$GUARD_GONE" -ge 0 ] || return 1
+  return 0
+}
+
+upload() { # upload LOCAL-PATH SRC-REL [extra rclone args] [--guard-allow FILE] [--guard-exclude FILE]...
+  local p="$1" rel="$2" dst list= allow= gx=() rest=()
   shift 2
+  GUARD_SENT=0 GUARD_EXCLUDED=0 GUARD_HELD=0 GUARD_GONE=0 copied=0 yielded=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --guard-allow) allow="$2"; shift 2 ;;
+      --guard-exclude) gx+=("$2"); shift 2 ;;
+      --files-from-raw) list="$2"; shift 2 ;;
+      # Gate 500ce4e F4: a list or filter that is not the guarded --files-from-raw would bypass the guard.
+      --files-from*|--include*|--filter*|--exclude*)
+        say "upload of $rel refused: $1 is not allowed here (lists go through the guard as --files-from-raw)"
+        ok=1; hard_fail=1; return ;;
+      *) rest+=("$1"); shift ;;
+    esac
+  done
   if [ -d "$p" ]; then dst="$R/$rel"; else dst="$R/$(dirname "$rel")"; fi
   args=(copy --dropbox-batch-mode sync --dropbox-batch-size 100 --tpslimit "$TPSLIMIT" --transfers "$TRANSFERS" --checkers 4
     --checksum --retries 3 --retries-sleep 30s --low-level-retries 20 --contimeout 60s --timeout 300s --log-file "$LOG" --log-level NOTICE)
-  # A --files-from-raw copy must carry no other filter (rclone refuses the mix): its list was made with the
-  # credential excludes and the source filters (bulk_upload). Every other copy gets the credential excludes here.
-  case " $* " in *" --files-from-raw "*) ;; *) args+=(--exclude-from "$EXCLUDES" --ignore-case) ;; esac
-  args+=("$@")
+  # A plain copy gets the credential excludes here. A list copy cannot carry a filter (rclone refuses the mix), so it
+  # sends only LIST.guarded, which guard_list builds from LIST just before the copy runs.
+  if [ -n "$list" ]; then args+=(--files-from-raw "$list.guarded"); else args+=(--exclude-from "$EXCLUDES" --ignore-case); fi
+  args+=("${rest[@]+"${rest[@]}"}")
   if [ "${LOG_BACKUP_VERSIONS:-1}" != 0 ]; then args+=(--backup-dir "$R/versions/$STAMP/$rel"); fi
   local remaining
   # Dropbox can rate-limit (too_many_write_operations): retry the source with a pause before calling it a failure.
@@ -440,12 +573,28 @@ upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
   attempt=0 copied=0 yielded=0
   # The transcripts themselves (the primary sources, copied last so the reserve protects them) still get their own
   # copy: stopping them too would let a throttled WAL or ledger copy starve the transcript backup run after run.
-  case "$rel" in .claude/projects|.codex/sessions) ;; *)
+  # The WAL tree too (goodqa#16660): the trees rotate, so a throttled transcript chunk may now run before it.
+  case "$rel" in .claude/projects|.codex/sessions|.claude/wals) ;; *)
     if [ "$throttled" = 1 ]; then
       say "skipped $rel: an earlier copy in this run failed on the Dropbox write rate limit; the next run sends it"
       ok=1; budget_hit=1; return
     fi ;;
   esac
+  if [ -n "$list" ]; then
+    if ! guard_list "$list" "$p" "$allow" "${gx[@]+"${gx[@]}"}"; then
+      rm -f -- "$list.guarded" "$list.held" 2>/dev/null
+      GUARD_SENT=0 GUARD_EXCLUDED=0 GUARD_HELD=0 GUARD_GONE=0
+      say "cannot check the $rel upload list against the current excludes; nothing of it sent"
+      ok=1; hard_fail=1; return
+    fi
+    [ "$GUARD_EXCLUDED" -eq 0 ] || say "$rel: $GUARD_EXCLUDED file(s) left out of the upload by the current excludes"
+    if [ "$GUARD_HELD" -gt 0 ]; then
+      # Not sent and not explained by an exclude: never recorded as verified, and the run is not fresh until it is.
+      say "$rel: $GUARD_HELD file(s) held: rclone cannot send them by list (an unsafe path, or a name it cannot look up again); not backed up, last-ok withheld"
+      ok=1
+    fi
+    if [ ! -s "$list.guarded" ]; then copied=1; return; fi   # nothing of this list may be sent
+  fi
   while :; do
     if [ "$TIER" = bulk ] && ! lane_gate; then
       say "lane budget (${LANE_BUDGET}s) used up waiting for tier 1 before $rel; the next lane run continues"; ok=1; budget_hit=1; return
@@ -536,6 +685,155 @@ upload() { # upload LOCAL-PATH SRC-REL [extra rclone args]
   fi
 }
 
+# goodqa#16660: a plain copy of a tree walks the Dropbox destination with one rate-limited list call per directory
+# (Dropbox has no ListR), so .claude/wals (5323 directories, about 2660 s at 2/s) could never finish in a 780 s run. A
+# tier-1 tree is therefore never traversed on the remote. Every run lists its local stage and sends, newest first and
+# with --no-traverse, only the lines (path, size, mtime) not in $LIVE_STATE/KEY/verified. When a chunk copies cleanly,
+# only the lines the copy was actually given (guard_list's .guarded list) are added to verified, through
+# record_verified, the only writer of verified/done/sent. A run cut short resumes, and a file changed later is listed
+# and sent again. A held file (one rclone cannot send by list) stays pending and withholds last-ok (gate 500ce4e F3).
+# The tree is complete when nothing is pending: verified is cut to this run's listing (dropping deleted files) and the
+# source writes log-backup.source.KEY.last-ok. Copies end at fit_for: the source's share minus RESERVE.
+live_key() { printf '%s' "${1#.}" | tr '/.' '__'; }
+live_upload() { # live_upload STAGE-PATH SRC-REL SNAPSHOT-CLEAN(0|1)
+  local snap="$1" rel="$2" clean="$3" st key total cur=0 held=0 n size fit f0=$found p0=$primary
+  key=$(live_key "$rel"); st="$LIVE_STATE/$key"
+  printf -v "PEND_$key" '%s' unknown
+  mkdir -p "$st" && chmod 700 "$LIVE_STATE" "$st" || { say "cannot create tier-1 state for $rel"; ok=1; return; }
+  if [ "$(cat "$st/remote" 2>/dev/null)" != "$R" ]; then   # verified belongs to one destination
+    # So does the tree's marker: a marker earned on another remote must not call this one fresh.
+    rm -f "$st/recheck" "$st/recheck.cursor" "$st/recheck-done" "$LOGDIR/log-backup.source.$key.last-ok"
+    record_verified reset "$st/verified" && printf '%s\n' "$R" > "$st/remote" || { say "cannot reset tier-1 state for $rel"; ok=1; return; }
+  fi
+  [ -f "$st/verified" ] || record_verified reset "$st/verified" || { say "cannot create the $rel verified list"; ok=1; return; }
+  # TZ=UTC: lsf prints modification times in the local zone, and a verified line must not depend on it.
+  TZ=UTC "$RCLONE" lsf -R --files-only --format pst --separator $'\t' --exclude-from "$EXCLUDES" --ignore-case -- "$snap" \
+    </dev/null > "$st/listing.tmp" 2>> "$LOG"
+  rc=$?
+  if [ $rc -ne 0 ]; then say "listing $rel failed (rclone exit $rc)"; ok=1; rm -f "$st/listing.tmp"; return; fi
+  n=$(awk -F'\t' 'NF != 3 {bad++} END {print bad + 0}' "$st/listing.tmp")
+  [ "$n" = 0 ] || { say "$rel: $n paths with a tab or newline cannot be listed safely; not backed up, run not fresh"; ok=1; clean=0; }
+  # Names the remote refuses (goodqa#16123) are never offered, even when the exclude list lacks them: counted, not failed.
+  local refused_awk='/(^|\/)(desktop\.ini|thumbs\.db|\.ds_store|icon\r|\.dropbox|\.dropbox\.attr)$/'
+  n=$(LC_ALL=C awk -F'\t' "NF == 3 && tolower(\$1) ~ $refused_awk {r++} END {print r + 0}" "$st/listing.tmp")
+  [ "$n" = 0 ] || note_refused "$rel" "$n" "left out of the listing, refused"
+  LC_ALL=C awk -F'\t' "NF == 3 && tolower(\$1) !~ $refused_awk" "$st/listing.tmp" > "$st/listing" && rm -f "$st/listing.tmp" \
+    && awk -F'\t' 'FILENAME == ARGV[1] {v[$0] = 1; next} !($0 in v)' "$st/verified" "$st/listing" \
+       | LC_ALL=C sort -t $'\t' -k3,3r -k1,1 > "$st/pending" || { say "cannot build the $rel pending list"; ok=1; return; }
+  total=$(wc -l < "$st/pending" | tr -d ' ')
+  while [ "$cur" -lt "$total" ]; do
+    fit=$(fit_for)
+    if [ "$fit" -lt "$MIN_SLICE" ]; then
+      say "$rel: its share of the run is used up at $cur of $total pending files; the next run continues"
+      ok=1; budget_hit=1; break
+    fi
+    size=$BULK_CHUNK fit=$(( fit * TPSLIMIT / 2 ))   # about 2 rate-limited operations a file
+    [ "$fit" -ge "$size" ] || size=$fit
+    [ "$size" -ge 1 ] || size=1
+    sed -n "$((cur + 1)),$((cur + size))p;$((cur + size))q" "$st/pending" > "$st/chunk" && cut -f1 "$st/chunk" > "$st/chunk.paths" \
+      || { say "cannot read the $rel chunk"; ok=1; break; }
+    n=$(wc -l < "$st/chunk" | tr -d ' ')
+    hard_fail=0
+    upload "$snap" "$rel" --files-from-raw "$st/chunk.paths" --no-traverse
+    if [ "$copied" -ne 1 ]; then   # upload said why and marked the run
+      # A chunk that really failed (not the budget, not the rate limit) stays pending, and the older files after it are
+      # still offered: one file that never uploads must not hold back the rest of the tree (red-team F1).
+      if [ "${hard_fail:-0}" = 1 ] && [ "$throttled" != 1 ]; then
+        say "$rel: a chunk of $n files failed; it stays pending and the next chunk is tried"
+        held=$((held + n)) cur=$((cur + n)); continue
+      fi
+      break
+    fi
+    # Only what the copy was given (the guarded list) is recorded; a held file stays pending (gate 500ce4e F3).
+    if [ -s "$st/chunk.paths.guarded" ]; then
+      record_verified add "$st/verified" "$st/chunk" "$st/chunk.paths.guarded" \
+        || { say "cannot record the $rel chunk; it is sent again"; ok=1; break; }
+    fi
+    held=$((held + GUARD_HELD)) cur=$((cur + n))
+  done
+  found=$f0 primary=$p0   # one source counts once, and only when it is complete
+  printf -v "PEND_$key" '%s' $(( total - cur + held ))   # held files count as pending in log-backup.sources
+  [ "$cur" -ge "$total" ] && [ "$held" -eq 0 ] || return
+  # Complete: verified keeps the listed lines it already holds (dropping deleted files); it never gains here.
+  record_verified keep "$st/verified" "$st/listing" && rm -f "$st/listing" || { say "cannot record the $rel listing"; ok=1; return; }
+  found=$((found + 1))
+  case "$rel" in .claude/projects|.codex/sessions)
+    [ -z "$(find "$HOME/$rel" -type f -print -quit 2>/dev/null)" ] || primary=$((primary + 1)) ;;
+  esac
+  [ "$clean" = 1 ] || return
+  echo "$STARTED pending=0" > "$LOGDIR/log-backup.source.$key.last-ok.tmp.$$" \
+    && mv "$LOGDIR/log-backup.source.$key.last-ok.tmp.$$" "$LOGDIR/log-backup.source.$key.last-ok"
+}
+# goodqa#16660 F2: verified says a file reached the remote once; a file lost there later (deleted by hand, a moved folder,
+# the remote re-pointed under the same name) would never be sent again, because a closed WAL never changes locally.
+# Every RECHECK_DAYS each tree offers everything it verified again, from a snapshot of verified with a cursor, in
+# --no-traverse chunks: rclone checks each file by its checksum (one metadata call, no folder listing) and sends what is
+# missing or different. At most RECHECK_LEFT files per run, only in the time tier 1 left over. A stop on the budget or
+# the rate limit resumes next run and never withholds last-ok; a chunk that really fails drops its lines from verified,
+# so the normal path sends those files again (and the run is not fresh).
+live_recheck() { # live_recheck STAGE-PATH SRC-REL
+  local snap="$1" rel="$2" st key total cur n size fit a ok0 bh0 f0 p0
+  key=$(live_key "$rel"); st="$LIVE_STATE/$key"
+  [ -s "$st/verified" ] || return 0
+  if [ ! -s "$st/recheck" ]; then
+    # The first time, verified was just copied: start the clock instead of checking it all again at once.
+    [ -e "$st/recheck-done" ] || { touch "$st/recheck-done"; return 0; }
+    a=$(raw_age "$st/recheck-done")
+    if [ -n "$a" ] && [ "$a" -ge 0 ] && [ "$a" -lt $(( RECHECK_DAYS * 86400 )) ]; then return 0; fi
+    cut -f1 "$st/verified" > "$st/recheck.tmp" && mv "$st/recheck.tmp" "$st/recheck" && echo 0 > "$st/recheck.cursor" \
+      || { say "cannot start the $rel re-check"; return 0; }
+    say "$rel: re-check of $(wc -l < "$st/recheck" | tr -d ' ') verified files started (every ${RECHECK_DAYS} days)"
+  fi
+  total=$(wc -l < "$st/recheck" | tr -d ' ')
+  cur=$(cat "$st/recheck.cursor" 2>/dev/null)
+  printf '%s' "$cur" | grep -Eq '^(0|[1-9][0-9]*)$' || cur=0
+  while [ "$cur" -lt "$total" ] && [ "$RECHECK_LEFT" -gt 0 ]; do
+    fit=$(fit_for)   # gate 500ce4e F1: what is promised to later work (a due bulk tier's slice) is not the re-check's
+    [ "$fit" -ge "$MIN_SLICE" ] || break
+    size=$BULK_CHUNK fit=$(( fit * TPSLIMIT / 2 ))
+    [ "$fit" -ge "$size" ] || size=$fit
+    [ "$RECHECK_LEFT" -ge "$size" ] || size=$RECHECK_LEFT
+    [ "$size" -ge 1 ] || size=1
+    sed -n "$((cur + 1)),$((cur + size))p;$((cur + size))q" "$st/recheck" > "$st/recheck.chunk" || break
+    n=$(wc -l < "$st/recheck.chunk" | tr -d ' ')
+    ok0=$ok bh0=${budget_hit:-0} f0=$found p0=$primary hard_fail=0
+    # Only paths still in the current verified (this run's listing, made with the current excludes) may go again.
+    upload "$snap" "$rel" --files-from-raw "$st/recheck.chunk" --no-traverse --guard-allow "$st/verified"
+    found=$f0 primary=$p0
+    if [ "$copied" -eq 1 ]; then
+      ok=$ok0 cur=$((cur + n)) RECHECK_LEFT=$((RECHECK_LEFT - n))
+      if [ "$GUARD_HELD" -gt 0 ]; then
+        # A verified file the copy could not be given now: it leaves verified, so tier 1 lists it as pending (and holds
+        # it there, last-ok withheld) instead of it staying "verified" unchecked.
+        record_verified drop "$st/verified" "$st/recheck.chunk.held" || { say "cannot update the $rel verified list"; }
+        ok=1
+      fi
+      echo "$cur" > "$st/recheck.cursor.tmp" && mv "$st/recheck.cursor.tmp" "$st/recheck.cursor"
+    elif [ "${hard_fail:-0}" = 1 ] && [ "$throttled" != 1 ]; then
+      record_verified drop "$st/verified" "$st/recheck.chunk" || { say "cannot update the $rel verified list"; ok=1; break; }
+      say "$rel: a re-check chunk of $n files failed; they are pending again"
+      cur=$((cur + n)) RECHECK_LEFT=$((RECHECK_LEFT - n))
+      echo "$cur" > "$st/recheck.cursor.tmp" && mv "$st/recheck.cursor.tmp" "$st/recheck.cursor"
+    else
+      ok=$ok0 budget_hit=$bh0   # out of time or rate limited: the pass resumes next run, tier 1 stays fresh
+      break
+    fi
+  done
+  if [ "$cur" -ge "$total" ]; then
+    rm -f "$st/recheck" "$st/recheck.cursor" "$st/recheck.chunk" && touch "$st/recheck-done"
+    say "$rel: re-check complete ($total files)"
+  fi
+  return 0
+}
+live_summary() { # log-backup.sources: one line per tree, read by log_backup.py status
+  local t key p okv
+  for t in "${TREES[@]}"; do
+    key=$(live_key "$t"); p="PEND_$key"; p=${!p:-unknown}
+    okv=$(cut -d' ' -f1 "$LOGDIR/log-backup.source.$key.last-ok" 2>/dev/null); okv=${okv:-never}
+    printf '%s pending=%s ok=%s\n' "$t" "$p" "$okv"
+  done > "$LOGDIR/log-backup.sources.tmp.$$" && mv "$LOGDIR/log-backup.sources.tmp.$$" "$LOGDIR/log-backup.sources"
+}
+
 # Bulk sources are far too large for one run (Mac 2026-11-07: 620k files in the work tree, about 7 minutes of copy
 # time per run). A fresh copy re-checked the same first files every run and never got further (goodqa#15062), so
 # a bulk pass is a generation with a checkpoint under $BULK_STATE/KEY:
@@ -559,11 +857,31 @@ bulk_upload() { # bulk_upload SRC-REL [filter args...] -- [copy args...]: one ch
   while [ $# -gt 0 ] && [ "$1" != -- ]; do list_filters+=("$1"); shift; done
   [ $# -gt 0 ] && shift
   copy_args=("$@")
+  # The source's own exclude files go to the upload guard too, so a chunk is checked against them as they are now.
+  local i=0 guard_ex=()
+  while [ $i -lt ${#list_filters[@]} ]; do
+    [ "${list_filters[$i]}" = --exclude-from ] && guard_ex+=(--guard-exclude "${list_filters[$((i + 1))]}")
+    i=$((i + 1))
+  done
   st="$BULK_STATE/$(bulk_key "$rel")"
   mkdir -p "$st" && chmod 700 "$BULK_STATE" "$st" || { say "cannot create bulk state for $rel"; ok=1; hard_fail=1; return 1; }
   # A checkpoint belongs to one destination: another remote or host starts over.
   if [ "$(cat "$st/remote" 2>/dev/null)" != "$R" ]; then
-    rm -f "$st/pending" "$st/cursor" "$st/done" "$st/listing" && printf '%s\n' "$R" > "$st/remote"
+    rm -f "$st/pending" "$st/cursor" "$st/listing" "$st/held" && record_verified reset "$st/done" \
+      && record_verified reset "$st/sent" && printf '%s\n' "$R" > "$st/remote" \
+      || { say "cannot reset bulk state for $rel"; ok=1; hard_fail=1; return 1; }
+  fi
+  # A generation in progress from before the upload guard has no sent file: what its cursor already passed was sent
+  # under the old rule, so it is recorded once rather than sent again (Mac 2026-11-23: 32,100 lines, about 9 hours).
+  if [ ! -f "$st/sent" ]; then
+    local c0
+    c0=$(cat "$st/cursor" 2>/dev/null)
+    if [ -s "$st/pending" ] && printf '%s' "$c0" | grep -Eq '^[1-9][0-9]*$'; then
+      record_verified migrate "$st/sent" "$st/pending" "$c0" || { say "cannot record the $rel pass in progress"; ok=1; hard_fail=1; return 1; }
+      say "$rel: pass in progress from before the upload guard: its first $c0 files are recorded as sent"
+    else
+      record_verified reset "$st/sent" || { say "cannot create the $rel sent list"; ok=1; hard_fail=1; return 1; }
+    fi
   fi
   # A pass listed with other exclude lists would send what they now exclude: list it again (the old `done` stays, so
   # files already verified are still not sent twice). A checkpoint from before this marker existed counts as changed.
@@ -581,8 +899,10 @@ bulk_upload() { # bulk_upload SRC-REL [filter args...] -- [copy args...]: one ch
     # full listing (it is counted, so it is never silently dropped).
     awk -F'\t' 'NF != 3 {bad++} END {print bad + 0}' "$st/listing.tmp" > "$st/odd"
     awk -F'\t' 'NF == 3' "$st/listing.tmp" > "$st/listing" && rm -f "$st/listing.tmp"
-    touch "$st/done"
-    awk -F'\t' 'FILENAME == ARGV[1] {seen[$0] = 1; next} !($0 in seen)' "$st/done" "$st/listing" > "$st/pending.tmp" \
+    [ -f "$st/done" ] || record_verified reset "$st/done" || { say "cannot create the $rel done list"; ok=1; hard_fail=1; return 1; }
+    # New or changed files only: not verified by an earlier pass (done) nor already sent in this one (sent).
+    awk -v D="$st/done" -v S="$st/sent" 'BEGIN {while ((getline l < D) > 0) seen[l] = 1
+                                                while ((getline l < S) > 0) seen[l] = 1} !($0 in seen)' "$st/listing" > "$st/pending.tmp" \
       && mv "$st/pending.tmp" "$st/pending" && echo 0 > "$st/cursor" || { say "cannot build the $rel checkpoint"; ok=1; hard_fail=1; return 1; }
     # Written last: a crash before this line leaves no matching marker, so the next run lists again.
     printf '%s\n' "$FILTER_ID" > "$st/filters.tmp" && mv "$st/filters.tmp" "$st/filters" \
@@ -602,7 +922,7 @@ bulk_upload() { # bulk_upload SRC-REL [filter args...] -- [copy args...]: one ch
     fi
     # No more files than fit the time left (about 2 rate-limited operations a file): a chunk cut short is sent again
     # whole and never advances the cursor (PR #124 review F1).
-    size=$BULK_CHUNK fit=$(( $(time_left) * TPSLIMIT / 2 ))
+    size=$BULK_CHUNK fit=$(( $(fit_for) * TPSLIMIT / 2 ))
     [ "$fit" -ge "$size" ] || size=$fit
     [ "$size" -ge 1 ] || size=1
     sed -n "$((cur + 1)),$((cur + size))p;$((cur + size))q" "$st/pending" > "$st/chunk" \
@@ -629,13 +949,24 @@ bulk_upload() { # bulk_upload SRC-REL [filter args...] -- [copy args...]: one ch
     if [ "$dropped" -gt 0 ]; then note_refused "$rel" "$dropped" "left out of the chunk, refused"; fi
     mv "$st/chunk.paths.tmp" "$st/chunk.paths" || { say "cannot filter the $rel chunk"; ok=1; hard_fail=1; return 1; }
     if [ -s "$st/chunk.paths" ]; then
-      upload "$HOME/$rel" "$rel" "${copy_args[@]+"${copy_args[@]}"}" --files-from-raw "$st/chunk.paths" --no-traverse
+      upload "$HOME/$rel" "$rel" "${copy_args[@]+"${copy_args[@]}"}" --files-from-raw "$st/chunk.paths" --no-traverse \
+        "${guard_ex[@]+"${guard_ex[@]}"}"
     else
-      copied=1 yielded=0   # nothing left in this chunk to send
+      copied=1 yielded=0 GUARD_HELD=0   # nothing left in this chunk to send
+      rm -f "$st/chunk.paths.guarded"
     fi
     # A chunk stopped for tier 1 never advances the cursor: the same lines are sent again whole (goodqa#15147 NEG-2).
     [ "$yielded" -eq 0 ] || continue
     [ "$copied" -eq 1 ] || { say "$rel: pass at $cur of $total files; the next run resumes there"; return 1; }
+    # The cursor moves past the chunk, but only what the copy was given is recorded as sent (gate 500ce4e F3); a held
+    # file is kept in `held`, so the pass closes without it and bulk-last-ok is withheld.
+    if [ -s "$st/chunk.paths.guarded" ]; then
+      record_verified add "$st/sent" "$st/chunk" "$st/chunk.paths.guarded" \
+        || { say "cannot record the $rel chunk; the cursor stays at $cur"; ok=1; hard_fail=1; return 1; }
+    fi
+    if [ "$GUARD_HELD" -gt 0 ]; then
+      cat "$st/chunk.paths.held" >> "$st/held" || { say "cannot record the $rel held files; the cursor stays at $cur"; ok=1; hard_fail=1; return 1; }
+    fi
     cur=$((cur + n))
     echo "$cur" > "$st/cursor.tmp" && mv "$st/cursor.tmp" "$st/cursor"
   done
@@ -644,11 +975,19 @@ bulk_upload() { # bulk_upload SRC-REL [filter args...] -- [copy args...]: one ch
   # complete without listing new files (PR #123 review L1).
   rm -f "$st/pending" "$st/cursor" "$st/chunk" "$st/chunk.paths" || { say "cannot close the $rel checkpoint"; ok=1; hard_fail=1; return 1; }
   if [ -f "$st/listing" ]; then
-    mv "$st/listing" "$st/done" || { say "cannot record the $rel pass; the next run lists it again"; ok=1; hard_fail=1; return 1; }
+    # done := the listed lines verified before or sent in this pass. A held file is in neither, so the next pass lists
+    # it again; it never becomes "done" without a copy that was given it.
+    record_verified keep "$st/done" "$st/listing" "$st/sent" && rm -f "$st/listing" && record_verified reset "$st/sent" \
+      || { say "cannot record the $rel pass; the next run lists it again"; ok=1; hard_fail=1; return 1; }
   else
     say "$rel: the pass listing is missing; the next run lists it again"
     ok=1
     return 1
+  fi
+  if [ -s "$st/held" ]; then
+    say "$rel: pass complete, but $(LC_ALL=C sort -u "$st/held" | wc -l | tr -d ' ') file(s) were held (rclone cannot send them by list); the next pass tries them again, bulk last-ok withheld"
+    rm -f "$st/held"; ok=1
+    return 0
   fi
   say "$rel: pass complete ($total files sent or verified)"
   return 0
@@ -712,14 +1051,24 @@ elif [ "$TIER" = live ] && bulk_due; then
 fi
 transcripts_ok=0
 if [ "$TIER" != bulk ]; then
-later=0
+later=0 trees_left=0
 for src in "${LIVE[@]}"; do [ -e "$HOME/$src" ] && later=$((later + 1)); done
+for src in "${TREES[@]}"; do [ -d "$HOME/$src" ] && [ ! -L "$HOME/$src" ] && trees_left=$((trees_left + 1)); done
 for src in "${LIVE[@]}"; do
   [ -e "$HOME/$src" ] || [ -L "$HOME/$src" ] || continue
   later=$((later - 1)); [ $later -ge 0 ] || later=0
   # A later copy that hangs costs its slice, both graces and about 3 s to snapshot the source first.
   RESERVE=$(( later * (MIN_SLICE + DEADLINE_GRACE + KILL_GRACE + 3) ))
   if [ -L "$HOME/$src" ]; then say "refusing symlinked source root: $src"; ok=1; continue; fi
+  is_tree=0
+  case " ${TREES[*]} " in *" $src "*) [ -d "$HOME/$src" ] && is_tree=1 ;; esac
+  if [ $is_tree -eq 1 ]; then
+    # An equal share of what is left for this tree and the trees after it (goodqa#16660), never less than the floor.
+    share_reserve=$(( $(time_left) * (trees_left - 1) / (trees_left > 0 ? trees_left : 1) ))
+    [ $share_reserve -le $RESERVE ] || RESERVE=$share_reserve
+    trees_left=$((trees_left - 1))
+  fi
+  snap_clean=1
   snap="$STAGE/$src"
   mkdir -p "$(dirname "$snap")" || { say "cannot stage $src"; ok=1; continue; }
   if [ -d "$HOME/$src" ]; then
@@ -733,15 +1082,30 @@ for src in "${LIVE[@]}"; do
     if [ $rc -eq 23 ]; then
       # Partial transfer (e.g. one unreadable file): rsync renames files into place, so the stage is consistent.
       # Back up what was staged, but withhold last-ok for this run.
-      say "snapshot partial (rsync exit 23): $src"; ok=1
+      say "snapshot partial (rsync exit 23): $src"; ok=1; snap_clean=0
     elif [ $rc -ne 0 ] && [ $rc -ne 24 ]; then
       say "snapshot failed (rsync exit $rc): $src"; ok=1; continue
     fi
   else
     cp -p "$HOME/$src" "$snap" || { say "snapshot failed: $src"; ok=1; continue; }
   fi
-  upload "$snap" "$src"
+  if [ $is_tree -eq 1 ]; then live_upload "$snap" "$src" "$snap_clean"; else upload "$snap" "$src"; fi
 done
+# The weekly re-check (goodqa#16660 F2) only runs after every tree had its turn, and only for trees with nothing fresh
+# left pending, so new transcripts always go first.
+# Gate F3: in a run that also copies tier 2, the re-check leaves that tier one slice when it is due, and a rate limit hit
+# by the re-check is still recorded (marker and log) without making this run skip the bulk sources it is due to copy.
+RESERVE=0 RECHECK_LEFT=$RECHECK_FILES recheck_throttle=
+[ "$TIER" = all ] && bulk_due && RESERVE=$(( MIN_SLICE + DEADLINE_GRACE + KILL_GRACE ))
+t0=$throttled ts0=$throttle_src
+for src in "${LIVE[@]}"; do
+  case " ${TREES[*]} " in *" $src "*) ;; *) continue ;; esac
+  key=$(live_key "$src"); p="PEND_$key"
+  [ "${!p:-unknown}" = 0 ] && [ -d "$STAGE/$src" ] && live_recheck "$STAGE/$src" "$src"
+done
+if [ "$throttled" = 1 ] && [ "$t0" != 1 ]; then recheck_throttle=$throttle_src throttled=$t0 throttle_src=$ts0; fi
+RESERVE=0
+live_summary
 # Tier 1 (transcripts, WALs, ledgers) is done: mark it on its own, so a slow bulk pass can never hide a gap here.
 [ $primary -gt 0 ] || { say "no primary source (.claude/projects or .codex/sessions) was copied"; ok=1; }
 say "transcripts exit=$ok sources=$found remote=${R%%:*}"
@@ -828,6 +1192,12 @@ fi
 if [ $bulk_ok -eq 0 ] && [ $bulk_ran -eq 1 ]; then
   echo "$STARTED" > "$LOGDIR/log-backup.bulk-last-ok.tmp.$$" \
     && mv "$LOGDIR/log-backup.bulk-last-ok.tmp.$$" "$LOGDIR/log-backup.bulk-last-ok"
+fi
+if [ "$throttled" != 1 ] && [ -n "${recheck_throttle:-}" ]; then
+  # Only the re-check hit the rate limit: the bulk sources still ran, but the marker shows the account was throttled.
+  echo "$STARTED stopped at $recheck_throttle" > "$LOGDIR/log-backup${TAG}.throttled.tmp.$$" \
+    && mv "$LOGDIR/log-backup${TAG}.throttled.tmp.$$" "$LOGDIR/log-backup${TAG}.throttled"
+  say "the weekly re-check stopped early on the Dropbox write rate limit (log-backup${TAG}.throttled); it resumes next run"
 fi
 if [ "$throttled" = 1 ]; then
   # Read by log_backup.py status and the backup alert: the run ended early on the rate limit, not on a hang.
