@@ -26,6 +26,12 @@
   },
   "reason": "documentation names public token prefixes, credential field names or the Bearer scheme; no value"
  },
+ "docs/secrets.md": {
+  "counts": {
+   "redact:named-credential:prefix": 1
+  },
+  "reason": "documentation or pattern text that names a credential shape (no credential value)"
+ },
  "harness/hooks/ah.py": {
   "counts": {
    "redact:named-credential:prefix": 1
@@ -38,6 +44,12 @@
   },
   "reason": "a redactor, scanner or credential-handling pattern names public token prefixes, credential field names or URL shapes; no value (restrict tier)"
  },
+ "harness/hooks/ah_log_push.py": {
+  "counts": {
+   "redact:url-userinfo:prefix": 1
+  },
+  "reason": "documentation or pattern text that names a credential shape (no credential value)"
+ },
  "harness/hooks/ahc_runner.py": {
   "counts": {
    "redact:named-credential:prefix": 8
@@ -46,7 +58,7 @@
  },
  "harness/hooks/command_guard.py": {
   "counts": {
-   "redact:named-credential:prefix": 1
+   "redact:named-credential:prefix": 2
   },
   "reason": "a redactor, scanner or credential-handling pattern names public token prefixes, credential field names or URL shapes; no value (restrict tier)"
  },
@@ -108,12 +120,6 @@
  "harness/hooks/mc_chat.py": {
   "counts": {
    "redact:named-credential:prefix": 2
-  },
-  "reason": "a redactor, scanner or credential-handling pattern names public token prefixes, credential field names or URL shapes; no value (restrict tier)"
- },
- "harness/hooks/merge_gate.py": {
-  "counts": {
-   "redact:named-credential:prefix": 1
   },
   "reason": "a redactor, scanner or credential-handling pattern names public token prefixes, credential field names or URL shapes; no value (restrict tier)"
  },
@@ -320,6 +326,13 @@
   },
   "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
  },
+ "tests/test_ah_secret.py": {
+  "counts": {
+   "openai:prefix": 1,
+   "redact:named-credential:prefix": 3
+  },
+  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
+ },
  "tests/test_ah_ticket_create.py": {
   "counts": {
    "openai": 2,
@@ -411,6 +424,13 @@
  "tests/test_command_guard_scp_dest.py": {
   "counts": {
    "redact:url-userinfo:prefix": 1
+  },
+  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
+ },
+ "tests/test_command_guard_secrets.py": {
+  "counts": {
+   "anthropic:prefix": 1,
+   "redact:named-credential:prefix": 1
   },
   "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
  },
@@ -508,16 +528,6 @@
  "tests/test_installer_scan.py": {
   "counts": {
    "redact:named-credential:prefix": 1
-  },
-  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
- },
- "tests/test_kill_guard.py": {
-  "counts": {
-   "github-classic:prefix": 1,
-   "openai": 2,
-   "openai:prefix": 1,
-   "redact:named-credential:prefix": 2,
-   "redact:openai": 1
   },
   "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
  },
