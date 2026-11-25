@@ -32,6 +32,9 @@ def git(cwd, *args, check=True):
 
 
 class WorktreeRemoveCase(unittest.TestCase):
+    """The strict verifier (linked_worktree_remove_refusal), which lifecycle_cleanup's managed copies still use. Since
+    2026-11-24 the hook form `git worktree remove` follows the role rules instead (tests/test_guard_delete_redesign.py),
+    so the hook-form assertions that were here are gone."""
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='cg-worktree-remove-')
         self.addCleanup(self.temp.cleanup)
@@ -79,34 +82,26 @@ class WorktreeRemoveCase(unittest.TestCase):
 
     def test_exact_clean_registered_published_linked_top_is_allowed(self):
         self.assertIsNone(self.refusal())
-        self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'allow')
-        self.assertEqual(self.decide('git worktree remove -- %s' % self.linked)[0], 'allow')
         # The full-clone verifier intentionally cannot judge this shape: .git is a file.
         self.assertIn('.git is not a real directory', cg.reproducible_clone_refusal(str(self.linked), self.policy))
 
     def test_published_detached_head_is_allowed_but_unpublished_detached_head_is_not(self):
         git(self.linked, 'checkout', '-q', '--detach')
-        self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'allow')
         (self.linked / 'local.txt').write_text('local\n')
         git(self.linked, 'add', 'local.txt')
         git(self.linked, 'commit', '-q', '-m', 'local only')
         self.assertIn('detached-unpublished', self.refusal())
-        self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'block')
 
     def test_modified_staged_untracked_and_unique_ignored_content_block(self):
         (self.linked / 'a.txt').write_text('changed\n')
         self.assertIn('not clean', self.refusal())
-        self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'block')
         git(self.linked, 'add', 'a.txt')
-        self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'block')
         git(self.linked, 'reset', '-q', '--hard', 'HEAD')
         (self.linked / 'notes.txt').write_text('unique\n')
-        self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'block')
         (self.linked / 'notes.txt').unlink()
         (self.primary / '.git/info/exclude').write_text('secret.txt\n')
         (self.linked / 'secret.txt').write_text('unique ignored\n')
         self.assertIn('ignored', self.refusal())
-        self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'block')
 
     def backed_ignored_fixture(self):
         (self.primary / '.git/info/exclude').write_text('.cache/\n')
@@ -440,65 +435,35 @@ class WorktreeRemoveCase(unittest.TestCase):
         git(self.linked, 'add', 'local.txt')
         git(self.linked, 'commit', '-q', '-m', 'local only')
         self.assertIn('exact HEAD', self.refusal())
-        self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'block')
         self.publish_linked_head()
-        self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'allow')
         self.live['refs/heads/linked'] = '0' * 40
-        self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'block')
 
     def test_stale_moved_deleted_offline_and_nonallowlisted_remotes_block(self):
         self.live['refs/heads/main'] = '0' * 40
         self.assertIn('stale', self.refusal())
-        self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'block')
         del self.live['refs/heads/main']
         self.assertIn('stale', self.refusal())
         self.live['refs/heads/main'] = self.head
         with mock.patch.object(cg, 'REMOTE_LS', lambda url, repo, timeout: None):
             self.assertIn('did not answer', self.refusal())
-            self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'block')
         git(self.primary, 'remote', 'set-url', 'origin', 'https://evil.example/acme/widgets.git')
         called = []
         with mock.patch.object(cg, 'REMOTE_LS', lambda *args: called.append(args) or dict(self.live)):
             self.assertIn('known hosting', self.refusal())
         self.assertEqual(called, [])
 
-    def test_symlink_alias_dotdot_glob_variable_force_compound_and_substitution_block(self):
-        alias = self.base / 'alias'
-        alias.symlink_to(self.linked, target_is_directory=True)
-        commands = [
-            'git worktree remove %s' % alias,
-            'git worktree remove %s/T/../linked' % self.base,
-            'git worktree remove %s/lin*' % self.base,
-            'git worktree remove $LINKED',
-            'git worktree remove --force %s' % self.linked,
-            'git worktree remove %s --force' % self.linked,
-            'git worktree remove %s && true' % self.linked,
-            'true && git worktree remove %s' % self.linked,
-            'git worktree remove $(printf %s) ' % self.linked,
-            'git worktree remove %s %s' % (self.linked, self.linked),
-            'git worktree prune %s' % self.linked,
-        ]
-        for command in commands:
-            with self.subTest(command=command):
-                self.assertEqual(self.decide(command)[0], 'block')
-
     def test_primary_current_unregistered_sibling_and_nested_worktrees_block(self):
-        self.assertEqual(self.decide('git worktree remove %s' % self.primary)[0], 'block')
-        self.assertEqual(self.decide('git worktree remove %s' % self.linked, cwd=self.linked)[0], 'block')
         sibling = self.base / 'sibling'
         sibling.mkdir()
         (sibling / '.git').write_text('gitdir: /nowhere\n')
-        self.assertEqual(self.decide('git worktree remove %s' % sibling)[0], 'block')
         nested = self.primary / 'nested'
         git(self.primary, 'worktree', 'add', '-q', '-b', 'nested', str(nested))
         self.assertIn('nested', self.refusal(nested))
-        self.assertEqual(self.decide('git worktree remove %s' % nested)[0], 'block')
 
     def test_gitlink_and_hidden_index_flags_block(self):
         (self.linked / 'a.txt').write_text('hidden edit\n')
         git(self.linked, 'update-index', '--assume-unchanged', 'a.txt')
         self.assertIn('hidden', self.refusal())
-        self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'block')
         git(self.linked, 'update-index', '--no-assume-unchanged', 'a.txt')
         git(self.linked, 'reset', '-q', '--hard', 'HEAD')
         git(self.linked, 'update-index', '--skip-worktree', 'a.txt')
@@ -514,12 +479,10 @@ class WorktreeRemoveCase(unittest.TestCase):
         git(self.linked, 'commit', '-q', '-m', 'embedded')
         self.publish_linked_head()
         self.assertIn('embedded repository', self.refusal())
-        self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'block')
 
     def test_verification_errors_fail_closed(self):
         with mock.patch.object(cg, '_git_out', side_effect=OSError('broken git')):
             self.assertIn('could not verify', self.refusal())
-            self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'block')
 
 
 if __name__ == '__main__':
@@ -545,7 +508,6 @@ class WorktreeRemoveMerged(WorktreeRemoveCase):
     def test_head_merged_into_live_default_with_remote_branch_deleted_is_allowed(self):
         self.advance_main()
         self.assertIsNone(self.refusal())
-        self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'allow')
 
     def test_control_unmerged_dirty_and_unverifiable_stay_refused(self):
         self.advance_main()
@@ -553,7 +515,6 @@ class WorktreeRemoveMerged(WorktreeRemoveCase):
         (self.linked / 'local.txt').write_text('local\n')
         git(self.linked, 'add', 'local.txt'); git(self.linked, 'commit', '-q', '-m', 'local only')
         self.assertIsNotNone(self.refusal())
-        self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'block')
         git(self.linked, 'reset', '-q', '--hard', 'HEAD~1')
         self.assertIn('reflog', self.refusal())  # the abandoned commit now lives only in this worktree's reflog
         # dirty
@@ -582,7 +543,6 @@ class WorktreeRemoveMerged(WorktreeRemoveCase):
         # the read-only check returned "could not verify (ValueError)" when cwd was a plain directory such as $HOME
         plain = self.home / 'plain'; plain.mkdir()
         self.assertIsNone(self.refusal(cwd=plain))
-        self.assertEqual(self.decide('git worktree remove %s' % self.linked, cwd=plain)[0], 'allow')
 
     def test_commit_reachable_only_from_the_worktree_reflog_or_private_refs_blocks(self):
         # red-team F1: a detached commit made and then abandoned lives only in this worktree's admin directory
@@ -592,7 +552,6 @@ class WorktreeRemoveMerged(WorktreeRemoveCase):
         git(self.linked, 'add', 'wip.txt'); git(self.linked, 'commit', '-q', '-m', 'WIP detached')
         git(self.linked, 'checkout', '-q', '--detach', 'main')
         self.assertIn('reflog', self.refusal())
-        self.assertEqual(self.decide('git worktree remove %s' % self.linked)[0], 'block')
 
     def test_private_worktree_ref_blocks_and_branch_kept_commits_do_not(self):
         self.advance_main()
@@ -605,55 +564,3 @@ class WorktreeRemoveMerged(WorktreeRemoveCase):
         git(self.linked, 'add', 'kept.txt'); git(self.linked, 'commit', '-q', '-m', 'on branch')
         git(self.linked, 'checkout', '-q', '--detach', 'main')
         self.assertIsNone(self.refusal())
-
-
-class WorktreeRemoveDashC(WorktreeRemoveCase):
-    """A subagent's shell resets to $HOME on every call, so the only way to name the registry repository is one literal
-    -C. Every other -C shape, and every refusal the plain form has, must still block."""
-
-    def test_literal_dash_c_repo_is_allowed_and_keeps_every_refusal(self):
-        plain = self.home / 'plain'; plain.mkdir()
-        ok = 'git -C %s worktree remove %s' % (self.primary, self.linked)
-        self.assertEqual(self.decide(ok, cwd=plain)[0], 'allow')
-        self.assertEqual(self.decide('git -C %s worktree remove -- %s' % (self.primary, self.linked), cwd=plain)[0], 'allow')
-        blocked = (
-            'git -C %s worktree remove %s' % (self.primary, self.linked) + ' --force',
-            'git -C ../primary worktree remove %s' % self.linked,
-            'git -C %s -C %s worktree remove %s' % (self.primary, self.primary, self.linked),
-            'git -C $HOME worktree remove %s' % self.linked,
-            'git -C "%s" worktree remove %s' % (self.primary, self.linked),
-            'git -C %s worktree remove %s; true' % (self.primary, self.linked),
-            'git -C %s worktree remove %s %s' % (self.primary, self.linked, self.primary),
-            'git -C %s worktree remove %s' % (self.linked, self.linked),          # cannot remove the current worktree
-            'git -C %s/nonexistent worktree remove %s' % (self.primary, self.linked),
-            'git -C %s worktree remove %s' % (self.primary, self.primary),        # the primary is not removable
-        )
-        passed = [c for c in blocked if self.decide(c, cwd=plain)[0] != 'block']
-        self.assertEqual(passed, [], 'a -C shape slipped through')
-        (self.linked / 'a.txt').write_text('changed\n')
-        self.assertEqual(self.decide(ok, cwd=plain)[0], 'block')
-
-    def test_red_team_shell_inside_the_target_and_unrelated_repo_block(self):
-        ok = 'git -C %s worktree remove %s' % (self.primary, self.linked)
-        sub = self.linked / 'sub'; sub.mkdir()
-        for cwd in (self.linked, sub):  # F1: the plain form refuses a shell inside the target; so must -C
-            self.assertEqual(self.decide(ok, cwd=cwd)[0], 'block', cwd)
-        other = self.home / 'other'; other.mkdir()
-        git(other, 'init', '-q', '-b', 'main')
-        git(other, 'remote', 'add', 'origin', URL)
-        self.assertEqual(self.decide('git -C %s worktree remove %s' % (other, self.linked), cwd=self.home)[0], 'block')  # F2
-        self.assertEqual(self.decide(ok, cwd=self.home)[0], 'allow')
-
-    def test_delta_n1_n3_shell_in_a_scan_blind_subdir_alias_or_the_git_dir_blocks(self):
-        # an upper-cased spelling of the target is another path string but the same directory on a case-folding volume
-        ok = 'git -C %s worktree remove %s' % (self.primary, self.linked)
-        gitdir = Path(git(self.linked, 'rev-parse', '--absolute-git-dir'))
-        self.assertEqual(self.decide(ok, cwd=gitdir)[0], 'block')                 # N3: the admin folder is deleted too
-        self.assertEqual(self.decide('git -C %s worktree remove %s' % (gitdir, self.linked), cwd=self.home)[0], 'block')
-        deep = self.linked / 'node_modules' / 'a' / 'b'
-        deep.mkdir(parents=True)
-        (self.primary / '.git/info/exclude').write_text('node_modules/\n')
-        upper = Path(str(self.linked).replace('/linked', '/LINKED'))
-        if upper.exists():  # case-insensitive volume (macOS default): the spelling differs, the directory is the same
-            self.assertEqual(self.decide(ok, cwd=upper / 'node_modules' / 'a' / 'b')[0], 'block')
-        self.assertEqual(self.decide(ok, cwd=deep)[0], 'block')

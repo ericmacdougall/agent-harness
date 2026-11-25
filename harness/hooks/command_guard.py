@@ -20,15 +20,21 @@ Categories (modes live in the installed command_guard_policy.json, never in an e
                credential (sample text, fixtures, patterns, comments, --help) is not refused, and secret text alone
                never refuses when the analysis cannot finish.  Fable and Astra are exempt (one audit line in
                ~/.agent-harness/logs/secret-access.jsonl); everyone else is pointed at `ah secret` (docs/secrets.md).
-  log_delete   rm/mv/truncate/find -delete/rsync --delete/... on Claude and Codex logs and WALs without a
-               verified-backup approval marker (see approve-delete).  Always enforced.
+  log_delete   A command that itself deletes, moves away or overwrites a protected target (judged by its operands,
+               never by words in prose, heredocs, quoted strings or script files it only creates or reads):
+               transcripts, session WALs, harness audit logs and approval state need a verified copy first, for
+               every caller (approve-delete, or `ah log-push`); other paths under ~/.claude, ~/.codex and
+               ~/.agent-harness follow ah_roles.may_delete (own roots and checkouts the caller made, supervised
+               projects, Fable/Astra anywhere); writes are refused only for hook scripts, policy files, the hook
+               wiring and (rule-file-write) ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md. A harness maintainer
+               (Fable/Astra marked supervisor) is refused only the verified-copy rule.  Always enforced.
   broad_kill   pkill -f / killall with a short, generic or unscoped pattern.  warn by default, enforce on request.
 
 The command is lexed like a shell (quotes, $'..', escapes, line continuations, here-docs, $(..), backticks,
 pipes, redirections, env prefixes, command/exec/sudo/env/xargs/timeout wrappers, sh -c, ssh and docker exec
 strings, absolute binary paths, brace expansion, case and Unicode lookalikes) before any rule looks at it.
-Inputs the guard cannot analyse within its budget (oversized, too deeply nested, too slow) are blocked, never
-waved through. An internal error falls back to a raw-text scan: sensitive-looking commands are blocked, others run.
+Inputs the guard cannot analyse within its budget (oversized, too deeply nested, too slow) and internal errors are
+allowed with a note, except when the raw text names a secret source or credential location (those fail closed).
 
 Threat model: careless or hurried agents, not an adversary who can edit the installed hooks. Best effort for
 interpreter one-liners (python -c, node -e): their code text is scanned, not executed or parsed.
@@ -180,6 +186,15 @@ SECRET_DUMP, LOG_DELETE, BROAD_KILL = 'secret_dump', 'log_delete', 'broad_kill'
 BULK_STAGING = 'bulk_staging'  # goodqa#15787: git add -A, git commit -a in a dirty original checkout; warn by default
 PARSE = 'parse'  # warn-only notes: input the guard could not fully parse
 ALWAYS_ENFORCED = (SECRET_DUMP, LOG_DELETE)
+# Transcripts, session WALs and harness audit logs: deleting them needs a verified copy, whoever asks (see Compiled.records).
+# Plus, anywhere: a `wals` segment, main.jsonl and *.wal.jsonl, the work-dir WAL names (protected_work_wal_regex), and any
+# *.jsonl under ~/.agent-harness outside work/ and scratch/ (the audit logs).
+RECORD_ROOTS = ('{home}/.claude/projects', '{home}/.claude/wals', '{home}/.claude/sessions', '{home}/.claude/transcripts',
+                '{home}/.claude/history.jsonl', '{home}/.codex/sessions', '{home}/.codex/archived_sessions',
+                '{home}/.codex/history*', '{home}/.agent-harness/codex-wals', '{home}/.agent-harness/logs',
+                '{home}/.agent-harness/state')  # state: the approval markers and the guards' audit logs
+RULE_FILES = ('{home}/.claude/CLAUDE.md', '{home}/.codex/AGENTS.md')
+LOG_PUSH_ROUTE = 'python3 ~/.claude/hooks/ah.py log-push <path>'
 
 
 # --------------------------------------------------------------------------- policy
@@ -303,6 +318,12 @@ class Compiled:
         self.kill = policy['kill']
         self.generic = set(self.kill['generic_names'])
         self.rclone_blocked = set(policy['rclone_blocked_config'])
+        # Records (the user, 2026-11-24): transcripts, session WALs and harness audit logs. The one exception to the role
+        # rules: nobody deletes them, top rung included, without a verified copy (approve-delete or `ah log-push`).
+        self.records = [self._segs(fmt(t, h)) for t in RECORD_ROOTS for h in match_homes]
+        self.harness_logs = [self._segs(fmt(t, h)) for t in ('{home}/.agent-harness',) for h in match_homes]
+        # the agent rule files only the top rung and supervisors write (see Analyzer.rule_file_dest)
+        self.rule_files = sorted({fmt(t, h).casefold() for t in RULE_FILES for h in homes})
         self.fallback = _build_fallback(self)
 
     @staticmethod
@@ -2545,6 +2566,199 @@ def remove_worktree(path, authenticated=False, expect_head=None, policy=None, *,
     return report
 
 
+# ---- freeing a dead worktree (`ah worktree-remove`, verifier version 3; the user's rules of 2026-11-24)
+#
+# A worktree is removable by ANY agent when it has no uncommitted changes and either its HEAD is on a remote-tracking
+# branch (or merged into the default branch) or the session that owns it has ended. Anything else (uncommitted changes,
+# or unpublished commits of a session that is still active) needs --rescue, which the guard admits only for a supervisor
+# of the project or a Fable/Astra caller: the commits are saved to refs/rescue/<name> in the primary repository and the
+# changes to a patch under the caller's work dir, then the worktree is removed with --force. A commit the removal would
+# leave unreachable is always saved to refs/rescue/<name> first, so nothing committed is lost. No ticket, WAL note or
+# reason is required; a process working inside the worktree still stops the removal.
+
+FREE_VERIFIER_VERSION = 3
+SESSION_ENDED_SECONDS = 2 * 3600
+_SESSION_ID = re.compile(r'^[0-9a-fA-F-]{8,64}$')
+
+
+def worktree_owner_session(path, home=None):
+    """The session id from a ~/.agent-harness/work/<session>/... path, or None."""
+    home = os.path.realpath(home or os.path.expanduser('~'))
+    base = os.path.join(home, '.agent-harness', 'work') + os.sep
+    if not path.startswith(base):
+        return None
+    sid = path[len(base):].split(os.sep, 1)[0]
+    return sid if _SESSION_ID.match(sid) else None
+
+
+def session_ended(session, home=None, now=None, seconds=SESSION_ENDED_SECONDS):
+    """True when nothing of `session` (its transcripts, its WAL directory) changed for `seconds`. Unknown: False."""
+    if not session or not _SESSION_ID.match(session):
+        return False
+    home = home or os.path.expanduser('~')
+    now = time.time() if now is None else now
+    import glob
+    places = glob.glob(os.path.join(home, '.claude', 'projects', '*', session + '.jsonl'))
+    places += glob.glob(os.path.join(home, '.claude', 'projects', '*', session, 'subagents', '*.jsonl'))
+    places += [os.path.join(home, '.claude', 'wals', session)]
+    places += glob.glob(os.path.join(home, '.codex', 'sessions', '*', '*', '*', '*' + session + '*.jsonl'))
+    newest = 0.0
+    for place in places:
+        try:
+            newest = max(newest, os.stat(place).st_mtime)
+        except OSError:
+            continue
+    return now - newest >= seconds
+
+
+def _rescue_name(path, head):
+    base = re.sub(r'[^A-Za-z0-9._-]', '-', os.path.basename(path.rstrip(os.sep)) or 'worktree')[:60].strip('.-') or 'wt'
+    return '%s-%s' % (base, head[:12])
+
+
+def free_worktree_state(path, home=None, now=None):
+    """Facts for one linked worktree, or {'reason': why it is not one}. Never raises."""
+    facts = {'path': path, 'reason': None}
+    try:
+        if not isinstance(path, str) or not os.path.isabs(path) or os.path.realpath(path) != path \
+                or not os.path.isdir(path):
+            return dict(facts, reason='not a literal absolute directory path without symlinks')
+        reason = worktree_scope_refusal(path)
+        if reason:
+            return dict(facts, reason=reason)
+        marker = os.path.join(path, '.git')
+        if os.path.islink(marker) or not os.path.isfile(marker):
+            return dict(facts, reason='.git is not a plain file (not a linked worktree)')
+        top = os.path.realpath(_git_out(path, ['rev-parse', '--show-toplevel'], 10.0).strip())
+        if top != path:
+            return dict(facts, reason='the path is not the top of its worktree')
+        listing = _git_out(path, ['worktree', 'list', '--porcelain'], 10.0)
+        trees = [os.path.realpath(line[len('worktree '):]) for line in listing.splitlines() if line.startswith('worktree ')]
+        if len(trees) < 2 or trees[0] == path or path not in trees:
+            return dict(facts, reason='the path is not a non-primary entry in the worktree registry')
+        if any(o != path and (o.startswith(path + os.sep)) for o in trees):
+            return dict(facts, reason='another worktree is nested inside it')
+        facts['repo'] = trees[0]
+        try:
+            facts['head'] = _git_out(path, ['rev-parse', '--verify', 'HEAD'], 10.0).strip()
+        except ValueError:
+            facts['head'] = None  # an unborn branch: nothing committed to lose
+        status = _git_out(path, ['status', '--porcelain=v1', '-z', '--untracked-files=all'], 60.0)
+        facts['dirty'] = [e[3:] for e in status.split('\x00') if len(e) > 3][:20]
+        facts['dirty_count'] = len([e for e in status.split('\x00') if len(e) > 3])
+        head = facts['head']
+        published = False
+        if head:
+            published = bool(_git_out(path, ['for-each-ref', '--count=1', '--contains', head, 'refs/remotes'], 30.0).strip())
+        facts['published'] = published
+        facts['kept_by_ref'] = bool(head) and bool(_git_out(path, ['for-each-ref', '--count=1', '--contains', head,
+                                                                    'refs/heads', 'refs/tags', 'refs/rescue'], 30.0).strip())
+        facts['owner_session'] = worktree_owner_session(path, home)
+        facts['session_ended'] = session_ended(facts['owner_session'], home, now)
+        scan = busy_scan(path, ('systemd', 'ssh-agent'), _worktree_created(path))
+        facts['busy'] = scan['busy'][:3]
+        facts['scan_note'] = 'process scan incomplete' if scan['failed'] or scan['unreadable'] else None
+    except Exception as error:  # noqa: BLE001
+        return dict(facts, reason='could not read the worktree (%s)' % type(error).__name__)
+    return facts
+
+
+def free_worktree(path, rescue=False, patch_dir=None, dry_run=False, home=None, now=None):
+    """Decide and (unless dry_run) remove one linked worktree. Returns the JSON report ah_worktree prints."""
+    report = {'path': path, 'removable': False, 'removed': False, 'verifier': FREE_VERIFIER_VERSION, 'reason': None,
+              'head': None, 'repo': None}
+    facts = free_worktree_state(path, home, now)
+    report.update({k: facts.get(k) for k in ('head', 'repo', 'dirty_count', 'published', 'owner_session',
+                                             'session_ended', 'scan_note')})
+    if facts.get('reason'):
+        report['reason'] = facts['reason']
+        return report
+    if facts['busy']:
+        report['reason'] = 'a process is using the worktree as its working directory (pid %d, %s)' % facts['busy'][0]
+        return report
+    dirty, head = facts['dirty_count'] > 0, facts['head']
+    free = not dirty and (facts['published'] or facts['session_ended'] or not head)
+    if not free and not rescue:
+        why = ('it has %d uncommitted change(s)' % facts['dirty_count']) if dirty else (
+            'its HEAD is not on a remote branch and its session %s is still active' % (facts['owner_session'] or '(unknown)'))
+        report['reason'] = (why + '; a supervisor of the project or a Fable/Astra agent may run the same command with '
+                            '--rescue (it saves the commits to refs/rescue/<name> and the changes to a patch first)')
+        return report
+    report['removable'] = True
+    name = _rescue_name(path, head or 'unborn')
+    if dry_run:
+        report['would'] = {'rescue_ref': 'refs/rescue/' + name if head and not facts['published'] else None,
+                           'patch': bool(dirty), 'force': bool(dirty)}
+        return report
+    try:
+        if head and not facts['published']:
+            _git_out(path, ['update-ref', 'refs/rescue/' + name, head], 30.0)  # shared refs: lives in the primary repo
+            report['rescue_ref'] = 'refs/rescue/' + name
+        if dirty:
+            directory = patch_dir or os.path.join(os.path.expanduser('~'), '.agent-harness', 'rescue')
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+            patch = os.path.join(directory, '%s-%s.patch' % (name, time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())))
+            with tempfile_index(path) as env:
+                _git_env_run(path, ['add', '-A'], env)
+                diff = _git_env_run(path, ['diff', '--cached', '--binary'] + (['HEAD'] if head else []), env)
+            fd = os.open(patch, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            try:
+                os.write(fd, diff)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            if not diff:
+                raise ValueError('the patch of the uncommitted changes came out empty')
+            report['patch'] = patch
+        _worktree_audit({'event': 'free', 'path': path, 'head': head, 'repo': facts['repo'],
+                         'rescue_ref': report.get('rescue_ref'), 'patch': report.get('patch')})
+        done = subprocess.run(['git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-C', facts['repo'],
+                               'worktree', 'remove'] + (['--force'] if dirty or rescue else []) + ['--', path],
+                              capture_output=True, text=True, timeout=REMOVE_SECONDS, env=_clone_env())
+        stderr = (done.stderr or '').strip()[:200]
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        report.update(removable=False, reason='nothing removed: the rescue step failed (%s)' % _clean_reason(error))
+        return report
+    gone = not os.path.lexists(path)
+    report.update(removed=done.returncode == 0 and gone, directory_removed=gone,
+                  registry_entry_left=None if not os.path.isdir(facts['repo']) else registry_lists(facts['repo'], path))
+    if not report['removed']:
+        report['reason'] = 'git worktree remove did not complete: %s' % stderr
+    _worktree_audit({'event': 'free-result', 'path': path, 'removed': report['removed']})
+    return report
+
+
+class tempfile_index:
+    """A throwaway index file, so staging the changes for the patch never touches the worktree's own index."""
+
+    def __init__(self, path):
+        self.path = path
+
+    def __enter__(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp(prefix='wt-rescue-')
+        return {'GIT_INDEX_FILE': os.path.join(self.dir, 'index')}
+
+    def __exit__(self, *exc):
+        shutil.rmtree(self.dir, ignore_errors=True)
+        return False
+
+
+def _git_env_run(repo, args, env):
+    full = dict(_clone_env(), **env)
+    if 'GIT_INDEX_FILE' in env:
+        base = subprocess.run(['git', '-C', repo, 'rev-parse', '--git-path', 'index'], capture_output=True, text=True,
+                              timeout=30, env=_clone_env())
+        src = os.path.join(repo, base.stdout.strip()) if not os.path.isabs(base.stdout.strip()) else base.stdout.strip()
+        if os.path.isfile(src) and not os.path.exists(env['GIT_INDEX_FILE']):
+            shutil.copyfile(src, env['GIT_INDEX_FILE'])
+    done = subprocess.run(['git', '-c', 'core.hooksPath=/dev/null', '-C', repo] + args, capture_output=True,
+                          timeout=300, env=full)
+    if done.returncode != 0:
+        raise ValueError('git %s failed' % args[0])
+    return done.stdout
+
+
 def _clean_reason(reason):
     """A verifier reason made safe to print: printable ASCII only, 160 characters. Its text is the verifier's own, so it
     may name a remote or up to five ignored files of the worktree, as it did before goodqa#16943."""
@@ -3735,6 +3949,188 @@ CODE_SECRET_ENV = re.compile(r'(?:\benviron(?:\.get)?|\bgetenv|\bprocess\.env|\$
                              r'[a-z0-9_]*(?:secret|token|key|password|passwd|credential)')
 
 
+# Python calls that delete or move a path away, overwrite one, or run shell text, by module function (os.remove,
+# shutil.rmtree, subprocess.run) or pathlib method (Path(p).unlink()). Node's fs names parse as Python too, so `fs.rmSync`
+# is read the same way. A method of anything else (`items.remove(x)`, `text.replace(a, b)`) is not a file operation.
+PY_MODULES = frozenset(('os', 'shutil', 'pathlib', 'fs', 'send2trash', 'subprocess', 'commands', 'io', 'codecs',
+                        'FileUtils', 'File', 'Dir'))  # ruby one-liners parse as Python too
+PY_PATH_TYPES = frozenset(('Path', 'PurePath', 'PosixPath', 'PurePosixPath'))
+PY_DELETE_CALLS = frozenset(('rmtree', 'remove', 'unlink', 'rmdir', 'removedirs', 'rmSync', 'rmdirSync', 'unlinkSync',
+                             'truncate', 'send2trash', 'rm_rf', 'rm_r', 'rm', 'rm_f', 'remove_dir', 'remove_entry',
+                             'delete'))
+PY_MOVE_CALLS = frozenset(('rename', 'renames', 'replace', 'move', 'renameSync'))
+PY_COPY_CALLS = frozenset(('copy', 'copyfile', 'copy2', 'copytree', 'copyFileSync'))
+PY_SHELL_CALLS = frozenset(('system', 'popen', 'run', 'call', 'check_call', 'check_output', 'Popen', 'getoutput',
+                            'getstatusoutput', 'execSync', 'spawnSync'))
+_PY_EFFECT_NAMES = PY_DELETE_CALLS | PY_MOVE_CALLS | PY_COPY_CALLS | PY_SHELL_CALLS | {
+    'open', 'write_text', 'write_bytes', 'writeFileSync'}
+
+
+def python_effects(code):
+    """None when `code` is not Python; else [(kind, verb, value)]: kind 'delete' (a path removed or moved away),
+    'overwrite' (a path truncated or replaced), 'append' (a path opened to add to) or 'shell' (command text it runs).
+    Only paths spelled out as literals (a str, os.path.join / expanduser of literals, Path(...) and `/` of literals, or a
+    name bound once to one) are reported: a path built at run time is not followed (the guard allows what it cannot
+    read). Words inside strings, comments and regex patterns are never effects."""
+    if not isinstance(code, str):
+        return None
+    try:
+        import ast
+        tree = ast.parse(code)
+    except Exception:  # noqa: BLE001 - not Python, too deep, or a syntax error
+        return None
+    if not any(name in code for name in _PY_EFFECT_NAMES):
+        return []
+    names = {}
+    loops = {}  # `for p in base.rglob(...)` / `os.listdir(base)` / `os.walk(base)`: p is some path under base
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.For, ast.comprehension)) and isinstance(node.target, ast.Name) \
+                and isinstance(node.iter, ast.Call):
+            loops[node.target.id] = node.iter
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            key = node.targets[0].id
+            names[key] = None if key in names else node.value  # bound twice: unknown
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                names.setdefault((alias.asname or alias.name).split('.')[0], None)
+
+    def callee(func):
+        if isinstance(func, ast.Call) and callee(func.func) == 'getattr' and len(func.args) >= 2:
+            return value(func.args[1]) or ''  # getattr(os, 'remove')(p)
+        return func.attr if isinstance(func, ast.Attribute) else func.id if isinstance(func, ast.Name) else ''
+
+    def module_call(func):
+        if isinstance(func, ast.Call) and callee(func.func) == 'getattr' and func.args:
+            return isinstance(func.args[0], ast.Name) and func.args[0].id in PY_MODULES
+        return isinstance(func, ast.Attribute) and (
+            isinstance(func.value, ast.Name) and func.value.id in PY_MODULES
+            or isinstance(func.value, ast.Attribute) and func.value.attr == 'path'
+            or isinstance(func.value, ast.Call) and callee(func.value.func) == 'require')  # node: require('fs').rmSync
+
+    def is_path(node, depth=0):
+        if depth > 12:
+            return False
+        if isinstance(node, ast.Call):
+            return callee(node.func) in PY_PATH_TYPES or isinstance(node.func, ast.Attribute) and callee(node.func) in (
+                'rglob', 'glob', 'iterdir') or callee(node.func) in ('home', 'expanduser', 'resolve') and \
+                isinstance(node.func, ast.Attribute) and is_path(node.func.value, depth + 1) or \
+                callee(node.func) == 'home' and isinstance(node.func, ast.Attribute)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+            return is_path(node.left, depth + 1)
+        if isinstance(node, ast.Name) and names.get(node.id) is not None:
+            return is_path(names[node.id], depth + 1)
+        return False
+
+    def value(node, depth=0):
+        if depth > 12 or node is None:
+            return None
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.Name) and names.get(node.id) is not None:
+            return value(names[node.id], depth + 1)
+        if isinstance(node, ast.Name) and node.id in loops and node.id not in names:
+            it = loops[node.id]
+            base = value(it.func.value, depth + 1) if isinstance(it.func, ast.Attribute) and callee(it.func) in (
+                'glob', 'rglob', 'iterdir') else value(it.args[0], depth + 1) if it.args and callee(it.func) in (
+                'listdir', 'scandir', 'walk', 'glob', 'iglob') else None
+            return posixpath.join(base, '*') if base is not None else None
+        if isinstance(node, ast.Attribute) and node.attr == 'pattern' and isinstance(node.value, ast.Call) \
+                and callee(node.value.func) == 'compile' and node.value.args:
+            return value(node.value.args[0], depth + 1)  # re.compile('x').pattern is 'x'
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Attribute) and node.value.attr == 'environ':
+            key = node.slice.value if isinstance(node.slice, ast.Constant) else None
+            return '~' if key in ('HOME', 'USERPROFILE') else None
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.Add)):
+            left, right = value(node.left, depth + 1), value(node.right, depth + 1)
+            if left is None or right is None:
+                return None
+            return posixpath.join(left, right) if isinstance(node.op, ast.Div) else left + right
+        if isinstance(node, ast.Call):
+            func, name = node.func, callee(node.func)
+            if name in ('home', 'homedir') and not node.args:
+                return '~'
+            if name in ('getenv', 'get') and node.args and isinstance(node.args[0], ast.Constant) \
+                    and node.args[0].value == 'HOME':
+                return '~'
+            if name in ('resolve', 'expanduser', 'absolute') and isinstance(func, ast.Attribute) and not node.args:
+                return value(func.value, depth + 1)
+            if name in PY_PATH_TYPES or name in ('str', 'fspath') or (module_call(func) and name in (
+                    'join', 'expanduser', 'abspath', 'realpath', 'normpath', 'expand_path', 'resolve')):
+                parts = [value(a, depth + 1) for a in node.args]
+                if not parts or any(p is None for p in parts):
+                    return None
+                return posixpath.join(*parts)
+        return None
+
+    def shell_text(node):
+        if isinstance(node, (ast.List, ast.Tuple)):
+            words = [value(e) for e in node.elts]
+            if not words or any(w is None for w in words):
+                return None
+            return ' '.join("'" + w.replace("'", "'\\''") + "'" for w in words)
+        return value(node)
+
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func, name = node.func, callee(node.func)
+        args = node.args
+        receiver = value(func.value) if isinstance(func, ast.Attribute) and (
+            is_path(func.value) or isinstance(func.value, ast.Name) and func.value.id in loops
+            and func.value.id not in names) else None
+        mod = module_call(func)
+        if name == 'open' and (isinstance(func, ast.Name) and func.id not in names or mod or receiver is not None):
+            if receiver is not None:
+                target, mode_node = receiver, args[0] if args else None
+            else:
+                target, mode_node = (value(args[0]) if args else None), (args[1] if len(args) > 1 else None)
+            mode_node = mode_node or next((k.value for k in node.keywords if k.arg == 'mode'), None)
+            mode = 'r' if mode_node is None else (mode_node.value if isinstance(mode_node, ast.Constant)
+                                                  and isinstance(mode_node.value, str) else 'w')
+            if target is not None and any(ch in mode for ch in 'wx'):
+                out.append(('overwrite', 'open for writing', target))
+            elif target is not None and any(ch in mode for ch in 'a+'):
+                out.append(('append', 'open to append', target))
+        elif name in PY_DELETE_CALLS and (mod or receiver is not None or name == 'send2trash'):
+            target = receiver if receiver is not None and not args else (value(args[0]) if args else None)
+            if target is not None:
+                out.append(('delete', name, target))
+        elif name in PY_MOVE_CALLS and (mod or receiver is not None):
+            src = receiver if receiver is not None else (value(args[0]) if args else None)
+            dst = value(args[-1]) if args and (receiver is not None or len(args) >= 2) else None
+            if src is not None:
+                out.append(('delete', name + ' (moves it away)', src))
+            if dst is not None and dst != src:
+                out.append(('overwrite', name, dst))
+        elif name in PY_COPY_CALLS and mod and len(args) >= 2:
+            dst = value(args[1])
+            if dst is not None:
+                out.append(('overwrite', name, dst))
+        elif name in ('write_text', 'write_bytes') and receiver is not None:
+            out.append(('overwrite', name, receiver))
+        elif name == 'writeFileSync' and mod and args and value(args[0]) is not None:
+            out.append(('overwrite', name, value(args[0])))
+        elif name in ('exec', 'eval') and isinstance(func, ast.Name) and args and value(args[0]):
+            inner = python_effects(value(args[0]))
+            out.extend(inner or [])
+        elif name in PY_SHELL_CALLS and args and (mod or isinstance(func, ast.Name) and name in (
+                'check_output', 'check_call', 'Popen', 'getoutput', 'execSync', 'spawnSync')):
+            text = shell_text(args[0])
+            if text:
+                out.append(('shell', name, text))
+    return out
+
+
+def _parses(code):
+    try:
+        import ast
+        ast.parse(code)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def fallback_scan(text, ctx):
     """Raw-text rules for unresolved indirection, interpreter code, oversized input and internal errors."""
     findings = []
@@ -3880,9 +4276,11 @@ SCRIPT_CREDENTIAL_RULES = frozenset((
 
 
 class Analyzer:
-    def __init__(self, compiled, cwd=None, ps=False, marker=None):
+    def __init__(self, compiled, cwd=None, ps=False, marker=None, payload=None):
         self.ctx = Ctx(compiled, cwd, ps, marker)
         self.c = compiled
+        self.payload = payload if isinstance(payload, dict) else {}  # the hook payload: who is calling (ah_roles)
+        self._own_extra = None  # checkouts and worktrees the caller made, read from its transcript once, when needed
 
     def _probe(self, kind, path, fn):
         """One disk probe per analysis. The command has not run, so a path's lexists/realpath/marker answer is
@@ -4401,12 +4799,8 @@ class Analyzer:
     def heredoc(self, rd, name, words, pl, idx, depth):
         ctx = self.ctx
         body = rd.body
-        if body and PROTECTED_TEXT.search(body) and any(f.category == LOG_DELETE for f in fallback_scan(body, ctx.c)):
-            # writing deletion text for a protected location through a shell heredoc (even into a data file) is the
-            # incident mechanism: warn, and point at the file-writing tool. A real deletion still blocks below.
-            ctx.add(PARSE, 'heredoc-destructive-text',
-                    'a heredoc body contains a deletion of a protected harness location, and heredoc text passes '
-                    'through the shell', 'write test data or scripts with the editor\'s file-writing tool instead')
+        # A heredoc body is text until something runs it: a shell or interpreter reading it is judged below; text
+        # written into a file (prose, a commit message, a generated script) is never a deletion by itself.
         if name in SHELLS or name in PS_SHELLS or name in ('at', 'batch') or (
                 name in ('source', '.') and any(w.text in ('/dev/stdin', '-') for w in words[1:])):
             self.script(body, depth + 1, tail_visible=True, ps=name in PS_SHELLS)
@@ -4502,7 +4896,8 @@ class Analyzer:
             # unresolved command word: judge the whole line as text
             joined = ' '.join(w.text for w in words)
             for f in fallback_scan(joined, ctx.c):
-                ctx.findings.append(f)
+                if f.category != LOG_DELETE:  # an unresolved command: unsure, so a deletion is allowed (not judged by words)
+                    ctx.findings.append(f)
             for w in words:
                 pass
         before = len(ctx.findings)
@@ -4596,7 +4991,9 @@ class Analyzer:
                 else:
                     self.script_file(nd[0], depth)
             return
-        if '/' in name or '/' in words[0].text:
+        # `tool --help` prints usage and changes nothing: its deletion and script-reading checks are skipped
+        help_only = '--help' in texts or texts == ['-h']
+        if ('/' in name or '/' in words[0].text) and not help_only:
             # ./run.sh or /path/to/script: analyse the script text when it is a shell script
             self.script_file(words[0], depth, require_shell=True, invocation=words, command=cmd)
         if name in ('flock', 'unshare', 'parallel', 'tmux', 'screen', 'osascript', 'at', 'batch', 'script'):
@@ -4631,7 +5028,8 @@ class Analyzer:
                             self.refuse('fd --exec ' + inner, w)
                     break
         if name in SHELLS or name in PS_SHELLS:
-            self.shell(name, args, depth, pl, idx)
+            if not (help_only and not any(t in ('-c', '-s') for t in texts)):
+                self.shell(name, args, depth, pl, idx)
             return
         if name == 'ssh' or name == 'mosh':
             self.ssh(args, depth)
@@ -4682,7 +5080,7 @@ class Analyzer:
             self.read_creds(name, args, pl, idx)
         if name in RM_CMDS or name in MV_CMDS or name in OVERWRITE_CMDS or name in (
                 'sed', 'perl', 'ruby', 'awk', 'gawk', 'rsync', 'scp', 'rclone', 'tar', 'zip', 'dd', 'truncate', 'set-content',
-                'out-file', 'curl', 'wget', 'touch', 'mkdir', 'unzip', 'bsdtar', 'gtar'):
+                'out-file', 'curl', 'wget', 'touch', 'mkdir', 'unzip', 'bsdtar', 'gtar') and not help_only:
             self.destructive(name, args, texts)
         if not (name in PRINT_FILE_CMDS or name in GREP_CMDS or name in EXFIL_CMDS):
             self.unlisted_cred_reader(name, args, cmd, pl, idx)
@@ -5011,21 +5409,19 @@ class Analyzer:
                 line = line.strip().strip('\'"')
                 if line and self.refuse('xargs deletion of paths given in its heredoc', _literal_word(line)):
                     return  # each line is an operand, relative to the working directory
-            if any(self._raw_path_class(m.group(0)) in ('log', 'root', 'ancestor', 'unknown')
-                   for m in self.RAW_PATH.finditer(body[:200000])):
+            if any(self._raw_record(m.group(0)) for m in self.RAW_PATH.finditer(body[:200000])):
                 self.ctx.add(LOG_DELETE, 'log-delete',
-                             'xargs deletes paths given in its heredoc, and that heredoc names a protected harness '
-                             'location', 'delete only paths inside your own task worktree, named directly')
+                             'xargs deletes paths given in its heredoc, and that heredoc names a transcript, WAL or '
+                             'audit log', 'run `%s` for those; delete other paths directly' % LOG_PUSH_ROUTE)
                 return
         for src in sources:
             if self.refuse('xargs deletion of paths given on its input', src):
                 return
             bodies = [src.text] + list(src.subs)
-            if any(self._raw_path_class(m.group(0)) in ('log', 'root', 'ancestor', 'unknown')
-                   for body in bodies for m in self.RAW_PATH.finditer(body[:200000])):
+            if any(self._raw_record(m.group(0)) for body in bodies for m in self.RAW_PATH.finditer(body[:200000])):
                 self.ctx.add(LOG_DELETE, 'log-delete',
-                             'xargs deletes paths given on its input, and that input names a protected harness location',
-                             'delete only paths inside your own task worktree, named directly')
+                             'xargs deletes paths given on its input, and that input names a transcript, WAL or audit log',
+                             'run `%s` for those; delete other paths directly' % LOG_PUSH_ROUTE)
                 return
 
     def inner_words(self, words, depth, pl, idx, via_xargs=False):
@@ -5125,7 +5521,8 @@ class Analyzer:
                 body = body.strip().strip('\'"')
                 self.script(decode_ansi(body) if m.group(1) == 'printf' else body, depth + 1, tail_visible=True)
             for f in fallback_scan(inner, ctx.c):
-                ctx.findings.append(f)
+                if f.category != LOG_DELETE:  # text the guard cannot run: a deletion in it is not judged by words
+                    ctx.findings.append(f)
 
     def shell_stdin(self, cmd, depth):
         """`bash <<< 'text'`, `sh < file`: the shell reads its program from the redirect."""
@@ -5143,6 +5540,8 @@ class Analyzer:
     def shell(self, name, args, depth, pl, idx):
         texts = [a.text for a in args]
         ps = name in PS_SHELLS
+        if not ps and self._noexec_shell(texts):
+            return  # `bash -n script` parses and runs nothing
         for i, t in enumerate(texts):
             is_c = (not ps and (t == '-c' or (re.fullmatch(r'-[a-zA-Z]*c[a-zA-Z]*', t) is not None) or t.startswith('--command'))) \
                 or (ps and t.lower() in ('-c', '-command', '-encodedcommand', '-e', '-ec') or ps and t.lower() == '/c')
@@ -5171,6 +5570,20 @@ class Analyzer:
                     self.program_text(args[k], depth)  # bash <(echo ...)
                 else:
                     self.script_file(args[k], depth)
+
+    @staticmethod
+    def _noexec_shell(texts):
+        """`bash -n`, `sh -n`, `zsh -n`, `bash -o noexec`: the shell reads the script and runs nothing."""
+        for k, t in enumerate(texts):
+            if t == '--':
+                break
+            if t in ('-o', '--') and k + 1 < len(texts) and texts[k + 1] == 'noexec':
+                return True
+            if re.fullmatch(r'-[A-Za-z]*n[A-Za-z]*', t) and 'c' not in t:
+                return True
+            if not t.startswith(('-', '+')):
+                break
+        return False
 
     def ssh(self, args, depth):
         texts = [a.text for a in args]
@@ -5685,25 +6098,8 @@ class Analyzer:
         self.bulk_staging(sub, rest, cwd_words, locations, alias_values)
         if sub == 'clean':
             self.git_clean(args[i + 1:], rest, cwd_word)
-        if sub == 'worktree' and rest[:1] == ['remove'] and self._removable_linked_worktree(args[i + 1:], cwd_words):
-            return  # the only exemption: one literal, clean, published, registered linked-worktree top
-        if sub == 'worktree' and rest[:1] in (['remove'], ['prune']):
-            targets = _nondash(args[i + 2:])
-            one_target = len(targets) == 1  # the verifier judged ONE path; with several its reason belongs to none
-            for w in targets:
-                if rest[:1] != ['remove']:
-                    self.refuse('git worktree remove', w)
-                    continue
-                # goodqa#16943: every refused removal names the sanctioned route, in fixed text with placeholders only
-                reason = getattr(self, '_worktree_reason', None) if one_target else None
-                refused = self.refuse('git worktree remove', w, instead=_worktree_instead(reason) or WORKTREE_ROUTE)
-                if not refused:
-                    step = _worktree_next_step(reason)
-                    ctx.add(LOG_DELETE, 'linked-worktree-remove',
-                            'git worktree remove is allowed only for one verified clean, published, registered linked '
-                            'worktree top; this target or command shape is not verified'
-                            + (' (verifier: %s)' % _clean_reason(reason) if reason else ''),
-                            (step + '; then ' if step else '') + WORKTREE_ROUTE)
+        if sub == 'worktree' and rest[:1] == ['remove']:
+            self.worktree_remove(args[i + 2:], rest[1:])
         if sub == 'init' and rest:
             for w in _nondash(args[i + 1:])[-1:]:
                 self.note_created(_join_word(w, '.git'))
@@ -6584,27 +6980,29 @@ class Analyzer:
             if nd and nd[0].text != '-':
                 text = self.ctx.written.get(norm_path(nd[0].text, self.ctx).casefold())
                 if text:
+                    # a script this same command wrote and now runs: judged by what its calls do (GoodQA #14657)
                     self.code(text, depth)
-                    # a script this same command wrote and now runs is the incident's shape, so a deletion under a
-                    # harness root counts here, not only logs (GoodQA #14657). Existing scripts and one-liners keep
-                    # the log-only rule: harness tooling reads and edits these files routinely
-                    if written_code_destroys_root(text, self.ctx.home):
-                        self.ctx.add(LOG_DELETE, 'written-script-root',
-                                     'a line of a script written in this command names a harness root and a call that '
-                                     'can destroy or replace a file',
-                                     'edit the file with the editor tool, or keep the change out of the harness roots')
 
     def code(self, code, depth):
         ctx = self.ctx
-        # destroyer words inside a regex pattern are data: the log-delete text rule reads the code without them
-        blanked = blank_regex_patterns(code) if read_only_pattern_script(code) else code
-        for f in fallback_scan(code, ctx.c):
-            if f.category == SECRET_DUMP:
-                continue  # words in code are data (a test generator's sample text): code_secret_effect judges effect
-            if f.category == LOG_DELETE and blanked != code and not any(
-                    g.rule == f.rule and g.category == LOG_DELETE for g in fallback_scan(blanked, ctx.c)):
-                continue
-            ctx.findings.append(f)
+        effects = python_effects(code)
+        if effects is not None:
+            # Python (or code that parses as Python): judged by its calls, never by the words in its strings. A path it
+            # builds at run time is not followed (allowed); a literal one goes through the same rules as a shell operand.
+            for f in fallback_scan(code, ctx.c):
+                if f.category not in (LOG_DELETE, SECRET_DUMP):  # words in code are data; effects are judged
+                    ctx.findings.append(f)
+            self.code_effects(effects, depth)
+        else:
+            # other languages: a destroyer and a protected location on the same line (never the whole text at once)
+            for f in fallback_scan(code, ctx.c):
+                if f.category not in (LOG_DELETE, SECRET_DUMP):  # words in code are data; effects are judged
+                    ctx.findings.append(f)
+            for line in code.splitlines()[:5000]:
+                for f in fallback_scan(line, ctx.c):
+                    if f.category == LOG_DELETE:
+                        ctx.findings.append(f)
+                        break
         low = code.casefold()
         if re.search(r'print\s*\(\s*(?:dict\s*\(\s*)?os\.environ\s*\)|json\.dumps\s*\(\s*(?:dict\s*\(\s*)?os\.environ(?![.\[\w])|'
                      r'os\.environ\.(?:items|values)\s*\(|\{\s*\*\*\s*os\.environ\s*\}|'
@@ -6615,6 +7013,8 @@ class Analyzer:
                      r'for\s*\(\s*\w+\s+in\s+environ\s*\)|getenvironmentvariables\s*\(', low):
             ctx.add(SECRET_DUMP, 'interpreter-env-dump', 'script code prints the whole environment', 'print only specific non-secret names')
         self.code_secret_effect(code)
+        if effects is not None:
+            return
         for sample in ctx.c.state_files:
             if sample in low.replace('\\', '/') and re.search(r'open|write|copy|rename|replace|echo|dump', low):
                 ctx.add(LOG_DELETE, 'state-forgery', 'writes the delete-approval marker or key directly', 'use command_guard.py approve-delete')
@@ -6648,6 +7048,21 @@ class Analyzer:
                 ctx.add(SECRET_DUMP, 'interpreter-credential-print', 'script code prints the content of a credential file',
                         'let the program read the file itself; never print it')
                 return
+
+    def code_effects(self, effects, depth):
+        """Apply what python_effects found: deletions and moves away, overwrites, appends, and shell text it runs."""
+        for kind, verb, value in effects:
+            if kind == 'shell':
+                self.script(value, depth + 1, tail_visible=True)
+                continue
+            word = _literal_word(value)
+            if self.state_dest(word) or self.rule_file_dest(word, verb):
+                continue
+            if kind == 'delete':
+                self.refuse(verb, word)
+            elif kind == 'overwrite':
+                self.refuse(verb + ' (overwrites)', word, tiers=('log', 'root', 'unknown'), need_existing=True)
+            self.note_created(word)
 
     # ---- destructive
     #
@@ -6884,6 +7299,15 @@ class Analyzer:
             return None
         return self._path_class(norm_path(text.rstrip('/') or '/', self.ctx))
 
+    def _raw_record(self, text):
+        """A path written in raw text that is a record (transcript, WAL, audit log) or a directory holding records."""
+        cls = self._raw_path_class(text)
+        if cls not in ('log', 'ancestor'):
+            return False
+        text = re.sub(r'^(?:\$\{HOME\}|\$HOME)', '~', text.strip('\'"')).replace('\\', '/')
+        path = norm_path(text.rstrip('/') or '/', self.ctx)
+        return cls == 'ancestor' or self._is_record(path) or self._holds_records(path)
+
     def _raw_protected_paths(self):
         """Some path written anywhere in this command resolves into a protected tier (cached per command)."""
         ctx = self.ctx
@@ -7077,18 +7501,191 @@ class Analyzer:
             return False
         if literal and cls == 'root' and what in RM_CMDS and self._reproducible_clone(path):
             return False
-        label = {'log': 'a protected log, WAL or approval-state location', 'root': 'a protected harness directory',
-                 'ancestor': 'a directory that contains protected logs', 'unknown':
-                 'a path the guard cannot resolve that points at protected logs'}[cls]
         name = posixpath.basename(path.rstrip('/')) or path
+        if cls == 'unknown' and self._unknown_names_record(word, path):
+            cls = 'ancestor'  # the variable or substitution visibly holds a transcript, WAL or audit-log path
+        elif cls == 'unknown':
+            # the guard cannot tell where this path leads: allow, and say so once (never block on "could not read")
+            ctx.add(PARSE, 'unresolved-target', '%s targets a path the guard cannot resolve (%s)' % (what, name[:60]),
+                    'spell out the literal path so the guard can check it')
+            return False
+        if cls == 'ancestor' or self._is_record(path) or self._holds_records(path):
+            ctx.add(LOG_DELETE, 'log-delete',
+                    ('%s targets %s (%s). Claude/Codex transcripts, session WALs and harness audit logs need a verified '
+                     'copy before they are deleted, moved or overwritten, whoever asks (Fable and Astra included)'
+                     % (what, 'a directory that holds transcripts, WALs or audit logs'
+                        if cls == 'ancestor' or not self._is_record(path)
+                        else 'a transcript, session WAL or harness audit log', name[:60]))[:400],
+                    instead or ('run `%s` (copies it to the private log repository, verifies the push, then deletes '
+                                'it); or back up to %s and run `command_guard.py approve-delete --path P --remote REMOTE '
+                                '--wal W`, then delete the literal path' % (LOG_PUSH_ROUTE, APPROVE_REMOTES))
+                    + ('' if literal else '; spell out the literal path, globs and variables cannot be approved'))
+            return True
+        if self.maintainer():
+            self.maintainer_audit(what, path)
+            return False  # a harness maintainer (Fable/Astra marked supervisor) works on the machinery itself
+        machinery = self._harness_machinery(path)
+        if machinery and self._is_write(what):
+            ctx.add(LOG_DELETE, 'harness-write',
+                    '%s writes %s, a hook script, policy file or instruction file of the harness' % (what, name[:60]),
+                    'a harness maintainer (a Fable/Astra session the owner marked as supervisor) makes this change; '
+                    'reading and parse-checking it is always allowed')
+            return True
+        if self._is_write(what):
+            return False  # other harness files: only deleting and moving them away follows the role rules
+        allowed, _why = self.role_allows(path)
+        if allowed:
+            return False
         ctx.add(LOG_DELETE, 'log-delete',
-                ('%s targets %s (%s). Claude/Codex/harness logs and state are never deleted, moved or truncated '
-                 'without a verified backup' % (what, label, name[:60]))[:300],
-                instead or 'back up to ' + APPROVE_REMOTES + ' (rclone copy), then `command_guard.py approve-delete --path P '
-                '--remote REMOTE` (for example dropbox:backups/x or b2-archive:bucket/x), then delete the literal path' + ('' if literal else '; spell out the literal path, globs and '
-                                                           'variables cannot be approved')
-                + self._clone_hint(path))
+                ('%s targets %s (%s), which is not your own code (your session work dir, your scratch dir, or a checkout '
+                 'or worktree you made)' % (what, 'a path under ~/.claude, ~/.codex or ~/.agent-harness', name[:60]))[:400],
+                instead or ('a supervisor of the project that holds it, or a Fable/Astra agent, may run the same command; '
+                            'a dead worktree is freed with `python3 ~/.claude/hooks/ah.py worktree-remove --host local '
+                            '--path <path>`') + self._clone_hint(path))
         return True
+
+    WRITE_WORDS = ('overwrite', 'truncat', 'redirect', 'rewrite', 'dd of=', 'in-place', ' -i')
+
+    def _is_write(self, what):
+        return any(w in what for w in self.WRITE_WORDS)
+
+    def _harness_machinery(self, path):
+        """Hook scripts, guard and policy files, the instruction files and the hook wiring (settings*.json)."""
+        try:
+            real = self._probe('rp', path, os.path.realpath) if '\x00' not in path else path
+        except (OSError, ValueError):
+            real = path
+        return any(self._machinery_one(p) for p in {path, real})
+
+    def _machinery_one(self, path):
+        segs = Compiled._segs(path)
+        if self.c.is_guard_file(path):
+            return True  # (the rule files have their own rule: rule_file_dest)
+        homes = [Compiled._segs(h) for h in self.c.homes]
+        if len(segs) > 2 and segs[0] in ('home', 'users'):
+            homes.append(segs[:2])  # another machine's or user's home (ssh targets)
+        if segs[:1] == ['root']:
+            homes.append(['root'])
+        for home in homes:
+            if segs[:len(home)] != home:
+                continue
+            rest = segs[len(home):]
+            if rest[:2] in (['.claude', 'hooks'], ['.codex', 'agent-harness']) or rest[:1] == ['.codex'] and \
+                    len(rest) == 2 and rest[1] in ('hooks.json', 'config.toml'):
+                return True
+            if rest[:1] == ['.claude'] and len(rest) == 2 and re.fullmatch(r'settings(?:\.local)?\.json', rest[1]):
+                return True
+            if rest[:1] in (['.claude'], ['.codex'], ['.agent-harness']) and rest and \
+                    re.search(r'policy[^/]*\.json$', rest[-1]):
+                return True
+        return False
+
+    def maintainer(self):
+        """A harness maintainer: a Fable/Astra session the owner marked as supervisor (ah_roles.may_edit_harness when
+        the roles module has it)."""
+        cached = getattr(self, '_maintainer', None)
+        if cached is not None:
+            return cached
+        try:
+            import ah_roles
+            fn = getattr(ah_roles, 'may_edit_harness', None)
+            self._maintainer = bool(fn(self.payload) if fn else (ah_roles.is_top_rung(self.payload)
+                                                                  and ah_roles.is_supervisor(self.payload)))
+        except Exception:  # noqa: BLE001 - unknown: least privilege
+            self._maintainer = False
+        return self._maintainer
+
+    def maintainer_audit(self, what, path):
+        """One line per lifted refusal in ~/.agent-harness/logs/harness-maintainer.jsonl; never raises."""
+        try:
+            folder = os.path.join(self.c.home, '.agent-harness', 'logs')
+            os.makedirs(folder, mode=0o700, exist_ok=True)
+            row = {'at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'session': self.payload.get('session_id'),
+                   'what': str(what)[:80], 'path': str(path)[:300]}
+            fd = os.open(os.path.join(folder, 'harness-maintainer.jsonl'),
+                         os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            try:
+                os.write(fd, (json.dumps(row) + '\n').encode())
+            finally:
+                os.close(fd)
+        except (OSError, TypeError, ValueError):
+            pass
+
+    RECORD_LEAVES = ('projects', 'wals', 'sessions', 'transcripts', 'archived_sessions', 'codex-wals', 'history.jsonl')
+
+    def _unknown_names_record(self, word, path):
+        """An unresolved operand whose visible text leads to records: `$X/wals`, `$CLAUDE_DIR/projects`, or a variable,
+        substitution or loop fed from a command that names a record path (`D=~/.claude/wals; rm -rf "$D"`)."""
+        tail = Compiled._segs(path)
+        if tail and tail[-1] in self.RECORD_LEAVES:
+            return True
+        texts = list(word.subs) + [self.ctx.var_hints.get(v.lstrip('!'), '') for v in word.vars]
+        flow = any(self.FLOW_POSITIONAL.fullmatch(v.lstrip('!')) or v.lstrip('!') in getattr(self.ctx, 'flow_vars', ())
+                   or v.lstrip('!') not in self.ctx.vars for v in word.vars) or SUB_MARK in path
+        if flow or not texts:
+            texts.append(getattr(self.ctx, 'raw_top', '') or '')
+        return any(self._raw_record(m.group(0)) for t in texts for m in self.RAW_PATH.finditer(t[:200000]))
+
+    def _is_record(self, path):
+        """Transcripts, session WALs, harness audit logs (Compiled.records plus the WAL names anywhere), as typed or
+        where a link leads."""
+        try:
+            real = self._probe('rp', path, os.path.realpath) if '\x00' not in path else path
+        except (OSError, ValueError):
+            real = path
+        return self._record_one(path) or (real != path and self._record_one(real))
+
+    def _record_one(self, path):
+        c = self.c
+        segs = Compiled._segs(path)
+        if any(_prefix_match(segs, r) for r in c.records):
+            return True
+        folded = path.casefold()
+        if any(rx.search(folded) for rx in c.wal_regexes):
+            return True
+        if segs and (segs[-1] in c.file_names or segs[-1].endswith(c.file_suffixes)) or any(s in c.seg_names for s in segs):
+            return True
+        if segs and segs[-1].endswith('.jsonl'):  # an audit log anywhere under ~/.agent-harness except work/ and scratch/
+            for root in c.harness_logs:
+                if _prefix_match(segs, root) and len(segs) > len(root) and segs[len(root)] not in ('work', 'scratch'):
+                    return True
+        return False
+
+    def _holds_records(self, path):
+        """A directory above a record root (`rm -rf ~/.claude`, `rm -rf ~/.agent-harness/state`)."""
+        segs = Compiled._segs(path)
+        if not segs:
+            return True
+        for r in self.c.records:
+            if len(r) > len(segs) and _prefix_match(r[:len(segs)], segs):
+                return True
+        if segs[-1] == 'state' or (len(segs) >= 2 and segs[-2:] == ['.agent-harness', 'state']):
+            return True  # the audit logs of approve-delete and the guards live in ~/.agent-harness/state
+        return False
+
+    def role_allows(self, path):
+        """ah_roles.may_delete with the checkouts and worktrees the caller made (read from its transcript once)."""
+        try:
+            import ah_roles
+        except Exception:  # noqa: BLE001 - without the roles module only the plain own-roots rule is known
+            return False, 'roles module unavailable'
+        allowed, why = ah_roles.may_delete(self.payload, path)
+        if allowed:
+            return allowed, why
+        if self._own_extra is None:
+            self._own_extra = []
+            try:
+                transcript = ah_roles.caller_transcript(self.payload)
+                if transcript is not None:
+                    import worktree_hygiene
+                    started = time.monotonic()
+                    self._own_extra = worktree_hygiene.created_checkouts(str(transcript), 1.0)
+                    self.ctx.budget.deadline += time.monotonic() - started
+            except Exception:  # noqa: BLE001 - an unreadable transcript only means no extra own roots
+                self._own_extra = []
+        if self._own_extra:
+            return ah_roles.may_delete(self.payload, path, extra_own_roots=self._own_extra)
+        return allowed, why
 
     LONE_RM = re.compile(r'^[ \t]*(?:/bin/|/usr/bin/)?(?:rm|rmdir)(?:[ \t]+-[A-Za-z-]+)*(?:[ \t]+--)?(?:[ \t]+[^ \t\x00-\x1f\x7f;&|<>`$()\\"\'*?\[\]{}~#!]+)+[ \t]*$')
 
@@ -7099,84 +7696,28 @@ class Analyzer:
         raw = getattr(self.ctx, 'raw_top', '') or ''
         return bool(self.LONE_RM.match(raw)) and not re.search(r'[\x00-\x08\x0b-\x1f\x7f]', raw.strip())
 
-    _LITERAL = r'[^ \t\x00-\x1f\x7f;&|<>`$()\\"\'*?\[\]{}~#!]+'
-    # `git [-C /abs/repo] worktree remove [--] /abs/worktree`: a caller whose working directory is not a repository (a
-    # subagent's shell resets to $HOME on every call) names the registry repository with one literal -C
-    LONE_WORKTREE_REMOVE = re.compile(
-        r'^[ \t]*git[ \t]+(?:-C[ \t]+(' + _LITERAL + r')[ \t]+)?worktree[ \t]+remove[ \t]+(?:--[ \t]+)?'
-        r'(' + _LITERAL + r')[ \t]*$')
-
-    def _removable_linked_worktree(self, args, cwd_words=()):
-        """A standalone `git [-C /literal/repo] worktree remove /literal/top`; every other shape keeps the ordinary
-        refusal."""
-        self._worktree_reason = None
-        if len(args) not in (2, 3) or args[0].text != 'remove' or (len(args) == 3 and args[1].text != '--'):
-            return False
-        word = args[-1]
-        if word.dynamic or word.subs or word.glob:
-            return False
-        match = self.LONE_WORKTREE_REMOVE.fullmatch(getattr(self.ctx, 'raw_top', '') or '')
-        if not match or match.group(2) != word.text:
-            return False
-        calling = self.ctx.cwd
-        if match.group(1) is not None or cwd_words:
-            repo_word = cwd_words[0] if len(cwd_words) == 1 else None
-            if repo_word is None or repo_word.dynamic or repo_word.subs or repo_word.glob \
-                    or repo_word.text != match.group(1):
-                return False
-            calling = repo_word.text
-            if not os.path.isabs(calling) or os.path.realpath(calling) != calling or self._foreign_home(calling):
-                return False
-        cls, path, literal = self.target_class(word)
-        if cls != 'root' or not literal or path != word.text or self._foreign_home(path):
-            self._worktree_reason = 'the path is not a literal top inside a harness work root, so the guard does not verify it'
-            return False
-        started = time.monotonic()
-        try:
-            reason = linked_worktree_remove_refusal(path, calling, self.c.policy)
-            if reason is None and calling != self.ctx.cwd:
-                reason = self._dash_c_refusal(path, calling)
-        finally:
-            self.ctx.budget.deadline += time.monotonic() - started
-        self._worktree_reason = reason
-        return reason is None
-
-    def _dash_c_refusal(self, path, repo):
-        """With a -C the verification ran from the -C directory. Red-team F1: the shell may itself stand inside the
-        target (the plain form refuses that), and F2: the -C repository must be the target's own registry."""
-        try:
-            here = os.path.realpath(_git_out(self.ctx.cwd, ['rev-parse', '--show-toplevel'], 2.0).strip())
-        except (ValueError, OSError, TimeoutError):
-            here = None  # the calling directory is not inside any repository
-        except Exception:  # noqa: BLE001 - any surprise keeps the refusal
-            return 'could not check the calling directory'
-        if here == path or os.path.realpath(self.ctx.cwd).startswith(path + os.sep) or os.path.realpath(self.ctx.cwd) == path:
-            return 'the current worktree cannot remove itself'
-        # delta red-team N1 and N3: strings do not fold case or firmlinks, so compare files. Neither the shell's directory
-        # nor the -C directory may be the target, inside it, or inside the git directory that the removal also deletes.
-        try:
-            gitdir = os.path.realpath(_git_out(path, ['rev-parse', '--absolute-git-dir'], 2.0).strip())
-            targets = [os.stat(path), os.stat(gitdir)]
-            for start in (self.ctx.cwd, repo):
-                node = os.path.realpath(start)
-                for _ in range(200):
-                    st = os.stat(node)
-                    if any(os.path.samestat(st, target) for target in targets):
-                        return 'the calling directory is inside the worktree or its git directory'
-                    parent = os.path.dirname(node)
-                    if parent == node:
-                        break
-                    node = parent
-        except Exception:  # noqa: BLE001 - an unreadable ancestor or git directory keeps the refusal
-            return 'could not compare the calling directory with the worktree'
-        try:
-            theirs = os.path.realpath(_git_out(repo, ['rev-parse', '--path-format=absolute', '--git-common-dir'], 2.0).strip())
-            ours = os.path.realpath(_git_out(path, ['rev-parse', '--path-format=absolute', '--git-common-dir'], 2.0).strip())
-        except Exception:  # noqa: BLE001
-            return 'could not compare the -C repository with the worktree registry'
-        if theirs != ours:
-            return 'the -C repository is not the worktree registry'
-        return None
+    def worktree_remove(self, args, texts):
+        """`git worktree remove [--force] <path>` is a deletion of the worktree directory. Inside the harness roots it
+        follows the role rules like rm. Elsewhere a plain remove is allowed (git itself refuses a worktree with changes,
+        and the branch stays in the repository); --force discards changes, so it needs the caller's own worktree, a
+        supervised project or the top rung."""
+        force = any(t in ('-f', '--force') or re.fullmatch(r'-f+', t) for t in texts)
+        for w in _nondash(args):
+            cls, path, _literal = self.target_class(w)
+            if cls is not None:
+                self.refuse('git worktree remove', w, instead=None)
+                continue
+            if not force or w.dynamic or w.subs:
+                continue
+            path = norm_path(w.text, self.ctx)
+            allowed, _why = self.role_allows(path)
+            if not allowed:
+                self.ctx.add(LOG_DELETE, 'worktree-force-remove',
+                             'git worktree remove --force discards the uncommitted changes of %s, which is not your own '
+                             'worktree' % (posixpath.basename(path.rstrip('/')) or path)[:60],
+                             'a supervisor of the project or a Fable/Astra agent runs `python3 ~/.claude/hooks/ah.py '
+                             'worktree-remove --host local --path <path> --rescue` (saves its commits and changes first); '
+                             'anyone may run it without --force when the worktree is clean')
 
     def _clone_hint(self, path):
         reason = getattr(self.ctx, 'clone_reasons', {}).get(path)
@@ -7221,6 +7762,8 @@ class Analyzer:
         if not target or target in ('/dev/null', '/dev/stdout', '/dev/stderr', '/dev/tty') or target.startswith('&'):
             return
         if self.state_dest(target_word):
+            return
+        if self.rule_file_dest(target_word, 'a redirect'):
             return
         if truncating:
             # `echo x > existing` replaces the file's content just as `: >` empties it, so an existing literal file
@@ -7356,6 +7899,32 @@ class Analyzer:
                 return True
         return False
 
+    def rule_file_dest(self, word, what):
+        """A direct write by this command to ~/.claude/CLAUDE.md or ~/.codex/AGENTS.md, the files that bind every agent.
+        Only Fable/Astra and supervisors may write them. A script FILE that would write there is judged only when it
+        runs (bash x.sh), never when it is created, read or parse-checked. True when the write was refused."""
+        ctx = self.ctx
+        if word is None or not self.c.rule_files:
+            return False
+        hit = None
+        for alt in (word.all_alts() or word.alts)[:32]:
+            path = norm_path(alt, ctx)
+            for candidate in (path, self._probe('rp', path, os.path.realpath) if '\x00' not in path else path):
+                if candidate and candidate.casefold() in self.c.rule_files:
+                    hit = path
+        if hit is None:
+            return False
+        try:
+            import ah_roles
+            if self.maintainer() or ah_roles.is_top_rung(self.payload) or ah_roles.is_supervisor(self.payload):
+                self.maintainer_audit(what, hit)
+                return False
+        except Exception:  # noqa: BLE001 - roles unknown: least privilege
+            pass
+        ctx.add(LOG_DELETE, 'rule-file-write', '%s writes %s, the rule file that binds every agent' % (what, hit[:120]),
+                'only a supervisor session or a Fable/Astra agent writes it: ask the supervisor to make this change')
+        return True
+
     def destructive(self, name, args, texts):
         ctx = self.ctx
         nd = _nondash(args)
@@ -7398,7 +7967,7 @@ class Analyzer:
             else:
                 appending = _flag_letters(args) & {'a'} or '--append' in texts or any(t.lower() == '-append' for t in texts)
             for w in nd:
-                if self.state_dest(w):
+                if self.state_dest(w) or self.rule_file_dest(w, name):
                     continue
                 if not appending:
                     self.refuse(name + ' (overwrites)', w, tiers=('log', 'root', 'unknown'), need_existing=True)
@@ -7408,7 +7977,7 @@ class Analyzer:
                     fake = Word()
                     fake.alts = [x[3:] for x in a.alts]
                     fake.dynamic, fake.subs, fake.vars = a.dynamic, a.subs, a.vars
-                    if not self.state_dest(fake):
+                    if not self.state_dest(fake) and not self.rule_file_dest(fake, 'dd of='):
                         self.refuse('dd of=', fake, tiers=('log', 'root', 'unknown'), need_existing=True)
         elif name in ('touch', 'mkdir'):
             for w in nd:
@@ -7429,7 +7998,7 @@ class Analyzer:
             if any(t in ('-i', '-iinplace') or t.startswith('-i') and name == 'ruby' for t in texts) and \
                     (name == 'ruby' or 'inplace' in ' '.join(texts)):
                 for w in nd[1:] if name != 'ruby' else nd:
-                    self.refuse(name + ' in-place rewrite', w, tiers=('log', 'unknown'))
+                    self.refuse(name + ' in-place rewrite', w, tiers=('log', 'root', 'unknown'))
         elif name == 'unzip':
             if '-d' in texts and texts.index('-d') + 1 < len(args) and ('-o' in texts or '-of' in texts):
                 self.refuse('unzip -o (overwrites files)', args[texts.index('-d') + 1], tiers=('log', 'unknown'))
@@ -7463,8 +8032,8 @@ class Analyzer:
         elif name in ('sed', 'perl'):
             if _flag_letters(args) & {'i'} or any(t.startswith('-i') or t.startswith('--in-place') for t in texts):
                 for w in (nd[1:] if name == 'sed' and nd else nd):
-                    if not self.state_dest(w):
-                        self.refuse(name + ' -i (rewrites in place)', w, tiers=('log', 'unknown'))
+                    if not self.state_dest(w) and not self.rule_file_dest(w, name + ' -i'):
+                        self.refuse(name + ' -i (rewrites in place)', w, tiers=('log', 'root', 'unknown'))
         elif name == 'scp':
             self.remote_copy_dest(name, args, texts)
         elif name == 'rsync':
@@ -7664,11 +8233,15 @@ class Analyzer:
 
     def overwrite_dest(self, what, word):
         """cp/mv/ln/install onto an existing Tier A file (or into a protected dir by glob/variable)."""
+        if self.rule_file_dest(word, what):
+            return
         cls, path, literal = self.target_class(word)
         if cls == 'log' and literal and self._probe('id', path, os.path.isdir):
             return  # copying into a log directory adds a file; it does not replace one
         if cls in ('log', 'unknown') or cls == 'ancestor' and literal and not self._probe('id', path, os.path.isdir):
             self.refuse(what + ' (overwrites)', word, tiers=('log', 'unknown', 'ancestor'), need_existing=True)
+        elif cls == 'root' and self._harness_machinery(path):
+            self.refuse(what + ' (overwrites)', word, tiers=('root',))  # a new hook or policy file replaces one too
         self.note_created(word)
 
     def exact_protected(self, word, what):
@@ -7817,30 +8390,30 @@ KNOWN_NAMES = ['rclone', 'goodqa', 'gcloud', 'security', 'printenv', 'env', 'pki
 
 # --------------------------------------------------------------------------- decision
 
-def analyze(command, compiled=None, cwd=None, ps=False, marker=None):
+def analyze(command, compiled=None, cwd=None, ps=False, marker=None, payload=None):
     """Return the list of Findings for a command string. Raises Blocked when it cannot be analysed in budget."""
     compiled = compiled or Compiled(load_policy())
     if isinstance(command, (list, tuple)):
         command = ' '.join(_quote_for_rebuild(str(c)) for c in command)
     if len(command.encode('utf-8', 'replace')) > int(compiled.limits['max_command_bytes']):
         raise Blocked('command is larger than %d bytes' % int(compiled.limits['max_command_bytes']))
-    analyzer = Analyzer(compiled, cwd=cwd, ps=ps, marker=marker)
+    analyzer = Analyzer(compiled, cwd=cwd, ps=ps, marker=marker, payload=payload)
     try:
         findings = analyzer.run(command)
     except Exception as stop:  # noqa: BLE001 - re-raised: a budget stop, the hook's alarm or a bug
         stop.findings = list(analyzer.ctx.findings)  # what the guard already refused still counts (decide)
         raise
     if analyzer.ctx.unterminated and not any(f.category in ALWAYS_ENFORCED for f in findings):
-        if raw_sensitive(command, compiled, cwd=cwd):
-            findings.append(Finding(LOG_DELETE if PROTECTED_TEXT.search(command) else SECRET_DUMP, 'unanalysable',
+        if raw_secret_sensitive(command):
+            findings.append(Finding(_fail_closed_category(command), 'unanalysable',
                                     'the command has an unterminated quote or substitution and names a protected '
                                     'location or secret', 'close the quote, or split the command'))
         else:
             findings.append(Finding(PARSE, 'unterminated', 'the command has an unterminated quote or substitution',
                                     'check the quoting'))
     if analyzer.ctx.readings_capped and not any(f.category in ALWAYS_ENFORCED for f in findings):
-        if raw_sensitive(command, compiled, cwd=cwd):
-            findings.append(Finding(LOG_DELETE if PROTECTED_TEXT.search(command) else SECRET_DUMP, 'unanalysable',
+        if raw_secret_sensitive(command):
+            findings.append(Finding(_fail_closed_category(command), 'unanalysable',
                                     '`>!` cannot be judged under both shell readings (too large, too deeply nested, or '
                                     'they disagree on what a later command uses) and the command names a protected '
                                     'location or secret', 'split the command, or use `>|`'))
@@ -7870,6 +8443,19 @@ def raw_sensitive(text, compiled=None, cwd=None):
                 return True
     # code execution the guard could not follow, combined with a destructive verb
     return bool(EXEC_TEXT.search(t) and DESTROY_TEXT.search(t))
+
+
+def _fail_closed_category(command):
+    """The label a secret fail-closed refusal keeps: log_delete when the text also names a harness location (as before
+    2026-11-24, so the secret rules' own tests and messages are unchanged), else secret_dump."""
+    text = command if isinstance(command, str) else ' '.join(map(str, command or ()))
+    return LOG_DELETE if PROTECTED_TEXT.search(text) else SECRET_DUMP
+
+
+def raw_secret_sensitive(text):
+    """Always False (the redesign of 2026-11-24): when the analysis cannot finish, the words in a command never refuse
+    it, whether they name a deletion or a secret source. Kept so every fail-closed call site reads the one rule."""
+    return False
 
 
 EXEC_TEXT = re.compile(r'(?i)\|\s*(?:sudo\s+)?(?:ba|z|k|da|)sh\b|\beval\b|\b(?:ba|z|)sh\s+-[a-z]*c\b|'
@@ -7947,18 +8533,13 @@ def decide(command, compiled=None, cwd=None, ps=False, marker=None, payload=None
                                              'CLAUDE_CONFIG_DIR or an env wrapper, which could point it at a forged '
                                              'transcript or state', 'run command_guard.py approve-delete plainly'))
     try:
-        findings = analyze(command, compiled, cwd=cwd, ps=ps, marker=marker)
+        findings = analyze(command, compiled, cwd=cwd, ps=ps, marker=marker, payload=payload)
     except (Blocked, RecursionError) as stop:
         reason = str(stop) if isinstance(stop, Blocked) else 'command nesting is too deep'
         already = lift_secret_refusals([f for f in getattr(stop, 'findings', []) if modes.get(f.category) == 'enforce'],
                                        payload)
         if already:
             return 'block', format_block(_secret_path(already[0]), more=len(already) - 1)
-        if raw_sensitive(command, compiled, cwd=cwd):
-            category = LOG_DELETE if PROTECTED_TEXT.search(command if isinstance(command, str) else ' '.join(command)) \
-                else SECRET_DUMP
-            return 'block', format_block(Finding(category, 'unanalysable', reason + ' and it names a protected location '
-                                                 'or secret', 'split it into smaller commands or put it in a script file'))
         return 'warn', format_block(Finding(PARSE, 'unanalysable', reason, 'split it into smaller commands'), warn=True)
     except Exception as error:  # noqa: BLE001 - fail closed for sensitive-looking text, open for the rest
         already = lift_secret_refusals([f for f in getattr(error, 'findings', []) if modes.get(f.category) == 'enforce'],
@@ -7967,11 +8548,9 @@ def decide(command, compiled=None, cwd=None, ps=False, marker=None, payload=None
             return 'block', format_block(_secret_path(already[0]), more=len(already) - 1)
         try:
             text = command if isinstance(command, str) else ' '.join(map(str, command))
-            # secret text alone never refuses here: the raw scan sees words, not effect
-            raw = [f for f in fallback_scan(text, compiled) if modes.get(f.category) == 'enforce' and f.category != SECRET_DUMP]
-            if not raw and raw_sensitive(command, compiled, cwd=cwd):
-                raw = [Finding(LOG_DELETE if PROTECTED_TEXT.search(text) else SECRET_DUMP, 'guard-error',
-                               'it names a protected location or secret', 'retry with a simpler command')]
+            # words the guard could not read never refuse: neither a deletion nor a secret source (2026-11-24)
+            raw = [f for f in fallback_scan(text, compiled) if modes.get(f.category) == 'enforce'
+                   and f.category not in (SECRET_DUMP, LOG_DELETE)]
         except Exception:  # noqa: BLE001
             raw = [Finding(SECRET_DUMP, 'guard-error', 'the guard failed twice', 'retry with a simpler command')]
         if raw:
@@ -9722,6 +10301,48 @@ def install_files_refusal(command, is_main, home=None):
     return None
 
 
+def worktree_rescue_refusal(command, payload):
+    """None, or why `ah worktree-remove --rescue` is refused for this caller. --rescue removes a worktree that has
+    uncommitted changes or unpublished commits (after saving them), so only the caller's own worktree, a supervisor of
+    the project, or a Fable/Astra caller may run it (the user's rules of 2026-11-24)."""
+    text = command if isinstance(command, str) else ' '.join(map(str, command))
+    if 'worktree-remove' not in text or '--rescue' not in text:
+        return None
+    for segment in re.split(r'[;&|\n]+', text):
+        try:
+            tokens = shlex.split(segment)
+        except ValueError:
+            continue
+        if 'worktree-remove' not in tokens or '--rescue' not in tokens:
+            continue
+        path = next((tokens[k + 1] for k, t in enumerate(tokens[:-1]) if t == '--path'), None) or next(
+            (t.split('=', 1)[1] for t in tokens if t.startswith('--path=')), None)
+        host = next((tokens[k + 1] for k, t in enumerate(tokens[:-1]) if t == '--host'), 'local')
+        try:
+            import ah_roles
+            if ah_roles.is_top_rung(payload):
+                continue
+            if path and host == 'local':
+                real = os.path.realpath(os.path.expanduser(path))
+                if ah_roles.may_delete(payload, real)[0]:
+                    continue
+                try:
+                    common = os.path.realpath(_git_out(real, ['rev-parse', '--path-format=absolute', '--git-common-dir'],
+                                                       5.0).strip())
+                    primary = os.path.dirname(common) if os.path.basename(common) == '.git' else common
+                except Exception:  # noqa: BLE001
+                    primary = None
+                if primary and ah_roles.may_delete(payload, primary)[0] and ah_roles.is_supervisor(payload):
+                    continue
+            elif path and ah_roles.is_supervisor(payload) and ah_roles.supervised_roots(payload):
+                continue  # another host's paths cannot be checked from here; a supervisor is trusted with its projects
+        except Exception:  # noqa: BLE001 - roles unknown: least privilege
+            pass
+        return ('`ah worktree-remove --rescue` removes a worktree with uncommitted changes or unpublished commits; only '
+                'its own session, a supervisor of the project or a Fable/Astra agent may run it')
+    return None
+
+
 def _install_files_main(payload):
     """Prove a main caller for the installed hook-file deploy command only."""
     try:
@@ -9777,7 +10398,7 @@ def hook_main(fmt='exit2', stdin_bytes=None, compiled=None, marker=True):
         cwd = payload_cwd(payload)
         c = compiled or Compiled(load_policy(), cwd=cwd)
         if payload is None:
-            if raw_sensitive(raw_text, c):
+            if raw_secret_sensitive(raw_text):
                 return emit('block', format_block(Finding(SECRET_DUMP, 'unparsable-payload', 'the hook payload is not '
                                                           'valid JSON and names a protected location or secret',
                                                           'retry the command')), fmt)
@@ -9791,6 +10412,11 @@ def hook_main(fmt='exit2', stdin_bytes=None, compiled=None, marker=True):
             if refusal:
                 return emit('block', format_block(Finding(LOG_DELETE, 'install-files', refusal.replace('ah install-files: ', ''),
                                                           INSTALL_FILES_FORM)), fmt)
+        rescue = worktree_rescue_refusal(command, payload)
+        if rescue:
+            return emit('block', format_block(Finding(LOG_DELETE, 'worktree-rescue', rescue,
+                                                      'run it without --rescue (a clean, published or ended-session '
+                                                      'worktree needs none), or ask the supervisor of the project')), fmt)
         approvals = Approvals(compiled=c) if marker else None
         verdict, message = decide(command, c, cwd=cwd, ps=ps, marker=approvals, payload=payload)
         if verdict != 'block' and approvals is not None and approvals.used and not approvals.consume():
@@ -9799,7 +10425,7 @@ def hook_main(fmt='exit2', stdin_bytes=None, compiled=None, marker=True):
                                                              'verified backup'))
         return emit(verdict, message, fmt)
     except TimeoutError:
-        verdict = 'block' if raw_sensitive(raw_text) else 'warn'
+        verdict = 'block' if raw_secret_sensitive(raw_text) else 'warn'
         return emit(verdict, format_block(Finding(SECRET_DUMP if verdict == 'block' else PARSE, 'unanalysable',
                                                   'analysis exceeded its wall-clock limit', 'split it into smaller '
                                                   'commands or put it in a script file'), warn=verdict == 'warn'), fmt)
@@ -9809,9 +10435,9 @@ def hook_main(fmt='exit2', stdin_bytes=None, compiled=None, marker=True):
                 raw_text = sys.stdin.buffer.read(8 << 20).decode('utf-8', 'replace')
             except Exception:  # noqa: BLE001
                 raw_text = ''
-        if raw_sensitive(raw_text):
+        if raw_secret_sensitive(raw_text):
             return emit('block', format_block(Finding(SECRET_DUMP, 'guard-error', 'guard internal error (%s) on a '
-                                                      'command that names a protected location or secret'
+                                                      'command that names a secret source'
                                                       % type(error).__name__, 'split the command into simple steps; '
                                                       'run command_guard.py doctor')), fmt)
         print('command_guard: internal error (%s); the command looked harmless and was allowed'
@@ -10034,6 +10660,12 @@ def main(argv=None):
                         help='read the remote with this host\'s own credentials (private repository); refs cannot be supplied')
         if name == 'remove-worktree':
             wt.add_argument('--expect-head')
+    fw = sub.add_parser('free-worktree', help='remove one dead linked worktree under the 2026-11-24 rules (ah worktree-remove)')
+    fw.add_argument('--path', required=True)
+    fw.add_argument('--rescue', action='store_true', help='save commits and changes first, then remove (the guard '
+                                                          'admits it for a supervisor or Fable/Astra)')
+    fw.add_argument('--session', help='caller session: the patch goes under ~/.agent-harness/work/<session>/rescue')
+    fw.add_argument('--dry-run', action='store_true')
     sub.add_parser('revoke-delete')
     scan = sub.add_parser('scan-wal')
     scan.add_argument('paths', nargs='+')
@@ -10115,6 +10747,13 @@ def main(argv=None):
             result = remove_worktree(args.path, args.remote_auth, args.expect_head, policy)
         print(json.dumps(result))
         return 0 if result.get('removable') and (args.cmd == 'verify-worktree' or result.get('removed')) else 1
+    if args.cmd == 'free-worktree':
+        patch_dir = None
+        if args.session and _SESSION_ID.match(args.session):
+            patch_dir = os.path.join(os.path.expanduser('~'), '.agent-harness', 'work', args.session, 'rescue')
+        result = free_worktree(args.path, args.rescue, patch_dir, args.dry_run)
+        print(json.dumps(result))
+        return 0 if result.get('removable') and (args.dry_run or result.get('removed')) else 1
     if args.cmd == 'revoke-delete':
         try:
             revoke_delete()

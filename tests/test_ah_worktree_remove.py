@@ -434,57 +434,6 @@ class RedTeamRound2(Repo):
 
 
 class GuardMessage(Repo):
-    def test_the_refusal_text_carries_the_verifier_reason_and_the_next_step_without_advising_discard(self):
-        (self.linked / "a.txt").write_text("changed\n")
-        compiled = cg.Compiled(self.policy, home=str(self.home), cwd=str(self.primary))
-        verdict, text = cg.decide("git worktree remove %s" % self.linked, compiled, cwd=str(self.primary))
-        self.assertEqual(verdict, "block")
-        self.assertIn("verifier: the working tree is not clean", text)
-        self.assertIn("commit and push what you need", text)
-        self.assertIn("belongs to another owner, leave it", text)
-        for harmful in ("git clean", "discard", "reset --hard", "clean the worktree"):
-            self.assertNotIn(harmful, text)
-        git(self.linked, "checkout", "-q", "--", "a.txt")
-
-        def refuses(url, repo, timeout):
-            raise ValueError("no credentials")
-        with mock.patch.object(cg, "REMOTE_LS", refuses):
-            verdict, text = cg.decide("git worktree remove %s" % self.linked, compiled, cwd=str(self.primary))
-        self.assertEqual(verdict, "block")
-        self.assertIn("the remote did not answer (private, unreachable or deleted", text)
-        self.assertIn("--remote-auth", text)
-        self.assertNotIn("--remote-heads-from", text)
-        self.assertNotIn(str(self.home), text.replace(str(self.linked), ""))
-
-    def test_a_reason_belongs_to_its_own_segment_only(self):
-        dirty = self.base / "dirty"
-        git(self.primary, "worktree", "add", "-q", "-b", "dirty", str(dirty))
-        git(self.primary, "update-ref", "refs/remotes/origin/dirty", git(dirty, "rev-parse", "HEAD"))
-        self.live["refs/heads/dirty"] = git(dirty, "rev-parse", "HEAD")
-        (dirty / "a.txt").write_text("changed\n")
-        compiled = cg.Compiled(self.policy, home=str(self.home), cwd=str(self.primary))
-
-        def text(command):
-            return cg.decide(command, compiled, cwd=str(self.primary))
-
-        # The exemption (and so a verifier reason) exists only for ONE standalone remove command; any multi-segment line
-        # is judged by the generic rule and must never carry a reason from another segment or an earlier command.
-        for command in ("git worktree remove %s ; git worktree prune" % dirty,
-                        "git worktree prune ; git worktree remove %s" % dirty,
-                        "git worktree remove %s ; git worktree remove %s" % (self.linked, dirty),
-                        "git worktree remove %s %s" % (self.linked, dirty)):
-            with self.subTest(command=command.replace(str(self.base), "~")):
-                verdict, message = text(command)
-                self.assertEqual(verdict, "block")
-                self.assertNotIn("verifier:", message)
-        # the standalone form still explains itself, and a later standalone command does not inherit it
-        verdict, message = text("git worktree remove %s" % dirty)
-        self.assertEqual(message.count("verifier: the working tree is not clean"), 1)
-        verdict, message = text("git worktree remove %s" % self.linked)
-        self.assertEqual(verdict, "allow")
-        verdict, message = text("git worktree prune")
-        self.assertNotIn("verifier:", message)
-
     def test_a_reason_from_one_segment_is_not_shown_for_another(self):
         self.assertIsNone(cg._worktree_instead(None))
         self.assertIsNone(cg._worktree_instead(""))
@@ -507,7 +456,7 @@ class FakeRun:
 
 def verdict(**kw):
     base = {"removable": True, "removed": True, "head": "a" * 40, "reason": None, "urls": {"origin": [URL]},
-            "freed_bytes": 10, "verifier": 2}
+            "freed_bytes": 10, "verifier": ah_worktree.VERIFIER_VERSION}
     base.update(kw)
     return {"out": json.dumps(base)}
 
@@ -534,7 +483,7 @@ class Delegation(unittest.TestCase):
         argv = run.calls[0][0]
         self.assertEqual(argv[:6], ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--"])
         self.assertEqual(argv[6], "t2-dev")
-        self.assertEqual(argv[7], "python3 -I .claude/hooks/command_guard.py remove-worktree --path " + self.PATH)
+        self.assertEqual(argv[7], "python3 -I .claude/hooks/command_guard.py free-worktree --path " + self.PATH)
         self.assertNotIn("--force", " ".join(argv))
         self.assertEqual([row["event"] for row in self.audit_rows()], ["start", "result"])
         self.assertEqual(len(run.calls), 1)
@@ -542,8 +491,8 @@ class Delegation(unittest.TestCase):
     def test_remote_auth_adds_one_flag_and_never_any_refs(self):
         run = FakeRun(verdict())
         self.remove(run, authenticated=True)
-        self.assertEqual(run.calls[0][0][7], "python3 -I .claude/hooks/command_guard.py remove-worktree --path "
-                         + self.PATH + " --remote-auth")
+        # 2026-11-24: the free-worktree verifier reads no remote, so --remote-auth is accepted and adds nothing
+        self.assertEqual(run.calls[0][0][7], "python3 -I .claude/hooks/command_guard.py free-worktree --path " + self.PATH)
         self.assertNotIn("input", run.calls[0][1])
         self.assertNotIn("ls-remote", " ".join(run.calls[0][0]))
 
@@ -553,13 +502,12 @@ class Delegation(unittest.TestCase):
         argv = run.calls[0][0]
         self.assertEqual(argv[1], "-I")
         self.assertTrue(argv[2].endswith("command_guard.py"))
-        self.assertEqual(argv[3:], ["remove-worktree", "--path", self.PATH])
+        self.assertEqual(argv[3:], ["free-worktree", "--path", self.PATH])
 
     def test_bad_requests_fail_before_any_process_or_audit_row(self):
         for kwargs in ({"host": "dev2"}, {"host": "t2-dev; id"}, {"path": "relative/p"}, {"path": "/a/../b"},
                        {"path": "/a/b/"}, {"path": "/a/b c"}, {"path": "/a/$(x)"}, {"path": "/a/b;rm"}, {"path": "/"},
-                       {"path": "/a//b"}, {"path": "/a/é"}, {"reason": ""}, {"reason": "x" * 501},
-                       {"reason": "bad\x01reason"}):
+                       {"path": "/a//b"}, {"path": "/a/é"}):  # a reason is optional since 2026-11-24
             with self.subTest(kwargs=str(kwargs)[:40]):
                 run = FakeRun()
                 with self.assertRaises(ah_worktree.WorktreeError):
@@ -579,9 +527,9 @@ class Delegation(unittest.TestCase):
 
     def test_an_unknown_outcome_after_the_runner_started_is_recorded_as_unknown_never_as_not_removed(self):
         for answer in ({"out": ""}, {"out": "not json"}, {"out": "[]"}, {"out": json.dumps({"removed": True})},
-                       {"out": json.dumps({"removable": "yes", "verifier": 2})}, OSError("ssh failed"),
+                       {"out": json.dumps({"removable": "yes", "verifier": ah_worktree.VERIFIER_VERSION})}, OSError("ssh failed"),
                        subprocess.TimeoutExpired("ssh", 1),
-                       {"out": json.dumps({"removable": True, "removed": "maybe", "verifier": 2})}):
+                       {"out": json.dumps({"removable": True, "removed": "maybe", "verifier": ah_worktree.VERIFIER_VERSION})}):
             with self.subTest(answer=str(answer)[:40]):
                 before = len(self.audit_rows())
                 with self.assertRaises(ah_worktree.WorktreeError) as caught:
@@ -604,7 +552,7 @@ class Delegation(unittest.TestCase):
     # red-team r4 F2: a null `removed` beside removable true is not a definite answer
     def test_a_null_removed_beside_removable_true_is_an_unknown_outcome_not_a_failure(self):
         for removed in (None, "missing"):
-            body = {"removable": True, "verifier": 2, "head": "a" * 40}
+            body = {"removable": True, "verifier": ah_worktree.VERIFIER_VERSION, "head": "a" * 40}
             if removed != "missing":
                 body["removed"] = None
             with self.subTest(removed=removed):
@@ -615,7 +563,7 @@ class Delegation(unittest.TestCase):
                 self.assertFalse(result["ok"])
                 self.assertIn("unknown", (row["why"] or "").lower())
         # removable false with no removed key is a definite refusal: False
-        result = self.remove(FakeRun({"out": json.dumps({"removable": False, "verifier": 2, "reason": "not clean"})}))
+        result = self.remove(FakeRun({"out": json.dumps({"removable": False, "verifier": ah_worktree.VERIFIER_VERSION, "reason": "not clean"})}))
         self.assertIs(self.audit_rows()[-1]["removed"], False)
         self.assertIs(result["removed"], False)
 

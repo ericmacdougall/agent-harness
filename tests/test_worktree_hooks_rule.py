@@ -146,12 +146,10 @@ class Hooks(Repo):
 
     # ---- AC-2 and NEG-3: the strict callers stay strict
     def test_the_default_policy_the_hook_form_and_the_clone_verifier_still_refuse_hooks(self):
+        # 2026-11-24: the hook form follows the role rules now; only the strict verifier is checked here
         self.assertEqual(cg.linked_worktree_remove_refusal(str(self.linked), str(self.primary), self.policy),
                          "it has hand-written git hooks")
         compiled = cg.Compiled(self.policy, home=str(self.home), cwd=str(self.primary))
-        verdict, text = cg.decide("git worktree remove %s" % self.linked, compiled, cwd=str(self.primary))
-        self.assertEqual(verdict, "block")
-        self.assertIn("hand-written git hooks", text)
         self.assertFalse(self.marker.exists())
 
     def test_only_a_real_true_allows_hooks(self):

@@ -724,9 +724,43 @@ def _git_touch(words: list, cwd: "str | None", env: dict) -> "tuple[str, str] | 
             if p:
                 return "created", p
         return None
+    if sub[0] == "clone":
+        # `git clone [opts] <url> [<dir>]`: the directory it makes (the URL's last name when no dir is given)
+        pos = [w for w in words[i + 1:] if not w[0].startswith("-")]
+        if any(dyn for _t, dyn in pos) or not pos or gcwd is None:
+            return None
+        if len(pos) >= 2:
+            target = pos[1][0]
+        else:
+            target = re.sub(r"\.git$", "", pos[0][0].rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1])
+        p = _resolve(target, gcwd) if target else None
+        return ("cloned", p) if p else None
     if sub[0] in MUTATING_GIT and gcwd:
         return "worked", gcwd
     return None
+
+
+def created_checkouts(transcript: str, seconds: float = 1.5) -> list:
+    """Absolute paths of the worktrees (`git worktree add`) and clones (`git clone`) the agent of `transcript` made, read
+    from its Bash calls within `seconds`. Best effort: a timeout or an unreadable transcript returns what was found so far.
+    Guards pass these as the caller's own roots (ah_roles.may_delete's extra_own_roots)."""
+    out: list = []
+    if not transcript or not os.path.isfile(transcript):
+        return out
+    try:
+        for ln in iter_lines(transcript, Budget(seconds), (b"worktree", b"clone")):
+            if b'"tool_use"' not in ln:
+                continue
+            try:
+                rec = json.loads(ln)
+            except ValueError:
+                continue
+            for kind, path, _ts in entry_touches(rec):
+                if kind in ("created", "cloned") and path not in out:
+                    out.append(path)
+    except (OutOfTime, OSError):
+        pass
+    return out
 
 
 def bash_touches(command: str, cwd: str) -> list:

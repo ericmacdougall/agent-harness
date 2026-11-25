@@ -3869,11 +3869,14 @@ def build_parser():
     kp.add_argument("--agent", help="calling agent id for the audit row")
     kp.add_argument("--wal", help="caller WAL path (default: this session's main WAL)")
     kp.add_argument("--via", help=argparse.SUPPRESS)
-    wp = sub.add_parser("worktree-remove", help="remove ONE verified clean, published linked worktree here or on t2-dev "
-                        "(audited; see ah_worktree.py; no --force exists)")
+    wp = sub.add_parser("worktree-remove", help="free ONE dead linked worktree here or on a remote host (audited; see "
+                        "ah_worktree.py; --rescue saves commits and changes first)")
     wp.add_argument("--host", required=True, help="local or t2-dev")
     wp.add_argument("--path", required=True, help="one literal absolute path")
-    wp.add_argument("--reason", required=True, help="why (mandatory, logged)")
+    wp.add_argument("--reason", help="why (optional, logged)")
+    wp.add_argument("--rescue", action="store_true", help="save commits to refs/rescue/<name> and changes to a patch, "
+                    "then remove (a supervisor of the project or Fable/Astra)")
+    wp.add_argument("--dry-run", dest="dry_run", action="store_true")
     wp.add_argument("--remote-auth", dest="remote_auth", action="store_true",
                     help="private repository: the verifier reads the remote with the TARGET host's own credentials in a "
                          "scrubbed environment (branch refs cannot be supplied by the caller)")
@@ -4076,7 +4079,7 @@ def run(args, home: Path) -> dict:
         try:
             return ah_worktree.remove(args.host, args.path, args.reason, args.remote_auth,
                                       args.session or env_session() or "", args.agent or os.environ.get("AH_AGENT_ID", ""),
-                                      home)
+                                      home, rescue=args.rescue, dry_run=args.dry_run)
         except ah_worktree.WorktreeError as e:
             raise AhError(e.code, str(e), e.exit_code)
     if cmd == "install-files":
@@ -4150,6 +4153,9 @@ def main(argv=None) -> int:
     if given[:1] == ["limits"]:  # thresholds: repo defaults plus owner/supervisor-tightened local values
         import resource_budget  # noqa: PLC0415
         return resource_budget.limits_cli(given[1:])
+    if given[:1] == ["log-push"]:  # push logs to the private log repository, verify, then delete them (ah_log_push.py)
+        import ah_log_push  # noqa: PLC0415
+        return ah_log_push.main(given[1:])
     if given[:1] == ["guard-selftest"]:  # goodqa#15876: a fixed live test of a guard rule; it takes no command, path or directory
         try:
             import guard_selftest  # noqa: PLC0415
