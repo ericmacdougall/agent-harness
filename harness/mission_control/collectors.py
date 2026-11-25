@@ -61,7 +61,7 @@ def read_regular(path, limit: int) -> bytes:
     return data
 
 
-POLICY_COUNT_CAPS = ("session_live_agents", "session_owner_agents", "live_ttl_seconds", "top_assent_max_age_seconds")
+POLICY_COUNT_CAPS = ("session_owner_agents", "live_ttl_seconds", "top_assent_max_age_seconds")
 
 
 def policy_caps(data) -> dict:

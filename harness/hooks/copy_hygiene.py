@@ -82,6 +82,8 @@ Config (~/.agent-harness/state/copy-hygiene.json; every key optional):
   min_free_gb (25), min_free_pct (10; the floor is the smaller of the two), max_age_hours (24), max_total_gb (60),
   reaper_delete_enabled (false), roots ([~/.agent-harness/work]), name_patterns (["tester-*", "test-copy-*",
   "click-test-*"]), protected_paths ([]).
+min_free_gb comes from resource_budget's limit of the same name (`ah limits set min_free_gb ...`) when that is set
+locally, else from this file, else the shipped default (resource_limits.json).
 Env: HARNESS_COPY_HYGIENE_MIN_FREE_GB overrides min_free_gb; HARNESS_COPY_HYGIENE_HOME relocates the state (tests);
 HARNESS_COPY_HYGIENE_UNIT_DIRS (os.pathsep list) replaces the systemd/launchd directories scanned (tests).
 """
@@ -190,10 +192,23 @@ def load_config() -> dict:
             user = d
     except (OSError, ValueError):
         pass
+    floor = _budget_min_free_gb()
+    if floor is not None and (floor[1] or "min_free_gb" not in user):
+        user = dict(user, min_free_gb=floor[0])  # one disk floor: `ah limits` wins once someone set it there
     env = os.environ.get("HARNESS_COPY_HYGIENE_MIN_FREE_GB")
     if env:
         user = dict(user, min_free_gb=env)
     return normalize(user)
+
+
+def _budget_min_free_gb():
+    """(value, set_locally) of resource_budget's min_free_gb limit, or None when resource_budget is not installed."""
+    try:
+        import resource_budget  # noqa: PLC0415 - a sibling module; older installs lack the limit
+        detail = resource_budget.limit_detail("min_free_gb")
+        return float(detail["value"]), detail["source"] != "repo default"
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _atomic_write(path: str, text: str) -> None:

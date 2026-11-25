@@ -239,21 +239,33 @@ def may_edit_harness(payload, home=None) -> bool:
 # Added for `log_backup.py ack` (context-noise workstream): a CLI run from an agent's shell has no hook payload, so
 # its session comes from the runtime's environment and its transcript from the session's project file.
 
-def cli_payload(environ=None, home=None) -> dict:
-    """A payload-shaped dict for a CLI run inside a Claude Code shell: session_id from CLAUDE_CODE_SESSION_ID and the
-    session's transcript when one is found. {} when the environment names no session."""
+SESSION_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")  # a session id the caller passed (ah's --session)
+
+
+def cli_payload(environ=None, home=None, session=None, agent="") -> dict:
+    """A payload-shaped dict for a CLI run inside a Claude Code shell: session_id (from `session`, else
+    CLAUDE_CODE_SESSION_ID), agent_id when given, and the session's transcript when one is found. {} when nothing names
+    a session or an agent. Unknown stays unknown, which is the least privilege. The one implementation: ah, ah_kill and
+    log_backup call it."""
     environ = os.environ if environ is None else environ
-    session = environ.get("CLAUDE_CODE_SESSION_ID") or ""
-    if not SESSION_ID.match(session):
-        return {}
-    payload = {"session_id": session}
-    try:
-        for path in (Path(home or Path.home()) / ".claude" / "projects").glob(f"*/{session}.jsonl"):
-            if path.is_file():
-                payload["transcript_path"] = str(path)
-                break
-    except OSError:
-        pass
+    if session is None:
+        session = environ.get("CLAUDE_CODE_SESSION_ID") or ""
+        valid = bool(SESSION_ID.match(session))
+    else:
+        session = str(session or "")
+        valid = bool(SESSION_NAME.match(session)) and ".." not in session
+    payload = {}
+    if valid:
+        payload["session_id"] = session
+        try:
+            found = sorted((Path(home or Path.home()) / ".claude" / "projects").glob(f"*/{session}.jsonl"))
+            found = [path for path in found if path.is_file()]
+            if found:
+                payload["transcript_path"] = str(found[0])
+        except OSError:
+            pass
+    if agent:
+        payload["agent_id"] = str(agent)
     return payload
 
 

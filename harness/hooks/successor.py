@@ -431,8 +431,9 @@ def _cli(argv=None) -> int:
         import ah
         import model_tiers
         import tier_gate
+        import resource_budget
         policy = model_tiers.load_policy()
-        cap = int((policy.get("caps") or {}).get("session_owner_agents") or 4)
+        cap = int(resource_budget.owner_cap()["max"])  # the one owner cap (2026-11-24)
         live = len(tier_gate.live_owner_ids(args.session, policy))
         out = succeed(home, args.session, args.agent, owners_doc=ah.owners(home, args.session), live_count=live, cap=cap,
                       dry_run=args.dry_run, alert=ring_alert(home))

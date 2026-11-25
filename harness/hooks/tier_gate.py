@@ -688,7 +688,7 @@ def _slot_freed(row):
     if not isinstance(disp, dict) or row.get('decision_required') is True:
         return False
     kind = disp.get('kind')
-    if kind in ('closed', 'superseded', 'wontdo', 'legacy'):
+    if kind in ('closed', 'superseded', 'wontdo', 'legacy', 'finished'):
         return True
     # a reassignment or a wait frees the slot only while its holder is live (`live` is ah's own verdict); this is checked
     # here, not left to liveness.row_disposed, which accepted any reassignment until never-drop 16.1 lands (red-team ad4294 B1)

@@ -94,5 +94,36 @@ class Finished(unittest.TestCase):
         self.assertEqual(args.kind, "finished")
 
 
+class FinishedEndsAnOwner(unittest.TestCase):
+    """liveness and tier_gate read `finished` as an ended owner, like closed (fails before 2026-11-24 integration)."""
+
+    def test_liveness_treats_finished_as_ended(self):
+        import liveness
+        self.assertIn("finished", liveness.DISPOSITIONS)
+        self.assertIn("finished", liveness.ENDING_DISPOSITIONS)
+        self.assertTrue(liveness.disposition_live({"kind": "finished", "at": NOW - 86400 * 30}, NOW))
+        self.assertTrue(liveness.row_disposed({"disposition": {"kind": "finished"}}))
+
+    def test_tier_gate_frees_the_slot_of_a_finished_owner(self):
+        import tier_gate
+        self.assertTrue(tier_gate._slot_freed({"disposition": {"kind": "finished"}}))
+        self.assertFalse(tier_gate._slot_freed({"disposition": {"kind": "finished"}, "decision_required": True}))
+
+    def test_cli_payload_has_one_implementation(self):
+        import ah_kill
+        import ah_roles
+        self.assertFalse(hasattr(ah_kill, "cli_payload"))
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / ".claude" / "projects" / "-p"
+            project.mkdir(parents=True)
+            (project / f"{SESSION}.jsonl").write_text("{}\n")
+            got = ah_roles.cli_payload(home=tmp, session=SESSION, agent="a1")
+            self.assertEqual(got["session_id"], SESSION)
+            self.assertEqual(got["agent_id"], "a1")
+            self.assertTrue(got["transcript_path"].endswith(f"{SESSION}.jsonl"))
+            self.assertEqual(ah_roles.cli_payload(environ={}, home=tmp), {})
+            self.assertNotIn("session_id", ah_roles.cli_payload(home=tmp, session="../x"))
+
+
 if __name__ == "__main__":
     unittest.main()

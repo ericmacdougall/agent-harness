@@ -81,7 +81,7 @@ def waiting_on(note: str):
 OWNER_TYPES = ("task-owner",)
 
 
-DISPOSITIONS = ("resumed", "reassigned", "waiting", "closed", "legacy", "superseded", "wontdo")
+DISPOSITIONS = ("resumed", "reassigned", "waiting", "closed", "legacy", "superseded", "wontdo", "finished")
 CLOSING = ("closed", "superseded", "wontdo")  # end an owner; only "closed" means done (deployed live and tested)
 RESUMED_GRACE_S = 30 * 60  # a "resumed" disposition must be followed by activity within this window
 
@@ -96,12 +96,13 @@ def disposition_live(disp: dict | None, now: float, last_activity: float = 0.0, 
     superseded  permanent, not done: the scope moved elsewhere; cites a ticket
     wontdo      permanent, not done: nobody will do it; cites a ticket
     legacy      permanent, not done: quiet before the gate was installed and unverified; `ah owners` keeps listing it
+    finished    permanent: the task's process ended or it reported finished (`ah task dispose --kind finished`)
     """
     if not isinstance(disp, dict) or disp.get("kind") not in DISPOSITIONS:
         return False
     at = float(disp.get("at") or 0.0)
     kind = disp["kind"]
-    if kind in ("closed", "legacy", "superseded", "wontdo"):
+    if kind in ("closed", "legacy", "superseded", "wontdo", "finished"):
         return True
     if kind == "waiting":
         return now < float(disp.get("until") or 0.0)
@@ -110,7 +111,7 @@ def disposition_live(disp: dict | None, now: float, last_activity: float = 0.0, 
     return (last_activity > at) or (now - at < RESUMED_GRACE_S)
 
 
-ENDING_DISPOSITIONS = frozenset(("reassigned", "closed", "superseded", "wontdo", "legacy"))
+ENDING_DISPOSITIONS = frozenset(("reassigned", "closed", "superseded", "wontdo", "legacy", "finished"))
 
 
 def row_disposed(row: dict) -> bool:
