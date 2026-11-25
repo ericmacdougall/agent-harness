@@ -28,6 +28,9 @@ class TicketDelivery(workflow.DeliveryWorkflow):
         policy['ticket_systems']['goodqa'].update(endpoint=self.fake.url, key_file=str(key), org_id='org-1',
                                                   repos=['github\\.com[:/]fixture/'], timeout_seconds=5,
                                                   total_deadline_seconds=20)
+        # These tests pin how deliver enforces the policy, so the fixture host runs it in strict mode (the shipped
+        # default since 2026-11-24 is warn: form problems are printed and never block).
+        policy['mode'] = 'strict'
         (hooks / 'commit_policy.json').write_text(json.dumps(policy))
         self.deliver = hooks / 'deliver.py'
         self.issue = self.fake.add_issue(7)
