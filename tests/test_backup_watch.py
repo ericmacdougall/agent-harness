@@ -44,8 +44,17 @@ class Verdict(Base):
     def test_fresh_both_is_zero(self):
         self.mark(lb.LAST_OK, 60)
         self.mark(lb.BULK_OK, 60)
+        self.mark(lb.LARGE_OK, 60)
         self.assertEqual(bw.run(self.home, NOW), 0)
         self.assertEqual(self.lines()[0]["event"], "recovered")  # first observation recorded
+
+    def test_a_stale_large_file_tier_is_a_code_3_alert_even_when_transcripts_and_bulk_are_fresh(self):
+        # goodqa#16123: the backup is fresh only when the large-file tier is within its own limit too.
+        self.mark(lb.LAST_OK, 60)
+        self.mark(lb.BULK_OK, 60)
+        self.mark(lb.LARGE_OK, lb.LARGE_MAX_AGE_SECONDS + 600)
+        self.assertEqual(bw.run(self.home, NOW), 3)
+        self.assertEqual(bw.verdict(self.home, NOW)["large"], "stale")
 
     def test_stale_transcripts_alerts_with_limit_from_log_backup(self):
         # Control: the 4 h old marker must be stale by the component's own limit, not a limit copied here.
@@ -93,6 +102,7 @@ class Dedupe(Base):
         bw.run(self.home, NOW)
         self.mark(lb.LAST_OK, 30)
         self.mark(lb.BULK_OK, 30)
+        self.mark(lb.LARGE_OK, 30)
         bw.run(self.home, NOW + 60)
         self.assertEqual([x["event"] for x in self.lines()], ["alert", "recovered"])
 

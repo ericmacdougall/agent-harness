@@ -6,7 +6,8 @@ The backup itself is harness/bin/log-backup.sh (copy only, scheduled by launchd 
 lock writes log-backup.last-skip instead, which this tool never treats as success.
 
   check          exit 0 fresh, 1 stale, 2 missing or invalid (a future timestamp is invalid), 3 transcripts fresh but
-                 the bulk marker is stale, missing or invalid
+                 the bulk or the large-file marker is stale, missing or invalid. Fresh means every tier is within its
+                 own limit: transcripts 1 h, large files 6 h, bulk 6 h (goodqa#16123)
   session-start  SessionStart hook: prints an alert only when the backup is not fresh; always exits 0
   status         last success, last run, last skip and lock holder
   restore        copy one backed-up source from the remote into an empty scratch directory and compare it
@@ -35,6 +36,9 @@ LAST_SKIP = "log-backup.last-skip"
 LAST_RUN = "log-backup.last-run"
 THROTTLED = "log-backup.throttled"   # a run that stopped early on the Dropbox rate limit (goodqa#15218)
 BULK_OK = "log-backup.bulk-last-ok"
+LARGE_OK = "log-backup.large-last-ok"   # live files over the size threshold, their own tier (goodqa#16123)
+LARGE_MAX_AGE_SECONDS = 6 * 3600
+REFUSED = ("log-backup.refused", "log-backup.lane.refused")   # files the remote refuses by name, counted per run
 FIRST_RUN = "log-backup.first-run"
 BULK_MAX_AGE_SECONDS = 6 * 3600
 LOCK_DIR = "log-backup.lock.d"
@@ -98,11 +102,12 @@ def printable(text: str) -> str:
     return "".join(c if c.isprintable() or c == " " else "?" for c in text.strip())
 
 
-def bulk_classify(home: Path, now: float | None = None, max_age: int = BULK_MAX_AGE_SECONDS) -> dict:
-    """State of the bulk tier (archived sessions, narrowed work tree). A bulk marker that never appeared is only a
-    problem once the backup has been installed for longer than max_age ('pending' before that)."""
+def bulk_classify(home: Path, now: float | None = None, max_age: int = BULK_MAX_AGE_SECONDS, marker: str = BULK_OK) -> dict:
+    """State of a slower tier: bulk (archived sessions, narrowed work tree) or large files (marker=LARGE_OK). A marker
+    that never appeared is only a problem once the backup has been installed for longer than max_age ('pending'
+    before that)."""
     now = time.time() if now is None else now
-    text = read_small(logs_dir(home) / BULK_OK)
+    text = read_small(logs_dir(home) / marker)
     stamp = parse_stamp(text)
     if stamp is None and text is not None:
         return {"state": "invalid", "age": None}  # present but unreadable is never "pending"
@@ -115,6 +120,23 @@ def bulk_classify(home: Path, now: float | None = None, max_age: int = BULK_MAX_
     if age < -FUTURE_TOLERANCE_SECONDS:
         return {"state": "invalid", "age": age}
     return {"state": "fresh" if max(age, 0.0) <= max_age else "stale", "age": max(age, 0.0)}
+
+
+def large_classify(home: Path, now: float | None = None, max_age: int = LARGE_MAX_AGE_SECONDS) -> dict:
+    return bulk_classify(home, now, max_age, LARGE_OK)
+
+
+def slow_tiers(home: Path, now: float | None = None) -> dict:
+    """{'large': state dict, 'bulk': state dict}: the two tiers that must be within their limit besides transcripts."""
+    return {"large": large_classify(home, now), "bulk": bulk_classify(home, now)}
+
+
+def large_alert_text(result: dict, max_age: int = LARGE_MAX_AGE_SECONDS) -> str:
+    when = "has not completed its first pass yet" if result["state"] == "missing" else (
+        "has an unreadable marker" if result["state"] == "invalid" else f"last completed {human_age(result['age'])} ago")
+    return (f"LOG BACKUP NOTICE: transcripts are backed up, but the large-file tier (live files of 100 MB or more) {when} "
+            f"(limit {max_age // 3600} h); the newest copy of those files is not on the remote. Do not delete logs until it is fresh. "
+            "Check ~/.agent-harness/logs/log-backup.lane.log and log-backup.log.")
 
 
 def bulk_alert_text(result: dict, max_age: int = BULK_MAX_AGE_SECONDS) -> str:
@@ -193,18 +215,22 @@ def cmd_check(args) -> int:
     """0 transcripts and bulk fresh, 1 transcripts stale, 2 transcripts missing or invalid, 3 transcripts fresh
     but the bulk tier stale, missing or invalid."""
     result = classify(args.home, max_age=args.max_age)
-    bulk = bulk_classify(args.home)
+    tiers = slow_tiers(args.home)
+    bulk, large = tiers["bulk"], tiers["large"]
+    bad = ("stale", "missing", "invalid")
     if args.json:
-        print(json.dumps({**result, "bulk": bulk["state"]}))
+        print(json.dumps({**result, "bulk": bulk["state"], "large": large["state"]}))
     elif result["state"] != "fresh":
         print(choice_note(args.home, alert_text(result, args.max_age)) + run_note(args.home) + throttle_note(args.home))
-    elif bulk["state"] in ("stale", "missing", "invalid"):
+    elif large["state"] in bad:
+        print(choice_note(args.home, large_alert_text(large)) + run_note(args.home))
+    elif bulk["state"] in bad:
         print(choice_note(args.home, bulk_alert_text(bulk)) + run_note(args.home))
     else:
         print("fresh")
     if result["state"] != "fresh":
         return {"stale": 1}.get(result["state"], 2)
-    return 3 if bulk["state"] in ("stale", "missing", "invalid") else 0
+    return 3 if (bulk["state"] in bad or large["state"] in bad) else 0
 
 
 def cmd_session_start(args) -> int:
@@ -214,10 +240,13 @@ def cmd_session_start(args) -> int:
         except (OSError, ValueError):
             pass
         result = classify(args.home, max_age=args.max_age)
-        bulk = bulk_classify(args.home)
+        tiers = slow_tiers(args.home)
+        bulk, large = tiers["bulk"], tiers["large"]
         text = ""
         if result["state"] != "fresh":
             text = choice_note(args.home, alert_text(result, args.max_age)) + run_note(args.home) + throttle_note(args.home)
+        elif large["state"] in ("stale", "missing", "invalid"):
+            text = choice_note(args.home, large_alert_text(large)) + run_note(args.home)
         elif bulk["state"] in ("stale", "missing", "invalid"):
             text = choice_note(args.home, bulk_alert_text(bulk)) + run_note(args.home)
         if text:
@@ -246,10 +275,19 @@ def lock_holder(home: Path, name: str = LOCK_DIR) -> str:
         return "held (pid unknown)"
 
 
+def refused_count(home: Path) -> int:
+    """Files the remote refused by name in the latest run of each run kind (scheduled and lane); not failures."""
+    total = 0
+    for name in REFUSED:
+        match = re.search(r"refused=([0-9]{1,9})\b", read_small(logs_dir(home) / name) or "")
+        total += int(match.group(1)) if match else 0
+    return total
+
+
 def status_json(home: Path, max_age: int = MAX_AGE_SECONDS) -> dict:
     """Machine-readable status; the schema is documented in docs/operations.md (status --json) and kept stable."""
     logs = logs_dir(home)
-    transcripts, bulk = classify(home, max_age=max_age), bulk_classify(home)
+    transcripts, bulk, large = classify(home, max_age=max_age), bulk_classify(home), large_classify(home)
 
     def tier(result, marker, limit):
         age = result["age"]
@@ -259,11 +297,14 @@ def status_json(home: Path, max_age: int = MAX_AGE_SECONDS) -> dict:
     return {"schema": 1,
             "transcripts": tier(transcripts, LAST_OK, max_age),
             "bulk": tier(bulk, BULK_OK, BULK_MAX_AGE_SECONDS),
+            "large": tier(large, LARGE_OK, LARGE_MAX_AGE_SECONDS),
+            "refused": refused_count(home),
             "last_run": printable(read_small(logs / LAST_RUN) or ""),
             "last_skip": printable(read_small(logs / LAST_SKIP) or ""),
             "last_throttled": printable(read_small(logs / THROTTLED) or ""),
             "lock": lock_holder(home),
-            "ok": transcripts["state"] == "fresh" and bulk["state"] in ("fresh", "pending")}
+            "ok": transcripts["state"] == "fresh" and bulk["state"] in ("fresh", "pending")
+                  and large["state"] in ("fresh", "pending")}
 
 
 def cmd_status(args) -> int:
@@ -275,13 +316,16 @@ def cmd_status(args) -> int:
     logs = logs_dir(args.home)
     print(f"last success : {printable(read_small(logs / LAST_OK) or 'never')} (age {human_age(result['age'])}, {result['state']})")
     bulk = bulk_classify(args.home)
+    large = large_classify(args.home)
     print(f"bulk success : {printable(read_small(logs / BULK_OK) or 'never')} (age {human_age(bulk['age'])}, {bulk['state']}; limit {BULK_MAX_AGE_SECONDS // 3600} h)")
+    print(f"large success: {printable(read_small(logs / LARGE_OK) or 'never')} (age {human_age(large['age'])}, {large['state']}; limit {LARGE_MAX_AGE_SECONDS // 3600} h; files of 100 MB or more)")
+    print(f"refused names: {refused_count(args.home)} file(s) the remote refuses by name in the latest runs (not backed up, not failures)")
     print(f"last run     : {printable(read_small(logs / LAST_RUN) or 'never')}")
     print(f"last skipped : {printable(read_small(logs / LAST_SKIP) or 'never')} (a skipped run is not a backup)")
     print(f"throttled    : {printable(read_small(logs / THROTTLED) or 'never')} (a run that stopped early on the Dropbox rate limit)")
     print(f"lock         : {lock_holder(args.home)}")
     print(f"bulk lane    : {lock_holder(args.home, LANE_LOCK_DIR)}; last lane run {printable(read_small(logs / LANE_LAST_RUN) or 'never')}")
-    return 0 if result["state"] == "fresh" else 1
+    return 0 if status_json(args.home, args.max_age)["ok"] else 1
 
 
 # ---- restore -------------------------------------------------------------------------------------------------
