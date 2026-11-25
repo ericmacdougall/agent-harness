@@ -82,6 +82,16 @@ MUTANTS = {
     "a revoke is ignored": ("ah.py", [("    revoked = {(r.get(\"args\") or {}).get(\"decision\") for r in rows if r.get(\"op\") == \"task.retire_revoke\"}", "    revoked = set()")]),
     "a revoke needs no stamp": ("ah.py", [("    _retire_stamp(home, args[\"session\"])\n    return args", "    return args")]),
     "a decision may be revoked twice": ("ah.py", [("    if any(r.get(\"op\") == \"task.retire_revoke\" and (r.get(\"args\") or {}).get(\"decision\") == args[\"decision\"] for r in rows):", "    if False:")]),
+    # N1, N2 and the delta red-team
+    "the ps start time is read in the host zone": ("ah.py", [('env=dict(os.environ, LC_ALL="C", LANG="C", TZ="UTC"))\n    except (OSError, subprocess.SubprocessError):\n        return None\n    return _retire_parse_start', 'env=dict(os.environ, LC_ALL="C", LANG="C"))\n    except (OSError, subprocess.SubprocessError):\n        return None\n    return _retire_parse_start')]),
+    "an unparseable recorded start time reads as reused": ("ah.py", [("        if started is not None and recorded is not None and abs(started - recorded) > RETIRE_START_SLACK_S:", "        if started is not None and abs(started - (recorded or 0.0)) > RETIRE_START_SLACK_S:")]),
+    "a matching start time reads as reused": ("ah.py", [("RETIRE_START_SLACK_S = 2 ", "RETIRE_START_SLACK_S = -1 ")]),
+    "the stamp is not bound to main's call": ("ah.py", [("take_stamp(purpose, retire_stamp_parts(fields, mode), home=home, bound=True)", "take_stamp(purpose, retire_stamp_parts(fields, mode), home=home, bound=False)")]),
+    "the hook mints an unbound stamp": ("dropped_gate.py", [('transcript=str(payload.get("transcript_path") or ""), require_bound=True)', 'transcript=str(payload.get("transcript_path") or ""), require_bound=False)')]),
+    "the stamp is not bound to the arguments": ("ah.py", [("hashlib.sha256(canonical(body).encode()).hexdigest()[:24]]", "\"x\"]")]),
+    "a revoke shares the retire purpose": ("ah.py", [('    purpose = "retire-revoke" if mode == "revoke" else "retire-session"\n    if caller_identity.take_stamp', '    purpose = "retire-session"\n    if caller_identity.take_stamp')]),
+    "the feature ticket stands for the dropped work": ("ah.py", [('        if dropped and canonical_ref(args["ticket"]) == RETIRE_OWN_TICKET:', "        if False:")]),
+    "a cite that names no session is not warned about": ("ah.py", [('        if args["session"][:8] not in args["source"] and', "        if False and")]),
     # shape
     "a retry is not a duplicate": ("ah.py", [("            if row.get(\"key\") == k0 and row.get(\"sha\") == sha0:", "            if False:")]),
     "a reused key with another body is not a conflict": ("ah.py", [("            if row.get(\"key\") == k0:\n                raise AhError(\"key_conflict\"", "            if False:\n                raise AhError(\"key_conflict\"")]),

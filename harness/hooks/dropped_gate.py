@@ -506,14 +506,18 @@ def _retire_rest(seg: list):
 
 
 def _stamp_retire(cmd: str, payload: dict) -> None:
-    """One stamp per `--session ID` of a main command that really runs `ah task retire-session` (goodqa#17148, as
-    `--ack-handoff`): only ah's own parser's reading of a simple command counts, and --dry-run mints nothing."""
+    """One stamp per main command that really runs `ah task retire-session` (goodqa#17148, as `--ack-handoff`): only
+    ah's own parser's reading of a simple command counts, and --dry-run mints nothing. The stamp is bound to this tool
+    call (it dies when the call ends) and to the parsed arguments; a revoke has its own purpose. Nothing is written when
+    it cannot be bound (the retire then refuses)."""
     if "retire-session" not in cmd:
         return
+    import ah  # noqa: PLC0415
     import caller_identity  # noqa: PLC0415
     segments = _segments(cmd)
     if segments is None:
         return
+    tool_use_id = payload.get("tool_use_id")
     for seg in segments:
         rest = _retire_rest(seg)
         if rest is None:
@@ -523,8 +527,18 @@ def _stamp_retire(cmd: str, payload: dict) -> None:
                 or getattr(args, "dry_run", False):
             continue
         session = getattr(args, "session", None)
-        if isinstance(session, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", session):
-            caller_identity.put_stamp("retire-session", [session], session=str(payload.get("session_id") or ""))
+        if not (isinstance(session, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", session)):
+            continue
+        revoke = bool(getattr(args, "revoke", None))
+        fields = {"session": session, "source": getattr(args, "source", None), "decision": getattr(args, "revoke", None),
+                  "ended": getattr(args, "ended", None), "replaced_by": getattr(args, "replaced_by", None),
+                  "ticket": getattr(args, "ticket", None), "expect": getattr(args, "expect", None),
+                  "dropped": getattr(args, "dropped", False)}
+        caller_identity.put_stamp("retire-revoke" if revoke else "retire-session",
+                                  ah.retire_stamp_parts(fields, "revoke" if revoke else "retire"),
+                                  session=str(payload.get("session_id") or ""),
+                                  tool_use_id=tool_use_id if isinstance(tool_use_id, str) else None,
+                                  transcript=str(payload.get("transcript_path") or ""), require_bound=True)
 
 
 def cmd_pretool(payload: dict) -> dict:

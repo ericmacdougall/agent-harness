@@ -6,8 +6,10 @@ live and the owner view is complete. Anything that cannot be read is a refusal. 
 disposition that cites the decision; a retired owner that shows new activity alerts again.
 
 Failing-first: tests/mutants_retire_session.py runs this file against controlled broken variants of ah.py."""
+import calendar
 import datetime as dt
 import json
+import shlex
 import os
 import subprocess
 import sys
@@ -28,13 +30,16 @@ import liveness  # noqa: E402
 import ops_watch  # noqa: E402
 
 REAL_PS = ah._retire_ps_rows
+REAL_PID_ALIVE = ah._retire_pid_alive
+REAL_PROC_START = ah._retire_proc_start
+REAL_HOME = Path.home()
 NOW = 1_800_000_000.0
 OLD = NOW - 10 * 3600  # an ended session: quiet for 10 h
 SESSION = "11111111-aaaa-4bbb-8ccc-222222222222"
 OTHER = "99999999-aaaa-4bbb-8ccc-222222222222"
 OTHER_LIVE = "88888888-aaaa-4bbb-8ccc-222222222222"
 SOURCE = "user:99999999/abcd \"retire the ended sessions\""
-TICKET = "GoodQA goodqa#17148"
+TICKET = "GoodQA goodqa#16999"  # the ticket that holds the dropped work (not the feature ticket)
 
 
 def iso(ts):
@@ -109,14 +114,17 @@ class Base(unittest.TestCase):
         self.build(SESSION, self.N)
         jl(self.home / ".claude" / "wals" / OTHER / "main.jsonl", [{"at": iso(OLD), "event": "intent", "note": "the replacement"}])
 
-    def registry(self, session, pid, start="Tue Nov 24 16:06:07 2026", alive=True, recorded=None, host=None):
-        entry = {"pid": pid, "sessionId": session, "procStart": recorded or start, "pidDomain": "darwin"}
+    START = 1_790_000_000  # a process start time (epoch)
+
+    def registry(self, session, pid, start=START, alive=True, recorded=None, host=None, text=None):
+        stamp = time.strftime("%a %b %d %H:%M:%S %Y", time.gmtime(recorded if recorded is not None else start))
+        entry = {"pid": pid, "sessionId": session, "procStart": text or stamp, "pidDomain": "darwin"}
         if host:
             entry["hostSessionId"] = host
         (self.home / ".claude" / "sessions" / f"{pid}.json").write_text(json.dumps(entry))
         if alive:
             self.alive.add(pid)
-        self.starts[pid] = start
+        self.starts[pid] = float(start)
 
     def build(self, session, n, transcript_at=OLD):
         w = self.home / ".claude" / "wals" / session
@@ -139,10 +147,18 @@ class Base(unittest.TestCase):
             sub.write_text("{}\n")
             os.utime(sub, (transcript_at - 2500, transcript_at - 2500))  # before the stop, so the owner reads as DROPPED
 
-    def stamp(self, session=SESSION):
-        caller_identity.put_stamp("retire-session", [session], session="main-session", home=self.home)
+    def txn(self):
+        p = self.home / "main-transcript.jsonl"
+        if not p.exists():
+            p.write_text('{"type":"user"}\n')
+        return p
 
-    def retire(self, session=SESSION, stamp=True, caller="", **extra):
+    def put_stamp(self, mode, fields, tool_use_id="toolu_test000001", bound=True):
+        purpose = "retire-revoke" if mode == "revoke" else "retire-session"
+        caller_identity.put_stamp(purpose, ah.retire_stamp_parts(fields, mode), session="main-session", home=self.home,
+                                  tool_use_id=tool_use_id if bound else None, transcript=str(self.txn()))
+
+    def args_for(self, session=SESSION, **extra):
         key = extra.pop("key", None)
         if extra.get("expect", None) is None:  # --expect is required: take it from a dry run like main does
             try:
@@ -155,9 +171,16 @@ class Base(unittest.TestCase):
         a.update(extra)
         if "dropped" in extra and extra["dropped"] is None:  # a --replaced-by call carries no ticket
             a.pop("ticket", None)
-        a = {k: v for k, v in a.items() if v is not None}
+        return {k: v for k, v in a.items() if v is not None}, key
+
+    def stamp(self, session=SESSION, **extra):
+        a, _key = self.args_for(session, **extra)
+        self.put_stamp("retire", a)
+
+    def retire(self, session=SESSION, stamp=True, caller="", **extra):
+        a, key = self.args_for(session, **extra)
         if stamp:
-            self.stamp(session)
+            self.put_stamp("retire", a)
         return ah.write(self.home, "task.retire_session", a, caller, key)
 
     def refused(self, code, **extra):
@@ -439,17 +462,85 @@ class Authority(Base):
         self.assertEqual(cm.exception.code, "provenance")
         self.assertEqual(self.retire(stamp=False)["result"], "applied")
 
+    def command(self, *more, session=SESSION, expect="0123456789abcdef"):
+        words = ["python3", "~/.claude/hooks/ah.py", "task", "retire-session", "--session", session, "--dropped", "--ticket", TICKET,
+                 "--ended", ended(OLD), "--expect", expect, "--source", SOURCE, *more]
+        return " ".join(shlex.quote(w) if w != "~/.claude/hooks/ah.py" else w for w in words)
+
     def test_main_hook_stamps_a_plain_command_and_only_that(self):
-        cmd = f"python3 ~/.claude/hooks/ah.py task retire-session --session {SESSION} --dropped --ticket 'GoodQA goodqa#17148' --ended 2026-11-24T10:00:00Z --source 'ticket:GoodQA goodqa#17148'"
+        cmd = self.command()
         calls = []
-        with mock.patch.object(caller_identity, "put_stamp", side_effect=lambda *a, **k: calls.append(a[:2])):
-            dropped_gate._stamp_retire(cmd, {"session_id": "m"})
-            self.assertEqual(calls, [("retire-session", [SESSION])])
+        payload = {"session_id": "m", "tool_use_id": "toolu_hook000001", "transcript_path": str(self.txn())}
+        with mock.patch.object(caller_identity, "put_stamp", side_effect=lambda *a, **k: calls.append((a[:2], k))):
+            dropped_gate._stamp_retire(cmd, payload)
+            fields = {"session": SESSION, "ended": ended(OLD), "ticket": TICKET, "expect": "0123456789abcdef", "source": SOURCE,
+                      "dropped": True}
+            self.assertEqual([c[0] for c in calls], [("retire-session", ah.retire_stamp_parts(fields))])
+            self.assertEqual(calls[0][1]["tool_use_id"], "toolu_hook000001")  # bound to main's tool call
+            self.assertIs(calls[0][1]["require_bound"], True)
             calls.clear()
             for text in (cmd + " --dry-run", f"echo task retire-session --session {SESSION}", "ah task retire-session --help",
                          f'bash -c "{cmd}"', f"python3 -c \"{cmd}\""):
-                dropped_gate._stamp_retire(text, {"session_id": "m"})
+                dropped_gate._stamp_retire(text, payload)
             self.assertEqual(calls, [])
+
+    def test_a_revoke_command_is_stamped_with_its_own_purpose(self):
+        calls = []
+        cmd = f"ah task retire-session --session {SESSION} --revoke ah0123456789 --source 'ticket:GoodQA goodqa#17148'"
+        with mock.patch.object(caller_identity, "put_stamp", side_effect=lambda *a, **k: calls.append(a[:2])):
+            dropped_gate._stamp_retire(cmd, {"session_id": "m", "tool_use_id": "toolu_hook000002", "transcript_path": str(self.txn())})
+        self.assertEqual([c[0] for c in calls], ["retire-revoke"])
+
+    def test_the_hook_and_write_agree_on_the_stamp_end_to_end(self):
+        # the REAL stamp: minted by the hook from the command text, taken by write() from its own arguments
+        sha = ah.retire_dry_run(self.home, SESSION)["owners_sha"]
+        dropped_gate._stamp_retire(self.command(expect=sha), {"session_id": "main-session", "tool_use_id": "toolu_hook000003",
+                                                              "transcript_path": str(self.txn())})
+        self.assertEqual(self.retire(stamp=False, expect=sha)["result"], "applied")
+
+    def test_a_stamp_that_is_not_bound_to_a_tool_call_is_refused(self):
+        a, _k = self.args_for()
+        self.put_stamp("retire", a, bound=False)
+        self.refused("forbidden", stamp=False)
+
+    def test_a_stamp_dies_with_main_s_call(self):
+        a, _k = self.args_for()
+        self.put_stamp("retire", a, tool_use_id="toolu_ended00001")
+        with open(self.txn(), "a") as fh:  # the call's result was appended: it is over
+            fh.write('{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_ended00001"}]}}\n')
+        self.refused("forbidden", stamp=False)
+
+    def test_a_stamp_for_other_arguments_does_not_authorize_this_command(self):
+        a, _k = self.args_for()
+        self.put_stamp("retire", dict(a, ticket="GoodQA goodqa#16000"))
+        self.refused("forbidden", stamp=False)
+        self.put_stamp("retire", dict(a, ended=ended(OLD + 60)))
+        self.refused("forbidden", stamp=False)
+        self.put_stamp("retire", dict(a, expect="f" * 16))
+        self.refused("forbidden", stamp=False)
+
+    def test_a_revoke_stamp_does_not_authorize_a_retire_and_the_reverse(self):
+        a, _k = self.args_for()
+        self.put_stamp("revoke", {"session": SESSION, "decision": "ah0123456789", "source": SOURCE})
+        self.refused("forbidden", stamp=False)
+        out = self.retire()
+        self.put_stamp("retire", a)
+        with self.assertRaises(ah.AhError) as cm:
+            ah.write(self.home, "task.retire_revoke", {"session": SESSION, "decision": out["id"], "at": iso(self.clock),
+                                                        "source": SOURCE}, "")
+        self.assertEqual(cm.exception.code, "forbidden")
+
+    def test_the_feature_ticket_is_not_the_dropped_work(self):
+        err = self.refused("bad_request", ticket="GoodQA goodqa#17148")
+        self.assertIn("this feature", str(err))
+
+    def test_a_cite_that_names_no_session_is_warned_about(self):
+        out = self.retire()
+        self.assertIn("names this session", out["warning"])
+        self.build(OTHER, 1)
+        jl(self.home / ".claude" / "wals" / OTHER / "main.jsonl", [])
+        out = self.retire(session=OTHER, source=f"ticket:GoodQA goodqa#17148 for {OTHER[:8]}")
+        self.assertNotIn("warning", out)
 
     def test_dropped_needs_a_ticket_that_exists(self):
         self.refused("bad_request", ticket=None)
@@ -515,6 +606,11 @@ class EndedAndPreview(Base):
     def test_ended_earlier_than_the_last_transcript_write_is_refused(self):
         self.refused("bad_request", ended=ended(OLD - 7200))
 
+    def test_an_offset_without_a_colon_is_accepted_or_refused_clearly(self):
+        local = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(OLD + 3600)) + "+0100"
+        self.retire(ended=local)
+        self.assertEqual(self.applied()[0]["args"]["ended_utc"], ah.iso(OLD))
+
     def test_ended_is_stored_normalized_to_utc(self):
         local = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(OLD + 2 * 3600)) + "+02:00"
         self.retire(ended=local)
@@ -543,10 +639,10 @@ class EndedAndPreview(Base):
 
 class Revoke(Base):
     def revoke(self, decision, stamp=True, **extra):
+        fields = dict({"session": SESSION, "decision": decision, "at": iso(self.clock), "source": SOURCE}, **extra)
         if stamp:
-            self.stamp()
-        return ah.write(self.home, "task.retire_revoke", dict({"session": SESSION, "decision": decision, "at": iso(self.clock),
-                                                               "source": SOURCE}, **extra), "")
+            self.put_stamp("revoke", fields)
+        return ah.write(self.home, "task.retire_revoke", fields, "")
 
     def test_a_revoke_brings_the_alerts_back(self):
         pol = ahd.load_policy()
@@ -600,7 +696,7 @@ class Registry(Base):
         self.assertEqual(self.retire()["result"], "applied")
 
     def test_a_reused_pid_is_not_the_session(self):
-        self.registry(SESSION, 9004, recorded="Mon Nov 23 01:02:03 2026")  # the pid now runs something else
+        self.registry(SESSION, 9004, recorded=self.START - 86400)  # the pid now runs something that started a day later
         self.assertEqual(self.retire()["result"], "applied")
 
     def test_a_start_time_that_cannot_be_compared_fails_closed(self):
@@ -675,7 +771,7 @@ class Reopen(Base):
     def test_a_revoked_decision_reopens_nothing_it_never_closed(self):
         out = self.retire()
         self.clock += 60
-        self.stamp()
+        self.put_stamp("revoke", {"session": SESSION, "decision": out["id"], "source": SOURCE})
         ah.write(self.home, "task.retire_revoke", {"session": SESSION, "decision": out["id"], "at": iso(self.clock), "source": SOURCE}, "")
         self.assert_alerting(self.owners())
 
@@ -743,6 +839,65 @@ class PlanReview(Base):
             return real(path, *a, **k)
         with mock.patch.object(ah.os, "stat", side_effect=deny):
             self.refused("retire_unreadable", dropped=None, replaced_by=OTHER)
+
+
+class RealSources(Base):
+    """Tests that mock BOTH sides cannot see a format or zone difference between them (the delta red-team's N1): these
+    read the real ps, a registry entry in Claude Code's own UTC format, and (when this host has one) the real registry."""
+
+    def real(self):
+        for name, fn in (("_retire_pid_alive", REAL_PID_ALIVE), ("_retire_proc_start", REAL_PROC_START)):
+            m = mock.patch.object(ah, name, fn)
+            m.start()
+            self.addCleanup(m.stop)
+
+    def own_start(self):
+        r = subprocess.run(["ps", "-o", "lstart=", "-p", str(os.getpid())], capture_output=True, text=True,
+                           env=dict(os.environ, LC_ALL="C", LANG="C", TZ="UTC"))
+        return " ".join(r.stdout.split())
+
+    def test_this_process_is_live_in_any_host_zone(self):
+        self.real()
+        text = self.own_start()
+        self.assertTrue(text, "ps printed no start time")
+        (self.home / ".claude" / "sessions" / f"{os.getpid()}.json").write_text(json.dumps(
+            {"pid": os.getpid(), "sessionId": SESSION, "procStart": text}))
+        for zone in ("America/Denver", "UTC", "Asia/Kolkata"):
+            with self.subTest(zone=zone), mock.patch.dict(os.environ, {"TZ": zone}):
+                self.assertEqual(ah._retire_registry_live(self.home, SESSION), [os.getpid()])
+
+    def test_a_different_start_time_is_a_reused_pid_in_any_host_zone(self):
+        self.real()
+        started = ah._retire_parse_start(self.own_start())
+        other = time.strftime("%a %b %d %H:%M:%S %Y", time.gmtime(started - 3 * 86400))
+        (self.home / ".claude" / "sessions" / f"{os.getpid()}.json").write_text(json.dumps(
+            {"pid": os.getpid(), "sessionId": SESSION, "procStart": other}))
+        for zone in ("America/Denver", "UTC"):
+            with self.subTest(zone=zone), mock.patch.dict(os.environ, {"TZ": zone}):
+                self.assertEqual(ah._retire_registry_live(self.home, SESSION), [])
+
+    def test_a_start_time_that_does_not_parse_fails_closed(self):
+        self.real()
+        for bad in ("", "garbage", "Tue Nov 24 2026", "2026-11-24T16:06:07Z"):
+            (self.home / ".claude" / "sessions" / f"{os.getpid()}.json").write_text(json.dumps(
+                {"pid": os.getpid(), "sessionId": SESSION, "procStart": bad}))
+            with self.subTest(bad=bad):
+                self.assertEqual(ah._retire_registry_live(self.home, SESSION), [os.getpid()])
+
+    def test_the_real_ps_table_lists_this_process(self):
+        rows = REAL_PS()
+        self.assertIn(os.getpid(), [r[0] for r in rows])
+        self.assertTrue(all(isinstance(r[3], str) for r in rows))
+
+    def test_the_real_registry_format_parses_when_this_host_has_one(self):
+        folder = REAL_HOME / ".claude" / "sessions"
+        names = sorted(n for n in os.listdir(folder) if ah.REGISTRY_FILE_RE.match(n)) if folder.is_dir() else []
+        if not names:
+            self.skipTest("this host has no Claude Code session registry")
+        for name in names:
+            entry = json.loads((folder / name).read_text())
+            self.assertIsInstance(entry.get("pid"), int, name)
+            self.assertIsNotNone(ah._retire_parse_start(entry.get("procStart")), name)
 
 
 class PartialFailure(Base):

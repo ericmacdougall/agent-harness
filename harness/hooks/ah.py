@@ -1546,6 +1546,9 @@ def precheck(op: str, args: dict) -> None:
         if dropped and not TICKET_RE.match(args.get("ticket") or ""):
             raise AhError("bad_request", "task.retire-session: --dropped needs --ticket 'GoodQA <project>#N', the ticket that "
                                          "holds the dropped work (a stream nobody works on is a defect)")
+        if dropped and canonical_ref(args["ticket"]) == RETIRE_OWN_TICKET:
+            raise AhError("bad_request", f"task.retire-session: {RETIRE_OWN_TICKET} is the ticket for this feature, not for the "
+                                         "work this session dropped; name the ticket that holds that work")
         if not re.fullmatch(r"[0-9a-f]{16}", str(args.get("expect") or "")):
             raise AhError("bad_request", "task.retire-session: --expect <owners_sha> is required: run --dry-run first and pass "
                                          "the owners_sha it prints, so the retire covers exactly the list that was reviewed")
@@ -2004,6 +2007,9 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
         out["retired"] = list(pinned)
         out["skipped"] = args["retire"]["skipped"]
         out["unacked_handoffs"] = args["retire"]["unacked_handoffs"]
+        if args["session"][:8] not in args["source"] and args["session"][:8] not in str(args.get("ticket") or ""):
+            out["warning"] = (f"neither the source nor the ticket names this session ({args['session'][:8]}); a cite that "
+                              "names no session may have been reused for another")
     elif op == "task.retire_revoke":
         main_wal = _wal_path(home, args["session"], "main")
         if not main_wal.is_file():
@@ -2727,6 +2733,8 @@ RETIRE_QUIET_S = 6 * 3600  # every transcript and owner must have been quiet thi
 RETIRE_PS_MAX = 100_000  # a longer process list is truncated or abnormal: refused, never half-read
 RETIRE_BURST_MAX = 10  # sessions one caller may retire ...
 RETIRE_BURST_WINDOW_S = 600  # ... within this window; the next one is refused and alerted
+RETIRE_OWN_TICKET = "GoodQA goodqa#17148"  # the feature's own ticket never stands for a session's dropped work
+RETIRE_START_SLACK_S = 2  # process start times from two clocks agree within this
 RETIRE_ENDED_SLACK_S = 3600  # --ended may not be earlier than the newest transcript by more than this
 RETIRE_REPLACER_S = 24 * 3600  # a --replaced-by session must have run within this long (or be live now)
 RETIRE_FIELDS = ("retire", "ended_utc")  # set only by ah's preflight and apply, never taken from the caller
@@ -2768,15 +2776,25 @@ def _retire_pid_alive(pid: int) -> bool:
     return True
 
 
+def _retire_parse_start(text):
+    """A process start time as epoch seconds, read as UTC, or None when it does not parse. Claude Code writes procStart
+    in UTC ("Tue Nov 24 16:06:07 2026") and `ps -o lstart` is asked for UTC too (TZ=UTC), so both sides are the same
+    zone; a zone or format difference is never mistaken for a reused pid."""
+    import calendar  # noqa: PLC0415
+    try:
+        return float(calendar.timegm(time.strptime(" ".join(str(text or "").split()), "%a %b %d %H:%M:%S %Y")))
+    except (ValueError, OverflowError, TypeError):
+        return None
+
+
 def _retire_proc_start(pid: int):
-    """The process start time ps prints, whitespace-normalized; None when ps cannot say (the caller fails closed)."""
+    """The process start time (epoch seconds, UTC) ps prints for the pid; None when ps cannot say (fail closed)."""
     try:
         r = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, timeout=10,
-                           env=dict(os.environ, LC_ALL="C", LANG="C"))
+                           env=dict(os.environ, LC_ALL="C", LANG="C", TZ="UTC"))
     except (OSError, subprocess.SubprocessError):
         return None
-    text = " ".join(r.stdout.split())
-    return text if r.returncode == 0 and text else None
+    return _retire_parse_start(r.stdout) if r.returncode == 0 else None
 
 
 def _retire_registry_live(home: Path, session: str) -> list:
@@ -2814,10 +2832,10 @@ def _retire_registry_live(home: Path, session: str) -> list:
                                                "usable pid; liveness is unknown, so nothing is retired", 3)
         if not _retire_pid_alive(pid):
             continue
-        started, recorded = _retire_proc_start(pid), " ".join(str(entry.get("procStart") or "").split())
-        if started is not None and recorded and started != recorded:
-            continue  # the pid was reused by another process: the session's own process is gone
-        live.append(pid)  # alive and the start time matches, or it cannot be compared: fail closed
+        started, recorded = _retire_proc_start(pid), _retire_parse_start(entry.get("procStart"))
+        if started is not None and recorded is not None and abs(started - recorded) > RETIRE_START_SLACK_S:
+            continue  # both parse and differ: the pid was reused by another process, the session's own is gone
+        live.append(pid)  # alive and the start time matches, or either cannot be read or compared: fail closed
     return live
 
 
@@ -2978,9 +2996,10 @@ def _retire_ended(args: dict, newest_at: float, now: float) -> str:
     if not RETIRE_ENDED_RE.match(text):
         raise AhError("bad_request", "task.retire-session: --ended needs a date, a time and an explicit offset "
                                      "(2026-11-24T10:00:00Z or +01:00); a time with no offset is ambiguous", 3)
-    at = parse_ts(text)
+    at = parse_ts(re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", text))  # +0100 -> +01:00 (Python 3.9 needs the colon)
     if not at:
-        raise AhError("bad_request", "task.retire-session: --ended is not a valid time", 3)
+        raise AhError("bad_request", "task.retire-session: --ended is not a valid time (use 2026-11-24T10:00:00Z or "
+                                     "2026-11-24T10:00:00+01:00)", 3)
     if at > now:
         raise AhError("bad_request", "task.retire-session: --ended is in the future", 3)
     if at < newest_at - RETIRE_ENDED_SLACK_S:
@@ -3003,14 +3022,26 @@ def _retire_burst(home: Path, caller: str, now: float) -> None:
                                 "retiring in bulk is refused. Wait, or retire the rest later", 3)
 
 
-def _retire_stamp(home: Path, session: str) -> None:
-    """Only main may retire: main's hook stamps a command it can read (dropped_gate, as --ack-handoff). No stamp, no
-    retire, whatever the sub-agent or script that typed it can compute."""
+def retire_stamp_parts(fields: dict, mode: str = "retire") -> list:
+    """The stamp's key parts: the mode, the session and a digest of the parsed arguments, so a stamp minted for one
+    command authorizes only that command. Main's hook (dropped_gate) and write() compute it from the same function."""
+    keys = ("decision", "source") if mode == "revoke" else ("ended", "replaced_by", "ticket", "expect", "source")
+    body = {k: str(fields.get(k) or "") for k in keys}
+    if mode != "revoke":
+        body["dropped"] = bool(fields.get("dropped"))
+    return [mode, fields.get("session") or "", hashlib.sha256(canonical(body).encode()).hexdigest()[:24]]
+
+
+def _retire_stamp(home: Path, fields: dict, mode: str = "retire") -> None:
+    """Only main may retire: main's hook stamps a command it can read (dropped_gate, as --ack-handoff), bound to that
+    one tool call and to the command's own arguments, with its own purpose for a revoke. No stamp, no retire, whatever a
+    sub-agent or script that typed it can compute; a stamp left by a refused call dies with main's call."""
     import caller_identity  # noqa: PLC0415
-    if caller_identity.take_stamp("retire-session", [session], home=home) is None:
-        raise AhError("forbidden", "task.retire-session: only the main agent retires a session (its hook stamps the "
-                                   f"call); none was found for {session}. Run ONE plain `ah task retire-session ...` "
-                                   "command with a literal --session (no $(...), no wrapper that hides ah)", 3)
+    purpose = "retire-revoke" if mode == "revoke" else "retire-session"
+    if caller_identity.take_stamp(purpose, retire_stamp_parts(fields, mode), home=home, bound=True) is None:
+        raise AhError("forbidden", "task.retire-session: only the main agent retires a session (its hook stamps the exact "
+                                   f"call, once); none was found for {fields.get('session')}. Run ONE plain `ah task "
+                                   "retire-session ...` command with literal arguments (no $(...), no wrapper that hides ah)", 3)
 
 
 def _retire_preflight(home: Path, args: dict, now: float, caller_session: str) -> dict:
@@ -3043,7 +3074,7 @@ def _retire_preflight(home: Path, args: dict, now: float, caller_session: str) -
     ev = retire_evidence(home, session, now)
     ended = _retire_ended(args, ev["transcript_newest_at"], now)
     _retire_burst(home, caller_session, now)
-    _retire_stamp(home, session)  # last: a refusal above never burns main's stamp
+    _retire_stamp(home, args)  # last: a refusal above leaves the stamp to die with main's call
     return dict(args, ended_utc=ended)
 
 
@@ -3086,7 +3117,7 @@ def _retire_revoke_preflight(home: Path, args: dict, caller_session: str) -> dic
         raise AhError("bad_request", f"task.retire-session: {args['decision']} is not a retire decision of {args['session']}", 3)
     if any(r.get("op") == "task.retire_revoke" and (r.get("args") or {}).get("decision") == args["decision"] for r in rows):
         raise AhError("bad_request", f"task.retire-session: {args['decision']} was already revoked", 3)
-    _retire_stamp(home, args["session"])
+    _retire_stamp(home, args, "revoke")
     return args
 
 
