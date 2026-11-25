@@ -68,6 +68,112 @@ An existing checkout can be reused at the disk floor. An advance to a different 
 
 Reaping reports by default. If enabled explicitly, it holds the managed checkout lease and checks liveness, service protection and local state. It confirms the same directory, Git registration, commit, tree and index before asking Git to remove the linked checkout without force. Keep legacy and unmanaged copies and copies with tracked protected logs or WALs for separate disposition. Tools that operate outside the managed lease must be stopped before reaping.
 
+## Updating the installed harness (user-run)
+
+`scripts/update_installed.py` brings the installed copy on this Mac and on t2-dev to one commit that is already on
+`origin/main`. It is the person's tool only: every agent run is refused, `--preview` included. Main's route to install
+a reviewed, merged commit stays `ah install-files` and `harness-patch.sh` until goodqa#17031 lands, so nothing about
+installs moves back to the user; this script is an extra path for him, not a replacement for main's route.
+
+```
+python3 -I -S scripts/update_installed.py --preview                          # what would change; installs nothing
+python3 -I -S scripts/update_installed.py --ticket "GoodQA goodqa#N"          # install origin/main HEAD
+python3 -I -S scripts/update_installed.py --commit <40-hex sha> --ticket "GoodQA goodqa#N"
+```
+
+Run it from a clean, up-to-date checkout of `origin/main`: the running copy of the script must be byte for byte main's
+own `scripts/update_installed.py`, or it stops before reading the commit (step 2). `-I -S` is required: without `-I` a
+file next to the script, or `PYTHONPATH`, could replace a module it imports, and without `-S` a `.pth` file in
+site-packages runs first (it exits 2 and says so).
+
+What it checks and does, in order. Any failed step stops the run, and nothing after it runs:
+
+1. **Not an agent.** It stops when an agent marker is set (`CLAUDECODE`, `CODEX_THREAD_ID`, `CODEX_TOOL_CALL_ID`,
+   `CODEX_SANDBOX`, `AI_AGENT`, the same list as `commit_policy.py`), for `--preview` too. This is a mitigation, not a
+   boundary: an agent can unset the variables. The command_guard rule that refuses every agent call of the script is
+   goodqa#17036.
+2. **Fresh source, main's own updater.** It fetches the canonical `main` into a new bare repository under
+   `~/.agent-harness/update-cache/run-<12 hex>` (created exclusively, mode 0700, deleted when the run ends). Git runs
+   hardened, the same way `ah install-files` runs it: no system or global config, no hooks, no fsmonitor, no replace
+   objects, https only, and every fetched object is fsck-checked. Grafts, shallow history and replace refs stop the run.
+   The git blob id of the running script must equal `main:scripts/update_installed.py` in that fetch; a copy from a
+   feature branch, an agent's worktree or an edited checkout stops here. There is no persistent install clone. What
+   the script reads from the checkout it runs in is only itself, and that is checked against main.
+3. **Commit.** The commit (default: `main` HEAD) must be a full lowercase sha that is an ancestor of that `main`. With
+   an older commit and a remote host, any hook that `main` changed after the commit stops the run, because the remote
+   installer refuses an older commit for such a hook even where the host already has it (use a newer commit or
+   `--no-remote`).
+4. **Export.** The commit's tree is written into the run folder from objects that are re-hashed against their ids.
+   Only regular files and folders are accepted: a symlink, a gitlink, an unsafe name, or two entries that land on one
+   path (for example names that differ only in case on APFS) stop it. The sha256 of every exported file is kept in
+   memory; later checks compare against those digests, never against the export's bytes again.
+5. **No unfinished host run.** For each remote host, a run on the Mac's `~/.agent-harness/install-audit.jsonl` with an
+   install, resume or rollback attempt and no definite result (the remote installer's own rule: no result yet, or
+   `unknown` or `attempt_refused`) stops the run before anything is installed anywhere, `--preview` included, with
+   the exact `--host H --resume` and `--rollback` commands. The remote installer refuses every new install on that
+   host until the run is finished, so going on would update the Mac and leave t2-dev behind. An audit that cannot be
+   read stops it too. The check runs again after the confirmation. Every `ah` call gets `AH_HOME` set to this run's
+   home, so `ah` writes the audit this check reads.
+6. **File list.** The list is derived, never kept by hand.
+   - Mac: every file that `install.py` lists at that commit (`AGENTS`, `HOOKS`, `TOOLS` as bare names, `SKILLS` as
+     bare names or `<folder>/<file>`, all literal tuples) whose copy under `~/.claude` is missing, differs from the
+     commit's digest, or is a symlink. If `main` changed one of those files after the commit, the run stops: installing
+     it would put an older version in place.
+   - t2-dev: every `HOOKS` file that the remote installer's dry run does not report as `already_current` there.
+7. **Confirmation.** A real run with something to install asks, on `/dev/tty`, for the first 12 characters of the
+   commit. No flag skips it, and without a terminal the run stops.
+8. **Mac install.** The Mac's doctor runs first. Then, immediately before `install.py` starts, the whole export is
+   walked: its regular files must be exactly the commit's files (no extra module such as a planted `json.py`, no
+   `__pycache__`, no symlink or hard link, no extra folder, nothing missing), and every file's sha256 must equal the
+   digest kept in memory. `install.py` runs from the export with the export folder first on its import path (it
+   imports `log_backup_install.py` and its other root modules from there), so this walk is what keeps anything but the
+   commit's own code from running. It then runs as `python3 -B -E -s -S install.py --apply --hooks-only --home ~`.
+   `CLAUDE.md` and `settings.json` are not touched, and every replaced file is backed up under
+   `~/.claude/agent-harness-backups/<time>/`. `--hooks-only` still does three other things: it registers the
+   commit-msg backstop in `~/.gitconfig`, renames an old `commit_policy.json`/`spec_policy.json` profile to its
+   `*.local.json` name, and records the dropped-owner gate's install time once. Every listed file is then compared with
+   the commit's digests; a file that differs is live but not the commit's, and the message says so and names the
+   backup folder. Residual: a process of the same user that rewrites the export between the walk and `install.py`'s
+   start is not caught (the window is one `exec`).
+9. **t2-dev install.** It runs the installed `ah.py` remote installer (the audited route, with its own staging,
+   self-test and rollback) for the changed files only, with the ticket, in batches of 20 with `command_guard.py` in the
+   last batch. Each batch prints its run id. If a batch fails or times out, the message lists the batches already
+   installed and every unfinished run on that host by the remote installer's own rule (a run with no result, or with
+   result `unknown` or `attempt_refused`), each with the exact `--resume` and `--rollback` commands: the remote
+   installer refuses a new install there until they are finished. A second dry run must then report every file current.
+10. **Registration.** `--hooks-only` never edits `settings.json`, so a hook the new manifest declares is not running
+   until it is registered. On every real run, whether or not anything was installed, the Mac's doctor runs before the
+   Mac install and again after it (before any remote install), and each host is checked after its install with the
+   doctor's read-only `doctor.py check --ssh <host>`. A doctor answer counts only when its exit code agrees with its
+   rows (0 exactly when every required row is `WIRED`); a doctor that does not answer, or whose exit code disagrees,
+   stops the run (exit 1: registration not proven). The doctor does not answer when `settings.json` is missing or
+   unreadable. A hook that was wired before and is not wired after stops the run, and so does a required hook in any
+   state other than `WIRED` or `MISSING` (`SCRIPT_MISSING`: registering it would not fix it). A required hook the
+   doctor reports `MISSING` (on the Mac, newly declared or already missing before this run, listed apart), or any name
+   a host's install reports `unregistered`, gives exit 3.
+
+`--preview` runs steps 1 to 6 and stops: it never installs and never writes under `~/.claude`. Each t2-dev dry run
+appends the remote installer's own audit row. `--no-remote` updates the Mac only.
+
+Exit codes: 0 every listed file matches the commit and every doctor reports every required hook wired, on the Mac
+and on each host (or a clean preview); 1 `STOP:` and the step that failed (files installed before that step stay
+installed, and the message says what was done); 2 usage (an unknown option, or a malformed `--commit` or
+`--ticket`), or not started with `-I -S`; 3 files in place, but some hooks need registering with `install.py --apply`
+(without `--hooks-only`) from a checkout of that commit, on each host named. There is no `--home` option: the home
+also decides which `ah.py` and `doctor.py` run, so only the tests set it.
+
+Run time: a preview makes `ceil(N/20)` dry runs per host, where N is the `HOOKS` count at the commit (about 110 today,
+so 6). Each dry run fetches the canonical `main` on its own and runs the host's self-test, which can take up to about
+200 s. A real run makes those, one install per batch of changed files, then the same dry runs again. No timing has
+been measured (goodqa#17036).
+
+Proof status: the tests run the script against the repository's own tree (its HEAD as `main`, a temporary home, the
+repository's own `install.py` and doctor, ending with the doctor answering every required hook `WIRED` for the
+settings `install.py` writes), with `--no-remote`. The host path is tested with the real answers: `ah install-files`
+runs through `ah.main` with the argv the updater builds, the real remote script runs against a temporary host home
+through a stand-in for ssh, and the real doctor runs with `--ssh` against that home. No one has yet run a preview
+against the real home or against t2-dev: the script refuses agents, so the first real use by the user is that check.
+
 ## Installer scan (installer_scan.py)
 
 `installer_scan.py <dir-or-file> [--json]` statically scans third-party shell and Python installers (`*.sh`, `*.py`, `install*`, `setup*`, `Makefile`) before anyone runs them. It never executes or imports the target and reads each file with a 2 MB cap (larger files are listed as skipped). Findings carry a category and `file:line`: `mcp` (agent CLI `mcp add`, `[mcp_servers.`, `mcpServers`), `agent-rules` (CLAUDE.md, AGENTS.md, settings files, config.toml, permission grants), `launchd` (launchctl, LaunchAgents, systemctl, crontab, schtasks), `shell-rc` (rc files, `PATH=`), `network-exec` (`curl | sh`, wget, pip/npm -g/brew install), `credentials` (keychain, keyring, `~/.ssh`, `~/.aws`, `~/.kimi-code`) and `privileged` (sudo, setuid, writes under `/usr/local`, `/etc`, `/Library`). Exit 0 means at least one file was scanned with no findings and nothing was left unscanned. Exit 1 means findings, a skipped file (oversize or unreadable), an executable-looking file the scan does not parse (`.js`, `.mjs`, `package.json`, `.plist`, `.ps1`, `.rb`, an executable or `#!` file, listed as skipped), no file scanned, or the 5,000-file limit reached. Exit 2 means bad usage. The rule is scan, then read. A clean scan is not a safety proof: it is regex matching on source text, so obfuscated or generated commands are missed. Review the installer anyway; the scan only makes the known side effects (for example the GoodQA MCP registration in the secure-login installer) visible first.
