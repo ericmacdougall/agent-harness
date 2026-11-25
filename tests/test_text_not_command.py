@@ -120,6 +120,53 @@ NEAR_MISSES = [
 ]
 
 
+TOOL = "~/.claude/hooks/wal_note.py"
+REST = " --wal ~/.claude/wals/s1/agent-a.jsonl --event status --note "
+
+# A literal assignment is literal. kill_guard, merge_gate and dropped_gate accept these; the launcher's fast path does not.
+ASSIGNED = [
+    "W=" + TOOL + "; python3 \"$W\"" + REST + "'dispose of it: the gate is fail-closed'",
+    "W=" + TOOL + "\npython3 $W" + REST + "'os.kill and pkill are words here'",
+    "PY=python3 && $PY " + TOOL + REST + "'gh pr merge 5 is main only; pkill too'",
+    "T='said: dispose, closed'; " + NOTE + "'a'",
+    "N='two words; kill 4242'; " + NOTE + '"$N"',
+    "note=\"git merge, gh pr merge 5\"; " + NOTE + '"${note}" --ticket goodqa#1',
+    "W=" + TOOL + "; N=plain; python3 ${W}" + REST + "$N; python3 $W" + REST + "'b'",
+]
+
+ASSIGNED_MISSES = [
+    # the value is computed, or is not the installed tool
+    "W=$(which wal_note.py); python3 $W" + REST + "'a'", "W=`which x`; python3 $W" + REST + "'a'",
+    "W=/tmp/wal_note.py; python3 $W" + REST + "'a'", "W=./wal_note.py; python3 $W" + REST + "'a'",
+    "W=\"~/.claude/hooks/wal_note.py\"; python3 $W" + REST + "'a'", "W=$HOME/.claude/hooks/wal_note.py; python3 $W" + REST + "'a'",
+    "W=" + TOOL + "x; python3 $W" + REST + "'a'", "W=~/.claude/hooks/kill_guard.py; python3 $W spawn -- kill 1",
+    "PY=bash; $PY " + TOOL + REST + "'a'", "PY='python3 -i'; $PY " + TOOL + REST + "'a'",
+    "W=/tmp/x:" + TOOL + "; python3 $W" + REST + "'a'",
+    # a name that can change what runs, or an assignment of another kind
+    "HOME=/tmp/x; " + NOTE + "'a'", "PATH=/tmp/x; " + NOTE + "'a'", "path=/tmp/x; " + NOTE + "'a'", "IFS=x; " + NOTE + "'a'",
+    "PYTHONPATH=/tmp/x; " + NOTE + "'a'", "fpath=/tmp/x; " + NOTE + "'a'", "BASH_ENV=/tmp/x; " + NOTE + "'a'",
+    "home=/tmp/x; " + NOTE + "'a'", "cdpath=/tmp; " + NOTE + "'a'", "ENV=/tmp/x; " + NOTE + "'a'",
+    "W=" + TOOL + " python3 $W" + REST + "'a'", "export W=" + TOOL + "; python3 $W" + REST + "'a'",
+    "declare W=" + TOOL + "; python3 $W" + REST + "'a'", "W+=" + TOOL + "; python3 $W" + REST + "'a'",
+    "W=(a b); " + NOTE + "'a'", "W[1]=a; " + NOTE + "'a'", "read W; python3 $W" + REST + "'a'",
+    # set somewhere else, later, in a subshell, or conditionally
+    "python3 $W" + REST + "'a'", "python3 $W" + REST + "'a'; W=" + TOOL + "; " + NOTE + "'a'",
+    "W=" + TOOL + " & python3 $W" + REST + "'a'", "W=" + TOOL + " | python3 $W" + REST + "'a'",
+    "W=" + TOOL + " || python3 $W" + REST + "'a'", "(W=" + TOOL + "); python3 $W" + REST + "'a'", "W=" + TOOL, "W=a;", "W=a; N=b\n",
+    # an expansion that is more than the whole value
+    "N='a b'; " + NOTE + "$N", "N='*'; " + NOTE + "$N", "N='$(kill 1)'; " + NOTE + "$N", "N='~/x'; " + NOTE + "$N",
+    "N=a; " + NOTE + "$N$N", "N=a; " + NOTE + '"$N"b', "N=a; " + NOTE + '"b$N"', "N=a; " + NOTE + "b$N", "N=a; " + NOTE + "$Nb",
+    "N=a; " + NOTE + "${N:-kill}", "N=a; " + NOTE + "${N%a}", "N=a; " + NOTE + "$N[1]", "N=a; " + NOTE + "$N:h",
+    "N=a; " + NOTE + "${N", "N=a; " + NOTE + '"$N', "N=a; " + NOTE + "$N\"", "N=a; " + NOTE + "${#N}", "N=a; " + NOTE + "${!N}",
+    "N=a; " + NOTE + "$(kill 1)", "N=a; " + NOTE + '"$(kill 1)"', "N=a; " + NOTE + "$1", "N=a; " + NOTE + "$@", "N=a; " + NOTE + "$$",
+    "N=a; " + NOTE + "$'$N'",
+    # a value that is not one literal word, and something else next to it
+    "N=\"$(kill 1)\"; " + NOTE + "'a'", "N=$'a'; " + NOTE + "'a'", "N=a\\ b; " + NOTE + "'a'", "N='a'b; " + NOTE + "'a'", "N=a b; " + NOTE + "'a'",
+    "N=a;kill 1; " + NOTE + "'a'", "N=a>x; " + NOTE + "'a'", "N=a <x; " + NOTE + "'a'", "N=a {b,c}; " + NOTE + "'a'", "N=; " + NOTE + '"$N"',
+    "N='--decision'; " + NOTE + "'a' $N approved", "N='-x'; " + NOTE + "$N", "N=kill; $N 4242; " + NOTE + "'a'",
+]
+
+
 class Home(unittest.TestCase):
     """A private HOME with the recording tools in place (empty files: nothing here runs them)."""
 
@@ -150,6 +197,12 @@ class FastPath(Home):
     def test_near_misses_do_not(self):
         self.assertGreater(len(NEAR_MISSES), 140)
         self.assertEqual([c for c in NEAR_MISSES if launcher.records_only(c)], [])
+
+    def test_literal_assignments_count_only_where_asked(self):
+        self.assertEqual([c for c in RECORDS + ASSIGNED if not launcher.records_only(c, True)], [])
+        self.assertEqual([c for c in ASSIGNED if launcher.records_only(c) or launcher.payload_records_only(self.bash(c))], [])
+        self.assertGreater(len(ASSIGNED_MISSES), 70)
+        self.assertEqual([c for c in NEAR_MISSES + ASSIGNED_MISSES if launcher.records_only(c, True)], [])
 
     def test_the_shared_shell_reader_reads_the_same_words(self):
         """bash and zsh agree with the fast path about every command it accepts (shell_words is checked against both)."""
@@ -259,6 +312,83 @@ class Launcher(Home):
         codex = [h["timeout"] for g in groups for h in g["hooks"] if "command_guard_hook.py" in h["command"]]
         self.assertEqual((claude, codex), (30, [30]))
         self.assertEqual(launcher.CHILD_TIMEOUT, 25.0)
+
+
+class OtherGuards(Home):
+    """kill_guard, merge_gate and dropped_gate use the same helper. A sub-agent's payload, so nothing is main's."""
+
+    def kill(self, command):
+        done = subprocess.run([sys.executable, str(HOOKS / "kill_guard.py"), "hook"], timeout=120, check=False,
+                              input=json.dumps(self.bash(command, agent_id="a1")).encode(), capture_output=True,
+                              env={"PATH": "/usr/bin:/bin", "HOME": str(self.home)})
+        return done.returncode, done.stderr.decode()
+
+    def merge(self, command):
+        import merge_gate
+
+        def no_gh(*_args, **_kwargs):
+            raise merge_gate.GateError("no gh in this test")
+
+        with tempfile.TemporaryDirectory() as state:
+            return merge_gate.decide(self.bash(command, agent_id="a1"), no_gh, state)
+
+    def dropped(self, command):
+        import dropped_gate
+        return dropped_gate.cmd_pretool(self.bash(command, agent_id="a1", session_id="s1"))
+
+    def test_kill_guard_allows_recording_calls(self):
+        rows = [RECONCILE + "'the run was killed' --evidence 'kill -0 said no'", ASSIGNED[1],
+                NOTE + "'HOME is set; os.kill was refused'"]
+        for command in rows + [ASSIGNED[4], RECORDS[8]]:  # the last two were allowed before and stay so
+            with self.subTest(command=command):
+                self.assertEqual(self.kill(command), (0, ""))
+
+    def test_kill_guard_still_refuses(self):
+        for command in (NOTE + "'a'; kill 4242", "W=/tmp/x.py; python3 $W" + REST + "'os.kill'", "pkill -f x; " + NOTE + "'a'",
+                        "python3 ~/.claude/hooks/usage_guard.py check --owner a -- pkill -f x",
+                        "python3 ./usage_guard.py reconcile --run r --actor a --reason 'kill 1' --evidence e",
+                        "python3 ~/.claude/hooks/usage_guard.py reconcile --reason x -- kill 4242",
+                        "HOME=/tmp/x python3 ~/.claude/hooks/usage_guard.py reconcile --reason 'kill 4242'",
+                        NOTE + '"$(pkill -f x)"', NOTE + "'kill 4242' | sh", "N=kill; $N 4242; " + NOTE + "'a'"):
+            with self.subTest(command=command):
+                code, err = self.kill(command)
+                self.assertEqual(code, 2)
+                self.assertIn("kill_guard BLOCKED", err)
+
+    def test_kill_guard_mixed_reconcile_is_judged_by_its_own_words(self):
+        mixed = "cd /tmp && " + RECONCILE + "'the run was killed' --evidence 'kill -0 said no'"
+        self.assertEqual(self.kill(mixed), (0, ""))
+        self.assertEqual(self.kill(mixed + " && pkill -f x")[0], 2)
+
+    def test_merge_gate_allows_recording_calls(self):
+        for command in (NOTE + "'gh pr merge 5 waits for main'", ASSIGNED[2], ASSIGNED[5],
+                        COMMENT + "'gh pr merge 5 waits for main'",
+                        RECONCILE + "'merge_gate.py waive was refused' --evidence 'none'",
+                        "W=" + TOOL + "; python3 $W" + REST + "'the merge_gate waive was refused'"):
+            with self.subTest(command=command):
+                self.assertEqual(self.merge(command), (0, ""))
+
+    def test_merge_gate_still_refuses(self):
+        waive = "python3 ~/.claude/hooks/merge_gate.py waive --repo o/r --pr 5 --head " + "a" * 40 + " --ticket 'GoodQA #1' --reason x"
+        for command in (waive, NOTE + "'a'; " + waive, "W=~/.claude/hooks/merge_gate.py; python3 $W waive --pr 5",
+                        "W='python3 ~/.claude/hooks/merge_gate.py waive --pr 5'; $W", "PY=python3; $PY ~/.claude/hooks/merge_gate.py waive --pr 5",
+                        NOTE + "'gh pr merge 5' | sh", NOTE + '"$(' + waive + ')"',
+                        NOTE + "'x' >> ~/.claude/merge-gate-waivers.jsonl", "G=gh; $G pr merge 5; " + NOTE + "'a'"):
+            with self.subTest(command=command):
+                self.assertEqual(self.merge(command)[0], 2)
+
+    def test_dropped_gate_allows_recording_calls(self):
+        for command in (ASSIGNED[0], "PY=python3; $PY " + TOOL + REST + "'dispose; kind closed'"):
+            with self.subTest(command=command):
+                self.assertEqual(self.dropped(command), {})
+
+    def test_dropped_gate_still_refuses_a_computed_acknowledgement(self):
+        ah = "python3 ~/.claude/hooks/ah.py task dispose --agent a --kind "
+        for command in (ah + "closed", "K=closed; " + ah + '"$K"', "A=~/.claude/hooks/ah.py; python3 $A task dispose --kind closed",
+                        NOTE + "'a'; " + ah + "closed", "W=$(which ah); python3 $W task dispose --kind closed",
+                        "AH='" + ah + "closed'; $AH", NOTE + '"$(' + ah + 'closed)"'):
+            with self.subTest(command=command):
+                self.assertIn("deny", json.dumps(self.dropped(command)))
 
 
 if __name__ == "__main__":

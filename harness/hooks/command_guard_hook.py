@@ -50,7 +50,13 @@ RECORD_CONTROL = re.compile(r'[\x00-\x08\x0b-\x1f\x7f]')
 # word: no expansion, substitution, escape, history, glob, brace, comment or zsh `=word`.
 RECORD_TOKEN = re.compile(r"(?P<gap>[ \t]+)|(?P<op>;|&&|\n)|'(?P<single>[^']*)'|\"(?P<double>[^\"$`\\!]*)\"|"
                           r"(?P<bare>(?:~/)?(?![=#~])[A-Za-z0-9_@%+:,./#=-]+)")
+# `NAME=literal` as a statement of its own, and `$NAME` or "$NAME" as a whole word later. A closed list of names: none is
+# read by a shell, Python or a harness tool, so setting one changes nothing but the words that use it.
+RECORD_NAME = r"(?P<name>[A-Za-z]|wal|WAL|note|NOTE|text|TEXT|body|BODY|tool|TOOL|hooks|HOOKS|ah|AH|py|PY|msg|MSG)"
 RECORD_PLAIN = re.compile(r'[A-Za-z0-9_@%+:,./#-]+')
+RECORD_ASSIGN = re.compile(RECORD_NAME + r"=(?:'(?P<single>[^']*)'|\"(?P<double>[^\"$`\\!]*)\"|"
+                                         r"(?P<bare>(?:~/)?(?![#~])[A-Za-z0-9_@%+:,./#-]+))(?=[ \t]*(?:;|&&|\n))")
+RECORD_USE = re.compile(r'(?P<quote>")?\$(?P<brace>\{)?' + RECORD_NAME + r'(?(brace)\}|(?![A-Za-z0-9_\[:]))(?(quote)")')
 RECORD_WAL = re.compile(r'/\.claude/wals/[A-Za-z0-9._-]{1,120}/[A-Za-z0-9._-]{1,120}\.jsonl')
 RECORD_EVENTS = frozenset(('intent', 'scope', 'decision', 'risk', 'check', 'commit', 'blocker', 'status', 'handoff',
                            'result', 'requirement', 'deploy'))  # not ask or ask_resolved: they open and settle asks
@@ -58,14 +64,33 @@ RECORD_TICKET = re.compile(r'(?:GoodQA ?)?[A-Za-z][A-Za-z0-9-]{0,62}#[1-9][0-9]{
 RECORD_PATH = re.compile(r'/(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+')
 
 
-def _record_statements(command):
+def _record_statements(command, assignments=False):
     """[[word, ...], ...] for a command made of literal words joined by `;`, `&&` or a newline, else None. A word is
-    (value, was bare); a bare `~/` is expanded, as both shells do for an argument word."""
+    (value, was bare); a bare `~/` is expanded, as both shells do for an argument word. With `assignments`, a statement
+    may also be one RECORD_ASSIGN, and a word one RECORD_USE of a name assigned before it (read as that value)."""
     if len(command) > 65536 or RECORD_CONTROL.search(command):
         return None
     home = os.path.expanduser('~')
-    statements, words, at, glued, last = [], [], 0, False, ''
+    statements, words, at, glued, last, held = [], [], 0, False, '', {}
     while at < len(command):
+        if assignments and not words:
+            match = RECORD_ASSIGN.match(command, at)
+            if match:
+                kind = next(k for k in ('single', 'double', 'bare') if match.group(k) is not None)
+                value = match.group(kind)
+                held[match.group('name')] = home + value[1:] if kind == 'bare' and value.startswith('~/') else value
+                at, words = match.end(), [None]
+                continue
+        if assignments and not glued:
+            match = RECORD_USE.match(command, at)
+            if match:
+                value = held.get(match.group('name'))
+                plain = value is not None and bool(RECORD_PLAIN.fullmatch(value))
+                if value is None or not (plain or match.group('quote')):
+                    return None  # unset here, or text an unquoted expansion splits or globs in bash
+                at, glued = match.end(), True
+                words.append((value, plain))
+                continue
         match = RECORD_TOKEN.match(command, at)
         if match is None:
             return None
@@ -75,7 +100,8 @@ def _record_statements(command):
         elif kind == 'op':
             glued = False
             if words:
-                statements.append(words)
+                if words != [None]:
+                    statements.append(words)
                 words, last = [], match.group()
             elif match.group() != '\n' or last == '&&':
                 return None  # an operator with no command before it, or a line break after `&&`
@@ -159,20 +185,22 @@ def _records(words):
     return False
 
 
-def records_only(command):
-    """True when `command` is one or more plain recording calls, joined by `;`, `&&` or newlines, and nothing else."""
-    statements = _record_statements(command) if isinstance(command, str) else None
+def records_only(command, assignments=False):
+    """True when `command` is one or more plain recording calls, joined by `;`, `&&` or newlines, and nothing else (with
+    `assignments`: nothing else but literal assignments the calls use)."""
+    statements = _record_statements(command, assignments) if isinstance(command, str) else None
     return bool(statements) and all(_records(words) for words in statements)
 
 
-def payload_records_only(payload):
+def payload_records_only(payload, assignments=False):
     """records_only() for the one command of a Bash tool call. Text typed into a running shell, a list, a second command
-    field and every other tool are judged as before: their state or shell is not known here."""
+    field and every other tool are judged as before: their state or shell is not known here. kill_guard, merge_gate and
+    dropped_gate call this with `assignments`; the launcher's own fast path does not."""
     if not isinstance(payload, dict) or payload.get('tool_name') != 'Bash':
         return False
     tool_input = payload.get('tool_input')
     return isinstance(tool_input, dict) and not any(k in tool_input for k in COMMAND_KEYS[1:]) \
-        and records_only(tool_input.get('command'))
+        and records_only(tool_input.get('command'), assignments)
 
 
 def guarded_text(raw):

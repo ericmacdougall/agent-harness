@@ -1933,7 +1933,8 @@ def make_analyzer_class(cg):
             if not texts or texts[0].startswith('-'):
                 return texts
             name = os.path.basename(texts[0])
-            if name not in self.DATA_ARG_SCRIPTS:
+            settles = name == 'usage_guard.py' and texts[1:2] == ['reconcile']  # it records; `check` runs its words
+            if name not in self.DATA_ARG_SCRIPTS and not settles:
                 return texts
             # goodqa#15276 red-team H1: decide on the RAW word, as hook_script_ok does. A quoted or escaped '~' is a
             # literal ./~ directory, while .text has HOME expanded, so a text match let a planted copy through.
@@ -2313,6 +2314,12 @@ def hook_main():
     policy = load_policy()
     if policy['mode'] == 'off':
         return 0
+    try:
+        from command_guard_hook import payload_records_only  # noqa: PLC0415 - the shared helper (goodqa#17149)
+        if payload_records_only(json.loads(raw), assignments=True):
+            return 0  # only recording calls with literal words: what they say is data, and nothing signals
+    except Exception:  # noqa: BLE001 - no helper, no exemption
+        pass
     try:
         child = subprocess.run([sys.executable, '-I', os.path.abspath(__file__), 'analyze'], input=data,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
