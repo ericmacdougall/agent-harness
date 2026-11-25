@@ -69,7 +69,10 @@ DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report
                     'ah_hook.py', 'ah_roles.py', 'ah_switch.py',
                     # imported by the helpers above (tests/test_shipped_modules.py walks the imports)
                     'ah_approvals.py', 'ah_secret.py', 'ah_log_push.py', 'ah_kill.py', 'ah_ticket.py', 'ah_chat.py',
-                    'ah_chat_send.py', 'central_decisions.py', 'gq_browser.py', 'successor.py', 'worktree_hygiene.py')
+                    'ah_chat_send.py', 'central_decisions.py', 'gq_browser.py', 'successor.py', 'worktree_hygiene.py',
+                    # Session folders, saved work and the reaper (docs/lifecycle.md): the save library, `ah reap` and
+                    # `ah co`, the SessionStart hook and the Stop save hook.
+                    'git_save.py', 'ah_reap.py', 'session_env.py', 'autosave.py')
 GIT_HOOK_KEY = 'agent-harness-commit-policy-codex'  # independent of the Claude install's key
 HOOK_EVENTS = ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'SubagentStart', 'Stop', 'Interrupt')
 
@@ -131,6 +134,14 @@ def owner_inbox_command(codex_home: Path, launcher: bool = True) -> str:
     return launch(codex_home, 'owner_inbox.py', ' hook', launcher)
 
 
+def session_env_command(codex_home: Path, launcher: bool = True) -> str:
+    return launch(codex_home, 'session_env.py', '', launcher)
+
+
+def autosave_command(codex_home: Path, launcher: bool = True) -> str:
+    return launch(codex_home, 'autosave.py', '', launcher)
+
+
 def command_argv(command: str) -> list[str]:
     """[script path, *args] of a Codex command string, direct or through the launcher (shell words after python3)."""
     words = shlex.split(command)[1:]
@@ -147,12 +158,13 @@ def known_commands(codex_home: Path) -> set[str]:
                 guard_command(codex_home, launcher=launcher), guard_command(codex_home, '', launcher),
                 gate_command(codex_home, launcher), gate_command(codex_home, launcher, legacy=True),
                 kill_guard_command(codex_home, launcher),
-                heavy_guard_command(codex_home, launcher), owner_inbox_command(codex_home, launcher)}
+                heavy_guard_command(codex_home, launcher), owner_inbox_command(codex_home, launcher),
+                session_env_command(codex_home, launcher), autosave_command(codex_home, launcher)}
     return out
 
 
 MANAGED_SCRIPTS = ('wal.py', 'commit_policy.py', 'command_guard_hook.py', 'merge_gate.py', 'kill_guard.py',
-                   'heavy_job_guard.py', 'owner_inbox.py')
+                   'heavy_job_guard.py', 'owner_inbox.py', 'session_env.py', 'autosave.py')
 
 
 def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) -> dict:
@@ -169,6 +181,10 @@ def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) ->
     heavy_guard = heavy_guard_command(codex_home)
     gate = gate_command(codex_home)
     owner_inbox = owner_inbox_command(codex_home)
+    # Session lifecycle (docs/lifecycle.md): the session folder and its one line at SessionStart, and a save of what
+    # the session's checkouts hold nowhere else at Stop. Both always exit 0 and print no decision.
+    session_env = {'hooks': [{'type': 'command', 'command': session_env_command(codex_home), 'timeout': 10}]}
+    autosave = {'hooks': [{'type': 'command', 'command': autosave_command(codex_home), 'timeout': 30}]}
     known = known_commands(codex_home)
     for event in HOOK_EVENTS:
         lifecycle = event in {'Stop', 'Interrupt'}
@@ -185,7 +201,7 @@ def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) ->
                         if not (isinstance(handler, dict) and handler.get('type') == 'command'
                                 and handler.get('command') in known)]
             legacy = {'hooks': [{**managed['hooks'][0], 'command': managed_command(codex_home, False)}]}
-            if lifecycle and len(handlers) != len(group['hooks']) and group not in (managed, legacy):
+            if lifecycle and len(handlers) != len(group['hooks']) and group not in (managed, legacy, autosave):
                 raise ValueError(f'hooks.json has a custom {event} hook invoking the managed command; '
                                  'reconcile that group explicitly before installing')
             if handlers:
@@ -213,6 +229,11 @@ def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) ->
         # Appended last so existing Codex hook-trust positions do not move. No Stop hook for Codex.
         if event in {'SessionStart', 'UserPromptSubmit'}:
             preserved.append({'hooks': [{'type': 'command', 'command': owner_inbox, 'timeout': 5}]})
+        # Appended after everything else, for the same reason: Codex asks the user to review a new hook in /hooks.
+        if event == 'SessionStart':
+            preserved.append(session_env)
+        if event == 'Stop':
+            preserved.append(autosave)
         hooks[event] = preserved
     return result
 

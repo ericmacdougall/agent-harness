@@ -16,8 +16,8 @@ Every guard and gate asks here instead of keeping its own idea of roles.
 Rules (the user, 2026-11-24):
   * Fable and Astra may delete files and folders anywhere, and may handle secrets.
   * A supervisor may clean up repositories and code of the projects it supervises.
-  * Any agent may clean up its own code: its session work directory, its scratch directory, and checkouts or
-    worktrees it made (callers pass those as `own_roots`).
+  * Any agent may clean up its own code: its session work directory, its session temp directory, its scratch
+    directory, and checkouts or worktrees it made (callers pass those as `own_roots`).
 
 Threat model, as everywhere in the harness: careless or hurried agents, not one that edits this file or roles.json.
 Standard library only; never raises on bad input (unknown means the least privilege).
@@ -191,12 +191,13 @@ def _inside(path: Path, root: Path) -> bool:
 
 
 def own_roots(payload, home=None) -> list[Path]:
-    """Directories every agent may clean without asking: its session's durable work directory and scratch."""
+    """Directories every agent may clean without asking: its session's durable work directory, its temp directory
+    (the TMPDIR session_env.py gives it: tmp/<first 8 characters of the session id>) and scratch."""
     session = _session(payload)
     if not session or not SESSION_ID.match(session):
         return []
     base = state_dir(home)
-    roots = [base / "work" / session]
+    roots = [base / "work" / session, base / "tmp" / session[:8]]
     scratch = base / "scratch"
     try:
         roots += [p for p in scratch.glob(f"*/*/{session}") if p.is_dir()]

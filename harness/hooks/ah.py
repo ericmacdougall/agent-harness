@@ -4160,6 +4160,12 @@ def main(argv=None) -> int:
     if given[:1] == ["log-push"]:  # push logs to the private log repository, verify, then delete them (ah_log_push.py)
         import ah_log_push  # noqa: PLC0415
         return ah_log_push.main(given[1:])
+    if given[:1] == ["reap"]:  # scan session folders, save their work, then remove the idle ones (ah_reap.py, docs/lifecycle.md)
+        import ah_reap  # noqa: PLC0415
+        return ah_reap.main(given[1:])
+    if given[:1] == ["co"]:  # a checkout in the session folder whose origin is the real URL (ah_reap.py, docs/lifecycle.md)
+        import ah_reap  # noqa: PLC0415
+        return ah_reap.co_main(given[1:])
     if given[:1] == ["guard-selftest"]:  # goodqa#15876: a fixed live test of a guard rule; it takes no command, path or directory
         try:
             import guard_selftest  # noqa: PLC0415

@@ -55,7 +55,10 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "ahc_release.json",  # imported or read by ahc_runner (goodqa#16049; ahc_release.json: AC-11 preflight)
          "ahc_merge.py",  # the ahc E2 sender; runs as its own OS user (goodqa#16049)
          "ah_hook.py", "ah_roles.py", "ah_switch.py",  # the launcher every hook runs through, roles, the off switch
-         "ah_approvals.py", "ah_secret.py", "ah_log_push.py")  # approvals store, `ah secret`, `ah log-push` (2026-11-24)
+         "ah_approvals.py", "ah_secret.py", "ah_log_push.py",  # approvals store, `ah secret`, `ah log-push` (2026-11-24)
+         # session folders, saved work and the reaper (docs/lifecycle.md): the save library, `ah reap` and `ah co`,
+         # the SessionStart hook and the Stop / SubagentStop / SessionEnd save hook
+         "git_save.py", "ah_reap.py", "session_env.py", "autosave.py")
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
@@ -106,7 +109,8 @@ def managed_scripts(claude: Path) -> set[str]:
             for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py",
                          "command_guard_hook.py", "kill_guard.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py", "log_backup.py", "bg_lint.py",
                          "dropped_gate.py", "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py",
-                         "mc_inbox.py", "owner_inbox.py", "mission_gate.py", "status_truth.py", "idle_guard.py", "copy_hygiene.py")}
+                         "mc_inbox.py", "owner_inbox.py", "mission_gate.py", "status_truth.py", "idle_guard.py", "copy_hygiene.py",
+                         "session_env.py", "autosave.py")}
 
 
 # Every agent type: a narrower matcher left general-purpose, claude and Explore owners without any
@@ -337,6 +341,16 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
                    "args": [str(claude / "hooks" / "owner_inbox.py"), "hook"], "timeout": 5}
     for event in ("UserPromptSubmit", "SessionStart", "PostToolUse"):
         managed.setdefault(event, []).append({"hooks": [dict(owner_inbox)]})
+    # Session lifecycle (docs/lifecycle.md). session_env makes the session folder, exports AH_SESSION, AH_WORK and
+    # TMPDIR through CLAUDE_ENV_FILE and prints one line. autosave saves what the session's checkouts hold nowhere
+    # else (own budget 20 s). Both read no command text, never block and always exit 0, so no onFailure. autosave is
+    # synchronous: nothing in this repository confirms that Claude Code accepts "async" on a handler.
+    managed["SessionStart"].append({"hooks": [{
+        "type": "command", "command": "python3", "args": [str(claude / "hooks" / "session_env.py")], "timeout": 10}]})
+    autosave = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "autosave.py")], "timeout": 30}
+    managed.setdefault("Stop", []).append({"hooks": [autosave]})
+    managed.setdefault("SubagentStop", []).append({"matcher": SUBAGENT_MATCHER, "hooks": [dict(autosave)]})
+    managed.setdefault("SessionEnd", []).append({"hooks": [dict(autosave)]})
     return through_launcher(managed, claude)
 
 
