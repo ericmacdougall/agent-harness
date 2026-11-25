@@ -64,7 +64,7 @@ DEFAULT_POLICY = {
     # systemd unit, a tmux session, a pm2 app or a container name. Stopping one needs the owner's approval.
     'protected': [r'\bahd(?:\.py)?\b', r'\bahd_peek\b', r'log[_-]backup', r'backup[_-]watch', r'ops[_-]watch',
                   r'\bnetwatch\b', r'\bhookd\b', r'\brclone\b', r'mission[_-]control', r'harness-console',
-                  r'com\.ericmacdougall\.', r'com\.agent-harness\.'],
+                  r'com\.agent-harness\.'],  # user-specific labels live in kill_guard_policy.json
     # Staging and live services (the owner fills this in): same matching as `protected`.
     'staging_live': [],
     'child_timeout_seconds': 10,
