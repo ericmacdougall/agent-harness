@@ -1,5 +1,6 @@
-"""Scenario B3.17: the owner cap (memory: at most 8 active owners) is enforced by the spawn hook, helpers are exempt,
-and warn mode no longer narrates allowed spawns (B24: enforce it or say nothing)."""
+"""The one owner cap (resource_limits.json max_live_owners, read by resource_budget.owner_cap; the spawn-time check is
+agent_gate.py). tier_gate.live_owner_ids still counts live owners for successor and Mission Control: helpers never
+count, an unknown label is an owner. tier_gate itself no longer denies or warns on the owner count."""
 
 import json
 import os
@@ -25,25 +26,26 @@ class OwnerCap(unittest.TestCase):
         self.env = mock.patch.dict(os.environ, {'AGENT_HARNESS_ESCALATION_DIR': str(self.root), 'AH_HOME': str(self.home)})
         self.env.start(); self.addCleanup(self.env.stop)
 
-    def test_shipped_caps_match_the_user_rule(self):
-        caps = self.policy['caps']
-        self.assertEqual(caps['session_owner_agents'], 8)  # the user raised it from 4 on 2026-11-09
-        self.assertEqual(caps['session_live_agents'], 16)
+    def test_shipped_cap_is_one_number_and_the_policy_carries_it(self):
+        import resource_budget  # noqa: PLC0415
+        with mock.patch.dict(os.environ, {'AH_HOME': str(self.home)}):
+            self.assertEqual(resource_budget.owner_cap(), {'max': 16, 'enforce': False})
+            caps = tiers.load_policy()['caps']
+        self.assertEqual(caps['session_owner_agents'], 16)  # copied from the one cap for older readers
+        self.assertNotIn('session_live_agents', caps)  # retired: helpers are never counted
         self.assertIn('task-owner', caps['owner_types']); self.assertNotIn('red-team', caps['owner_types'])
+        raw = json.loads((HOOKS / 'model_tiers.json').read_text())['caps']
+        self.assertNotIn('session_owner_agents', raw); self.assertNotIn('session_live_agents', raw)
 
-    def test_ninth_owner_is_denied_with_the_live_ids_and_helpers_still_pass(self):
+    def test_live_owner_ids_count_owners_only_and_unknown_labels_are_owners(self):
         for n in range(8):
             gate.live_update('s7', 'owner-%d' % n, start=True, agent_type='task-owner')
         gate.live_update('s7', 'reviewer-1', start=True, agent_type='red-team')  # a helper never counts as an owner
-        self.assertEqual(gate.live_owner_ids('s7', self.policy), ['owner-%d' % n for n in range(8)])
-        reason, owners = gate.owner_cap_decision('s7', {'subagent_type': 'task-owner'}, self.policy)
-        self.assertIn('owner cap 8 reached', reason); self.assertIn('owner-0', reason); self.assertIn('ah.py owners', reason)
-        for helper in ('red-team', 'click-tester', 'fixer', 'Explore', 'Plan'):
-            self.assertEqual(gate.owner_cap_decision('s7', {'subagent_type': helper}, self.policy)[0], None, helper)
-        for invented in ('helper', 'assistant', 'owner-lite'):  # round 2: an unknown label is an owner, not an exemption
-            self.assertIn('owner cap 8 reached', gate.owner_cap_decision('s7', {'subagent_type': invented}, self.policy)[0] or '', invented)
+        gate.live_update('s7', 'invented-1', start=True, agent_type='owner-lite')  # an unknown label is an owner
+        self.assertEqual(gate.live_owner_ids('s7', self.policy), ['invented-1'] + ['owner-%d' % n for n in range(8)])
+        self.assertFalse(hasattr(gate, 'owner_cap_decision'))  # one cap: no second owner cap in tier_gate
         gate.live_update('s7', 'owner-2', start=False)
-        self.assertIsNone(gate.owner_cap_decision('s7', {'subagent_type': 'general-purpose'}, self.policy)[0])
+        self.assertNotIn('owner-2', gate.live_owner_ids('s7', self.policy))
 
     def test_owner_count_prefers_wal_liveness_over_the_expiring_live_map(self):
         # Kimi round 1 (HIGH): the live map forgets an owner after 30 minutes without a start/stop; ah owners does not.
@@ -52,7 +54,6 @@ class OwnerCap(unittest.TestCase):
         rows.append({'agent_id': 'finished1', 'owner': True, 'state': 'done'})
         with mock.patch('ah.owners', return_value={'owners': rows}):
             self.assertEqual(gate.live_owner_ids('s8', self.policy), ['longrunner%d' % n for n in range(8)])
-            self.assertIsNotNone(gate.owner_cap_decision('s8', {'subagent_type': 'task-owner'}, self.policy)[0])
 
     def test_unmocked_owner_count_includes_general_purpose_and_quiet_owners(self):
         # Review F3: ah owners flags only task-owner agents, so six live general-purpose owners counted zero. This test
@@ -74,12 +75,9 @@ class OwnerCap(unittest.TestCase):
         (wals / 'agent-done1.jsonl').write_text(_json.dumps({'at': iso(now - 200), 'event': 'result', 'note': 'finished'}) + '\n')
         owners = gate.live_owner_ids('s10', self.policy)
         self.assertEqual(owners, ['gp%d' % n for n in range(10)])
-        reason, _ = gate.owner_cap_decision('s10', {'subagent_type': 'general-purpose'}, self.policy)
-        self.assertIn('owner cap 8 reached', reason or '')
-        self.assertIsNone(gate.owner_cap_decision('s10', {'subagent_type': 'red-team'}, self.policy)[0])
 
-    def test_hook_denies_in_enforce_and_warn_mode_is_silent_on_allowed_spawns(self):
-        for n in range(8):
+    def test_tier_gate_never_denies_or_warns_on_the_owner_count(self):
+        for n in range(20):
             gate.live_update('s9', 'owner-%d' % n, start=True, agent_type='general-purpose')
 
         def run_hook(data, mode):
@@ -92,12 +90,10 @@ class OwnerCap(unittest.TestCase):
             return json.loads(result.stdout)['hookSpecificOutput'] if result.stdout.strip() else None
 
         spawn = {'tool_name': 'Agent', 'tool_input': {'prompt': 'x [task:k20]', 'subagent_type': 'task-owner', 'model': 'sonnet'}, 'session_id': 's9'}
-        self.assertEqual(run_hook(spawn, 'enforce')['permissionDecision'], 'deny')
-        self.assertIn('would deny: owner cap', run_hook(spawn, 'warn')['additionalContext'])
-        helper = dict(spawn, tool_input={**spawn['tool_input'], 'subagent_type': 'fixer'})  # a helper at the matching rung
-        self.assertIsNone(run_hook(helper, 'warn'))  # allowed: warn mode says nothing (no "would apply updatedInput")
-        allowed = run_hook(helper, 'enforce')
-        self.assertTrue(allowed is None or allowed.get('permissionDecision') == 'allow')
+        self.assertIsNone(run_hook(spawn, 'enforce'))  # 20 live owners: the advisory is agent_gate's, not this hook's
+        self.assertIsNone(run_hook(spawn, 'warn'))
+        helper = dict(spawn, tool_input={**spawn['tool_input'], 'subagent_type': 'fixer'})
+        self.assertIsNone(run_hook(helper, 'warn'))
 
 
 if __name__ == '__main__':

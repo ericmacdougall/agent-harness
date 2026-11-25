@@ -1,5 +1,6 @@
 {
-  "max_agents": 20,
-  "warn_agents": 12,
+  "_doc": "Repo defaults for the harness's numbers (resource_budget.LIMITS reads them; `ah limits show` prints the effective values). max_live_owners is THE owner cap per session: helpers, reviewers and testers are never counted. enforce=false: at the cap a short advisory; true: the spawn is denied. A local override (~/.agent-harness/limits.local.json, via `ah limits set`) may loosen freely; only the owner or a supervisor may tighten.",
+  "max_live_owners": 16,
+  "enforce": false,
   "max_heavy_mac": 2
 }

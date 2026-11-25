@@ -46,6 +46,13 @@ def load_policy(path=None):
     except (ValueError, UnicodeError):
         raise TierError('tier table is not valid JSON') from None
     validate(policy)
+    caps = policy.setdefault('caps', {})
+    try:  # the one owner cap lives in resource_limits.json; older readers of caps.session_owner_agents see it here
+        import resource_budget  # noqa: PLC0415
+        caps['session_owner_agents'] = resource_budget.owner_cap()['max']
+    except Exception:  # noqa: BLE001  a partial install keeps whatever the table says
+        pass
+    caps.pop('session_live_agents', None)  # retired: helpers are never counted, so there is no all-agents cap
     return policy
 
 
