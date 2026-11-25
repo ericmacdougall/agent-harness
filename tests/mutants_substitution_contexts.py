@@ -24,20 +24,22 @@ MUTANTS = {
          "            if False:\n                j = scan_backtick(text, i + 1)\n"
          "                w.subs.append((text[i + 1:j - 1]")],
     'arithmetic inside a body is skipped whole': [
-        ('                    i += 3  # arithmetic: scan its operands',
-         '                    i = min(self._arith_end(text, i), n)')],
+        ('                    i += 3\n                    continue\n                j = scan_balanced(text, i + 2)  # `$((cmd)',
+         '                    i = min(end, n)\n                    continue\n'
+         '                j = scan_balanced(text, i + 2)  # `$((cmd)')],
     'the scan ends a substitution at a closer inside a nested one': [
         ("        if c == '$' and s[i + 1:i + 2] in ('(', '{'):\n            i = scan_balanced(",
          "        if False:\n            i = scan_balanced(")],
     'the scan ignores substitutions inside double quotes': [
         ("                if s[i] == '$' and s[i + 1:i + 2] in ('(', '{'):", '                if False:')],
     "a case pattern's ) ends the substitution": [
-        ('            m = _SCAN_WORD.match(s, i) if edge else None', '            m = None')],
+        ("        elif start and w == 'case':\n            cases.append('subject')",
+         "        elif False:\n            cases.append('subject')")],
     'a dropped case pattern loses its substitutions': [
         ('    if not dropped:\n        return stripped', '    if True:\n        return stripped')],
     'a fall-through does not return to patterns': [
-        ("            if cases and cases[-1] == 'body' and c == ';' and s[i + 1:i + 2] in (';', '&'):",
-         "            if cases and cases[-1] == 'body' and c == ';' and s[i + 1:i + 2] == ';':")],
+        ("            if state == 'body' and c == ';' and s[i + 1:i + 2] in (';', '&'):",
+         "            if state == 'body' and c == ';' and s[i + 1:i + 2] == ';':")],
 }
 
 if __name__ == '__main__':
