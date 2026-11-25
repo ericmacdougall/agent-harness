@@ -44,5 +44,6 @@
   "clock_hold_ticks": 1,
   "no_evidence_window_seconds": 604800,
   "memory_cap_bytes": 1073741824,
-  "owners_wal_max_bytes": 268435456
+  "owners_wal_max_bytes": 268435456,
+  "owners_cache_ttl_seconds": 300
 }

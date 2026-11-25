@@ -1635,23 +1635,55 @@ def _append_line(path: Path, record: dict) -> None:
         os.close(fd)
 
 
+_LEDGER_MEMO: dict = {}   # (path, include_intents) -> (stat fingerprint, rows, lost lines, skipped, parse time); goodqa#17100
+LEDGER_MEMO_SETTLE_S = 2.0   # a memo is served only if the file had been still this long when it was parsed (coarse mtime granularity)
+
+
 def _ledger(home: Path, include_intents: bool = False, tally: "ReadTally | None" = None) -> list:
     """Applied rows (rows written before `state` existed count as applied); intents only on request. `tally` (the
     read-only views): an unreadable ledger is an unread source and a torn row a skipped line (PR 234 v8), since the
-    registrations, dispositions and pending stops all come from here."""
+    registrations, dispositions and pending stops all come from here.
+
+    A read-only view (tally given) reuses the parse while the file is unchanged (inode, size, mtime and ctime), so a
+    process that asks for many sessions parses the 20 MB ledger once, not once per session (goodqa#17100: ops-watch
+    spent most of a 30-minute run there). The tally effects are replayed from the memo; the list is a copy. Writers
+    pass no tally and always read the file.
+
+    Settle rule: a memo is served only when the file's mtime was at least LEDGER_MEMO_SETTLE_S older than the wall
+    clock at the start of its parse. Within the filesystem's timestamp granularity an in-place rewrite of the same
+    size keeps inode, size, mtime and ctime, so a parse that raced the last write must not be trusted; a file that
+    has not settled is parsed again on the next read, which then settles. Two assumptions: the file's mtime and
+    time.time() come from the same clock (a local filesystem; a remote one whose server clock runs behind this host
+    could serve a stale memo, one running ahead only costs the memo), and the timestamp granularity is 2 s or less
+    (ext4, APFS and FAT all are)."""
     path = store_dir(home) / "ledger.jsonl"
-    out = []
+    key = (str(path), bool(include_intents))
+    out, lost, skipped = [], [], 0
+    parsed_at = time.time()
     try:
         with open(path, "rb") as handle:
-            mtime = os.fstat(handle.fileno()).st_mtime
+            st = os.fstat(handle.fileno())
+            mtime = st.st_mtime
+            fp = (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+            memo = _LEDGER_MEMO.get(key) if tally is not None else None
+            # same stat triple AND settled: an in-place rewrite of the same size inside the filesystem's timestamp
+            # granularity of the parse would keep inode, size, mtime and ctime, so a memo of a just-written file is not served
+            if memo and memo[0] == fp and memo[4] - st.st_mtime >= LEDGER_MEMO_SETTLE_S:
+                for at_tail, lost_mtime in memo[2]:
+                    tally.line_lost(at_tail, lost_mtime)
+                tally.skipped += memo[3]
+                tally.read_ok += 1
+                return list(memo[1])
             for raw in handle:
                 try:
                     row = json.loads(raw)
                 except ValueError:
+                    lost.append((not raw.endswith(b"\n"), mtime))
                     if tally is not None:
-                        tally.line_lost(not raw.endswith(b"\n"), mtime)
+                        tally.line_lost(*lost[-1])
                     continue  # a torn line from a crash is ignored, never fatal
                 if not isinstance(row, dict):
+                    skipped += 1
                     if tally is not None:
                         tally.skipped += 1
                     continue
@@ -1661,6 +1693,10 @@ def _ledger(home: Path, include_intents: bool = False, tally: "ReadTally | None"
                     out.append(row)
         if tally is not None:
             tally.read_ok += 1
+            after = os.stat(path)
+            if fp == (after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                _LEDGER_MEMO[key] = (fp, out, lost, skipped, parsed_at)   # only a parse of a file that did not move meanwhile
+                return list(out)
     except OSError as error:
         if tally is not None:
             tally.missed("ah ledger", error)

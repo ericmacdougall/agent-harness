@@ -1858,7 +1858,7 @@ class TicketLookup:
             self.cache.pop(ref, None)
 
 
-def _owner_alerts(home, session, tickets, now):
+def _owner_alerts(home, session, tickets, now, info=None):
     """Sub-agent owners, through the one shared rule (ah.owners and liveness.classify). A stop followed by later
     WAL or transcript activity is not a stop, a just-stopped owner gets liveness.FINISH_GRACE_S, and helpers
     that return their result to the parent are not owners. Task text never leaves here, only ids and tickets."""
@@ -1869,6 +1869,8 @@ def _owner_alerts(home, session, tickets, now):
         rows = ah.owners(home, session, now=now)["owners"]
     except ah.AhError:
         return []
+    if info is not None:  # the caller's reuse decision: complete read, and nothing here changes with the clock alone
+        info["stable"] = all(liveness.row_time_independent(row) for row in rows)
     out = []
     for row in rows:
         state = row.get("state", "")
@@ -1932,6 +1934,74 @@ def _task_wal_alert(f, session, lc, tickets, now):
                   "ticket_quiet_h": quiet})
 
 
+class LedgerDigests:
+    """Per-session digests of the ledger rows `ah owners` derives its answer from (registrations, dispositions,
+    pending stops, deadlines), so an unrelated ledger append (comments, alerts) does not invalidate a session's
+    cached result. Computed once per run, lazily, from the memoised ah ledger read."""
+
+    def __init__(self, home):
+        self.home, self.loaded, self.glob, self.per = home, False, None, {}
+
+    def _load(self):
+        self.loaded = True
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import ah  # noqa: PLC0415
+        glob, per = hashlib.sha256(), {}
+        for r in ah._ledger(self.home, tally=ah.ReadTally()):
+            op = str(r.get("op") or "")
+            a = r.get("args") or {}
+            if not (op.startswith("task.") or op.startswith("deadline.")):
+                continue
+            blob = json.dumps(r, sort_keys=True).encode()
+            if op == "task.register" or (op == "task.dispose" and a.get("kind") == "legacy"):
+                glob.update(blob)  # read for every session: registrations and the legacy gate epoch
+            if a.get("session"):
+                per.setdefault(a["session"], hashlib.sha256()).update(blob)
+        self.glob, self.per = glob.hexdigest(), {k: v.hexdigest() for k, v in per.items()}
+
+    def fingerprint(self, session: str, files):
+        """None when the ledger cannot be read: that session is then rescanned, never reused."""
+        try:
+            if not self.loaded:
+                self._load()
+            if self.glob is None:
+                return None
+            h = hashlib.sha256((self.glob + self.per.get(session, "")).encode())
+            for f in sorted(files, key=lambda e: e.name):
+                st = f.stat()
+                h.update(f"{f.name}:{st.st_ino}:{st.st_size}:{st.st_mtime_ns};".encode())
+            return h.hexdigest()[:24]
+        except Exception:  # noqa: BLE001 - no fingerprint means no reuse, which is the safe direction
+            return None
+
+
+def _session_owner_alerts(home, session, files, tickets, now, state, scan, ledger_fp, deadline, lc, seen, skipped):
+    """_owner_alerts with two bounds (goodqa#17100). (1) A session whose WALs and relevant ledger rows are unchanged
+    and whose owners are all time-independent (finished or dropped) reuses its last result for up to reuse_max_s,
+    so owners already reported dropped are not re-read every run; any WAL write or disposition changes the
+    fingerprint and the session is read again at once. (2) Past the wall budget an unreached session keeps the alerts
+    it already has (carried from the active set): a bound never clears an alert on missing data."""
+    fp = ledger_fp.fingerprint(session, files)
+    ent = scan.get(session) or {}
+    if fp and ent.get("fp") == fp and 0 <= now - ent.get("at", 0) < float(lc.get("reuse_max_s", 3600)):
+        seen[session] = now
+        return [alert("liveness", k, sev, msg, det) for k, sev, msg, det in ent.get("alerts", [])]
+    if time.monotonic() >= deadline:
+        skipped.append(session)  # reported by check_liveness as liveness-scan-truncated; not marked as seen
+        prefix = f"liveness:{session[:8]}/agent-"
+        return [alert("liveness", k, v.get("severity", "warning"), v.get("message", ""), v.get("detail") or {})
+                for k, v in sorted((state.get("active") or {}).items()) if k.startswith(prefix)]
+    info = {}
+    got = _owner_alerts(home, session, tickets, now, info)
+    seen[session] = now
+    if fp and info.get("stable"):
+        scan[session] = {"fp": fp, "at": now,
+                         "alerts": [[a["key"], a["severity"], a["message"], a["detail"]] for a in got]}
+    else:
+        scan.pop(session, None)
+    return got
+
+
 def check_liveness(cfg, state, runner, now):
     """One alert per owner that needs a decision (key liveness:<session8>/<task>). Sub-agents follow the shared
     rule in liveness.py through ah.owners; named task WALs follow _task_wal_alert. A session idle past lookback_h
@@ -1948,7 +2018,14 @@ def check_liveness(cfg, state, runner, now):
     tickets = TicketLookup(lc, state, runner, gq if gq and os.path.isfile(gq) else None, now)
     alerting = {k.split(":", 1)[1].split("/", 1)[0] for k in (state.get("active") or {}) if k.startswith("liveness:")}
     out = []
-    for sess in sorted(sessions, key=lambda e: e.name):
+    scan = state.setdefault("liveness_scan", {})
+    deadline = time.monotonic() + float(lc.get("scan_budget_s", 240))
+    ledger_fp = LedgerDigests(home)
+    visited, skipped = set(), []
+    # last time each session was actually covered, kept apart from the reuse cache (which only stable sessions have),
+    # so a run that hits its budget starts next time with the sessions it did not reach (goodqa#17100 F1)
+    seen = state.setdefault("liveness_seen", {})
+    for sess in sorted(sessions, key=lambda e: (seen.get(e.name, 0), e.name)):
         try:
             files = [f for f in os.scandir(sess.path) if f.is_file(follow_symlinks=False) and f.name.endswith(".jsonl")]
             newest = max((f.stat().st_mtime for f in files), default=0)
@@ -1957,8 +2034,9 @@ def check_liveness(cfg, state, runner, now):
         horizon = lc["lookback_active_h"] if sess.name[:8] in alerting else lc["lookback_h"]
         if newest < now - horizon * 3600:
             continue
+        visited.add(sess.name)
         if root == home / ".claude" / "wals" and any(f.name == "main.jsonl" for f in files):
-            out += _owner_alerts(home, sess.name, tickets, now)
+            out += _session_owner_alerts(home, sess.name, files, tickets, now, state, scan, ledger_fp, deadline, lc, seen, skipped)
         for f in sorted(files, key=lambda e: e.name):
             if f.name == "main.jsonl" or f.name.startswith("agent-"):
                 continue
@@ -1969,6 +2047,15 @@ def check_liveness(cfg, state, runner, now):
             if found:
                 out.append(found)
     tickets.prune()
+    for cache in (scan, seen):
+        for name in [k for k in cache if k not in visited]:  # a session out of its horizon is history: drop its cache
+            cache.pop(name)
+    if skipped:
+        out.append(alert("liveness", "ops-watch:liveness-scan-truncated", "warning",
+                         f"liveness scan truncated: {len(skipped)} of {len(visited)} session(s) not reached within the "
+                         f"{round(float(lc.get('scan_budget_s', 240)))}s budget; their previous alerts are kept and "
+                         "they are read first next run",
+                         {"skipped": len(skipped), "sessions": len(visited)}))
     return out
 
 
@@ -2848,6 +2935,20 @@ def uninstall(home: Path, apply: bool) -> int:
     return 2 if loaded else 0
 
 
+def acquire_run_lock(home: Path):
+    """An exclusive, non-blocking flock on ~/.agent-harness/run/ops-watch.lock. Returns the open fd, or None when
+    another live run holds it. The kernel drops the lock when that process dies, so a crash never strands it."""
+    run_dir = home / ".agent-harness" / "run"
+    run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(str(run_dir / "ops-watch.lock"), os.O_RDONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
 def lower_priority() -> None:
     try:
         os.nice(max(0, 19 - os.nice(0)))
@@ -2929,8 +3030,12 @@ def main(argv=None) -> int:
                 for x in p.get("active") or []:
                     print(f"  [{x.get('severity')}] {h} {x.get('key')}: {x.get('message')} (peer)")
             return 0
+        lock = acquire_run_lock(home)
+        if lock is None:  # a live run holds it (goodqa#17100): never stack runs; its own heartbeat reports health
+            print("ops-watch: another run holds the lock; exiting")
+            return 0
         lower_priority()
-        return run_once(cfg, home)
+        return run_once(cfg, home)  # `lock` stays open (and held) until this process exits
     except Exception as exc:  # noqa: BLE001 - never fail silently
         print(f"ops-watch: internal error {type(exc).__name__}", file=sys.stderr)
         try:

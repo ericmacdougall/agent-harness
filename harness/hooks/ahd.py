@@ -36,6 +36,7 @@ import subprocess
 import sys
 import threading
 import time
+import zlib
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -624,6 +625,7 @@ class Daemon:
         self.last_wall = None
         self.last_mono = None
         self.hold_ticks = 0
+        self.owner_cache = {}  # session -> (fingerprint, monotonic fetch time, `ah owners` doc); goodqa#17100
         self.unsupported = {}  # ah verb -> monotonic time until which it is not retried
         self.stop = threading.Event()
         self.last = {}
@@ -781,12 +783,62 @@ class Daemon:
             self.call(f"alert {op}", self.alert_args(op, ev.get("key"), flag, src), deadline)
         return len(transitions or [])
 
+    def owners_fingerprint(self, session: str):
+        """What `ah owners` reads for a session, as stat tuples: every WAL file in its directory plus the ah ledger
+        (dispositions, registrations and pending stops live there). None when the directory cannot be listed,
+        which means no caching (goodqa#17100). Transcript-only activity is not in it; the TTL bounds that lag."""
+        try:
+            with os.scandir(home() / ".claude" / "wals" / session) as it:
+                wals = []
+                for e in it:
+                    if e.name.endswith(".jsonl"):
+                        st = e.stat(follow_symlinks=False)
+                        wals.append((e.name, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns))
+        except OSError:
+            return None
+        try:
+            st = os.stat(home() / ".agent-harness" / "state" / "ah" / "store" / "ledger.jsonl")
+            ledger = (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+        except FileNotFoundError:
+            ledger = None  # no ledger yet is a stable state
+        except OSError:
+            return None
+        return (tuple(sorted(wals)), ledger)
+
+    def owners_ttl(self, session: str) -> float:
+        """Cache lifetime for an unchanged session: the policy base, shortened by 0..25 % per session so a host's
+        sessions do not all expire on the same tick."""
+        base = float(self.policy.get("owners_cache_ttl_seconds", 300))
+        if base <= 0:
+            return 0.0
+        return base * (0.75 + 0.25 * (zlib.crc32(session.encode()) % 1000) / 1000.0)
+
     def owner_docs(self, sessions: list, deadline: float) -> dict:
+        """`ah owners --all` per session, reused while the session's WAL/ledger fingerprint is unchanged and the TTL
+        has not passed (goodqa#17100: one interpreter per session per 60 s tick was the daemon's whole cost).
+        Only a complete read (read.state ok) of a session with no time-dependent row is cached; anything else is
+        refetched on the next tick."""
         docs = {}
+        cache = self.owner_cache
+        for gone in set(cache) - set(sessions):
+            del cache[gone]
         for s in sessions:
+            ttl = self.owners_ttl(s)
+            fp = self.owners_fingerprint(s) if ttl > 0 else None
+            hit = cache.get(s)
+            if fp is not None and hit and hit[0] == fp and mono() - hit[1] < ttl:
+                docs[s] = hit[2]
+                continue
+            cache.pop(s, None)
             rc, doc = self.call("owners", ["--session", s, "--all"], deadline)  # ahd needs every row, not the recent view
             if rc == 0 and isinstance(doc, dict) and isinstance(doc.get("owners"), list):
                 docs[s] = doc
+                # only a session whose every row is finished or dropped with a permanent disposition: the row fields of a
+                # live, silent, finishing or timed-wait owner (idle_s, DROPPED after the grace, expiry) change with the
+                # clock alone, so ahd asks `ah` for those every tick (liveness.row_time_independent, shared with ops-watch)
+                if fp is not None and (doc.get("read") or {}).get("state") == "ok" \
+                        and all(isinstance(r, dict) and liveness.row_time_independent(r) for r in doc["owners"]):
+                    cache[s] = (fp, mono(), doc)
         return docs
 
     def _request_rows(self, session: str):

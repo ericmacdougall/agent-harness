@@ -96,6 +96,9 @@ class Scratch(unittest.TestCase):
         self.clock.start()
         self.policy = ahd.load_policy()
         self.policy["ah"] = [sys.executable, "-I", str(self.fake / "ah.py")]
+        # these tests swap the fake owners doc between ticks with no WAL change; the owners cache has its own tests
+        # (tests/test_load_17100.py), so the alert logic is exercised here against a fresh doc every tick
+        self.policy["owners_cache_ttl_seconds"] = 0
 
     def tearDown(self):
         self.clock.stop()
