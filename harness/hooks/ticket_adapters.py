@@ -320,6 +320,14 @@ class GoodQAAdapter:
             raise TicketSystemUnavailable(f"GoodQA status update failed ({data['__error__']})")
         return data
 
+    def update_fields(self, ticket: Ticket, patch: dict):
+        """update_issue with a patch of plain fields (title, priority): GoodQA's documented MCP tool
+        (bugtracker docs/MCP-TOOL-REFERENCE.md, `update_issue`), the same call set_status makes."""
+        data = self.call("update_issue", {"issueId": ticket.id, "patch": dict(patch)})
+        if "__error__" in data:
+            raise TicketSystemUnavailable(f"GoodQA update failed ({data['__error__']})")
+        return data
+
     # ---- spec flow (spec_flow.py): issue reads, attachments, uploads and the done transition
 
     def issue(self, issue_id: str):

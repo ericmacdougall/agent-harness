@@ -1,34 +1,34 @@
 #!/usr/bin/env python3
-"""PreToolUse guard against broad process kills and kills of processes the caller does not own (GoodQA #14506).
+"""PreToolUse guard against stopping processes the caller does not own (GoodQA #14506; redesign 2026-11-24).
 
-Why: on 2026-11-04 an owner piped pgrep -f into xargs kill and an earlier owner ran pkill -f; both stopped other
-owners' test runs on a shared dev host.
+Why: on 2026-11-04 an owner piped `pgrep -f` into `xargs kill` and another ran `pkill -f`; both stopped other owners'
+test runs on a shared dev host.
 
-What it blocks, before the command runs, on Claude Code (Bash, PowerShell) and Codex (every shell tool):
-  * pkill, killall, killall5, skill, slay, fuser -k, taskkill, Stop-Process, systemctl/launchctl kill, interpreter
-    code that signals processes (os.kill, process.kill, psutil ...), find -exec / parallel running those verbs;
-  * kill whose targets come from a pid finder (xargs, $(...), backticks, read or for loops with a variable);
-  * text that names a kill and is run as shell code: the left side of a pipe into a shell, or a substitution given to
-    eval or a shell; the guard does not compute what that text becomes;
-  * a plain `kill PID` unless every target is a literal PID that is provably the caller's own: its cwd, or argv[0]
-    or argv[1], is inside the caller's own git worktree (the toplevel of the tool call's cwd), or it is in the
-    per-worktree spawn ledger written by `kill_guard.py spawn -- CMD...`;
-  * `netwatch orphans --kill --pid N[,N...]` unless every PID passes the same ownership proof, except that the main
-    agent (proven by caller_identity.is_main) outside any git worktree, such as main in HOME, needs only the basic checks
-    (not init, not its own ancestor, same uid, not a protected process or interactive shell);
-  * every kill inside ssh, mosh, docker exec and kubectl exec (ownership cannot be checked locally) except
-    `netwatch orphans --kill --pid N[,N...]`, and `ssh HOST kill [-SIG] PID...` where every PID was started by
-    `kill_guard.py spawn --host HOST -- CMD...` (recorded with its start time in a per-host ledger) and the host
-    still reports that start time for it (2026-11-06: an agent could not stop its own remote wait loop).
-Allowed: kill -0 on literal targets or one quoted simple variable, kill -l, job specs (%N, %%, %+, %-, %name), process
-listing, and text that merely contains the word. Every kill word must fit the closed grammar below; anything else fails
-closed, including $!, a variable with a known value and a brace list.
+The rule judges EFFECT, not words. It refuses a command only when running it would send a signal to, or stop, a process
+the caller may not stop:
+  * a broad pattern: `pkill`, `killall`, `pgrep`/`pidof`/`ps | grep`/`lsof -t` fed into `kill`, `fuser -k`, whose matches
+    (resolved against the live process table) include a process that is not the caller's;
+  * every process at once: `kill -1`, `kill -9 -1`, `kill -- -1`, `killall5`, `tmux kill-server`, `pm2 kill`,
+    `docker system prune`, `docker container prune`, `docker kill $(docker ps -q)` and the like;
+  * a literal pid (or process group) that is not the caller's and that the caller's role does not cover;
+  * a protected process (the harness's own daemons and log backup, and what kill_guard_policy.json marks as
+    staging/live), which keeps needing the owner's approval whoever asks.
 
-It reuses command_guard.Analyzer for lexing, parsing, wrappers, aliases, heredocs, ssh and script files, and only
-overrides the methods listed in OVERRIDDEN (a test pins their signatures). Threat model: careless agents and common
-obfuscation, not an agent that edits its own hooks. See docs/operations.md, "Kill guard".
+Who may stop what (roles come from ah_roles; nothing here keeps its own idea of a role):
+  * anyone: its own processes, with no approval: descendants of its agent process, pids it started with
+    `kill_guard.py spawn`, processes whose cwd or program is in its own work dir, scratch or git worktree, `$!`, `$$`,
+    job specs (`%1`), `kill 0`, `pkill -P $$`;
+  * a supervisor: also processes whose cwd or program is under a project it supervises;
+  * a top-rung caller (Fable or Astra): any process except the protected list.
 
-Entry points: `hook` (PreToolUse launcher, fails closed), `analyze` (child process), `spawn`, `explain`.
+Never refused: reads (`ps`, `pgrep`, `lsof`, `docker ps`, `ah task list`, grep of an audit log), `--help`/`-l`
+forms, prose, quoted text, here-document text, file contents (a test file run by pytest or node is not judged), a
+program signalling itself (`os.kill(os.getpid(), ...)`, `kill $$`), `ah kill ...` (ah kill judges and audits itself).
+When the analysis cannot parse, times out, fails or is unsure (a pid read from a file, a variable it cannot follow, a
+remote host), the command is ALLOWED and one line is logged to ~/.agent-harness/state/kill-guard/audit.jsonl.
+A refusal names the one command that proceeds.
+
+Entry points: `hook` (PreToolUse), `analyze` (same, kept for old registrations), `spawn`, `explain`.
 Python 3.9+, standard library only.
 """
 
@@ -36,519 +36,50 @@ import hashlib
 import hmac
 import json
 import os
+import pwd
 import re
 import signal
-import stat
 import subprocess
 import sys
 import time
-import unicodedata
 from pathlib import Path
-
-# Reviewed native append-only implementation; changing it requires updating the binding and tests.
-CODEX_WAL_NOTE_SHA256 = 'eebaeda8cc22ca056632041a2e3f1a5128ac6cbf24d814b909be7c3002e56f3c'
-CODEX_WAL_EVENTS = frozenset(('intent', 'scope', 'decision', 'risk', 'check', 'commit', 'blocker',
-                              'status', 'handoff', 'result'))
-
-
-def _owned_path(path, root, private=False, digest=None):
-    """Observe a canonical owned file without following links. Not atomic execution binding.
-
-    A same-account writer can change an installed script after this observation; this is an
-    installed-account trust boundary, not isolation from a hostile process with the same uid.
-    """
-    try:
-        path, root = Path(path), Path(root)
-        if not path.is_absolute() or path != Path(os.path.normpath(path)) or root.resolve() != root:
-            return False
-        relative = path.relative_to(root)
-        if not relative.parts:
-            return False
-        current = root
-        for part in (None,) + relative.parts:
-            if part is not None:
-                current = current / part
-            info = current.lstat()
-            last = current == path
-            if info.st_uid != os.getuid() or stat.S_ISLNK(info.st_mode):
-                return False
-            if last:
-                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-                    return False
-            elif not stat.S_ISDIR(info.st_mode):
-                return False
-            # The root home need not itself be private; the WAL subtree must be.
-            forbidden = 0o077 if private and current != root else 0o022
-            if info.st_mode & forbidden:
-                return False
-        if digest:
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-            try:
-                opened = os.fstat(fd)
-                if (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns) != (
-                        info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns) or opened.st_size > 200000:
-                    return False
-                with os.fdopen(fd, 'rb', closefd=False) as stream:
-                    data = stream.read(200001)
-                after = os.fstat(fd)
-                identity = lambda value: (value.st_dev, value.st_ino, value.st_size,
-                                          value.st_mtime_ns, value.st_ctime_ns, value.st_mode, value.st_uid)
-                if identity(after) != identity(opened) or hashlib.sha256(data).hexdigest() != digest:
-                    return False
-            finally:
-                os.close(fd)
-        return True
-    except (OSError, ValueError):
-        return False
-
-
-def _trusted_cellar_directory(path, info):
-    """One observed Homebrew admin-managed directory, never an arbitrary writable ancestor."""
-    if (sys.platform != 'darwin' or str(path) != '/opt/homebrew/Cellar'
-            or not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, os.getuid())
-            or info.st_gid != 80 or info.st_mode & 0o002):
-        return False
-    try:
-        import grp  # only available on Unix; the exception is Darwin-only
-        if grp.getgrgid(80).gr_name != 'admin':
-            return False
-        # Darwin exposes extended ACL presence as '+' in the ls mode field. Unknown or
-        # extended ACLs are refused rather than inferring their effective permissions.
-        result = subprocess.run(['/bin/ls', '-lde', '/opt/homebrew/Cellar'], capture_output=True,
-                                text=True, timeout=2, env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
-        mode = result.stdout.split()[0] if result.stdout.split() else ''
-        return result.returncode == 0 and bool(re.fullmatch(r'd[rwxstST-]{9}', mode))
-    except (KeyError, OSError, subprocess.TimeoutExpired):
-        return False
-
-
-def _trusted_python_chain(path):
-    """Inspect original aliases and each intermediate target, not just the resolved leaf."""
-    pending, current, links = list(Path(path).parts[1:]), Path('/'), 0
-    root = current.lstat()
-    if root.st_uid not in (0, os.getuid()) or not stat.S_ISDIR(root.st_mode) or root.st_mode & 0o022:
-        return None
-    while pending:
-        part = pending.pop(0)
-        if part in ('', '.'):
-            continue
-        if part == '..':
-            current = current.parent
-            continue
-        candidate = current / part
-        info = candidate.lstat()
-        if info.st_uid not in (0, os.getuid()):
-            return None
-        if stat.S_ISLNK(info.st_mode):
-            # Symlink modes are conventionally 0777; replacement is controlled by the
-            # already-inspected parent. The link owner and every target ancestor matter.
-            links += 1
-            if links > 40:
-                return None
-            target = os.readlink(candidate)
-            if target.startswith('/'):
-                current = Path('/')
-            pending = list(Path(target).parts[1:] if target.startswith('/') else Path(target).parts) + pending
-            continue
-        if info.st_mode & 0o022 and not _trusted_cellar_directory(candidate, info):
-            return None
-        if pending:
-            if not stat.S_ISDIR(info.st_mode):
-                return None
-        elif not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not info.st_mode & 0o111:
-            return None
-        current = candidate
-    return current
-
-
-def _trusted_note_python(word):
-    """Literal trusted system/Homebrew installation; no arbitrary basename or relocated alias."""
-    text = word.text
-    if word.raw != text or not re.fullmatch(
-            r'(?:/usr/bin/python3(?:\.[0-9]+)?|/opt/homebrew/(?:bin/python3(?:\.[0-9]+)?|'
-            r'opt/python@3\.[0-9]+/bin/python3\.[0-9]+|Cellar/python@3\.[0-9]+/[0-9][0-9A-Za-z_.-]*/'
-            r'(?:Frameworks/Python\.framework/Versions/3\.[0-9]+/bin/|bin/)python3(?:\.[0-9]+)?))', text):
-        return False
-    try:
-        resolved = _trusted_python_chain(text)
-        if '/Cellar/' in text and resolved != Path(text):
-            return False  # the canonical versioned entry must itself be physical, not a second alias
-        if resolved is None or not (str(resolved).startswith('/usr/bin/') or re.fullmatch(
-                r'/opt/homebrew/Cellar/python@3\.[0-9]+/[^/]+/(?:Frameworks/Python\.framework/Versions/'
-                r'3\.[0-9]+/bin/)?(?:bin/)?python3(?:\.[0-9]+)?', str(resolved))):
-            return False
-        return True
-    except OSError:
-        return False
-
-
-def _literal_wrapper_tail(name, args):
-    """Return the proven inner argv boundary for a deliberately finite wrapper grammar."""
-    if any(a.dynamic or a.subs or a.vars or a.glob for a in args):
-        return None
-    texts = [a.text for a in args]
-    if name == 'env':
-        if texts[:1] != ['-i']:
-            return None
-        i, seen = 1, set()
-        while i < len(texts) and '=' in texts[i]:
-            key, _, value = texts[i].partition('=')
-            if key in seen or key not in ('PATH', 'LC_ALL'):
-                return None
-            if key == 'PATH' and value != '/usr/bin:/bin' or key == 'LC_ALL' and value != 'C':
-                return None
-            seen.add(key)
-            i += 1
-        return i if seen == {'PATH', 'LC_ALL'} and i < len(texts) and not texts[i].startswith('-') else None
-    if name == 'sudo':
-        return 1 if len(texts) > 1 and texts[0] == '-n' and not texts[1].startswith('-') else None
-    if name != 'timeout':
-        return None
-    def duration(value):
-        match = re.fullmatch(r'([0-9]+(?:\.[0-9]+)?)([smhd]?)', value)
-        return bool(match and 0 < float(match[1]) * {'': 1, 's': 1, 'm': 60, 'h': 3600, 'd': 86400}[match[2]] <= 86400)
-    i, seen = 0, set()
-    while i < len(texts) and texts[i].startswith('-'):
-        key, equal, value = texts[i].partition('=')
-        if key not in ('--signal', '--kill-after', '-s', '-k'):
-            return None
-        key = {'-s': '--signal', '-k': '--kill-after'}.get(key, key)
-        if key in seen:
-            return None
-        if not equal:
-            i += 1
-            if i >= len(texts):
-                return None
-            value = texts[i]
-        if key == '--signal' and value not in ('TERM', 'KILL', 'INT', 'HUP', '15', '9', '2', '1'):
-            return None
-        if key == '--kill-after' and not duration(value):
-            return None
-        seen.add(key)
-        i += 1
-    return i + 1 if i + 1 < len(texts) and duration(texts[i]) and not texts[i + 1].startswith('-') else None
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-ALTERNATIVE = 'netwatch orphans --kill --pid <pid>'
 MAX_STDIN = 8 * 1024 * 1024
 MAX_PID = 4194304
-GUARDED_TOOLS = {'bash', 'powershell', 'shell', 'local_shell', 'exec_command', 'unified_exec', 'write_stdin',
-                 'container.exec'}
+MAX_DEPTH = 6
 COMMAND_KEYS = ('command', 'cmd', 'script', 'chars', 'input')
-# File-edit tools write text and run nothing; the shell tool that later runs the file is judged then (GoodQA #15565).
-# Codex apply_patch carries the patch body in tool_input.command. Same set as merge_gate.WRITE_TOOLS and the tools
-# commit_policy.shell_like excludes; kept local so the launcher imports nothing extra. Exact casefolded match only:
-# write_stdin types into a running shell and stays guarded.
 EDIT_TOOLS = frozenset({'apply_patch', 'write', 'edit', 'multiedit', 'notebookedit'})
-PROTECTED_COMM = {'claude', 'codex', 'sshd', 'launchd', 'systemd', 'init', 'tmux', 'screen', 'netwatch', 'login',
-                  'terminal', 'iterm2', 'alacritty', 'kitty', 'wezterm', 'gnome-terminal', 'sudo'}
-SHELL_COMM = {'zsh', 'bash', 'sh', 'fish', 'dash', 'ksh', 'tcsh', 'csh'}  # protected when interactive
-REJECT_ROOTS = {'/', '/tmp', '/private/tmp', '/var', '/private/var', '/var/tmp', '/opt', '/usr', '/private', '/etc',
-                '/home', '/Users', '/mnt', '/srv', '/root'}
-INTERPRETER_COMM = {'python', 'python3', 'node', 'nodejs', 'ruby', 'perl', 'php', 'deno', 'bun', 'bash', 'sh', 'zsh',
-                    'dash', 'ksh', 'lua', 'pypy', 'pypy3', 'uv', 'java'}
-# commands that run another command: the rest of their words are scanned for a kill verb
-WRAPPER_NAMES = {'sudo', 'doas', 'env', 'nohup', 'timeout', 'nice', 'ionice', 'time', 'command', 'builtin', 'exec',
-                 'setsid', 'stdbuf', 'chrt', 'taskset', 'unbuffer', 'strace', 'ltrace', 'runuser', 'su', 'sg', 'chroot',
-                 'nsenter', 'flock', 'unshare', 'watch', 'xargs', 'parallel', 'systemd-run', 'caffeinate', 'gosu',
-                 'firejail', 'tmux', 'screen', 'at', 'batch', 'uv', 'uvx', 'pipx', 'npx', 'bunx', 'pnpx', 'dtruss', 'script',
-                 'arch', 'start', 'call', 'busybox', 'toybox', 'poetry', 'pipenv', 'conda', 'pdm', 'rye', 'hatch', 'sshpass', 'fakeroot', 'entr', 'bundle'}
-REMOTE_WRAPPERS = {'docker-compose', 'oc', 'wsl', 'limactl', 'multipass', 'vagrant', 'colima', 'orb', 'adb', 'gcloud',
-                   'aws', 'podman-compose', 'lxc', 'incus', 'ctr', 'crictl'}
-REMOTE_EXEC = {'ssh', 'mosh', 'docker', 'podman', 'kubectl', 'nerdctl', 'oc'}
-GNU_PREFIXED = {'timeout', 'xargs', 'find', 'nohup', 'env', 'nice', 'stdbuf', 'time', 'sudo', 'parallel', 'kill'}
-STOP_COMMANDS = {'grep', 'egrep', 'fgrep', 'rg', 'ag', 'echo', 'printf', 'cat', 'git', 'gh', 'ls', 'sed', 'awk', 'head',
-                 'tail', 'less', 'more', 'man', 'which', 'type', 'whereis', 'apt', 'apt-get', 'brew', 'pip', 'pip3',
-                 'cp', 'mv', 'rm', 'mkdir', 'touch', 'chmod', 'chown', 'make', 'cargo', 'go', 'docker', 'kubectl',
-                 'python', 'python3', 'node', 'ruby', 'perl', 'sleep', 'true', 'false', 'test', 'wc', 'sort', 'uniq',
-                 'tee', 'diff', 'find', 'curl', 'wget', 'pytest', 'ssh', 'scp', 'rsync', 'tar', 'zip', 'unzip', 'date'}
-NAME_FIRST = {'gosu', 'chroot', 'flock', 'sg', 'su', 'runuser'}  # gosu git bash: the first operand is no command
-OVERRIDDEN = ('apply', 'command', 'dispatch', 'inner_words', 'script', 'ssh', 'container', 'check_tokens', 'resolve',
-              'bind_loop_var', 'names_for')
-
-SSH_GLOB_LINE_FIX = True  # goodqa#15365; tests/test_kill_guard_ssh_glob.py flips it in a copy to prove the tests catch a regression
-
-LOOKUP_HEAD_FIX = True  # goodqa#15377; tests/test_kill_guard_lookup_head.py flips it in a copy to prove the tests catch a regression
+SHELL_TOOLS = ('bash', 'powershell', 'shell', 'local_shell', 'exec_command', 'unified_exec', 'write_stdin',
+               'container.exec')
+# Cheap prefilter: a command with none of these words cannot stop a process, so it is never parsed.
+MAYBE_STOP = re.compile(r'(?i)kill|stop|down|\brm\b|prune|terminate|signal|bootout|unload|remove|delete|restart|pause|'
+                        r'taskkill|fuser')
 
 DEFAULT_POLICY = {
     'mode': 'enforce',
-    'broad_verbs': ['pkill', 'killall', 'killall5', 'skill', 'slay', 'fkill', 'kill-port', 'killport'],
-    'windows_verbs': ['taskkill', 'stop-process', 'spps', 'wmic'],
-    'service_kill': {'systemctl': ['kill'], 'launchctl': ['kill'], 'tmux': ['kill-server'], 'pm2': ['kill'],
-                     'loginctl': ['kill-session', 'kill-user', 'terminate-user', 'terminate-session']},
-    'script_kill_pattern': r'(?i)(?<![a-z])(?:p|f|posix_)?kill(?![a-z])|killpg|terminate\(|send_signal|taskkill|killall|invoke-cimmethod|getprocessbyid|raise_signal|sigqueue|pidfd_send_signal',
-    'pid_finders': ['pgrep', 'pidof', 'ps', 'lsof', 'fuser', 'pstree', 'cat', 'awk', 'grep'],
-    'ledger_max_lines': 2000,
+    # The harness's own daemons and log backup: regexes searched in a process's command line, a launchd label, a
+    # systemd unit, a tmux session, a pm2 app or a container name. Stopping one needs the owner's approval.
+    'protected': [r'\bahd(?:\.py)?\b', r'\bahd_peek\b', r'log[_-]backup', r'backup[_-]watch', r'ops[_-]watch',
+                  r'\bnetwatch\b', r'\bhookd\b', r'\brclone\b', r'mission[_-]control', r'harness-console',
+                  r'com\.agent-harness\.'],  # user-specific labels live in kill_guard_policy.json
+    # Staging and live services (the owner fills this in): same matching as `protected`.
+    'staging_live': [],
     'child_timeout_seconds': 10,
+    'ledger_max_lines': 2000,
 }
-
-KILLISH = re.compile(r'kill|fuser|stop-process|spps|slay|wmic')
-INDIRECT = re.compile(r"\$'|\\x[0-9a-fA-F]{2}|\\[0-7]{3}|\beval\b|base64|\bxxd\b", re.I)
-CLOBBER_TEXT = re.compile(r'>&?!')  # >!, >>!, &>!, &>>!, >&!, >>&!: zsh and bash read these apart (GoodQA #14657)
-LINE_JOIN = re.compile(r'\\\r?\n')  # a backslash-newline the shell removes, so `>\` then `!` is still `>!`
-LIST_FLAGS = {'-l', '-L', '--list', '-t', '--table', '-Ll', '-lL'}
-# The closed grammar of a kill command line. Each pattern is matched against text that word_text() has first tied to the
-# word's exact source, so a form the lexer does not understand (zsh ${=x}, $=x, ${(z)x}, =(cmd), a glob qualifier, the
-# unquoted $x in $x"") can never pass as a literal. Add a form only by showing it is one literal word in bash and zsh.
-INTEGER = re.compile(r'0|[1-9][0-9]{0,9}')
-JOB_SPEC = re.compile(r'%(?:[0-9]{1,10}|[%+-]|[A-Za-z_][A-Za-z0-9_.-]*)')
-SIGNAL_OPTION = re.compile(r'-(?:[Ss][Ii][Gg])?([A-Za-z0-9+]{1,32})')
-SIGNAL_VALUE = re.compile(r'[A-Za-z0-9+]{1,32}')
-PAREN_REASON = 'a kill word is followed by a parenthesis, which zsh reads as a glob qualifier that can drop the word or run code'
-FEED_REASON = 'text that names a kill is run as shell code, so the guard cannot tell which targets it reaches'
-WORDS_NOT_VERBS_IN_TEXT = {'skill', 'slay', 'spps', 'wmic'}
-TEXT_ESCAPE = re.compile(r'\\(?:[abefnrtv]|[0-7]{1,3}|x[0-9a-fA-F]{1,2})')
-INERT_COMMANDS = {'echo', 'printf', 'print', 'ls', 'cat', 'head', 'tail', 'wc', 'grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack'}
-ASSIGNMENT_WORD = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)(\[[^\]]*\])?(\+?)=(.*)', re.S)
-QUOTED_VARIABLE = re.compile(r'"\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})"')
-FUNCTION_KW = re.compile(r'\bfunction\s+([A-Za-z_][\w.:-]*)\s*(?:\(\s*\))?\s*\{')
-COPROC_KW = re.compile(r'\bcoproc\s+(?:[A-Za-z_]\w*\s*)?\{')
-INTERPRETER_NAME = re.compile(r'(?:python|pypy)[0-9.]*|node(?:js)?[0-9]*|ruby[0-9.]*|perl[0-9.]*|php[0-9.]*|deno|bun|lua[0-9.]*')
-# goodqa#16124: an operand that is only a file name (test/qac-kill-switch-ceiling.test.ts) is not signalling.
-PATH_OPERAND_EXTS = ('.ts', '.tsx', '.js', '.mjs', '.py', '.go', '.rs')
-PATH_OPERAND_CHARS = re.compile(r'[A-Za-z0-9_.@+/-]+')
+# Never signalled by anyone: the machine itself and the user's session.
+SYSTEM_NAMES = {'launchd', 'init', 'systemd', 'sshd', 'kernel_task', 'windowserver', 'loginwindow', 'login',
+                'systemd-logind', 'dbus-daemon'}
+AGENT_NAMES = {'claude', 'codex'}
+REJECT_ROOTS = {'/', '/tmp', '/private/tmp', '/var', '/private/var', '/var/tmp', '/opt', '/usr', '/private', '/etc',
+                '/home', '/Users', '/mnt', '/srv', '/root'}
+AH_KILL = 'python3 -I ~/.claude/hooks/ah.py kill --pid %s --reason "<why>"'
 
 
-def path_operand(word, kill_re):
-    """True when `word` is a plain path-shaped operand whose kill word, if any, is only part of a file name: a literal
-    word (unquoted, no expansion, glob or substitution) of path characters, not an option, whose last component ends
-    in a listed test or source extension, or which has a '/' and whose last component holds no kill word. So
-    `test/qac-kill-switch.test.ts` and `kill-notes/README` pass; `pkill`, `/usr/bin/pkill`, `bin/kill`,
-    `scripts/kill-all.sh`, `'kill 4242'` and `--script=x/kill.py` do not. Where the word sits is decided by the
-    caller (test_runner_exemptions); this only judges its shape."""
-    text = word.text
-    if word.dynamic or word.subs or word.glob or word.quoted or word.raw != text:
-        return False
-    if not text or text.startswith('-') or not PATH_OPERAND_CHARS.fullmatch(text):
-        return False
-    base = text.rsplit('/', 1)[-1]
-    if not base:
-        return False
-    if base.lower().endswith(PATH_OPERAND_EXTS):
-        return True
-    return '/' in text and not kill_re.search(base)
-
-
-# PR 265 rescue (receipts v1 and v2): the exemption is an allowlist. A test path is exempt only when the WHOLE
-# interpreter command is one of the exact test-runner lines below; any other word, option, wrapper, runner or
-# subcommand anywhere in the command means no exemption, and the full script-kill scan applies. There is no generic
-# wrapper or runner parsing: unknown means scan.
-PYTHON_TEST_FLAGS = frozenset(('-I', '-u', '-B'))  # python3 -I lanes/pgpool.py ...: flags that take no value
-PGPOOL_SCRIPT = re.compile(r'(?:.*/)?lanes/pgpool\.py')
-PGPOOL_RUN_OPTS = frozenset(('--job', '--lane', '--ttl', '--mode', '--template', '--database'))  # each takes a value
-DBTEST_SCRIPT = re.compile(r'dbtest-any\.sh|(?:/|~/)[A-Za-z0-9_.@+/-]*/dbtest-any\.sh')
-TEST_DIRS = frozenset(('test', 'tests', '__tests__'))
-
-
-def plain_word(word):
-    """A literal word: no expansion, substitution, glob or brace alternatives, so the shell passes exactly this one
-    word and the grammar's slot count is the real argv count."""
-    return (not (word.dynamic or word.subs or word.glob) and bool(word.text) and len(word.alts) == 1
-            and word.overflow is None)
-
-
-def is_test_path(word, kill_re):
-    """A test-file operand: a path_operand that is a relative path written only with plain names (no leading `/`,
-    no empty, `.` or `..` component; path_operand already refuses `~`, quotes and expansions), that has a test/,
-    tests/ or __tests__/ directory component, and whose file name is test-shaped (`.test.`, `.spec.`, `test_` or
-    `test-`). PR 265 review v3: `tests/../tools/kill-all.js` names a file outside the test directory, so it is not
-    a test path. `tools/kill-all.ts`, `tools/kill-all.test.ts` and `tests/kill-all.py` are not test paths either,
-    so a runner given them keeps the full scan. A symlink inside a test directory cannot be seen statically."""
-    if not path_operand(word, kill_re):
-        return False
-    text = word.text
-    if text.startswith('/'):
-        return False
-    parts = text.split('/')
-    if any(p in ('', '.', '..') for p in parts):
-        return False
-    base = parts[-1].lower()
-    return (any(p in TEST_DIRS for p in parts[:-1])
-            and ('.test.' in base or '.spec.' in base or base.startswith(('test_', 'test-'))))
-
-
-def _test_paths(args, i, kill_re):
-    """Indexes of args[i:] when every one of them (at least one) is a test path, else None."""
-    if i >= len(args) or not all(is_test_path(a, kill_re) for a in args[i:]):
-        return None
-    return set(range(i, len(args)))
-
-
-def _pgpool_inner(args, i, kill_re):
-    """The command after pgpool's `--`, which must be exactly one of:
-    `[~/|/...]dbtest-any.sh WT LOG TEST [-t NAME]`, `npx [-y] vitest run TEST...` or
-    `pnpm --filter PKG exec vitest run TEST...`. Only TEST words are exempt; WT, LOG, PKG and NAME stay scanned."""
-    texts = [a.text for a in args]
-    rest = texts[i:]
-    if rest and DBTEST_SCRIPT.fullmatch(rest[0]):
-        if len(rest) not in (4, 6) or rest[1].startswith('-') or rest[2].startswith('-'):
-            return None
-        if len(rest) == 6 and rest[4] != '-t':
-            return None
-        test = i + 3
-        return {test} if is_test_path(args[test], kill_re) else None
-    if rest[:2] == ['npx', 'vitest'] and rest[2:3] == ['run']:
-        return _test_paths(args, i + 3, kill_re)
-    if rest[:3] == ['npx', '-y', 'vitest'] and rest[3:4] == ['run']:
-        return _test_paths(args, i + 4, kill_re)
-    if len(rest) > 6 and rest[0] == 'pnpm' and rest[1] == '--filter' and not rest[2].startswith('-') \
-            and rest[3:6] == ['exec', 'vitest', 'run']:
-        return _test_paths(args, i + 6, kill_re)
-    return None
-
-
-def test_runner_exemptions(name, args, kill_re):
-    """goodqa#16124: the indexes of `args` (the words after interpreter `name`) that are test paths of one of these
-    exact lines, and so are file names rather than signalling code:
-      G1 python3 [-I|-u|-B]... lanes/pgpool.py run [--job|--lane|--ttl|--mode|--template|--database V]... -- INNER
-         (INNER as _pgpool_inner says)
-      G2 python3 [-I|-u|-B]... -m pytest TEST...
-      G3 node --test TEST...
-    Every word must be literal (plain_word). Anything else returns the empty set, which keeps the full scan."""
-    if kill_re is None or not args or not all(plain_word(a) for a in args):
-        return set()
-    texts = [a.text for a in args]
-    if name.startswith('python'):
-        i = 0
-        while i < len(texts) and texts[i] in PYTHON_TEST_FLAGS:
-            i += 1
-        if texts[i:i + 2] == ['-m', 'pytest']:
-            return _test_paths(args, i + 2, kill_re) or set()  # G2
-        if i + 1 < len(texts) and PGPOOL_SCRIPT.fullmatch(texts[i]) and texts[i + 1] == 'run':  # G1
-            i, seen = i + 2, set()
-            while i < len(texts) and texts[i] in PGPOOL_RUN_OPTS and texts[i] not in seen:
-                if i + 1 >= len(texts) or texts[i + 1].startswith('-'):
-                    return set()
-                seen.add(texts[i])
-                i += 2
-            if i < len(texts) and texts[i] == '--':
-                return _pgpool_inner(args, i + 1, kill_re) or set()
-        return set()
-    if name == 'node' and texts[:1] == ['--test']:
-        return _test_paths(args, 1, kill_re) or set()  # G3
-    return set()
-RUN_OPTS = {'-c', '-s', '-i', '-e', '-lc', '-ic', '--command', '-l', '-S'}  # options that take a command to run
-LAUNCHERS = {'tmux', 'screen', 'at', 'batch', 'watch'}
-CLASSIC_VERBS = {'pkill', 'killall', 'killall5', 'skill', 'slay', 'taskkill', 'stop-process', 'spps'}
-PID_OPT_VALUE = re.compile(r'[0-9]+(?:,[0-9]+)*')
-# Harness CLIs whose arguments are data (a note, a search text), never code. ah.py kill is judged by is_ah_kill.
-AH_SUBCOMMANDS = {'owners', 'user-msg', 'ticket', 'disk', 'task', 'doctor', 'spool', 'write'}
-PY_LITERAL = re.compile(r"""('\'\'[\s\S]*?\'\'\'|"{3}[\s\S]*?"{3}|'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*")""")
-# Inline Python that only formats data (a closed set of syntax, calls and modules): its string literals are prose.
-PY_SAFE_IMPORTS = {'json', 're', 'datetime', 'time', 'textwrap'}
-PY_SAFE_CALLS = {'print', 'str', 'len', 'dict', 'list', 'sorted', 'int', 'repr', 'tuple', 'set', 'range', 'sum', 'min',
-                 'max', 'bool', 'float', 'enumerate', 'zip'}
-PY_SAFE_NODES = ('Module', 'Expr', 'Assign', 'Name', 'Load', 'Store', 'Constant', 'Call', 'keyword', 'Attribute', 'Dict',
-                 'List', 'Tuple', 'Set', 'Subscript', 'Index', 'Slice', 'BinOp', 'JoinedStr', 'FormattedValue', 'Import',
-                 'ImportFrom', 'alias', 'Add', 'Sub', 'Mult', 'Mod', 'Div')
-# Module members a data-only program may reach, as full dotted paths. Every other attribute of a module (re.enum,
-# json.decoder, textwrap.re ...) is a route to sys/os, so a chain must be a prefix of one of these or equal to it.
-PY_SAFE_MEMBERS = {'json.dumps', 'json.loads', 'json.load', 're.sub', 're.match', 're.search', 're.findall', 're.split',
-                   're.compile', 're.escape', 're.I', 're.IGNORECASE', 'datetime.datetime.now', 'datetime.datetime.utcnow',
-                   'datetime.datetime.fromisoformat', 'datetime.datetime.strptime', 'datetime.timedelta',
-                   'datetime.date.today', 'datetime.timezone.utc', 'time.time', 'time.strftime', 'time.gmtime',
-                   'time.localtime', 'textwrap.dedent', 'textwrap.indent', 'textwrap.fill', 'textwrap.shorten'}
-PY_SAFE_PREFIXES = {'.'.join(m.split('.')[:i]) for m in PY_SAFE_MEMBERS for i in range(1, len(m.split('.')) + 1)}
-# Methods of plain values (str, list, dict, dates, match objects). None of them returns a module or a function.
-PY_SAFE_METHODS = {'join', 'get', 'items', 'keys', 'values', 'upper', 'lower', 'strip', 'lstrip', 'rstrip', 'split',
-                   'splitlines', 'replace', 'startswith', 'endswith', 'append', 'extend', 'isoformat', 'strftime',
-                   'group', 'groups', 'title', 'count', 'index', 'find', 'ljust', 'rjust', 'center', 'zfill'}
-
-
-def _dotted(node, aliases):
-    """Real dotted path of a Name/Attribute chain rooted at an imported module, else None."""
-    import ast
-    parts = []
-    while isinstance(node, ast.Attribute):
-        parts.append(node.attr)
-        node = node.value
-    if isinstance(node, ast.Name) and node.id in aliases:
-        return '.'.join([aliases[node.id]] + parts[::-1])
-    return None
-
-
-def pure_data_python(code):
-    """True when the program is built only from print/json-style calls on literals, so it cannot reach the OS. An
-    allowlist over the syntax tree: sys.modules, exec*/spawn*, getattr, dunders, every other module and every module
-    member outside PY_SAFE_MEMBERS (re.enum.sys...) are out."""
-    import ast
-    import builtins
-    try:
-        tree = ast.parse(code)
-    except (SyntaxError, ValueError, RecursionError, MemoryError):
-        return False
-    aliases = {}  # local name -> real dotted path of an imported module or member
-    for node in ast.walk(tree):
-        kind = type(node).__name__
-        if kind not in PY_SAFE_NODES:
-            return False
-        if isinstance(node, ast.Import):
-            for a in node.names:
-                if a.name not in PY_SAFE_IMPORTS:  # `import os.path` or `import a.b` is never needed here
-                    return False
-                aliases[a.asname or a.name] = a.name
-        elif isinstance(node, ast.ImportFrom):
-            if node.level or node.module not in PY_SAFE_IMPORTS:
-                return False
-            for a in node.names:
-                path = node.module + '.' + a.name
-                if path not in PY_SAFE_PREFIXES:
-                    return False
-                aliases[a.asname or a.name] = path
-    # A builtin or module is only ever safe as the thing being called or the head of a vetted attribute chain. In
-    # value position (key=eval, print = eval, repl=exec) a data program could hand code to a pure helper.
-    called = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
-    heads = set()
-    for n in ast.walk(tree):
-        if isinstance(n, ast.Attribute):
-            h = n.value
-            while isinstance(h, ast.Attribute):
-                h = h.value
-            heads.add(id(h))
-    stored = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Name):
-            if node.id.startswith('_'):
-                return False
-            if isinstance(node.ctx, ast.Store):
-                if node.id in aliases or hasattr(builtins, node.id):
-                    return False  # rebinding print/eval/an imported name could hide a different object
-            elif node.id in aliases:
-                if id(node) not in called and id(node) not in heads:
-                    return False
-            elif node.id in stored:
-                pass  # the program's own variable, only ever bound to vetted expressions
-            elif node.id in PY_SAFE_CALLS:
-                if id(node) not in called:
-                    return False
-            else:
-                return False  # any other builtin or unknown name (eval, exec, open, getattr, vars ...)
-        elif isinstance(node, ast.Attribute):
-            if node.attr.startswith('_'):
-                return False
-            path = _dotted(node, aliases)
-            if path is not None:
-                if path not in PY_SAFE_PREFIXES:
-                    return False
-            elif node.attr not in PY_SAFE_METHODS:
-                return False
-        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id not in PY_SAFE_CALLS \
-                and node.func.id not in aliases:
-            return False
-    return True
-
-
-def hook_script_ok(raw, names, codex=False):
-    """The raw word names ~/.claude/hooks/<name>.py or the same path under the caller's real HOME, nothing else.
-    With codex=True the Codex install copy ~/.codex/agent-harness/<name>.py counts as well (goodqa#15565)."""
-    home = re.escape(str(Path.home()))
-    root = r'\.claude/hooks' if not codex else r'(?:\.claude/hooks|\.codex/agent-harness)'
-    return bool(re.fullmatch(r'(?:~|%s)/%s/(?:%s)\.py' % (home, root, '|'.join(names)), raw or ''))
-
-
-# --------------------------------------------------------------------------- policy and small helpers
+# --------------------------------------------------------------------------- policy, state and the audit line
 
 def load_policy(path=None):
     policy = json.loads(json.dumps(DEFAULT_POLICY))
@@ -566,28 +97,6 @@ def load_policy(path=None):
     return policy
 
 
-DELETE_CHARS = {ord(c): None for c in '\'"\\${}`'}
-DELETE_CHARS.update({c: None for c in list(range(0x200B, 0x2010)) + list(range(0x2060, 0x2065)) +
-                     [0xFEFF, 0x00AD]})
-
-
-def norm_raw(text):
-    """Raw text with quoting, backslashes, braces and $ removed, NFKC and case-folded: the loose probe used where
-    the parser is unavailable. `pk""ill`, `p\\kill` and `$'\\x70kill'` all still contain `kill`."""
-    return unicodedata.normalize('NFKC', text).translate(DELETE_CHARS).casefold()
-
-
-def fallback_blocks(raw):
-    """Used when the analyser cannot run: block kill-looking or indirect input, allow the rest. A hook payload is
-    reduced to its command text first, so a cwd such as .../kill-notes does not make `ls` look like a kill."""
-    text = raw
-    try:
-        text = guarded_text(text)[1] or text
-    except Exception:  # noqa: BLE001
-        pass
-    return bool(KILLISH.search(norm_raw(text)) or INDIRECT.search(text))
-
-
 def one_line(text, limit=400):
     text = ''.join(ch if 32 <= ord(ch) < 127 else ' ' for ch in str(text))
     return re.sub(r'\s+', ' ', text).strip()[:limit]
@@ -597,29 +106,41 @@ def state_dir(home=None):
     return Path(home or os.path.expanduser('~')) / '.agent-harness' / 'state' / 'kill-guard'
 
 
-def block_message(rule, reason):
-    text = 'kill_guard BLOCKED [%s]: %s. Safe alternative: %s; processes you start with `kill_guard.py spawn -- CMD` ' \
-           'are yours to kill.' % (rule, one_line(reason, 220), ALTERNATIVE)
-    return one_line(text, 500)
-
-
-# --------------------------------------------------------------------------- secure state (key and ledger)
-
 def _secure_dir_ok(path):
+    import stat as stat_mod
     try:
         st = os.lstat(str(path))
     except OSError:
         return False
-    import stat as stat_mod
     return stat_mod.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not (st.st_mode & 0o022)
 
+
+def audit(rule, raw, pids, home=None, verdict='block'):
+    """One redacted line per refusal or unsure allow: no command text, only its hash. Best effort, never raises."""
+    try:
+        sdir = state_dir(home)
+        os.makedirs(str(sdir), mode=0o700, exist_ok=True)
+        if not _secure_dir_ok(sdir):
+            return
+        line = json.dumps({'ts': int(time.time()), 'verdict': verdict, 'rule': rule, 'pids': list(pids)[:16],
+                           'sha256': hashlib.sha256(str(raw).encode('utf-8', 'replace')).hexdigest()[:16]})
+        fd = os.open(str(sdir / 'audit.jsonl'), os.O_CREAT | os.O_APPEND | os.O_WRONLY | getattr(os, 'O_NOFOLLOW', 0),
+                     0o600)
+        try:
+            os.write(fd, (line + '\n').encode('utf-8'))
+        finally:
+            os.close(fd)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# --------------------------------------------------------------------------- spawn ledger (pids the caller started)
 
 def _read_secure_file(path, limit, tail=False):
     """Bytes of a regular file owned by us that is not group/world writable; None otherwise. Never follows links."""
     import stat as stat_mod
-    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)
     try:
-        fd = os.open(str(path), flags)
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
     except OSError:
         return None
     try:
@@ -672,19 +193,17 @@ def ledger_mac(key, root, pid, start, ts):
 
 
 def read_ledger(root, home=None, max_lines=2000):
-    """Valid entries (pid, start) for this worktree. Anything unreadable, unsafe or unauthenticated yields nothing."""
+    """Valid entries (pid, start) for this root. Anything unreadable, unsafe or unauthenticated yields nothing."""
     key = read_key(home)
     if not key:
         return []
     data = _read_secure_file(ledger_path(root, home), 1 << 20, tail=True)
-    if not data:
-        return []
     out = []
-    for line in data.decode('utf-8', 'replace').splitlines()[-max_lines:]:
+    for line in (data or b'').decode('utf-8', 'replace').splitlines()[-max_lines:]:
         try:
             entry = json.loads(line)
-            pid, start, ts, mac, entry_root = int(entry['pid']), str(entry['start']), int(entry['ts']), \
-                str(entry['mac']), str(entry['root'])
+            pid, start, ts, mac = int(entry['pid']), str(entry['start']), int(entry['ts']), str(entry['mac'])
+            entry_root = str(entry['root'])
         except (ValueError, KeyError, TypeError):
             continue
         if entry_root == root and hmac.compare_digest(mac, ledger_mac(key, root, pid, start, ts)):
@@ -696,148 +215,13 @@ def append_ledger(root, pid, start, home=None):
     key = ensure_key(home)
     ts = int(time.time())
     entry = {'pid': pid, 'start': start, 'ts': ts, 'root': root, 'mac': ledger_mac(key, root, pid, start, ts)}
-    path = ledger_path(root, home)
-    fd = os.open(str(path), os.O_CREAT | os.O_APPEND | os.O_WRONLY | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    fd = os.open(str(ledger_path(root, home)), os.O_CREAT | os.O_APPEND | os.O_WRONLY | getattr(os, 'O_NOFOLLOW', 0),
+                 0o600)
     try:
         os.write(fd, (json.dumps(entry, sort_keys=True) + '\n').encode('utf-8'))
     finally:
         os.close(fd)
 
-
-# ---- remote spawn ledger (goodqa#14927): the one route to a remote kill. Separate from the local ledger functions
-# above on purpose; it reuses them with a `remote:HOST` root, so an ssh kill can never be proven by a local entry.
-
-REMOTE_HOST_RE = re.compile(r'^(?:[A-Za-z0-9._-]{1,64}@)?[A-Za-z0-9][A-Za-z0-9._-]{0,127}$')
-REMOTE_LOG_RE = re.compile(r'^[A-Za-z0-9._/-]{1,512}$')  # no ~: the path is single-quoted on the host
-SSH_RUNNER = subprocess.run  # tests replace it; nothing here is ever run without BatchMode
-PLAIN_SSH_FLAGS = {'-q', '-T', '-n', '-t', '-tt', '-4', '-6'}
-PLAIN_SSH_OPTIONS = {'batchmode', 'connecttimeout', 'loglevel', 'serveraliveinterval', 'serveralivecountmax',
-                     'connectionattempts'}
-
-
-PLACEHOLDER = re.compile('[-]')  # the parser stands a substitution in for a private-use character
-
-
-def _unliteral(word):
-    """A word whose value is not known from the text: variable, substitution, glob, or a parser placeholder."""
-    return bool(word.dynamic or word.subs or word.glob or PLACEHOLDER.search(word.text or ''))
-
-
-def plain_ssh_hop(texts, host):
-    """True when every ssh option before the host word is one that cannot change where the connection goes.
-    `-o HostName=`, `-J`/ProxyJump, `-F`, `-W`, `-S`, ProxyCommand and anything unknown make the hop non-literal,
-    so a recorded PID on `dev2` can never be killed on another machine (review finding, 2026-11-06)."""
-    i = 0
-    while i < host:
-        t = texts[i]
-        if t in PLAIN_SSH_FLAGS:
-            i += 1
-            continue
-        if t in ('-p', '-l', '-o'):
-            value = texts[i + 1] if i + 1 < host else ''
-            i += 2
-        elif t.startswith(('-p', '-l', '-o')) and len(t) > 2:
-            value, t = t[2:], t[:2]
-            i += 1
-        else:
-            return False
-        if t == '-p' and not re.fullmatch(r'\d{1,5}', value):
-            return False
-        if t == '-l' and not re.fullmatch(r'[A-Za-z0-9._-]{1,64}', value):
-            return False
-        if t == '-o' and value.split('=', 1)[0].strip().lower() not in PLAIN_SSH_OPTIONS:
-            return False
-    return True
-
-
-def remote_root(host):
-    return 'remote:' + host
-
-
-def _remote_start(host, pid):
-    """The start time the host reports for PID now (`ps -o lstart=`), normalized, or None. Bounded: 5 s, BatchMode."""
-    try:
-        done = SSH_RUNNER(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=3', host, 'ps', '-o', 'lstart=', '-p', str(int(pid))],
-                          capture_output=True, text=True, timeout=5, env=CLEAN_ENV)
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return None
-    text = ' '.join((done.stdout or '').split())
-    return text if done.returncode == 0 and text else None
-
-
-def remote_spawned(host, pid, home=None, probe=None):
-    """(ok, reason): PID on HOST was started by `spawn --host HOST` and still carries the recorded start time."""
-    if not REMOTE_HOST_RE.match(host or ''):
-        return False, 'the ssh host is not a plain host name'
-    recorded = [start for p, start in read_ledger(remote_root(host), home) if p == pid]
-    if not recorded:
-        return False, 'not started by `kill_guard.py spawn --host %s`' % host
-    live = (probe or _remote_start)(host, pid)
-    if live is None:
-        return False, 'the host did not report it (probe failed or it exited)'
-    if live not in recorded:
-        return False, 'its start time differs from the spawn record (pid reused)'
-    return True, ''
-
-
-def spawn_remote_main(host, argv):
-    """`kill_guard.py spawn --host HOST [--log REMOTE_FILE] -- CMD ARGS...`: start CMD detached on HOST over ssh,
-    record (host, pid, start time) in the per-host ledger, print them. Only such a PID is later killable through
-    `ssh HOST kill PID`. The command is passed as single-quoted words, never re-parsed here."""
-    log = '/dev/null'
-    args = list(argv)
-    if args[:1] == ['--log'] and len(args) >= 2:
-        log, args = args[1], args[2:]
-    if args[:1] == ['--']:
-        args = args[1:]
-    if not args or not REMOTE_HOST_RE.match(host) or not REMOTE_LOG_RE.match(log):
-        sys.stderr.write('usage: kill_guard.py spawn --host HOST [--log REMOTE_FILE] -- CMD [ARGS...] '
-                         '(a plain host name; a plain remote path)\n')
-        return 2
-    try:
-        ensure_key()
-    except OSError as error:
-        sys.stderr.write('kill_guard spawn: %s; nothing was started\n' % error)
-        return 2
-    import shlex  # noqa: PLC0415
-    script = ('nohup %s >%s 2>&1 </dev/null & p=$!; printf \'%%s\\n\' "$p"; ps -o lstart= -p "$p"'
-              % (' '.join(shlex.quote(a) for a in args), shlex.quote(log)))
-    try:
-        done = SSH_RUNNER(['ssh', '-o', 'BatchMode=yes', host, script], capture_output=True, text=True, timeout=30)
-    except (OSError, subprocess.SubprocessError) as error:
-        sys.stderr.write('kill_guard spawn: ssh to %s failed (%s); nothing was recorded\n' % (host, type(error).__name__))
-        return 1
-    lines = [line.strip() for line in (done.stdout or '').splitlines() if line.strip()]
-    if done.returncode != 0 or len(lines) < 2 or not lines[0].isdigit():
-        sys.stderr.write('kill_guard spawn: %s did not report a pid and start time (exit %s); nothing was recorded: %s\n'
-                         % (host, done.returncode, one_line(done.stderr or '', 200)))
-        return 1
-    pid, start = int(lines[0]), ' '.join(lines[1].split())
-    append_ledger(remote_root(host), pid, start)
-    print(json.dumps({'host': host, 'pid': pid, 'start': start, 'log': log}))
-    return 0
-
-
-def audit(rule, raw, pids, home=None):
-    """Append one redacted line per block: no command text, only its hash. Best effort, never raises."""
-    try:
-        sdir = state_dir(home)
-        os.makedirs(str(sdir), mode=0o700, exist_ok=True)
-        if not _secure_dir_ok(sdir):
-            return
-        line = json.dumps({'ts': int(time.time()), 'rule': rule, 'pids': list(pids)[:16],
-                           'sha256': hashlib.sha256(raw.encode('utf-8', 'replace')).hexdigest()[:16]})
-        fd = os.open(str(sdir / 'audit.jsonl'), os.O_CREAT | os.O_APPEND | os.O_WRONLY | getattr(os, 'O_NOFOLLOW', 0),
-                     0o600)
-        try:
-            os.write(fd, (line + '\n').encode('utf-8'))
-        finally:
-            os.close(fd)
-    except Exception:  # noqa: BLE001
-        pass
-
-
-# --------------------------------------------------------------------------- process probes
 
 CLEAN_ENV = {'PATH': '/usr/sbin:/usr/bin:/bin:/sbin', 'LC_ALL': 'C'}
 
@@ -850,112 +234,34 @@ def _run(argv, timeout=2.0, cwd=None, env=None):
         return None
     if done.returncode != 0:
         return None
-    return done.stdout[:65536].decode('utf-8', 'replace')
+    return done.stdout[:1 << 20].decode('utf-8', 'replace')
 
 
 class Probe:
-    """Reads facts about a PID. Every method returns None when the fact cannot be read (then the PID is unprovable)."""
-
-    def __init__(self):
-        self.proc = os.path.isdir('/proc/self')
-
-    def _stat_fields(self, pid):
-        try:
-            with open('/proc/%d/stat' % pid, 'rb') as handle:
-                text = handle.read(4096).decode('utf-8', 'replace')
-        except OSError:
-            return None
-        tail = text[text.rfind(')') + 2:].split()
-        return tail if len(tail) > 20 else None
-
-    def uid(self, pid):
-        if self.proc:
-            try:
-                with open('/proc/%d/status' % pid, 'rb') as handle:
-                    for line in handle.read(8192).decode('utf-8', 'replace').splitlines():
-                        if line.startswith('Uid:'):
-                            return int(line.split()[1])
-            except (OSError, ValueError, IndexError):
-                return None
-            return None
-        out = _run(['ps', '-o', 'uid=', '-p', str(pid)])
-        try:
-            return int(out.strip()) if out and out.strip() else None
-        except ValueError:
-            return None
-
-    def ppid(self, pid):
-        if self.proc:
-            fields = self._stat_fields(pid)
-            try:
-                return int(fields[1]) if fields else None
-            except ValueError:
-                return None
-        out = _run(['ps', '-o', 'ppid=', '-p', str(pid)])
-        try:
-            return int(out.strip()) if out and out.strip() else None
-        except ValueError:
-            return None
+    """Start time of one pid in the spawn ledger's format (ah_kill.spawn_start uses it)."""
 
     def start(self, pid):
-        if self.proc:
-            fields = self._stat_fields(pid)
-            return fields[19] if fields else None
+        if os.path.isdir('/proc/self'):
+            try:
+                with open('/proc/%d/stat' % pid, 'rb') as handle:
+                    text = handle.read(4096).decode('utf-8', 'replace')
+            except OSError:
+                return None
+            fields = text[text.rfind(')') + 2:].split()
+            return fields[19] if len(fields) > 20 else None
         out = _run(['ps', '-o', 'lstart=', '-p', str(pid)])
         return out.strip() if out and out.strip() else None
 
-    def comm(self, pid):
-        if self.proc:
-            try:
-                with open('/proc/%d/comm' % pid, 'rb') as handle:
-                    return handle.read(256).decode('utf-8', 'replace').strip().casefold()
-            except OSError:
-                return None
-        out = _run(['ps', '-o', 'comm=', '-p', str(pid)])
-        return os.path.basename(out.strip()).casefold() if out and out.strip() else None
-
-    def cwd(self, pid):
-        if self.proc:
-            try:
-                return os.readlink('/proc/%d/cwd' % pid)
-            except OSError:
-                return None
-        out = _run(['lsof', '-a', '-d', 'cwd', '-p', str(pid), '-Fn'])
-        for line in (out or '').splitlines():
-            if line.startswith('n') and len(line) > 1:
-                return line[1:]
-        return None
-
-    def argv(self, pid):
-        """argv[0:4] as a list. On macOS only the whitespace-split `ps` command is available, so paths with spaces
-        are not recognised there (unprovable, which is the safe side)."""
-        if self.proc:
-            try:
-                with open('/proc/%d/cmdline' % pid, 'rb') as handle:
-                    raw = handle.read(65536)
-            except OSError:
-                return None
-            parts = [p.decode('utf-8', 'replace') for p in raw.split(b'\0') if p]
-            return parts[:4] or None
-        out = _run(['ps', '-ww', '-o', 'command=', '-p', str(pid)])
-        parts = out.split() if out else []
-        return parts[:4] or None
-
-
-# --------------------------------------------------------------------------- ownership
-
-def _fold(path):
-    return path.casefold() if sys.platform == 'darwin' else path
-
 
 def under(path, root):
-    p, r = _fold(path), _fold(root)
+    fold = (lambda s: s.casefold()) if sys.platform == 'darwin' else (lambda s: s)
+    p, r = fold(path), fold(root)
     return p == r or p.startswith(r.rstrip('/') + '/')
 
 
 def find_worktree(cwd, home=None, runner=None):
-    """(root, nested_worktree_roots) for the git worktree containing cwd, or (None, []). Root is realpath-normalised
-    and refused when it is `/`, HOME or an ancestor of HOME: such a root would 'own' everything."""
+    """(root, nested_worktree_roots) for the git worktree containing cwd, or (None, []). A root that is `/`, HOME or an
+    ancestor of HOME is refused: it would 'own' everything."""
     runner = runner or _run
     if not cwd:
         return None, []
@@ -969,8 +275,7 @@ def find_worktree(cwd, home=None, runner=None):
     if root in REJECT_ROOTS or under(home_path, root) or root.count('/') < 2:
         return None, []
     nested = []
-    listing = runner(['git', '-C', root, 'worktree', 'list', '--porcelain'], 3.0, None, env) or ''
-    for line in listing.splitlines():
+    for line in (runner(['git', '-C', root, 'worktree', 'list', '--porcelain'], 3.0, None, env) or '').splitlines():
         if line.startswith('worktree '):
             other = os.path.realpath(line[9:].strip())
             if other != root and under(other, root):
@@ -978,1258 +283,1358 @@ def find_worktree(cwd, home=None, runner=None):
     return root, nested
 
 
-class Ownership:
-    """Decides whether a literal PID is provably the caller's own. check() returns (ok, code, detail)."""
+# --------------------------------------------------------------------------- the shell text, read just enough
 
-    def __init__(self, cwd, home=None, probe=None, runner=None, policy=None):
-        self.cwd = cwd
+class Word:
+    __slots__ = ('text', 'quoted', 'dynamic', 'subs', 'vars')
+
+    def __init__(self):
+        self.text, self.quoted, self.dynamic, self.subs, self.vars = '', False, False, [], []
+
+    def __repr__(self):
+        return 'Word(%r)' % self.text
+
+
+OPERATORS = ('&&', '||', ';;', '|&', ';', '&', '|', '(', ')')
+REDIRS = ('<<<', '<<-', '<<', '>>', '>&', '&>>', '&>', '<&', '>|', '<>', '<', '>')
+SPECIAL_VARS = '$!?#@*-0123456789'
+
+
+def _balanced(text, i, open_ch='(', close_ch=')'):
+    """Index just past the close that matches the open at text[i-1]; quote-aware. len(text) when unterminated."""
+    depth, n = 1, len(text)
+    while i < n:
+        c = text[i]
+        if c == '\\':
+            i += 2
+            continue
+        if c == "'":
+            j = text.find("'", i + 1)
+            i = n if j < 0 else j + 1
+            continue
+        if c == '"':
+            i += 1
+            while i < n and text[i] != '"':
+                i += 2 if text[i] == '\\' else 1
+            i += 1
+            continue
+        if c == open_ch:
+            depth += 1
+        elif c == close_ch:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return n
+
+
+def _dollar(text, i, word):
+    """Read a $-expansion at text[i] == '$' into word; return the next index."""
+    n = len(text)
+    nxt = text[i + 1] if i + 1 < n else ''
+    if text.startswith('$((', i):
+        end = _balanced(text, i + 3)
+        end = end + 1 if end < n and text[end] == ')' else end
+        word.text += text[i:end]
+        word.dynamic = True
+        return end
+    if nxt == '(':
+        end = _balanced(text, i + 2)
+        word.subs.append(text[i + 2:end - 1])
+        word.text += '$(%s)' % text[i + 2:end - 1]
+        word.dynamic = True
+        return end
+    if nxt == '{':
+        end = _balanced(text, i + 2, '{', '}')
+        inner = text[i + 2:end - 1]
+        name = re.match(r'[!#]?([A-Za-z_][A-Za-z0-9_]*|[%s])' % re.escape(SPECIAL_VARS), inner)
+        word.vars.append(name.group(1) if name else inner)
+        word.text += '${%s}' % inner
+        word.dynamic = True
+        return end
+    match = re.match(r'[A-Za-z_][A-Za-z0-9_]*', text[i + 1:])
+    if match:
+        word.vars.append(match.group(0))
+        word.text += '$' + match.group(0)
+        word.dynamic = True
+        return i + 1 + match.end()
+    if nxt and nxt in SPECIAL_VARS:
+        word.vars.append(nxt)
+        word.text += '$' + nxt
+        word.dynamic = True
+        return i + 2
+    word.text += '$'
+    return i + 1
+
+
+ANSI = {'n': '\n', 't': '\t', 'r': '\r', 'a': '\a', 'b': '\b', 'e': '\x1b', 'f': '\f', 'v': '\v', '\\': '\\',
+        "'": "'", '"': '"'}
+
+
+def lex(text):
+    """Tokens of a shell text: ('w', Word), ('op', str), ('redir', str), ('body', str) for a here-document or a
+    here-string. Never raises on odd input; an unterminated quote just ends the word."""
+    tokens, pending_heredocs, i, n = [], [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in ' \t':
+            i += 1
+            continue
+        if c == '\\' and i + 1 < n and text[i + 1] == '\n':
+            i += 2
+            continue
+        if c == '\n':
+            tokens.append(('op', '\n'))
+            i += 1
+            for delim, strip in pending_heredocs:
+                lines, body = [], ''
+                while i < n:
+                    j = text.find('\n', i)
+                    line = text[i:] if j < 0 else text[i:j]
+                    i = n if j < 0 else j + 1
+                    if (line.lstrip('\t') if strip else line) == delim:
+                        break
+                    lines.append(line)
+                body = '\n'.join(lines)
+                tokens.append(('heredoc', body))
+            pending_heredocs = []
+            continue
+        if c == '#':
+            j = text.find('\n', i)
+            i = n if j < 0 else j
+            continue
+        redir = next((r for r in REDIRS if text.startswith(r, i)), None)
+        if redir and not (redir == '<' and text.startswith('<(', i)) and not (redir == '>' and text.startswith('>(', i)):
+            i += len(redir)
+            if redir in ('<<', '<<-'):
+                while i < n and text[i] in ' \t':
+                    i += 1
+                word, i = _word(text, i)
+                pending_heredocs.append((word.text, redir == '<<-'))
+                continue
+            tokens.append(('redir', redir))
+            continue
+        op = next((o for o in OPERATORS if text.startswith(o, i)), None)
+        if op:
+            tokens.append(('op', op))
+            i += len(op)
+            continue
+        word, i = _word(text, i)
+        if re.fullmatch(r'\d+', word.text) and not word.quoted and i < n and text[i] in '<>':
+            continue  # 2>&1: the fd number belongs to the redirection that follows
+        tokens.append(('w', word))
+    # redirection targets are not argv words; here-strings are bodies
+    out, skip = [], False
+    for k, tok in enumerate(tokens):
+        if skip:
+            skip = False
+            if tok[0] == 'w':
+                if tokens[k - 1][1] == '<<<':
+                    out.append(('herestring', tok[1].text))
+                continue
+        if tok[0] == 'redir':
+            skip = True
+            continue
+        out.append(tok)
+    return out
+
+
+def _word(text, i):
+    word, n = Word(), len(text)
+    while i < n:
+        c = text[i]
+        if c in ' \t\n;&|()<>' and not (c in '<>' and i + 1 < n and text[i + 1] == '(' and not word.text):
+            break
+        if c in '<>':  # process substitution <(...) / >(...)
+            end = _balanced(text, i + 2)
+            word.subs.append(text[i + 2:end - 1])
+            word.text += text[i:end]
+            word.dynamic = True
+            i = end
+            continue
+        if c == '\\':
+            if i + 1 < n and text[i + 1] != '\n':
+                word.text += text[i + 1]
+            i += 2
+            continue
+        if c == "'":
+            j = text.find("'", i + 1)
+            j = n if j < 0 else j
+            word.text += text[i + 1:j]
+            word.quoted = True
+            i = j + 1
+            continue
+        if c == '$' and i + 1 < n and text[i + 1] == "'":
+            i += 2
+            while i < n and text[i] != "'":
+                if text[i] == '\\' and i + 1 < n:
+                    word.text += ANSI.get(text[i + 1], text[i + 1])
+                    i += 2
+                else:
+                    word.text += text[i]
+                    i += 1
+            word.quoted = True
+            i += 1
+            continue
+        if c == '"':
+            word.quoted = True
+            i += 1
+            while i < n and text[i] != '"':
+                d = text[i]
+                if d == '\\' and i + 1 < n:
+                    word.text += text[i + 1] if text[i + 1] in '$`"\\\n' else '\\' + text[i + 1]
+                    i += 2
+                elif d == '$':
+                    i = _dollar(text, i, word)
+                elif d == '`':
+                    j = text.find('`', i + 1)
+                    j = n if j < 0 else j
+                    word.subs.append(text[i + 1:j])
+                    word.text += '`%s`' % text[i + 1:j]
+                    word.dynamic = True
+                    i = j + 1
+                else:
+                    word.text += d
+                    i += 1
+            i += 1
+            continue
+        if c == '$':
+            i = _dollar(text, i, word)
+            continue
+        if c == '`':
+            j = text.find('`', i + 1)
+            j = n if j < 0 else j
+            word.subs.append(text[i + 1:j])
+            word.text += '`%s`' % text[i + 1:j]
+            word.dynamic = True
+            i = j + 1
+            continue
+        word.text += c
+        i += 1
+    return word, i
+
+
+class Cmd:
+    __slots__ = ('words', 'bodies', 'source')
+
+    def __init__(self):
+        self.words, self.bodies, self.source = [], [], None  # source: the Cmd list piped into this one
+
+
+OPENERS = {'while', 'until', 'for', 'if', 'case', 'select', '{'}
+CLOSERS = {'done', 'fi', 'esac', '}'}
+RESERVED = {'then', 'do', 'else', 'elif', '!', 'time', 'in'} | OPENERS | CLOSERS
+
+
+def commands(text):
+    """Simple commands in order. A command after a pipe gets `source`: the earlier stages of its pipeline; the commands
+    inside a loop or group that is a pipeline stage (`pgrep x | while read p; do kill $p; done`) inherit it."""
+    out, cur, stages, group, depth = [], Cmd(), [], None, 0  # group: (depth, source) of a compound pipeline stage
+
+    def finish(pipe=False):
+        nonlocal cur, stages
+        if cur.words or cur.bodies:
+            if cur.source is None:
+                cur.source = list(stages) if stages else (group[1] if group else None)
+            out.append(cur)
+            if pipe:
+                stages.append(cur)
+        if not pipe:
+            stages = []
+        cur = Cmd()
+
+    for kind, value in lex(text):
+        if kind == 'w':
+            if not cur.words and not value.quoted:
+                if value.text in OPENERS:
+                    if stages and group is None:
+                        group = (depth, list(stages))
+                    depth += 1
+                elif value.text in CLOSERS:
+                    depth = max(0, depth - 1)
+                    if group and depth <= group[0]:
+                        cur.source, group = group[1], None
+            cur.words.append(value)
+        elif kind in ('heredoc', 'herestring'):
+            # a here-document belongs to the last command that asked for one
+            target = cur if (cur.words or not out) else out[-1]
+            target.bodies.append(value)
+        elif value in ('|', '|&'):
+            finish(pipe=True)
+        elif value == '(':
+            finish()
+            depth += 1
+        elif value == ')':
+            finish()
+            depth = max(0, depth - 1)
+        else:
+            finish()
+    finish()
+    return out
+
+
+# --------------------------------------------------------------------------- the process table and who owns what
+
+class Proc:
+    __slots__ = ('pid', 'ppid', 'pgid', 'uid', 'command', 'name')
+
+    def __init__(self, pid, ppid, pgid, uid, command):
+        self.pid, self.ppid, self.pgid, self.uid, self.command = pid, ppid, pgid, uid, command
+        first = command.split(' ', 1)[0] if command else ''
+        self.name = os.path.basename(first).lstrip('-').casefold()
+
+
+def read_table():
+    out = _run(['ps', '-axww', '-o', 'pid=,ppid=,pgid=,uid=,command='], timeout=4.0)
+    table = {}
+    for line in (out or '').splitlines():
+        parts = line.split(None, 4)
+        if len(parts) >= 4 and all(p.lstrip('-').isdigit() for p in parts[:4]):
+            pid = int(parts[0])
+            table[pid] = Proc(pid, int(parts[1]), int(parts[2]), int(parts[3]), parts[4] if len(parts) > 4 else '')
+    return table
+
+
+def read_cwds(pids):
+    """{pid: cwd} for the pids whose cwd can be read; one lsof call on macOS."""
+    pids = [p for p in pids if p > 1][:64]
+    found = {}
+    if not pids:
+        return found
+    if os.path.isdir('/proc/self'):
+        for pid in pids:
+            try:
+                found[pid] = os.readlink('/proc/%d/cwd' % pid)
+            except OSError:
+                pass
+        return found
+    out = _run(['lsof', '-a', '-d', 'cwd', '-p', ','.join(map(str, pids)), '-Fpn'], timeout=5.0) or ''
+    current = None
+    for line in out.splitlines():
+        if line.startswith('p') and line[1:].isdigit():
+            current = int(line[1:])
+        elif line.startswith('n') and current is not None:
+            found[current] = line[1:]
+    return found
+
+
+class Context:
+    """Everything the judge needs to know about the caller and the machine. Tests build one with fixed facts."""
+
+    def __init__(self, payload=None, cwd=None, home=None, policy=None, table=None, ancestors=None, roles=None,
+                 cwds=None, ledger=None, own_roots=None, lsof=None, start=None):
+        self.payload = payload if isinstance(payload, dict) else {}
+        self.cwd = cwd or self.payload.get('cwd') or os.getcwd()
         self.home = home
-        self.probe = probe or Probe()
-        self.runner = runner
-        self.policy = policy or DEFAULT_POLICY
-        self._tree = None
-        self._ancestors = None
-        self._ledger = None
-        self._memo = {}
+        self.policy = policy or load_policy()
+        self._table, self._ancestors, self._roles, self._cwds = table, ancestors, roles, dict(cwds or {})
+        self._ledger, self._own_roots, self._lsof = ledger, own_roots, lsof
+        self._start, self._worktree = start or Probe().start, None
+        self.notes = []  # allowed stops worth one audit line (a maintainer stopping a protected process)
+        self.harness = [re.compile(p) for p in self.policy.get('protected', []) if _compiles(p)]
+        self.live = [re.compile(p) for p in self.policy.get('staging_live', []) if _compiles(p)]
+        self.patterns = self.harness + self.live
 
-    def tree(self):
-        if self._tree is None:
-            self._tree = find_worktree(self.cwd, self.home, self.runner)
-        return self._tree
+    # ---- facts, read once and lazily
+    def table(self):
+        if self._table is None:
+            self._table = read_table()
+        return self._table
 
     def ancestors(self):
+        """The hook's own process chain: the agent session that runs this command and everything above it."""
         if self._ancestors is None:
-            chain, pid = set(), os.getpid()
+            chain, pid, table = [], os.getpid(), self.table()
             for _ in range(64):
                 if pid is None or pid <= 1 or pid in chain:
                     break
-                chain.add(pid)
-                pid = self.probe.ppid(pid)
+                chain.append(pid)
+                pid = table[pid].ppid if pid in table else None
             self._ancestors = chain
         return self._ancestors
 
-    def _inside(self, path, root, nested):
-        if not path or not path.startswith('/'):
-            return False
-        norm = os.path.normpath(path)
-        return under(norm, root) and not any(under(norm, n) for n in nested)
+    def agent_pid(self):
+        """Nearest ancestor that is a claude or codex process: its descendants are the caller's own."""
+        table = self.table()
+        for pid in self.ancestors():
+            proc = table.get(pid)
+            if proc and (proc.name in AGENT_NAMES or (proc.name in ('node', 'bun') and re.search(
+                    r'(?i)claude|codex', proc.command.split(' ', 2)[1] if ' ' in proc.command else ''))):
+                return pid
+        return None
 
-    def check(self, pid, main_netwatch=False):
-        """main_netwatch: the main agent's `netwatch orphans --kill --pid` outside any worktree, where the basic
-        checks are the whole proof (no worktree can own the PID, and netwatch only signals listed orphans)."""
-        key = (pid, bool(main_netwatch))
-        if key not in self._memo:
-            self._memo[key] = self._check(pid, main_netwatch)
-        return self._memo[key]
+    def roles(self):
+        if self._roles is None:
+            try:
+                import ah_roles  # noqa: PLC0415
+                fn = getattr(ah_roles, 'may_edit_harness', None)
+                maintainer = bool(fn(self.payload) if fn else (ah_roles.is_top_rung(self.payload)
+                                                               and ah_roles.is_supervisor(self.payload, self.home)))
+                self._roles = {'top': ah_roles.is_top_rung(self.payload), 'maintainer': maintainer,
+                               'supervised': [os.path.realpath(str(p)) for p in ah_roles.supervised_roots(self.payload, self.home)],
+                               'own': [os.path.realpath(str(p)) for p in ah_roles.own_roots(self.payload, self.home)]}
+            except Exception:  # noqa: BLE001 - unknown means the least privilege
+                self._roles = {'top': False, 'maintainer': False, 'supervised': [], 'own': []}
+        return self._roles
 
-    def _check(self, pid, main_netwatch=False):
-        if pid <= 1:
-            return False, 'protected', 'pid %d is init or invalid' % pid
-        if pid in self.ancestors():
-            return False, 'ancestor', 'pid %d is the agent session that runs this command' % pid
-        uid = self.probe.uid(pid)
-        if uid is None:
-            return False, 'uninspectable', 'pid %d does not exist or cannot be inspected' % pid
-        if uid != os.getuid():
-            return False, 'other-user', 'pid %d belongs to another user' % pid
-        comm = self.probe.comm(pid)
-        if comm is None:
-            return False, 'uninspectable', 'pid %d cannot be inspected' % pid
-        comm = comm.lstrip('-')
-        if comm in PROTECTED_COMM:
-            return False, 'protected', 'pid %d is a protected process (%s)' % (pid, one_line(comm, 20))
-        if comm in SHELL_COMM:
-            shell_argv = self.probe.argv(pid) or []
-            if len(shell_argv) <= 1 or shell_argv[0].startswith('-'):
-                return False, 'protected', 'pid %d is an interactive shell' % pid
-        root, nested = self.tree()
-        if not root and main_netwatch:
-            return True, 'main-netwatch', 'main agent outside a worktree; basic checks passed'
-        if not root:
-            return False, 'no-worktree', 'pid %d is not provably yours: this call is not in a git worktree' % pid
+    def own_roots(self):
+        """(roots, excluded): the caller's work dir and scratch (ah_roles) and the git worktree of its cwd, minus
+        worktrees nested inside it (those are other owners')."""
+        if self._own_roots is None:
+            roots = list(self.roles()['own'])
+            self._worktree, nested = find_worktree(self.cwd, self.home)
+            if self._worktree:
+                roots.append(self._worktree)
+            self._own_roots = (roots, nested)
+        return self._own_roots
+
+    def ledger(self):
         if self._ledger is None:
-            self._ledger = read_ledger(root, self.home, int(self.policy.get('ledger_max_lines', 2000)))
-        start = self.probe.start(pid)
-        if start is not None and (pid, start) in self._ledger:
-            return True, 'ledger', 'spawned by this worktree'
-        cwd = self.probe.cwd(pid)
-        if cwd and self._inside(cwd, root, nested):
-            return True, 'cwd', 'cwd is inside this worktree'
-        argv = self.probe.argv(pid) or []
-        if argv and '/' in argv[0] and self._inside(argv[0], root, nested):
-            return True, 'argv', 'runs a program inside this worktree'
-        if len(argv) > 1 and os.path.basename(argv[0]).casefold().rstrip('0123456789.-') in INTERPRETER_COMM:
-            script = next((a for a in argv[1:] if not a.startswith('-')), '')
-            if '/' in script and self._inside(script, root, nested):
-                return True, 'argv', 'runs a script inside this worktree'
-        return False, 'outside', 'pid %d is not provably yours: its cwd and program are outside worktree %s' % (
-            pid, one_line(os.path.basename(root), 40))
+            self.own_roots()
+            root = self._worktree
+            self._ledger = set(read_ledger(root, self.home)) if root else set()
+        return self._ledger
 
+    def cwd_of(self, pids):
+        missing = [p for p in pids if p not in self._cwds]
+        if missing:
+            found = read_cwds(missing)
+            for p in missing:
+                self._cwds[p] = found.get(p)
+        return {p: self._cwds.get(p) for p in pids}
 
-# --------------------------------------------------------------------------- analysis
-
-def _import_base():
-    import command_guard as cg
-    return cg
-
-
-def make_analyzer_class(cg):
-    class KillAnalyzer(cg.Analyzer):
-        def __init__(self, compiled, cwd, ps, ownership, policy, raw, main=False, session=None):
-            super().__init__(compiled, cwd=cwd, ps=ps)
-            self.main = bool(main)  # caller_identity.is_main proved main: netwatch route and ah --session-scope
-            self.session = session or ""  # the payload's session_id (D-F2: --session must match it for those flags)
-            self.own = ownership
-            self.policy = policy
-            self.raw = raw
-            self.kf = []          # (rule, reason, pids)
-            self.remote = 0
-            self.remote_hosts = []  # literal ssh host per open ssh hop (None when the host word is not literal)
-            self.xargs = 0
-            self.before_paren = {}  # id -> word, holding the word so its id stays unique
-            self.fed = {}           # id -> (word, sink stage): its text goes down a pipe, maybe into a shell
-            self.broad = set(policy['broad_verbs'])
-            self.windows = set(policy['windows_verbs'])
-            self.script_kill = re.compile(policy['script_kill_pattern']) if policy['script_kill_pattern'] else None
-            self.finders = set(policy['pid_finders'])
-            verbs = (self.broad | self.windows | {'kill', 'gkill', 'fuser'}) - WORDS_NOT_VERBS_IN_TEXT
-            self.kill_word = re.compile(r'(?<![\w.*?\[\]-])(?:%s)(?![\w.*?\[\]/-])' % '|'.join(
-                map(re.escape, sorted(verbs, key=len, reverse=True))))
-
-        # ---- findings
-        def block(self, rule, reason, pids=()):
-            self.kf.append((rule, reason, tuple(pids)))
-
-        def run_kill_scan(self, text):
-            self.script(text, depth=0)
-            return self.kf
-
-        # ---- overridden traversal hooks (OVERRIDDEN lists them; a test pins the base signatures)
-        def script(self, text, depth, tail_visible=None, ps=None):
-            saved, self.xargs = self.xargs, 0
-            text = FUNCTION_KW.sub(lambda m: m.group(1) + '() {', text)
-            text = COPROC_KW.sub('{', text)
-            try:
-                return super().script(text, depth, tail_visible=tail_visible, ps=ps)
-            finally:
-                self.xargs = saved
-
-        def names_kill(self, text):
-            # norm_raw deletes a backslash so k\\ill still reads kill; a printf escape in front of a verb must split instead.
-            return bool(self.kill_word.search(norm_raw(text)) or self.kill_word.search(norm_raw(TEXT_ESCAPE.sub(' ', text))))
-
-        def check_tokens(self, tokens):
-            # Tokens come before variables are bound, so this only tags words and normalises assignments; command() judges
-            # the tagged words once their values are known. PowerShell parentheses and pipes mean something else.
-            if self.ctx.ps:
-                return
-            flat = cg._strip_case_patterns(tokens)
-            self.tag_paren_cuts(flat)
-            self.normalize_assignments(flat)
-            self.tag_shell_feeders(flat)
-
-        def tag_paren_cuts(self, tokens):
-            # parse() ends a command at `(`, so the words after it are never seen. `kill 4001(N) 4004` is a syntax error in
-            # bash, but in zsh (N) is a glob qualifier: the word vanishes and 4004 is signalled, and (e:...:) runs code. Not a
-            # cut: `name()` defines a function, `name=(` is an array, and `[[ ]]` groups with parentheses.
-            words = []
-            for k, (kind, value) in enumerate(tokens):
-                if kind == 'w':
-                    words.append(value)
-                elif kind == 'op':
-                    if value == '(' and words:
-                        definition = len(words) == 1 and tokens[k + 1:k + 2] == [('op', ')')]
-                        array = bool(re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=', words[-1].raw or ''))
-                        conditional = cg.strip_reserved(words)[:1] and cg.strip_reserved(words)[0].text == '[['
-                        if not (definition or array or conditional):
-                            for w in words:
-                                self.before_paren[id(w)] = w
-                    words = []
-
-        def normalize_assignments(self, tokens):
-            # The base reads NAME=value only. `K=(kill)` would leave K empty and `$K 4004` unjudged, so give the first word
-            # of an array literal, an append and a subscripted assignment the value the variable holds afterwards; the head
-            # resolution every other variable gets then applies. The literal's own words still parse as a command, as before.
-            for k, (kind, word) in enumerate(tokens):
-                if kind != 'w':
-                    continue
-                match = ASSIGNMENT_WORD.fullmatch(word.text)
-                if not match or not (word.raw or '').startswith(match.group(1)):
-                    continue
-                name, subscript, plus, value = match.groups()
-                items = self.array_items(tokens, k) if not value else None
-                prev = tokens[k - 1] if k else None
-                at_start = prev is None or prev[0] == 'op' or (prev[0] == 'w' and (
-                    prev[1].text in cg.RESERVED or ASSIGNMENT_WORD.fullmatch(prev[1].text)))
-                if items is None and not ((subscript or plus) and at_start):
-                    continue
-                parts = [] if items is None else [re.sub(r'^\[[^\]]*\]\+?=', '', it.text) for it in items]
-                text = ' '.join(parts) if items is not None else value
-                if subscript or plus:  # keeps what the variable held; when that is unknown the value stays a hint
-                    joiner = ' ' if subscript or items is not None else ''
-                    text = cg.VAR_OPEN + name + cg.VAR_CLOSE + joiner + text
-                    word.vars.append(name)
-                word.alts = ['%s=%s' % (name, text)]
-                word.glob = False
-                for it in items or ():
-                    word.vars.extend(it.vars)
-                    word.subs.extend(it.subs)
-                    word.dynamic = word.dynamic or it.dynamic
-
-        @staticmethod
-        def array_items(tokens, k):
-            if tokens[k + 1:k + 2] != [('op', '(')]:
-                return None
-            items = []
-            for kind, value in tokens[k + 2:]:
-                if kind == 'w':
-                    items.append(value)
-                elif kind == 'op' and value == ')':
-                    return items
-                elif not (kind == 'op' and value == '\n'):
-                    return None
+    def lsof_pids(self, args):
+        if self._lsof is not None:
+            return self._lsof(args)
+        out = _run(['lsof', '-t'] + [a for a in args if a not in ('-t',)], timeout=5.0)
+        if out is None:
             return None
+        return [int(x) for x in out.split() if x.isdigit()]
 
-        def tag_shell_feeders(self, tokens):
-            # `for p in A B; do echo "kill $p"; done | sh`: what comes out of the left side is the program, and the guard
-            # does not compute program output. Every word on that side is judged by command(), however it is nested.
-            for k, (kind, value) in enumerate(tokens):
-                if kind == 'op' and value in ('|', '|&'):
-                    stage = []
-                    for later_kind, later in tokens[k + 1:]:
-                        if later_kind == 'op' and later == '\n' and not stage:
-                            continue  # a newline after a pipe continues the pipeline
-                        if later_kind == 'op':
-                            break
-                        if later_kind == 'w':
-                            stage.append(later)
-                    if self.reads_program(stage) or any(w.vars for w in stage):  # S=sh; ... | $S: judged once S is known
-                        for w in self.feeder_words(tokens, k):
-                            self.fed[id(w)] = (w, stage)
+    # ---- the decisions
+    def protected_text(self, text):
+        return any(p.search(text or '') for p in self.patterns)
 
-        @staticmethod
-        def feeder_words(tokens, pipe):
-            """The words left of a pipe, back to the start of the statement it belongs to."""
-            out, depth = [], 0
-            for j in range(pipe - 1, -1, -1):
-                kind, value = tokens[j]
-                if kind == 'w':
-                    out.append(value)
-                    prev = tokens[j - 1] if j else None
-                    keyword = not value.quoted and (prev is None or prev[0] == 'op' or (
-                        prev[0] == 'w' and not prev[1].quoted and prev[1].text in cg.RESERVED))
-                    if keyword and value.text in ('done', 'fi', 'esac', '}'):
-                        depth += 1
-                    elif keyword and value.text in ('for', 'select', 'while', 'until', 'if', 'case', '{'):
-                        if depth == 0:
-                            break
-                        depth -= 1
-                elif kind == 'op':
-                    if value == ')':
-                        depth += 1
-                    elif value == '(':
-                        if depth == 0:
-                            break
-                        depth -= 1
-                    elif value == '\n' and j and tokens[j - 1] in (('op', '|'), ('op', '|&')):
-                        continue
-                    elif depth == 0 and value in (';', '\n', '&&', '||', '&'):
-                        break
-            return out
+    def _paths(self, proc, cwd):
+        words = proc.command.split()[:4]
+        return [w for w in [cwd] + words if w and w.startswith('/')]
 
-        def reads_program(self, words):
-            """True when this pipeline stage runs its stdin as shell code."""
-            words = self._skip_assigns(cg.strip_reserved(words))[1]
-            while words and self.expands_to_nothing(words[0]):  # K=(); ... | "${K[@]}" bash: bash is the command
-                words = words[1:]
-            if not words:
-                return False
-            picked = self.picked_elements(words[0])
-            if picked:  # S=(cat bash); ... | "${S[1]}": which element runs depends on the shell, so any of them may
-                return any(self.reads_program([e] + words[1:]) for e in picked)
-            head = words[0].text.strip()
-            if re.search(r'\s', head) and not head.startswith('-') and self.shell_splits(words[0]):  # S="ssh -T dev2"; ... | $S bash
-                split = [v for k, v in cg.Lexer(self.ctx, self.ctx.ps).lex(head) if k == 'w']
-                if [w.text for w in split] != [head]:  # defensive: a word the lexer cannot split must not recurse forever
-                    return self.reads_program(split + words[1:])
-            name, args = cg.norm_name(words[0].text), words[1:]
-            if name.startswith('g') and name[1:] in GNU_PREFIXED:
-                name = name[1:]
-            if name in cg.SHELLS and name != 'busybox':
-                i = 0
-                while i < len(args):
-                    t = args[i].text
-                    if t in ('-s', '-', '/dev/stdin', '/dev/fd/0'):
-                        return True
-                    if re.fullmatch(r'-[a-zA-Z]*[cn][a-zA-Z]*', t) or t.startswith('--command') or not t.startswith(('-', '+')):
-                        return False  # -c gives the program, -n only parses, and a first operand is a script file
-                    i += 2 if re.fullmatch(r'[-+][a-zA-Z]*[oO]', t) or t in ('--rcfile', '--init-file') else 1
-                return True
-            if name in ('at', 'batch'):
-                return not any(a.text == '-f' for a in args)
-            if name == 'parallel' and all(a.text.startswith('-') for a in args):
-                return True
-            if name in WRAPPER_NAMES or name in REMOTE_EXEC or name in REMOTE_WRAPPERS:
-                host = self._ssh_host_index([a.text for a in args]) if name in ('ssh', 'mosh') else None
-                remote = name in REMOTE_EXEC or name in REMOTE_WRAPPERS
-                for i, a in enumerate(args):
-                    if re.search(r'\s', a.text.strip()) and name not in ('xargs', 'parallel'):  # ssh host 'cd /srv && bash -s'
-                        for bang in (True, False):  # the remote shell may be zsh or bash, which read `>! sh` apart
-                            lexed = cg.Lexer(self.ctx, self.ctx.ps, bang_operators=bang).lex(a.text)
-                            if any(self.reads_program(c.words) for pl in cg.parse(lexed) for c in pl.cmds):
-                                return True
-                        if remote:
-                            continue  # a remote command line; a local wrapper's word is one argv word, a path
-                    n = cg.norm_name(a.text)
-                    if n in cg.SHELLS:
-                        if name in ('xargs', 'parallel'):  # the text reaches the shell only when it is the whole -c program
-                            marks = {args[j + 1].text for j in range(i) if args[j].text == '-I'} | {'{}'} | {
-                                t.text[2:] for t in args[:i] if t.text.startswith('-I') and len(t.text) > 2}
-                            return any(re.fullmatch(r'-[a-zA-Z]*c[a-zA-Z]*', args[j].text) and args[j + 1].text.strip() in marks
-                                       for j in range(i + 1, len(args) - 1))
-                        return self.reads_program(args[i:])
-                    if name in ('xargs', 'parallel') or i == host or self.names_a_value(name, args, i):
-                        continue  # xargs needs the exact `sh -c {}` above, so nothing before it can end the search
-                    if n in REMOTE_EXEC or n in NAME_FIRST:  # timeout 30 ssh dev2 bash, sudo gosu git sh: the inner one has its own rules
-                        return self.reads_program(args[i:])
-                    if n in STOP_COMMANDS:
-                        return False
-            return False
-
-        def expands_to_nothing(self, word):
-            """A word whose expansions all resolve to nothing: `K=(); "${K[@]}"`, `${K[*]}`, zsh `$K[@]`, `K=; $K`, `${K}`,
-            and any concatenation of them (`${K[@]}${K[@]}`, `$K$J`, `"${K[@]}""${J[@]}"`; review N1 of 676c0e2). The
-            shell drops it (or fails on it), so the word after it is the command; judging that word errs only towards a
-            refusal. Decided on the resolved value, not the spelling: the word expands variables, no command
-            substitution, every resolved alternative is blank, and every variable it reads is known and untainted. An
-            unknown name resolves to `$NAME`, and `${K:-x}`, `${K[0]}`, `${!K}` and `${#K}` resolve to their text or a
-            marker, so none of them is blank and none is dropped."""
-            if not word.vars or word.subs or any(a.strip() for a in word.alts):
-                return False
-            return all(v in self.ctx.vars and v not in self.ctx.tainted for v in word.vars)
-
-        def drop_empty_head(self, words):
-            """The words left once leading words that expand to nothing are dropped. When any was dropped, main's
-            dynamic-head verb check still applies to what remains (review N3 of 676c0e2): main read the empty word as a
-            command built at run time and refused when a kill verb was among the next two words, so `K=(); "${K[@]}"
-            nocache kill 4004` (an unlisted wrapper) stays refused rather than judged as `nocache`."""
-            words = list(words)
-            dropped = False
-            while words and self.expands_to_nothing(words[0]):  # P=(sudo); [ root ] && P=(); "${P[@]}" pkill -f node
-                words, dropped = words[1:], True
-            if dropped and any(cg.norm_name(w.text) in (self.broad | self.windows | {'kill'}) for w in words[:2]):
-                self.block('dynamic-head', 'a command name that expands to nothing is followed by a kill verb')
-            return words
-
-        def names_for(self, head):
-            """goodqa#15365: a head word holding whitespace is a whole command line (an ssh remote string), not a name; it
-            is re-read word by word elsewhere, where a glob in command position still expands against the known names.
-            norm_name() keeps only the text after its last '/', so `ls tools/x/*` read as the name `*` and matched every verb."""
-            text = (head.text or '').strip()
-            # The same predicate as apply(), which re-parses exactly such a head (a space, not a leading '-'). A tab or
-            # newline head is NOT re-parsed there, so it keeps the glob expansion (red-team F1: parallel ::: $'ls\t|\txargs\t/bin/k*l').
-            if SSH_GLOB_LINE_FIX and ' ' in text and not text.startswith('-') and not head.vars and not head.subs:
-                return [cg.norm_name(text)]
-            return super().names_for(head)
-
-        def dispatch(self, words, cmd, pl, idx, depth):
-            words = self.drop_empty_head(words)
-            if not words:
-                return None
-            return super().dispatch(words, cmd, pl, idx, depth)
-
-        @staticmethod
-        def shell_splits(word):
-            """A held value is split into words only when it came from an unquoted variable, or from a quoted `[@]` or `[*]`.
-            A quoted path with a space (`"/opt/my dir/bash"`, `"$B"`) stays one word."""
-            raw = word.raw or ''
-            if not word.vars:
-                return False
-            return not raw.startswith('"') or bool(re.search(r'\[[@*]\]', raw))
-
-        def picked_elements(self, word):
-            """The elements of a known array when this word picks one of them: `"${S[1]}"`, zsh `$S[1]`, `${S[-1]}`."""
-            match = re.fullmatch(r'"?\$\{?([A-Za-z_][A-Za-z0-9_]*)\[([^\]]*)\]\}?"?', word.raw or '')
-            if not match or match.group(2) in ('@', '*'):
-                return None
-            name = match.group(1)
-            if name not in self.ctx.vars or name in self.ctx.tainted:
-                return None
-            return [v for k, v in cg.Lexer(self.ctx, self.ctx.ps).lex(self.ctx.vars[name]) if k == 'w'] or None
-
-        @staticmethod
-        def names_a_value(name, args, i):
-            """This word may be a user or container, not a command: `sudo -u git bash`, `docker run --rm -i node sh`,
-            `kubectl exec node -i -- sh`. An option may take no value, so this can only keep the search going: a word that
-            is both a stop word and an option's neighbour costs a refusal only when a shell's name follows it."""
-            if i == 0 and name in NAME_FIRST:
-                return True
-            prev = args[i - 1].text if i else ''
-            if prev.startswith('-') and prev != '--' and '=' not in prev:
-                return True
-            return prev in ('exec', 'run', 'attach') and (name in REMOTE_EXEC or name in REMOTE_WRAPPERS)
-
-        def command(self, cmd, pl, idx, depth):
-            self.judge_reread(cmd)
-            return super().command(cmd, pl, idx, depth)
-
-        def judge_reread(self, cmd):
-            """The one rule for words that can be read again as code after this parse, whatever the command is called:
-            they were cut at a parenthesis, or their text goes down a pipe into a shell. If they name a kill, or may hold
-            one because the value is unknown and the input names one, nothing about the targets can be proven. A command
-            that only prints or searches its words, with no pipe into a shell, leaves them as data."""
-            cut = any(id(w) in self.before_paren for w in cmd.words)
-            fed = any(id(w) in self.fed and self.reads_program([self.resolve(s) for s in self.fed[id(w)][1]])
-                      for w in cmd.words)
-            if not (cut or fed):
-                return
-            words = [self.resolve(w) for w in cg.strip_reserved(cmd.words)]
-            reason = FEED_REASON if fed else PAREN_REASON
-            rule = 'text-to-shell' if fed else 'unprovable-target'
-            bodies = []
-            if fed:
-                bodies = [r.body or (r.target.text if r.op == '<<<' and r.target is not None else '') for r in cmd.redirs]
-            rest = self._skip_assigns(words)[1]
-            name = cg.norm_name(rest[0].text) if rest else ''
-            if not fed and (not rest or (name in INERT_COMMANDS and not rest[0].vars)):
-                return  # a held name is only the guard's guess of the value: K=(kill); (K=(echo)); "${K[@]}" 4002(N)
-            if self.names_kill(' '.join([p for w in words for p in (w.text, w.raw or '', *w.subs)] + bodies)):
-                self.block(rule, reason)
-                return
-            unknown = any(w.dynamic or w.subs for w in words) or any('$' in b or '`' in b for b in bodies)
-            runs_text = fed or (rest and (rest[0].dynamic or rest[0].subs or self.runs_text(name)))
-            if unknown and runs_text and self.names_kill(self.raw):
-                self.block(rule, reason)
-
-        @staticmethod
-        def runs_text(name):
-            return name in cg.SHELLS or name in ('eval', 'source', '.', 'trap') or name in WRAPPER_NAMES \
-                or name in REMOTE_EXEC or name in REMOTE_WRAPPERS
-
-        def resolve(self, word):
-            # resolve() builds a new Word for any word holding a variable, so a tag has to follow it.
-            out = super().resolve(self.array_value(word))
-            if out is not word and word is not None:
-                if id(word) in self.before_paren:
-                    self.before_paren[id(out)] = out
-                if id(word) in self.fed:
-                    self.fed[id(out)] = (out, self.fed[id(word)][1])
-            return out
-
-        def array_value(self, word):
-            """`"${S[@]}"` and zsh's `$S[@]` hold the words normalize_assignments gave S; the base keeps them as text. One
-            element (`${S[1]}`) stays unresolved, as before, so a command name picked from an array is judged as unknown."""
-            if word is None or not word.vars:
-                return word
-            use = r'\$\{([A-Za-z_][A-Za-z0-9_]*)\[[@*]\]\}|%s([A-Za-z_][A-Za-z0-9_]*)%s\[[@*]\]' % (cg.VAR_OPEN, cg.VAR_CLOSE)
-            alts = [re.sub(use, lambda m: cg.VAR_OPEN + (m.group(1) or m.group(2)) + cg.VAR_CLOSE, a) for a in word.alts]
-            if alts == word.alts:
-                return word
-            out = cg.Word()
-            out.alts, out.subs, out.vars, out.glob, out.quoted, out.raw = alts, word.subs, word.vars, word.glob, word.quoted, word.raw
-            out.dynamic = word.dynamic
-            return out
-
-        def bind_loop_var(self, words):
-            # `for p in A B; do kill $p`: the base binds only one item; make the variable unresolvable instead so
-            # the kill is judged as dynamic, never as the first item only.
-            if len(words) >= 2:
-                self.ctx.tainted.add(words[1].text)
-                self.ctx.vars.pop(words[1].text, None)
-
-        def inner_words(self, words, depth, pl, idx, via_xargs=False):
-            words = self.drop_empty_head(words)  # K=(); sudo "${K[@]}" find ... -exec ...: find runs
-            if via_xargs:
-                self.xargs += 1
-            try:
-                return super().inner_words(words, depth, pl, idx, via_xargs)
-            finally:
-                if via_xargs:
-                    self.xargs -= 1
-
-        def _ssh_host_index(self, texts):
-            value_opts = set('bcDEeFIiJLlmOopQRSWwBP')
-            i = 0
-            while i < len(texts):
-                t = texts[i]
-                if t.startswith('-') and len(t) > 1:
-                    consumed = 1
-                    for k, letter in enumerate(t[1:]):
-                        if letter in value_opts:
-                            consumed = 2 if k == len(t) - 2 else 1  # value glued on, or the next word
-                            break
-                    i += consumed
-                    continue
-                return i
-            return None
-
-        def ssh(self, args, depth):
-            texts = [a.text for a in args]
-            for i, t in enumerate(texts):  # these run on THIS machine, before the connection
-                value = texts[i + 1] if t == '-o' and i + 1 < len(texts) else (t[2:] if t.startswith('-o') and len(t) > 2 else None)
-                match = re.match(r'(?i)\s*(?:proxycommand|localcommand)\s*[= ]\s*(.+)', value or '')
-                if match:
-                    self.script(match.group(1), depth + 1)
-            host = self._ssh_host_index(texts)
-            if host is not None and host + 1 < len(texts) and texts[host + 1] == '--':
-                args = args[:host + 1] + args[host + 2:]  # `mosh host -- cmd`, `ssh host -- cmd`
-            self.remote += 1
-            # OpenSSH keeps reading options after the destination (`ssh dev2 -o HostName=prod kill 4242` reroutes),
-            # so an option word right after the host (anything but `--`) also makes the hop non-literal (review round 2).
-            after = args[host + 1] if host is not None and host + 1 < len(args) else None
-            literal = (host is not None and not _unliteral(args[host]) and not any(_unliteral(a) for a in args[:host])
-                       and plain_ssh_hop(texts, host)
-                       and not (after is not None and (_unliteral(after)  # `$(echo -o)` expands to an option word
-                                                       or (after.text.startswith('-') and after.text != '--'))))
-            self.remote_hosts.append(texts[host] if literal else None)
-            try:
-                result = super().ssh(args, depth)
-                host = self._ssh_host_index(texts)
-                if host is not None and host + 1 < len(args):  # the base joins words unquoted; judge the quoted form too
-                    self.script(' '.join(cg._quote_for_rebuild(a.text) for a in args[host + 1:]), depth + 1)
-                return result
-            finally:
-                self.remote -= 1
-                self.remote_hosts.pop()
-
-        def container(self, name, args, words, depth, pl, idx):
-            self.remote += 1
-            try:
-                return super().container(name, args, words, depth, pl, idx)
-            finally:
-                self.remote -= 1
-
-        def apply(self, name, words, cmd, pl, idx, depth):
-            if words[0].vars and name.endswith(']'):
-                name = re.sub(r'\[[^\]]*\]$', '', name)  # zsh subscript on an array head: $K[1]
-            if name.startswith('g') and name[1:] in GNU_PREFIXED:
-                return self.apply(name[1:], words, cmd, pl, idx, depth)  # Homebrew coreutils: gtimeout, gxargs ...
-            args = words[1:]
-            # goodqa#15377: a head that is a whole command line (it holds a space) is re-parsed below; its last path segment
-            # (`... ; ls /x/which`) is not a lookup command, so the early return must not apply to it.
-            whole_line = LOOKUP_HEAD_FIX and ' ' in words[0].text.strip() and not words[0].text.strip().startswith('-')
-            if name in ('command', 'builtin', 'type', 'which', 'whereis', 'hash') and not words[0].vars and not whole_line and (
-                    name in ('type', 'which', 'whereis', 'hash') or leading_lookup(args)):
-                return None  # asks where a program is; runs nothing. Not for a held name: K=(env); (K=(which)); "${K[@]}"
-            if name in ('export', 'declare', 'local', 'readonly', 'typeset'):
-                for a in args:
-                    if '=' in a.text and not a.dynamic and not a.text.startswith('-'):
-                        key, _, value = a.text.partition('=')
-                        self.ctx.vars[key] = value
-                        self.ctx.tainted.discard(key)
-            head_text = words[0].text.strip()
-            if ' ' in head_text and not head_text.startswith('-'):
-                self.script(head_text + ' ' + ' '.join(cg._quote_for_rebuild(a.text) for a in args), depth + 1)
-            self.inspect(name, words, cmd, pl, idx, depth)
-            if name in WRAPPER_NAMES or name.startswith('-') or name in REMOTE_WRAPPERS:
-                self.scan_tail(name, args, pl, idx, depth)
-            elif name not in STOP_COMMANDS and name not in cg.SHELLS and name not in self.broad \
-                    and name not in self.windows and name != 'netwatch':
-                if any(cg.norm_name(a.text) in CLASSIC_VERBS for a in args):  # pnpm exec pkill x, bundle exec ..., entr -r ...
-                    self.block('indirect-kill', '`%s` runs a process-killing command by name' % one_line(name, 30))
-            return super().apply(name, words, cmd, pl, idx, depth)
-
-        def scan_tail(self, name, args, pl, idx, depth):
-            """After a wrapper (or the option left over once `time` was stripped): the first later word that is a
-            kill verb starts the real command, whatever options the wrapper takes. Words that are a known ordinary
-            command end the scan, and a word holding a whole command line (`sudo -i 'pkill x'`) is re-parsed."""
-            verbs = self.broad | self.windows | {'kill'}
-            remote = name in REMOTE_WRAPPERS
-            via_xargs = name in ('xargs', 'parallel')
-            for i, w in enumerate(args):
-                if cg.norm_name(w.text).lstrip('g') in ('xargs', 'parallel'):
-                    via_xargs = True
-                if i and args[i - 1].text in ('-s', '--signal', '-k', '--kill-after', '-S'):
-                    continue  # a signal name given to timeout and friends, not a command
-                n = cg.norm_name(w.text)
-                if n.startswith('g') and n[1:] in GNU_PREFIXED:
-                    n = n[1:]
-                if n in verbs:
-                    if remote:
-                        self.remote += 1
-                    try:
-                        self.inner_words(args[i:], depth, pl, idx, via_xargs=via_xargs)
-                    finally:
-                        if remote:
-                            self.remote -= 1
-                    return
-                if n in ('ssh', 'mosh') and name == 'sshpass':
-                    self.inner_words(args[i:], depth, pl, idx)  # sshpass -p x ssh host ...
-                    return
-                if INTERPRETER_NAME.fullmatch(n) or n in cg.SHELLS:
-                    self.inner_words(args[i:], depth, pl, idx, via_xargs=via_xargs)  # uv run python -c ..., tmux new sh -c ...
-                    return
-                if not remote and n in STOP_COMMANDS:
-                    return
-                if w.text.startswith(('--split-string=', '-S')) and len(w.text) > 2 and name == 'env':
-                    self.script(w.text.split('=', 1)[1] if '=' in w.text else w.text[2:], depth + 1)
-                prev = args[i - 1].text if i else ''
-                # `--command` runs a command only for su and runuser; `wrangler d1 execute --command "SELECT count(*)"`
-                # takes SQL. A value that mentions a kill verb is still re-read as a command line.
-                sql_like = prev == '--command' and name not in ('su', 'runuser') and not KILLISH.search(w.text)
-                value_of_other_option = prev.startswith('-') and (prev not in RUN_OPTS or sql_like) \
-                    and name not in LAUNCHERS and not re.fullmatch(r'-[A-Za-z]*c', prev)
-                if (' ' in w.text.strip() or ';' in w.text) and not w.text.startswith('-') \
-                        and name not in ('xargs', 'parallel') and not value_of_other_option:
-                    if remote:
-                        self.remote += 1
-                    try:
-                        self.script(w.text, depth + 1)
-                    finally:
-                        if remote:
-                            self.remote -= 1
-
-        # ---- the checks
-        def finder_before(self, pl, idx, subs=()):
-            for prev in pl.cmds[:idx]:
-                head = self._skip_assigns(cg.strip_reserved(prev.words))[1]
-                if head and cg.norm_name(head[0].text) in self.finders:
-                    return True
-            return any(re.search(r'\b(?:%s)\b' % '|'.join(map(re.escape, self.finders - {'cat', 'awk', 'grep'})), s)
-                       for s in subs)
-
-        def inspect(self, name, words, cmd, pl, idx, depth):
-            args = words[1:]
-            texts = [a.text for a in args]
-            head = words[0]
-            if re.fullmatch(r'\$[@*0-9]', head.text) and KILLISH.search(norm_raw(self.raw)):
-                self.block('dynamic-head', 'positional parameters run a command and the input mentions kill')
-            if head.dynamic:
-                hints = ' '.join(self.ctx.var_hints.values()) + ' ' + ' '.join(head.subs) + ' ' + ' '.join(
-                    self.ctx.vars.get(v, '') for v in head.vars)  # ${K:-x} reads a variable the guard does know
-                try:
-                    hints += ' ' + cg.decode_ansi(hints)
-                except Exception:  # noqa: BLE001
-                    pass
-                if args and any(cg.norm_name(a.text) in (self.broad | self.windows | {'kill'}) for a in args[:2]):
-                    self.block('dynamic-head', 'a command name built at run time is followed by a kill verb')  # $x kill 4242
-                spliced = re.sub('[\ue000-\uf8ff]', '', cg.VAR_MARKER.sub('', head.text))
-                elided = any(cg.norm_name(spliced[:p] + spliced[e:]) in (self.broad | self.windows | {'kill'})
-                             for p in range(len(spliced)) if spliced[p] == '$'
-                             for e in range(p + 2, min(len(spliced), p + 40) + 1))  # k${x}ill, k$@ill
-                if elided or KILLISH.search(norm_raw(spliced + ' ' + hints)) or INDIRECT.search(hints):
-                    self.block('dynamic-head', 'the command name is built at run time and the input mentions kill')
-            if name in self.broad:
-                self.block('broad-kill', '`%s` signals processes by name or pattern and can hit other owners' % name)
-            elif name in self.windows:
-                if name != 'wmic' or any(t.casefold() in ('delete', 'terminate') for t in texts):
-                    self.block('windows-kill', '`%s` cannot be checked for ownership' % name)
-            elif name == 'kill':
-                if self.ctx.ps:
-                    self.block('windows-kill', 'PowerShell kill is Stop-Process and cannot be checked for ownership')
-                elif any(id(w) in self.before_paren for w in words):
-                    self.block('unprovable-target', PAREN_REASON)
-                else:
-                    self.check_kill(args, pl, idx)
-            elif name == 'fuser':
-                if any(re.fullmatch(r'-[A-Za-z]*k[A-Za-z]*', t) or t == '--kill' for t in texts):
-                    self.block('broad-kill', '`fuser -k` kills whatever holds a file or port')
-            elif name in self.policy['service_kill']:
-                if any(t in self.policy['service_kill'][name] for t in texts):
-                    self.block('service-kill', '`%s kill` stops processes the guard cannot attribute' % name)
-            elif name == 'netwatch':
-                self.check_netwatch(args)
-            elif name in cg.SHELLS or name in ('eval', 'source', '.'):
-                if any(INDIRECT.search(' '.join(a.subs)) for a in args if a.subs):
-                    self.block('obfuscated-input', 'a shell is fed decoded text, so the guard cannot see what runs')
-                elif any(self.names_kill(' '.join(a.subs)) for a in args if a.subs):
-                    self.block('text-to-shell', FEED_REASON)  # eval "$(for p in A B; do echo "kill $p"; done)"
-            elif name == 'trap':
-                rest = [t for t in texts if t not in ('--',)]
-                if rest and rest[0] not in ('-p', '-l', '-', ''):
-                    self.script(rest[0], depth + 1)
-            elif name in ('find', 'parallel'):
-                self.check_indirect(name, args, texts)
-            elif name in ('busybox', 'toybox', 'systemd-run') and args:
-                rest = [a for a in args if not a.text.startswith('-')][:1]
-                if rest:
-                    self.inner_words(args[args.index(rest[0]):], depth, pl, idx)
-            elif name in cg.INTERPRETERS or INTERPRETER_NAME.fullmatch(name):
-                if not self.is_codex_note(words, cmd, depth, pl) and not self.is_ah_kill(name, args, cmd, depth) \
-                        and not self.is_harness_cli(name, args, cmd, depth):
-                    self.check_interpreter(name, texts, cmd, args)
-            self.check_spawn(name, args, texts, depth, pl, idx)
-            self.check_text_runners(name, args, texts, cmd, depth, pl, idx)
-
-        def check_text_runners(self, name, args, texts, cmd, depth, pl, idx):
-            """Commands that run a text argument or here-string as shell code, which the base does not follow."""
-            runs_stdin = name in cg.SHELLS or name in ('at', 'batch') or (
-                (name in WRAPPER_NAMES or name in REMOTE_WRAPPERS or name in REMOTE_EXEC) and any(
-                    cg.norm_name(a.text) in cg.SHELLS or cg.norm_name(a.text) in ('at', 'batch') for a in args))
-            if name in ('ssh', 'mosh'):
-                runs_stdin = True
-            if runs_stdin:
-                remote = name in REMOTE_EXEC or name in REMOTE_WRAPPERS
-                self.remote += 1 if remote else 0
-                try:
-                    for redir in getattr(cmd, 'redirs', []):
-                        if redir.op == '<<<' and redir.target is not None:
-                            self.script(redir.target.text, depth + 1)
-                        elif redir.op == '<' and redir.target is not None:
-                            self.script_file(redir.target, depth)
-                        elif redir.body and redir.op.startswith('<<'):
-                            self.script(redir.body, depth + 1)
-                finally:
-                    self.remote -= 1 if remote else 0
-            if (name in WRAPPER_NAMES) and any(INTERPRETER_NAME.fullmatch(cg.norm_name(a.text)) for a in args):
-                # Rebuilt inner argv does not carry the original input redirections or pipeline.
-                # Keep the old full scan in those contexts rather than losing stdin code.
-                head = (getattr(cmd, 'words', None) or [None])[0]
-                trusted_wrapper = head is not None and head.raw == '/usr/bin/' + name
-                boundary = (None if not trusted_wrapper or getattr(cmd, 'redirs', [])
-                            or (pl is not None and len(pl.cmds) != 1)
-                            else _literal_wrapper_tail(name, args))
-                if boundary is None:
-                    self.check_interpreter(name, texts, cmd)  # uncertain wrapper: retain conservative scan
-                else:
-                    # Prove the actual inner boundary by analyzing that argv, not by exempting a whole
-                    # wrapper. Base wrapper recursion and scan_tail still run independently. Original
-                    # redirections above remain checked; inner Python/shell code is never omitted.
-                    self.inner_words(args[boundary:], depth, pl, idx)
-            if name in ('at', 'batch'):
-                for i, t in enumerate(texts):
-                    if t == '-f' and i + 1 < len(args):
-                        self.script_file(args[i + 1], depth)
-            elif name == 'watch':
-                i = 0
-                while i < len(texts) and texts[i].startswith('-'):
-                    i += 2 if texts[i] in ('-n', '-d', '--interval') else 1
-                if i < len(texts):
-                    self.script(' '.join(texts[i:]), depth + 1)
-            elif name in ('cmd', 'cmd.exe'):
-                for i, t in enumerate(texts):
-                    if t.casefold() in ('/c', '/k') and i + 1 < len(texts):
-                        self.script(' '.join(texts[i + 1:]), depth + 1)
-
-        def check_spawn(self, name, args, texts, depth, pl, idx):
-            """`kill_guard.py spawn [--log F] -- CMD` runs CMD: judge CMD as if it were typed directly."""
-            if name in ('kill_guard.py', 'kill_guard'):
-                rest = list(args)
-            elif name in cg.INTERPRETERS and any(cg.norm_name(t) == 'kill_guard.py' for t in texts):
-                rest = list(args)[[cg.norm_name(t) for t in texts].index('kill_guard.py') + 1:]
+    def judge(self, pids):
+        """{pid: (ok, why)} for literal pids. ok is True when the caller may stop it without approval."""
+        table, ancestors, out = self.table(), set(self.ancestors()), {}
+        agent = self.agent_pid()
+        need_paths = []
+        for pid in pids:
+            proc = table.get(pid)
+            if pid <= 1:
+                out[pid] = (False, 'pid %d is init or invalid' % pid)
+            elif proc is None:
+                out[pid] = (True, 'no such process')  # kill of a gone pid fails harmlessly
+            elif pid in ancestors:
+                out[pid] = (False, 'pid %d is the agent session that runs this command' % pid)
+            elif proc.name in SYSTEM_NAMES:
+                out[pid] = (False, 'pid %d is a system process (%s)' % (pid, proc.name))
+            elif agent and self._descends(pid, agent):
+                out[pid] = (True, 'started by this agent session')
             else:
+                need_paths.append(pid)
+        if need_paths:
+            cwds = self.cwd_of(need_paths)
+            roots, nested = self.own_roots()
+            roles = self.roles()
+            for pid in need_paths:
+                proc = table[pid]
+                paths = self._paths(proc, cwds.get(pid))
+                protected = self.protected_text(proc.command)
+                if not protected and any(_inside(p, roots, nested) for p in paths):
+                    out[pid] = (True, 'runs in your own work dir or worktree')
+                elif not protected and self._in_ledger(pid):
+                    out[pid] = (True, 'started with kill_guard.py spawn')
+                elif protected and roles.get('maintainer') and not any(r.search(proc.command) for r in self.live):
+                    self.notes.append('harness maintainer stops protected pid %d' % pid)
+                    out[pid] = (True, 'harness maintainer (Fable/Astra supervisor) may stop a harness daemon')
+                elif protected:
+                    out[pid] = (False, 'pid %d is protected (harness daemon, log backup or staging/live): %s' % (
+                        pid, one_line(proc.name, 40)))
+                elif roles['supervised'] and any(_inside(p, roles['supervised'], []) for p in paths):
+                    out[pid] = (True, 'in a project you supervise')
+                elif roles['top']:
+                    out[pid] = (True, 'top rung (Fable/Astra) may stop it')
+                elif proc.uid != os.getuid():
+                    out[pid] = (False, 'pid %d belongs to another user' % pid)
+                else:
+                    out[pid] = (False, 'pid %d (%s) is not yours: not started by this session, not in your work dir '
+                                'or worktree' % (pid, one_line(proc.name, 40)))
+        return out
+
+    def _descends(self, pid, root):
+        table, seen = self.table(), set()
+        while pid in table and pid not in seen and pid > 1:
+            if pid == root:
+                return True
+            seen.add(pid)
+            pid = table[pid].ppid
+        return pid == root
+
+    def _in_ledger(self, pid):
+        ledger = self.ledger()
+        if not ledger:
+            return False
+        return (pid, self._start(pid)) in ledger
+
+    def named_unit(self, name):
+        """(ok, why) for a named service, container, session or label (no pid to judge)."""
+        if self.protected_text(name):
+            if self.roles().get('maintainer') and not any(r.search(name or '') for r in self.live):
+                self.notes.append('harness maintainer stops protected unit %s' % one_line(name, 60))
+                return True, 'harness maintainer'
+            return False, '%s is protected (harness daemon, log backup or staging/live)' % one_line(name, 60)
+        return True, 'named unit'
+
+
+def _compiles(pattern):
+    try:
+        re.compile(pattern)
+        return True
+    except re.error:
+        return False
+
+
+def _inside(path, roots, nested):
+    norm = os.path.normpath(path)
+    return any(under(norm, r) for r in roots) and not any(under(norm, n) for n in nested)
+
+
+# --------------------------------------------------------------------------- the analysis
+
+class Finding(Exception):
+    """A refusal: rule, reason, the one command that proceeds, the pids."""
+
+    def __init__(self, rule, reason, proceed, pids=()):
+        super().__init__(reason)
+        self.rule, self.reason, self.proceed, self.pids = rule, reason, proceed, tuple(pids)
+
+
+WRAPPERS_WITH_VALUES = {
+    'sudo': {'-u', '-g', '-C', '-D', '-h', '-p', '-r', '-t', '-U'},
+    'env': {'-u', '-C', '-S', '--unset', '--chdir'},
+    'nice': {'-n', '--adjustment'},
+    'ionice': {'-c', '-n', '-p'},
+    'timeout': {'-s', '-k', '--signal', '--kill-after'},
+    'stdbuf': {'-i', '-o', '-e'},
+    'chrt': set(), 'taskset': set(), 'nohup': set(), 'time': set(), 'command': set(), 'builtin': set(),
+    'exec': {'-a'}, 'setsid': set(), 'caffeinate': {'-t', '-w'}, 'unbuffer': set(), 'doas': {'-u'},
+    'flock': {'-w', '-E', '-c'}, 'xargs': {'-I', '-i', '-n', '-P', '-L', '-d', '-E', '-s', '-a'},
+}
+SHELL_NAMES = {'sh', 'bash', 'zsh', 'dash', 'ksh', 'fish'}
+INTERP_CODE = {'python': '-c', 'python3': '-c', 'node': '-e', 'nodejs': '-e', 'perl': '-e', 'ruby': '-e', 'bun': '-e',
+               'deno': 'eval'}
+HELP_FLAGS = {'--help', '-h', '-help', '--version', '-V', '-l', '-L', '--list', '-t', '--table'}
+VERBS = {'kill': 'kill', 'pkill': 'pkill', 'killall': 'killall', 'killall5': 'killall5', 'fuser': 'fuser',
+         'docker': 'docker', 'podman': 'docker', 'nerdctl': 'docker', 'docker-compose': 'compose',
+         'podman-compose': 'compose', 'systemctl': 'systemctl', 'launchctl': 'launchctl', 'tmux': 'tmux', 'pm2': 'pm2',
+         'netwatch': 'netwatch', 'loginctl': 'loginctl', 'taskkill': 'taskkill', 'taskkill.exe': 'taskkill',
+         'stop-process': 'taskkill'}
+
+
+def basename(word):
+    return os.path.basename(word.text).casefold() if word.text else ''
+
+
+class Analyzer:
+    def __init__(self, ctx, remote=False):
+        self.ctx = ctx
+        self.remote = remote
+        self.vars = {}  # name -> ('own'|'finder'|'literal'|'unknown', value or finder stages)
+        self.unsure = []  # one-line reasons for an allow that could not be proven either way
+
+    # ---- walking
+    def script(self, text, depth=0):
+        if depth > MAX_DEPTH:
+            self.unsure.append('nested too deep')
+            return
+        for cmd in commands(text):
+            self.command(cmd, depth)
+
+    def command(self, cmd, depth):
+        words = list(cmd.words)
+        while words and not words[0].quoted and words[0].text in RESERVED:
+            if words[0].text == 'for' and len(words) >= 2:
+                self.bind_for(words)
                 return
-            if not rest or rest[0].text != 'spawn':
+            words = words[1:]
+        assigns = []
+        while words and re.match(r'[A-Za-z_][A-Za-z0-9_]*=', words[0].text) and not words[0].text.startswith('='):
+            assigns.append(words.pop(0))
+        for w in words:  # substitutions run wherever they stand
+            for sub in w.subs:
+                self.script(sub, depth + 1)
+        for w in assigns:
+            for sub in w.subs:
+                self.script(sub, depth + 1)
+        if not words:
+            for w in assigns:
+                self.assign(w)
+            return
+        self.run(words, cmd, depth)
+
+    def assign(self, word):
+        name, _, value = word.text.partition('=')
+        if word.vars and set(word.vars) <= {'!', '$', 'BASHPID'} and not word.subs:
+            self.vars[name] = ('own', None)
+        elif word.subs:
+            finder = self.finder_of_text(word.subs[0])
+            self.vars[name] = ('finder', finder) if finder else ('unknown', None)
+        elif word.dynamic:
+            self.vars[name] = ('unknown', None)
+        else:
+            self.vars[name] = ('literal', value)
+
+    def bind_for(self, words):
+        name = words[1].text
+        items = words[3:] if len(words) > 2 and words[2].text == 'in' else []
+        finder = None
+        for w in items:
+            for sub in w.subs:
+                finder = finder or self.finder_of_text(sub)
+        if finder:
+            self.vars[name] = ('finder', finder)
+        elif items and all(not w.dynamic for w in items):
+            self.vars[name] = ('literal', ' '.join(w.text for w in items))
+        else:
+            self.vars[name] = ('unknown', None)
+
+    def run(self, words, cmd, depth):
+        name = basename(words[0])
+        args = words[1:]
+        if name.startswith('g') and name[1:] in ('kill', 'timeout', 'xargs', 'env', 'nice', 'nohup'):
+            name = name[1:]  # Homebrew coreutils
+        if name == 'read':
+            for w in args:
+                if not w.text.startswith('-') and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', w.text):
+                    finder = self.finder_of_stages(cmd.source) if cmd.source else None
+                    self.vars[w.text] = ('finder', finder) if finder else ('unknown', None)
+            return
+        if name in ('export', 'declare', 'local', 'readonly', 'typeset'):
+            for w in args:
+                if '=' in w.text and not w.text.startswith('-'):
+                    self.assign(w)
+            return
+        if name in WRAPPERS_WITH_VALUES:
+            rest = self.unwrap(name, args)
+            if rest is None:
                 return
-            rest = rest[1:]
-            if rest[:1] and rest[0].text == '--log':
-                rest = rest[2:]
-            if rest[:1] and rest[0].text == '--':
-                rest = rest[1:]
+            if name == 'xargs':
+                self.xargs(rest, cmd, depth)
+                return
             if rest:
-                self.inner_words(rest, depth, pl, idx)
-
-        def check_indirect(self, name, args, texts):
-            verbs = self.broad | self.windows | {'kill'}
-            hit = False
-            if name == 'find':
-                for i, t in enumerate(texts):
-                    if t in ('-exec', '-execdir', '-ok', '-okdir') and i + 1 < len(texts) \
-                            and cg.norm_name(texts[i + 1]) in verbs:
-                        hit = True
-            else:
-                first = next((t for t in texts if not t.startswith('-') and t != ':::'), '')
-                hit = cg.norm_name(first) in verbs
-            if hit:
-                self.block('indirect-kill', '`%s` runs a kill verb on targets the guard cannot list' % name)
-
-        def home_moved(self):
-            """goodqa#15276 red-team H2: `HOME=/tmp/x; python3 ~/.claude/hooks/ah.py` runs /tmp/x/.claude/hooks/ah.py,
-            because the shell expands `~` from the HOME it has at that point. Any HOME word in the command that is not
-            a plain $HOME or ${HOME} read (an assignment, export, declare, read or unset) means `~` may not be the
-            caller's install root, so no install-root exemption applies."""
-            return bool(re.search(r'(?<![$\w{])HOME\b', self.raw or ''))
-
-        def is_harness_cli(self, name, args, cmd, depth):
-            """`python3 [-I|-B|-u] ~/.claude/hooks/{ah,wal_note,provenance}.py ...`: the words after the script are
-            data for that script, so a note or search text that mentions kill is not signalling. `ah.py kill` is
-            excluded (is_ah_kill decides it), and so is any assignment prefix, quoted head or other script."""
-            if not name.startswith('python') or not INTERPRETER_NAME.fullmatch(name) or self.remote or depth:
-                return False
-            words = getattr(cmd, 'words', None) or []
-            if not words or words[0].raw is None or words[0].raw != name:
-                return False
+                self.run(rest, cmd, depth)
+            return
+        if name == 'watch':
+            texts = [a.text for a in args]
             i = 0
-            while i < len(args) and args[i].text in ('-I', '-B', '-u'):
-                i += 1
-            if i >= len(args) or not hook_script_ok(args[i].raw, ('ah', 'wal_note', 'provenance'), codex=True) \
-                    or self.home_moved():
-                return False
-            if args[i].text.endswith('/ah.py'):
-                # only a known non-kill subcommand (optionally after the top-level --text) makes the rest data
-                rest = [a.text for a in args[i + 1:]]
-                if rest[:1] == ['--text']:
-                    rest = rest[1:]
-                if not rest or rest[0] not in AH_SUBCOMMANDS:
-                    return False
-            return True
-
-        def is_codex_note(self, words, cmd, depth, pl):
-            """Only reviewed installed append data, isolated from Python startup and shell expansion."""
-            if self.remote or depth or self.ctx.ps or self.home_moved() or getattr(cmd, 'redirs', []):
-                return False
-            if pl is not None and len(pl.cmds) != 1:
-                return False
-            if not words or any(w.dynamic or w.subs or w.vars or w.glob for w in words):
-                return False
-            original = getattr(cmd, 'words', None) or []
-            if not original or original[0].raw != words[0].raw:
-                return False  # assignment prefixes may have been removed from the execution words
-            if not _trusted_note_python(words[0]):
-                return False
-            args = words[1:]
+            while i < len(texts) and texts[i].startswith('-'):
+                i += 2 if texts[i] in ('-n', '-d', '--interval') else 1
+            self.script(' '.join(texts[i:]), depth + 1)
+            return
+        if name in SHELL_NAMES:
+            self.shell(args, cmd, depth)
+            return
+        if name in ('eval',):
+            self.script(' '.join(a.text for a in args), depth + 1)
+            return
+        if name in ('ssh', 'mosh'):
+            self.ssh(args, depth)
+            return
+        if name in ('kubectl', 'oc') and 'exec' in [a.text for a in args[:2]]:
             texts = [a.text for a in args]
-            if texts[:2] != ['-I', '-S']:
-                return False
-            i = 2
-            seen_flags = set()
-            while i < len(texts) and texts[i] in ('-B', '-u'):
-                if texts[i] in seen_flags:
-                    return False
-                seen_flags.add(texts[i])
-                i += 1
-            home = Path.home()
-            script = home / '.codex/agent-harness/wal.py'
-            if i >= len(texts) or texts[i] != str(script) or args[i].raw != str(script):
-                return False
-            if not _owned_path(script, home, digest=CODEX_WAL_NOTE_SHA256):
-                return False
-            rest = texts[i + 1:]
-            if len(rest) != 7 or rest[0] != 'note':
-                return False
-            values = {}
-            for j in (1, 3, 5):
-                key, value = rest[j:j + 2]
-                if key not in ('--wal', '--event', '--note') or key in values:
-                    return False
-                values[key] = value
-            if values.get('--event') not in CODEX_WAL_EVENTS or not 1 <= len(values['--note'].strip()) <= 4000:
-                return False
-            wal = Path(values['--wal'])
-            root = home / '.agent-harness/codex-wals'
-            try:
-                parts = wal.relative_to(root).parts
-            except ValueError:
-                return False
-            if len(parts) != 2 or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', parts[0]):
-                return False
-            if parts[1] != 'main.jsonl' and not re.fullmatch(r'agent-[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\.jsonl', parts[1]):
-                return False
-            return _owned_path(wal, home, private=True)
+            if '--' in texts:
+                self.remote_command(args[texts.index('--') + 1:], depth, argv=True)
+            return
+        base = re.sub(r'[0-9.]+$', '', name)
+        if base in INTERP_CODE or name in INTERP_CODE:
+            self.interpreter(base if base in INTERP_CODE else name, args)
+            return
+        if name in ('docker', 'podman', 'nerdctl') and args and args[0].text == 'exec':
+            self.container_exec(args[1:], depth)
+            return
+        verb = VERBS.get(name)
+        if verb:
+            getattr(self, 'verb_' + verb)(args, cmd)
+        elif name in ('kill_guard.py', 'kill_guard'):
+            self.spawned(args, depth)
 
-        def is_ah_kill(self, name, args, cmd, depth):
-            """True only for the literal form `python3 [-I|-B|-u] ~/.claude/hooks/ah.py kill --pid N[,N] --reason R
-            [--tree] [--grace S] [--host H] [--agent A] [--session S]`. ah kill audits every pid and refuses
-            system, other-user, GUI and ancestor processes itself, so the guard only has to prove the form is
-            literal: no variable, substitution, glob, heredoc, `-c`, eval or second script. Anything else
-            returns False and is judged by the ordinary interpreter rules."""
-            if not INTERPRETER_NAME.fullmatch(name) or not name.startswith('python') or self.remote or depth:
-                return False
-            if any(getattr(r, 'body', None) or getattr(r, 'op', '').startswith('<') for r in getattr(cmd, 'redirs', [])):
-                return False
-            if any(a.dynamic or a.subs or a.glob for a in args):
-                return False
-            words = getattr(cmd, 'words', None) or []
-            if not words or words[0].raw is None or words[0].raw != name:
-                return False  # an assignment prefix (PYTHONPATH=x python3 ...) or a quoted head
-            texts = [a.text for a in args]
-            if not texts or texts[0] != '-I':
-                return False  # isolated mode ignores PYTHONPATH and user site, so a planted module cannot run first
-            i = 1
-            while i < len(texts) and texts[i] in ('-B', '-u'):
+    def container_exec(self, args, depth):
+        texts, i = [a.text for a in args], 0
+        while i < len(texts) and texts[i].startswith('-'):
+            i += 2 if texts[i] in ('-u', '--user', '-w', '--workdir', '-e', '--env', '--env-file') else 1
+        if i + 1 < len(args):
+            self.remote_command(args[i + 1:], depth, argv=True)
+
+    def unwrap(self, name, args):
+        """The words after a wrapper's own options, or None when nothing runs."""
+        takes = WRAPPERS_WITH_VALUES[name]
+        i = 0
+        while i < len(args):
+            t = args[i].text
+            if name in ('env',) and re.match(r'[A-Za-z_][A-Za-z0-9_]*=', t):
                 i += 1
-            # the raw word is matched: a quoted '~' is a literal directory, and .text has HOME expanded
-            if i + 1 >= len(texts) or not hook_script_ok(args[i].raw, ('ah',)) or texts[i + 1] != 'kill' \
-                    or self.home_moved():
-                return False
-            if texts[i + 2:] in (['--help'], ['-h']):
-                return True  # usage text only: ah.py prints it and exits before any process is touched
-            rest, i, seen, given_session = texts[i + 2:], 0, set(), None
-            while i < len(rest):
-                t = rest[i]
-                key, eq, val = t.partition('=') if t.startswith('--') else (t, '', '')
-                if key == '--session-scope' and not eq and not self.main:
-                    return False  # main only: a subagent's payload carries agent_id (goodqa#15253)
-                if key in ('--tree', '--foreign', '--session-scope') and not eq:
-                    seen.add(key)
+                continue
+            if t == '--':
+                i += 1
+                break
+            if not t.startswith('-') or t == '-':
+                break
+            if t in HELP_FLAGS and name != 'xargs' and t in ('--help', '--version'):
+                return None
+            if t in takes or (len(t) == 2 and t in takes):
+                i += 2
+                continue
+            if name == 'env' and t.startswith('-S'):
+                return None
+            i += 1
+        rest = args[i:]
+        if name == 'timeout' and rest:
+            rest = rest[1:]  # the duration
+        if name == 'nice' and rest and re.fullmatch(r'-?\d+', rest[0].text):
+            rest = rest[1:]
+        if name in ('chrt', 'taskset') and rest:
+            rest = rest[1:]
+        return rest
+
+    def shell(self, args, cmd, depth):
+        texts = [a.text for a in args]
+        for i, t in enumerate(texts):
+            if re.fullmatch(r'-[a-zA-Z]*c[a-zA-Z]*', t) and i + 1 < len(texts):
+                self.script(texts[i + 1], depth + 1)
+                return
+            if not t.startswith('-'):
+                return  # a script file: its contents are not judged
+        for body in cmd.bodies:  # bash <<EOF ... EOF, bash -s <<< "..."
+            self.script(body, depth + 1)
+
+    def ssh(self, args, depth):
+        texts, i = [a.text for a in args], 0
+        value_opts = set('bcDEeFIiJLlmOopQRSWw')
+        while i < len(texts):
+            t = texts[i]
+            if t.startswith('-') and len(t) > 1:
+                i += 2 if t[-1] in value_opts and len(t) == 2 else 1
+                continue
+            break
+        rest = args[i + 1:]
+        if rest and rest[0].text == '--':
+            rest = rest[1:]
+        if rest:
+            self.remote_command(rest, depth)
+
+    def remote_command(self, words, depth, argv=False):
+        """ssh joins its words with spaces and the remote shell reads them again; an exec gets them as argv."""
+        sub = Analyzer(self.ctx, remote=True)
+        sub.vars = dict(self.vars)
+        sub.script(' '.join((_requote(w) if argv else w.text) for w in words), depth + 1)
+        self.unsure.extend(sub.unsure)
+
+    def interpreter(self, name, args):
+        """Inline code only (python -c, node -e ...); a script file or a test runner is never read."""
+        flag = INTERP_CODE[name]
+        texts = [a.text for a in args]
+        if flag not in texts:
+            return
+        k = texts.index(flag)
+        code = texts[k + 1] if k + 1 < len(texts) else ''
+        for match in re.finditer(r'\b(?:os\.kill|os\.killpg|process\.kill|Process\.kill|posix\.kill)\s*\(\s*([^,)]*)', code):
+            target = match.group(1).strip()
+            if re.fullmatch(r'-?\d+', target):
+                n = int(target)
+                if n == -1:
+                    raise Finding('broad-kill', 'inline code signals every process (pid -1)', 'kill <pid> for each of yours')
+                if n == 0:
+                    continue
+                self.check_pids([abs(n)], group=n < 0)
+            elif re.search(r'getpid|process\.pid|\$\$|getppid', target):
+                continue  # itself (getppid: the shell that runs it, also the caller's)
+            else:
+                self.unsure.append('inline code signals a computed pid')
+
+    def spawned(self, args, depth):
+        texts = [a.text for a in args]
+        if 'spawn' in texts and '--' in texts and args[texts.index('--') + 1:]:
+            self.run(args[texts.index('--') + 1:], Cmd(), depth + 1)
+
+    # ---- verbs
+    def verb_kill(self, args, cmd):
+        texts = [a.text for a in args]
+        if not args or texts[0] in HELP_FLAGS or texts[0] in ('-0', '-s0') or texts[:2] in (['-s', '0'], ['-n', '0']):
+            return
+        i, signal_given = 0, False
+        if texts[0] in ('-s', '-n', '--signal'):
+            i, signal_given = 2, True
+        elif texts[0].startswith('--signal=') or re.fullmatch(r'-(?:SIG)?[A-Za-z0-9+]{1,12}', texts[0]):
+            i, signal_given = 1, True
+            if texts[0] == '-1' and len(args) == 1:
+                raise Finding('broad-kill', '`kill -1` signals every process you can reach in some shells',
+                              'kill <pid> for each process of yours')
+        if i < len(texts) and texts[i] == '--':
+            i += 1
+        targets = args[i:]
+        if not targets and signal_given:
+            return
+        pids, groups = [], []
+        for w in targets:
+            t = w.text
+            if t in ('-1', '--1'):
+                raise Finding('broad-kill', '`kill -1` signals every process you own, other owners\' included',
+                              'kill <pid> for each process of yours')
+            if t.startswith('%') and not w.dynamic:
+                continue  # a job of this shell
+            if not w.dynamic and re.fullmatch(r'-?\d{1,10}', t):
+                n = int(t)
+                if n == 0:
+                    continue  # this shell's own process group
+                (groups if n < 0 else pids).append(abs(n))
+                continue
+            self.dynamic_target(w)
+        if self.remote:
+            if pids or groups:
+                self.unsure.append('kill on a remote host: ownership cannot be read from here')
+            return
+        if pids:
+            self.check_pids(pids)
+        if groups:
+            self.check_pids(groups, group=True)
+
+    def dynamic_target(self, word):
+        """A kill target the text does not spell out."""
+        if re.fullmatch(r'-?\$\{?(?:\$|!|BASHPID)\}?', word.text):
+            return  # this shell, its last background job or its parent: the caller's own
+        kinds = [self.vars.get(v, ('unknown', None)) for v in word.vars]
+        if word.vars and all(k[0] == 'own' or v in ('$', '!', 'BASHPID') for k, v in zip(kinds, word.vars)) and not word.subs:
+            return
+        for v, (kind, value) in zip(word.vars, kinds):
+            if kind == 'finder':
+                self.resolve_finder(value)
+                return
+            if kind == 'literal' and value:
+                pids = [int(x) for x in value.split() if re.fullmatch(r'\d{1,10}', x)]
+                if pids and not self.remote:
+                    self.check_pids(pids)
+                    return
+        for sub in word.subs:
+            finder = self.finder_of_text(sub)
+            if finder:
+                self.resolve_finder(finder)
+                return
+        self.unsure.append('a kill target comes from a variable or command the guard does not follow')
+
+    def xargs(self, rest, cmd, depth):
+        if not rest:
+            return
+        name = basename(rest[0])
+        if name == 'kill' or (name in SHELL_NAMES and any('kill' in a.text for a in rest[1:])):
+            if name == 'kill':
+                self.verb_kill([a for a in rest[1:]], cmd)  # its literal targets, if any
+            finder = self.finder_of_stages(cmd.source) if cmd.source else None
+            if finder:
+                self.resolve_finder(finder)
+            else:
+                self.unsure.append('xargs kill reads its targets from a command the guard does not follow')
+            return
+        self.run(rest, cmd, depth)
+
+    def verb_pkill(self, args, cmd):
+        texts = [a.text for a in args]
+        if not texts or any(t in ('--help', '-h', '-V', '--version') for t in texts):
+            return
+        spec = self.pgrep_spec(args)
+        if spec is None:
+            return
+        if self.remote:
+            self.remote_broad('pkill')
+            return
+        self.resolve_spec(spec, 'pkill')
+
+    def verb_killall(self, args, cmd):
+        texts = [a.text for a in args]
+        if not texts or any(t in ('--help', '-h', '-l', '--list', '-V', '--version') for t in texts):
+            return
+        names, regex, ignore, user, i = [], False, False, None, 0
+        while i < len(texts):
+            t = texts[i]
+            if t in ('-s', '--signal', '-u', '--user', '-o', '-y', '--older-than', '--younger-than', '-c', '-t', '-n'):
+                if t in ('-u', '--user'):
+                    user = texts[i + 1] if i + 1 < len(texts) else None
+                i += 2
+                continue
+            if t.startswith('-') and len(t) > 1:
+                regex = regex or t in ('-r', '--regexp')
+                ignore = ignore or t in ('-I', '--ignore-case')
+                i += 1
+                continue
+            names.append(t)
+            i += 1
+        if not names:
+            if user is not None or '-m' in texts:
+                raise Finding('broad-kill', '`killall` without a name signals every process it matches',
+                              'kill <pid> for each process of yours')
+            return
+        if self.remote:
+            self.remote_broad('killall')
+            return
+        flags = re.I if ignore else 0
+        if regex:
+            pats = [_regex(n, flags) for n in names]
+            match = lambda p: any(r.search(p.name) for r in pats)  # noqa: E731
+        else:
+            wanted = {n.casefold() for n in names}
+            match = lambda p: p.name in wanted or (ignore and p.name.casefold() in wanted)  # noqa: E731
+        self.resolve_matches([p for p in self.ctx.table().values() if match(p) and _uid_ok(p, user)], 'killall')
+
+    def verb_killall5(self, args, cmd):
+        raise Finding('broad-kill', '`killall5` signals every process on the machine', 'kill <pid> for each process of yours')
+
+    def verb_fuser(self, args, cmd):
+        texts = [a.text for a in args]
+        if not any(re.fullmatch(r'-[a-zA-Z]*k[a-zA-Z]*', t) or t == '--kill' for t in texts):
+            return
+        targets = [t for t in texts if not t.startswith('-')]
+        lsof_args = []
+        for t in targets:
+            m = re.fullmatch(r'(\d+)/(tcp|udp)', t)
+            lsof_args += ['-i', '%s:%s' % (m.group(2), m.group(1))] if m else [t]
+        self.resolve_lsof(lsof_args, 'fuser -k')
+
+    def verb_netwatch(self, args, cmd):
+        texts = [a.text.lower() for a in args]
+        if 'orphans' not in texts or not any(t in ('--kill', '-kill') for t in texts):
+            return
+        pids = []
+        for i, t in enumerate(texts):
+            value = texts[i + 1] if t in ('--pid', '-pid') and i + 1 < len(texts) else (
+                t.split('=', 1)[1] if t.startswith(('--pid=', '-pid=')) else None)
+            if value is not None:
+                pids += [int(p) for p in value.split(',') if p.isdigit()]
+        if not pids:
+            raise Finding('broad-kill', '`netwatch orphans --kill` without --pid signals every orphan',
+                          'netwatch orphans --kill --pid <pid>')
+        if not self.remote:
+            self.check_pids(pids)
+
+    def verb_docker(self, args, cmd):
+        texts = [a.text for a in args]
+        if not texts or any(t in ('--help', '-h') for t in texts):
+            return
+        if texts[0] == 'compose':
+            self.verb_compose(args[1:], cmd)
+            return
+        sub = texts[0] if texts[0] != 'container' else (texts[1] if len(texts) > 1 else '')
+        rest = args[1:] if texts[0] != 'container' else args[2:]
+        if texts[:2] in (['system', 'prune'], ['container', 'prune']) or texts[:1] == ['prune']:
+            if not any(t.startswith('--filter') for t in texts):
+                raise Finding('broad-kill', '`docker %s` removes every stopped container, other owners\' included'
+                              % ' '.join(texts[:2]), 'docker rm <container> for each container of yours')
+            return
+        if sub not in ('kill', 'stop', 'rm', 'restart', 'pause'):
+            return
+        for w in rest:
+            if w.text.startswith('-'):
+                continue
+            if w.dynamic:
+                subs = ' '.join(w.subs)
+                if re.search(r'\bdocker\s+(?:container\s+)?(?:ps|ls)\b', subs) and '--filter' not in subs \
+                        and not re.search(r'\s-f\s', subs):
+                    raise Finding('broad-kill', '`docker %s $(docker ps -q)` stops every container, other owners\' '
+                                  'included' % sub, 'docker %s <container> for each container of yours' % sub)
+                self.unsure.append('docker %s of a computed container' % sub)
+                continue
+            ok, why = self.ctx.named_unit(w.text)
+            if not ok:
+                self.protected(why, 'docker %s %s' % (sub, w.text))
+
+    def verb_compose(self, args, cmd):
+        texts = [a.text for a in args]
+        if not any(t in ('down', 'stop', 'kill', 'rm', 'restart', 'pause') for t in texts):
+            return
+        for i, t in enumerate(texts):
+            name = texts[i + 1] if t in ('-p', '--project-name') and i + 1 < len(texts) else (
+                t.split('=', 1)[1] if t.startswith('--project-name=') else None)
+            if name:
+                ok, why = self.ctx.named_unit(name)
+                if not ok:
+                    self.protected(why, 'docker compose -p %s down' % name)
+
+    def verb_systemctl(self, args, cmd):
+        texts = [a.text for a in args]
+        actions = {'stop', 'kill', 'restart', 'disable', 'mask', 'isolate', 'poweroff', 'reboot', 'halt'}
+        verbs = [t for t in texts if t in actions]
+        if not verbs:
+            return
+        if any(t in ('isolate', 'poweroff', 'reboot', 'halt') for t in verbs):
+            raise Finding('broad-kill', '`systemctl %s` stops everything on the machine' % verbs[0], 'systemctl --user stop <unit>')
+        units = [t for t in texts if not t.startswith('-') and t not in actions and t != '--now']
+        for unit in units:
+            ok, why = self.ctx.named_unit(unit)
+            if not ok:
+                self.protected(why, 'systemctl --user stop %s' % unit)
+        if '--user' not in texts and units and not self.ctx.roles()['top']:
+            raise Finding('not-yours', 'a system unit (%s) is not the caller\'s; only a --user unit is'
+                          % one_line(units[0], 60), 'systemctl --user stop <your unit>')
+
+    def verb_launchctl(self, args, cmd):
+        texts = [a.text for a in args]
+        if not texts or texts[0] not in ('kill', 'stop', 'bootout', 'remove', 'unload', 'disable'):
+            return
+        for t in texts[1:]:
+            if not t.startswith('-'):
+                ok, why = self.ctx.named_unit(t)
+                if not ok:
+                    self.protected(why, 'launchctl %s %s' % (texts[0], t))
+
+    def verb_tmux(self, args, cmd):
+        texts = [a.text for a in args]
+        if 'kill-server' in texts:
+            raise Finding('broad-kill', '`tmux kill-server` ends every tmux session, other owners\' included',
+                          'tmux kill-session -t <your session>')
+        if 'kill-session' in texts or 'kill-window' in texts or 'kill-pane' in texts:
+            for i, t in enumerate(texts):
+                if t == '-t' and i + 1 < len(texts):
+                    ok, why = self.ctx.named_unit(texts[i + 1])
+                    if not ok:
+                        self.protected(why, 'tmux kill-session -t %s' % texts[i + 1])
+
+    def verb_pm2(self, args, cmd):
+        texts = [a.text for a in args]
+        if texts[:1] == ['kill']:
+            raise Finding('broad-kill', '`pm2 kill` stops the pm2 daemon and every app it runs', 'pm2 stop <your app>')
+        if texts[:1] and texts[0] in ('stop', 'delete', 'restart'):
+            for t in texts[1:]:
+                if t == 'all':
+                    raise Finding('broad-kill', '`pm2 %s all` stops every pm2 app' % texts[0], 'pm2 %s <your app>' % texts[0])
+                ok, why = self.ctx.named_unit(t)
+                if not ok:
+                    self.protected(why, 'pm2 %s %s' % (texts[0], t))
+
+    def verb_loginctl(self, args, cmd):
+        texts = [a.text for a in args]
+        if texts[:1] and texts[0] in ('kill-session', 'kill-user', 'terminate-user', 'terminate-session'):
+            raise Finding('broad-kill', '`loginctl %s` ends a whole login session' % texts[0], 'kill <pid> for each process of yours')
+
+    def verb_taskkill(self, args, cmd):
+        texts = [a.text.lower() for a in args]
+        if any(t in ('/im', '-name', '-processname') for t in texts):
+            raise Finding('broad-kill', 'stopping processes by image name hits every process of that name',
+                          'Stop-Process -Id <pid> for each process of yours')
+        self.unsure.append('a Windows stop by pid: ownership cannot be read from here')
+
+    def protected(self, why, command):
+        raise Finding('protected', why + '; it keeps needing the owner\'s approval',
+                      'register an ask (wal_note.py --event ask), then after the owner answers: %s' % command)
+
+    def remote_broad(self, verb):
+        if self.ctx.roles()['top']:
+            self.unsure.append('a top-rung %s on a remote host' % verb)
+            return
+        raise Finding('broad-kill', '`%s` on a remote host signals by pattern and can hit other owners there' % verb,
+                      'ssh <host> pgrep -fl <pattern>, then ssh <host> kill <pid> for each of yours')
+
+    # ---- finders (what produces pids for kill)
+    def finder_of_text(self, text):
+        cmds = commands(text)
+        return self.finder_of_stages(cmds) if cmds else None
+
+    def finder_of_stages(self, stages):
+        """A description of the pid producer: ('pgrep', spec) | ('lsof', args) | ('ps', pattern) | ('own',) | None."""
+        if not stages:
+            return None
+        first = stages[0].words
+        if not first:
+            return None
+        name, args = basename(first[0]), first[1:]
+        if name in WRAPPERS_WITH_VALUES and name != 'xargs':
+            args = self.unwrap(name, args) or []
+            if not args:
+                return None
+            name, args = basename(args[0]), args[1:]
+        texts = [a.text for a in args]
+        if name == 'jobs':
+            return ('own',)
+        if name == 'pgrep':
+            spec = self.pgrep_spec(args)
+            return ('pgrep', spec) if spec else None
+        if name == 'pidof':
+            return ('names', [t for t in texts if not t.startswith('-')])
+        if name == 'lsof':
+            return ('lsof', texts)
+        if name == 'fuser':
+            return ('lsof', [t for t in texts if not t.startswith('-')])
+        if name in ('ps', 'pstree'):
+            pattern, invert = None, []
+            for stage in stages[1:]:
+                sw = stage.words
+                if not sw:
+                    continue
+                sname, sargs = basename(sw[0]), [a.text for a in sw[1:]]
+                if sname in ('grep', 'egrep', 'rg'):
+                    ops = [a for a in sargs if not a.startswith('-')]
+                    if not ops:
+                        continue
+                    if '-v' in sargs:
+                        invert.append(ops[0])
+                    elif pattern is None:
+                        pattern = ops[0]
+                elif sname == 'awk' and pattern is None:
+                    m = re.search(r'/((?:[^/\\]|\\.)+)/', ' '.join(sargs))
+                    if m:
+                        pattern = m.group(1)
+            return ('ps', pattern, invert, texts)
+        if name == 'cat' or name == 'head' or name == 'tail':
+            return None
+        return None
+
+    def resolve_finder(self, finder):
+        if finder is None:
+            self.unsure.append('a pid producer the guard does not follow')
+            return
+        if self.remote:
+            if finder[0] in ('pgrep', 'ps', 'names', 'lsof'):
+                self.remote_broad(finder[0])
+            return
+        kind = finder[0]
+        if kind == 'own':
+            return
+        if kind == 'pgrep':
+            self.resolve_spec(finder[1], 'pgrep | kill')
+        elif kind == 'names':
+            wanted = {n.casefold() for n in finder[1]}
+            self.resolve_matches([p for p in self.ctx.table().values() if p.name in wanted], 'pidof | kill')
+        elif kind == 'lsof':
+            self.resolve_lsof(finder[1], 'lsof -t | kill')
+        elif kind == 'ps':
+            _, pattern, invert, _texts = finder
+            if pattern is None:
+                raise Finding('broad-kill', 'kill fed from `ps` with no filter signals every process it lists',
+                              'kill <pid> for each process of yours')
+            pat = _regex(pattern, 0)
+            inv = [_regex(x, 0) for x in invert]
+            self.resolve_matches([p for p in self.ctx.table().values()
+                                  if pat.search(p.command) and not any(r.search(p.command) for r in inv)], 'ps | grep | kill')
+
+    def resolve_lsof(self, args, label):
+        if any(re.search(r'[`$;|&]', a) for a in args):
+            self.unsure.append('%s with a computed selection' % label)
+            return
+        pids = self.ctx.lsof_pids(args)
+        if pids is None:
+            self.unsure.append('%s: lsof could not be run' % label)
+            return
+        self.check_pids(sorted(set(pids)), label=label)
+
+    def pgrep_spec(self, args):
+        """{'pattern', 'full', 'exact', 'ignore', 'parents', 'user', 'invert'} or None when pgrep/pkill would match
+        nothing it can be judged on (only options)."""
+        spec = {'pattern': None, 'full': False, 'exact': False, 'ignore': False, 'parents': None, 'user': None,
+                'invert': False, 'own_parent': False, 'pidfile': False}
+        i = 0
+        while i < len(args):
+            w = args[i]
+            t = w.text
+            if t in ('-P', '--parent', '-u', '--euid', '-U', '--uid', '-g', '--pgroup', '-G', '--group', '-s',
+                     '--session', '-t', '--terminal', '-F', '--pidfile', '--signal', '-q'):
+                value = args[i + 1] if i + 1 < len(args) else None
+                if t in ('-P', '--parent') and value is not None:
+                    if re.fullmatch(r'\$\{?(?:\$|BASHPID)\}?', value.text):
+                        spec['own_parent'] = True
+                    elif not value.dynamic:
+                        spec['parents'] = {int(x) for x in value.text.split(',') if x.isdigit()}
+                    else:
+                        spec['own_parent'] = value.vars and all(self.vars.get(v, ('',))[0] == 'own' for v in value.vars)
+                elif t in ('-u', '--euid', '-U', '--uid') and value is not None:
+                    spec['user'] = value.text
+                elif t in ('-F', '--pidfile'):
+                    spec['pidfile'] = True
+                i += 2
+                continue
+            if t.startswith('-') and len(t) > 1 and not w.dynamic:
+                if re.fullmatch(r'-(?:SIG)?[A-Z0-9]+|-\d+', t) or t.startswith('--signal='):
                     i += 1
                     continue
-                if key == '--approved-by' and not self.main:
-                    return False  # main only: a subagent cannot spend the user's approval (goodqa#15253)
-                if key not in ('--pid', '--reason', '--grace', '--host', '--agent', '--session', '--approved-by'):
-                    return False
-                if not eq:
-                    if i + 1 >= len(rest):
-                        return False
-                    val, i = rest[i + 1], i + 1
+                for letter in t[1:] if not t.startswith('--') else []:
+                    spec['full'] |= letter == 'f'
+                    spec['exact'] |= letter == 'x'
+                    spec['ignore'] |= letter == 'i'
+                    spec['invert'] |= letter == 'v'
+                spec['full'] |= t == '--full'
+                spec['exact'] |= t == '--exact'
+                spec['ignore'] |= t == '--ignore-case'
+                spec['invert'] |= t == '--inverse'
                 i += 1
-                if key in seen:
-                    return False
-                seen.add(key)
-                if key == '--pid':
-                    if not PID_OPT_VALUE.fullmatch(val) or any(int(p) <= 1 for p in val.split(',')):
-                        return False
-                elif key == '--reason':
-                    if not val.strip():
-                        return False
-                elif key == '--grace':
-                    if not re.fullmatch(r'[0-9]{1,3}(?:\.[0-9]{1,2})?', val):
-                        return False
-                elif key == '--host':
-                    if val not in ('dev2', 't2-dev', 'ah-mac-mini', 'ah-spectre'):  # ah-spectre: goodqa#15275
-                        return False
-                    if val == 'ah-spectre' and not self.main:
-                        return False  # delta red-team D-F4: the Windows stop is main only
-                elif key == '--approved-by':
-                    if not re.fullmatch(r'[A-Za-z0-9_-]{4,40}', val):
-                        return False
-                elif not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', val):
-                    return False
-                if key == '--session':
-                    given_session = val
-            if ({'--session-scope', '--approved-by'} & seen) and given_session is not None \
-                    and given_session != self.session:
-                return False  # delta red-team D-F2: main may not use another session's spawns or asks
-            return '--pid' in seen and '--reason' in seen
+                continue
+            if spec['pattern'] is None:
+                spec['pattern'] = w
+            i += 1
+        return spec
 
-        def check_interpreter(self, name, texts, cmd, args=None):
-            if args is not None and len(args) == len(texts) and all(a.text == t for a, t in zip(args, texts)):
-                skip = test_runner_exemptions(name, args, self.script_kill)
-                if skip:
-                    keep = [k for k in range(len(args)) if k not in skip]
-                    texts, args = [texts[k] for k in keep], [args[k] for k in keep]
-            texts = self.drop_script_arguments(texts, args)
-            body = ' '.join(texts)
-            for redir in getattr(cmd, 'redirs', []):
-                if redir.body:
-                    body += '\n' + redir.body
-                elif redir.op == '<<<' and redir.target is not None:
-                    body += '\n' + redir.target.text
-            body = body.replace('kill_guard', '').replace('kill-guard', '')  # the guard's own name
-            if name.startswith('python') and '-c' in texts and texts.index('-c') + 1 < len(texts):
-                code = texts[texts.index('-c') + 1]
-                if pure_data_python(code):  # a program that only formats data: prose in literals is not signalling
-                    body = body.replace(code, PY_LITERAL.sub("''", code), 1)
-            body = re.sub(r'\b(?:os|process)\.kill\(\s*[\w.]+(?:\(\))?\s*,\s*0\s*\)', '', body)  # liveness probe
-            if self.script_kill is not None and self.script_kill.search(body):
-                if 'ah.py' in body and ' kill' in body:
-                    self.block('script-kill', 'the audited stop is `python3 -I ~/.claude/hooks/ah.py kill --pid N --reason R '
-                                              '[--host H] [--foreign]` (literal words, with -I; remote hosts via --host, not ssh)')
-                else:
-                    self.block('script-kill', 'interpreter code signals processes the guard cannot check')
+    def resolve_spec(self, spec, label):
+        if spec['own_parent']:
+            return  # pkill -P $$: children of this shell
+        if spec['pidfile']:
+            self.unsure.append('%s -F reads its pid from a file' % label)
+            return
+        pattern = spec['pattern']
+        if pattern is not None and pattern.dynamic:
+            self.unsure.append('%s with a computed pattern' % label)
+            return
+        if pattern is None and spec['parents'] is None and spec['user'] is None:
+            return  # pkill with nothing to match is a usage error
+        flags = re.I if spec['ignore'] else 0
+        regex = _regex(pattern.text, flags) if pattern is not None else None
+        out = []
+        for p in self.ctx.table().values():
+            hit = True
+            if regex is not None:
+                subject = p.command if spec['full'] else p.name
+                hit = bool(regex.fullmatch(subject) if spec['exact'] else regex.search(subject))
+            if spec['parents'] is not None:
+                hit = hit and p.ppid in spec['parents']
+            if spec['user'] is not None:
+                hit = hit and _uid_ok(p, spec['user'])
+            if spec['invert']:
+                hit = not hit
+            if hit:
+                out.append(p)
+        self.resolve_matches(out, label)
 
-        DATA_ARG_SCRIPTS = frozenset(('wal_note.py', 'gq.py', 'ah.py', 'spec_flow.py', 'provenance.py', 'commit_policy.py',
-                                      'peer_review.py', 'deliver.py', 'workdir.py', 'escalation.py', 'ops_watch.py',
-                                      'rescue.py', 'ticket_adapters.py', 'report_file.py', 'merge_gate.py'))
-        # goodqa#15276: only the caller's own installed copies, never ./ah.py, /tmp/ah.py or another user's home
-        DATA_ARG_DIRS = ('~/.claude/hooks/', '~/.codex/agent-harness/')
+    def resolve_matches(self, procs, label):
+        ancestors = set(self.ctx.ancestors())
+        procs = [p for p in procs if p.pid != os.getpid()]
+        if not procs:
+            return  # nothing matches now: nothing would be signalled
+        self.check_pids([p.pid for p in procs], label=label, ancestors=ancestors)
 
-        def drop_script_arguments(self, texts, args=None):
-            """`python3 wal_note.py --note 'will kill nothing'`: the arguments of a NAMED harness tool that records
-            text are data, not code (goodqa#14817). Deliberately an allowlist: any other script (run_capped.py,
-            watch-tests.py, a runner) may run its arguments as a command, and a flag before the script may carry
-            inline code, so everything else keeps being scanned in full. The script must be the first word and the
-            arguments must not carry a `--` separator or a bare signal verb."""
-            if not texts or texts[0].startswith('-'):
-                return texts
-            name = os.path.basename(texts[0])
-            if name not in self.DATA_ARG_SCRIPTS:
-                return texts
-            # goodqa#15276 red-team H1: decide on the RAW word, as hook_script_ok does. A quoted or escaped '~' is a
-            # literal ./~ directory, while .text has HOME expanded, so a text match let a planted copy through.
-            raw = getattr(args[0], 'raw', None) if args else None
-            home = re.escape(os.path.expanduser('~').rstrip('/'))
-            if not re.fullmatch(r'(?:~|%s)/(?:\.claude/hooks|\.codex/agent-harness)/%s' % (home, re.escape(name)), raw or ''):
-                return texts
-            if self.home_moved():
-                return texts
-            rest = texts[1:]
-            if '--' in rest or any(self.script_kill is not None and self.script_kill.fullmatch(w.strip().lower())
-                                   for w in rest):
-                return texts
-            return texts[:1]
-
-        def check_netwatch(self, args):
-            texts = [a.text for a in args]
-            if 'orphans' not in texts:
+    def check_pids(self, pids, group=False, label=None, ancestors=None):
+        if group:
+            table = self.ctx.table()
+            members = sorted({p.pid for p in table.values() if p.pgid in set(pids)})
+            if not members:
                 return
-            before = texts[:texts.index('orphans')]
-            rest = texts[texts.index('orphans') + 1:]
-            low = [t.lower() for t in rest]
-            if not any(t in ('-kill', '--kill') or t.startswith(('-kill=', '--kill=')) for t in low + [b.lower() for b in before]):
-                return  # listing only
-            bad, has_pid, i, pids = None, False, 0, []
-            if any(a.dynamic or a.subs for a in args):
-                bad = 'a dynamic argument'
-            elif any(t.startswith('-') for t in before):
-                bad = 'a flag before orphans'
-            while i < len(rest) and bad is None:
-                t = low[i]
-                if t in ('-kill', '--kill', '-json', '--json'):
-                    i += 1
-                elif t in ('-pid', '--pid'):
-                    value = rest[i + 1] if i + 1 < len(rest) else ''
-                    if not PID_OPT_VALUE.fullmatch(value):
-                        bad = '--pid needs digits'
-                    else:
-                        pids.extend(int(p) for p in value.split(','))
-                    has_pid = True
-                    i += 2
-                elif t.startswith(('-pid=', '--pid=')):
-                    value = rest[i].split('=', 1)[1]
-                    if not PID_OPT_VALUE.fullmatch(value):
-                        bad = '--pid needs digits'
-                    else:
-                        pids.extend(int(p) for p in value.split(','))
-                    has_pid = True
-                    i += 1
-                else:
-                    bad = 'option %s is not allowed' % one_line(rest[i].split('=', 1)[0], 20)
-            if bad is None and not has_pid:
-                bad = '--kill without --pid signals every orphan'
-            if bad is None and any(int(p) <= 1 for t in rest for p in re.findall(r'\d+', t if t.replace(',', '').isdigit() else '')):
-                bad = 'pid 0 or 1'
-            if bad:
-                self.block('netwatch-broad', 'netwatch orphans --kill is allowed only as --pid N[,N...] (%s); '
-                           '--all, --force and --match need the user' % bad)
-                return
-            if self.remote:
-                ok, reason = self.remote_spawn_ok(pids)
-                if not ok:
-                    self.block('remote-kill', reason + '; an unledgered remote PID needs the audited --foreign route', pids)
-                return
-            for pid in dict.fromkeys(pids):
-                ok, _code, detail = self.own.check(pid, main_netwatch=self.main)
-                if not ok:
-                    self.block('not-yours', detail, [pid])
-                    break
-
-        def remote_spawn_ok(self, pids):
-            """`ssh HOST kill [-SIG] PID...` passes only when this is a single literal ssh hop (no container, no
-            nested hop) and every PID is in HOST's spawn ledger with the start time the host still reports."""
-            host = self.remote_hosts[-1] if len(self.remote_hosts) == 1 else None
-            if self.remote != 1 or not host or not pids:
-                return False, 'kill on a remote host or container cannot be checked for ownership'
-            for pid in dict.fromkeys(pids):
-                ok, why = remote_spawned(host, pid, self.own.home)
-                if not ok:
-                    return False, 'pid %d on %s: %s' % (pid, host, why)
-            return True, ''
-
-        def check_kill(self, args, pl, idx):
-            error, signal, targets = parse_kill_words(args, self.remote)
-            if error:
-                self.block('unprovable-target', error)
-                return
-            if targets is None:
-                return  # kill -l and friends only print
-            if self.xargs:
-                self.block('pidfeed', 'kill through xargs takes its targets from another command, so none can be '
-                           'proven yours')
-                return
-            if not targets:
-                return
-            probe = signal == '0'
-            if probe and len(targets) == 1 and QUOTED_VARIABLE.fullmatch(targets[0].raw or ''):
-                return  # exactly one word in both shells, and one word cannot hold both a signal and a target
-            pids, problems = [], []
-            for w in targets:
-                text = word_text(w, quoted_ok=True)
-                if text is not None and JOB_SPEC.fullmatch(text):
-                    continue
-                if text is not None and INTEGER.fullmatch(text) and (probe or 0 < int(text) <= MAX_PID):
-                    pids.append(int(text))
-                elif w.dynamic or w.subs or w.glob:
-                    finder = self.finder_before(pl, idx, w.subs) or any(
-                        re.search(r'pgrep|pidof|lsof|ps\b', h) for h in self.ctx.var_hints.values())
-                    problems.append(('pidfeed' if finder else 'unprovable-target',
-                                     'a kill target comes from %s, so it cannot be proven yours' % (
-                                         'a pid finder' if finder else 'a variable, substitution or glob')))
-                else:
-                    problems.append(('unprovable-target', 'a kill target is not a literal PID or job spec (%N, %%, %+, '
-                                     '%-, %name) typed in this command'))
-            for rule, reason in problems[:1]:
-                self.block(rule, reason)
-            if probe and not problems:
-                return
-            if self.remote:
-                ok, reason = self.remote_spawn_ok(pids)
-                if not ok:
-                    self.block('remote-kill', reason, pids)
-                return
-            for pid in dict.fromkeys(pids):
-                ok, code, detail = self.own.check(pid)
-                if not ok:
-                    self.block('not-yours', detail, [pid])
-                    break
-
-    return KillAnalyzer
+            pids = members
+        verdicts = self.ctx.judge(sorted(set(pids)))
+        bad = [(pid, why) for pid, (ok, why) in verdicts.items() if not ok]
+        if not bad:
+            return
+        good = [pid for pid, (ok, _why) in verdicts.items() if ok and pid in self.ctx.table()]
+        what = ('%s matches %d process(es); ' % (label, len(verdicts))) if label else ''
+        reason = what + '; '.join(why for _pid, why in bad[:3]) + (' (+%d more)' % (len(bad) - 3) if len(bad) > 3 else '')
+        protected = [pid for pid, why in bad if 'protected' in why]
+        hard = [pid for pid, why in bad if 'init or invalid' in why or 'agent session' in why or 'system process' in why]
+        if label:
+            proceed = ('kill %s   (only the matches that are yours)' % ' '.join(map(str, good[:20])) if good else
+                       'list the matches (pgrep -fl <pattern>) and stop only yours by pid')
+            raise Finding('broad-kill', reason, proceed, [p for p, _w in bad])
+        if hard:
+            proceed = ('kill %s' % ' '.join(map(str, good))) if good else 'nothing: these are never stopped from an agent'
+            raise Finding('never', reason, proceed, [p for p, _w in bad])
+        if protected:
+            proceed = ('register an ask (wal_note.py --event ask); after the owner answers: '
+                       + AH_KILL % ','.join(map(str, protected)) + ' --approved-by <ask id>')
+            raise Finding('protected', reason, proceed, protected)
+        proceed = ('register an ask (wal_note.py --event ask); after the owner answers: '
+                   + AH_KILL % ','.join(str(p) for p, _w in bad[:20]) + ' --foreign --approved-by <ask id>')
+        raise Finding('not-yours', reason, proceed, [p for p, _w in bad])
 
 
+def _regex(pattern, flags):
+    try:
+        return re.compile(pattern, flags)
+    except re.error:
+        return re.compile(re.escape(pattern), flags)
 
-def leading_lookup(args):
-    """`command -v kill` looks a name up; `command kill 4004 -v` runs kill. Only a bundled -p/-v/-V option before the
-    first operand (or before `--`) can make it a lookup."""
-    for a in args:
-        t = a.text
-        if a.dynamic or a.subs or a.glob or not re.fullmatch(r'-[pvV]+', t):
-            return False
-        if 'v' in t or 'V' in t:
+
+def _uid_ok(proc, user):
+    if user is None:
+        return True
+    for name in str(user).split(','):
+        if name.isdigit() and proc.uid == int(name):
             return True
+        try:
+            if pwd.getpwnam(name).pw_uid == proc.uid:
+                return True
+        except KeyError:
+            continue
     return False
 
 
-def word_text(word, quoted_ok=False, remote=False):
-    """The word's text when its source proves it is that one literal word in bash and zsh, else None. Whole-word quotes
-    are accepted only where asked; a remote command line is rebuilt with every word single-quoted, so they say nothing
-    there. Anything else (escapes, $'..', concatenation, expansions, braces) is not proof, even if it would be literal."""
-    if word.dynamic or word.subs or word.glob or len(word.alts) != 1:
-        return None
-    text = word.text
-    forms = {text}
-    if quoted_ok or remote:
-        forms.add("'%s'" % text)
-    if quoted_ok:
-        forms.add('"%s"' % text)
-    return text if word.raw in forms else None
+def _requote(word):
+    if re.fullmatch(r'[A-Za-z0-9_./:=@%+,-]+', word.text or 'x'):
+        return word.text
+    return "'" + word.text.replace("'", "'\\''") + "'"
 
 
-def parse_kill_words(args, remote=False):
-    """Read `kill [SIGNAL] [--] TARGET...` or `kill LIST_FLAG [VALUE...]`. Returns (error, signal, targets); targets is
-    None for the printing form. Only the first word can be an option: bash stops there, zsh reads later dash words as
-    targets and procps reorders, so a later dash word is left in targets for the target grammar to refuse."""
-    if not args:
-        return None, None, []
-    first = args[0]
-    text = first.text
-    if not text.startswith('-'):
-        return None, None, list(args)
-    if word_text(first, remote=remote) is None:
-        return 'a kill option is quoted, expanded, braced or a glob, so the shell may read it as something else', None, None
-    rest = 1
-    signal = None
-    if text in LIST_FLAGS:
-        for w in args[1:]:
-            value = word_text(w, remote=remote)
-            if value is None or not SIGNAL_VALUE.fullmatch(value):
-                return 'kill -l takes only plain signal names or numbers', None, None
-        return None, None, None
-    if text in ('-s', '-n', '--signal'):
-        if len(args) > 1:
-            signal = word_text(args[1], remote=remote)
-            if signal is None or not SIGNAL_VALUE.fullmatch(signal):
-                return 'the signal value is not one plain name or number, and the shell may split it into more kill ' \
-                       'options or targets', None, None
-        rest = 2
-    elif text.startswith('--signal='):
-        signal = text.split('=', 1)[1]
-        if not SIGNAL_VALUE.fullmatch(signal):
-            return 'the signal value is not one plain signal name or number', None, None
-    elif text != '--':
-        match = SIGNAL_OPTION.fullmatch(text)
-        if match is None:
-            return 'kill option %s is outside the literal grammar the guard proves (-SIG, -s SIG, -n SIG, --signal SIG, ' \
-                   '--)' % one_line(text.split('=', 1)[0], 20), None, None
-        signal = match.group(1)
-    if text == '--':
-        return None, None, list(args[1:])
-    if rest < len(args) and args[rest].text == '--' and word_text(args[rest], remote=remote) == '--':
-        rest += 1
-    return None, signal, list(args[rest:])
+def powershell_findings(text):
+    if re.search(r'(?i)\bstop-process\b[^\n;|]*-(?:name|processname)\b|get-process\b[^\n;]*\|\s*stop-process', text) \
+            or re.search(r'(?i)\btaskkill\b[^\n;]*/im\b', text):
+        raise Finding('broad-kill', 'stopping processes by name hits every process of that name',
+                      'Stop-Process -Id <pid> for each process of yours')
 
 
-def decide(command, cwd=None, ps=False, ownership=None, policy=None, compiled=None, home=None, main=False,
-           session=None):
-    """Return (verdict, rule, message, pids): verdict is 'allow', 'warn' or 'block'. Never raises.
-    main: the caller is proven to be the main agent (caller_identity.is_main). Default False, the stricter reading."""
+def decide(command, cwd=None, ps=False, policy=None, home=None, payload=None, context=None, **_ignored):
+    """(verdict, rule, message, pids): verdict is 'allow', 'warn' or 'block'. Never raises; anything unexpected
+    allows and logs one line."""
     policy = policy or load_policy()
-    if policy['mode'] == 'off':
+    raw = ' '.join(map(str, command)) if isinstance(command, (list, tuple)) else str(command or '')
+    if policy['mode'] == 'off' or not MAYBE_STOP.search(raw):
         return 'allow', '', '', ()
-    raw = ' '.join(map(str, command)) if isinstance(command, (list, tuple)) else str(command)
-    analyzer = None
+    ctx = context or Context(payload=payload, cwd=cwd, home=home, policy=policy)
+    analyzer = Analyzer(ctx)
     try:
-        cg = _import_base()
-        compiled = compiled or cg.Compiled(cg.load_policy(), cwd=cwd)
-        if isinstance(command, (list, tuple)):
-            command = ' '.join(cg._quote_for_rebuild(str(c)) for c in command)
-        if len(command.encode('utf-8', 'replace')) > int(compiled.limits['max_command_bytes']):
-            raise cg.Blocked('command is larger than the analysis limit')
-        effective = cwd or compiled.cwd
-        own = ownership or Ownership(effective, home=home, policy=policy)
-        analyzer = make_analyzer_class(cg)(compiled, effective, ps, own, policy, raw, main=main, session=session)
-        findings = analyzer.run_kill_scan(command)
-        if not findings:
-            for base in analyzer.ctx.findings:
-                if str(getattr(base, 'rule', '')).startswith('obfuscated'):
-                    findings = [('obfuscated-input', 'the input feeds decoded text to a shell, so the guard cannot see '
-                                 'what runs', ())]
-                    break
-        if not findings and ps and analyzer.script_kill is not None and analyzer.script_kill.search(command):
-            findings = [('script-kill', 'PowerShell code signals processes the guard cannot check', ())]
-        if analyzer.ctx.unterminated and not findings and fallback_blocks(raw):
-            findings = [('unterminated', 'the command has an unterminated quote or substitution and mentions a kill '
-                         'verb or indirection', ())]
-        if analyzer.ctx.readings_capped and not findings:  # the kill may be in the reading it dropped, spelled any way
-            findings = [('readings-capped', '`>!` could not be judged under both shell readings, so what runs is unknown',
-                         ())]
-    except Exception as error:  # noqa: BLE001 - Blocked, RecursionError and bugs alike: fail closed on kill-looking text
-        # With `>!` in the text the stop can come before a reading main would have judged (a script judged on disk
-        # first, GoodQA #14657), so a kill spelled without the word is refused too.
-        findings = list(getattr(analyzer, 'kf', None) or ())  # a kill already found stays found when the analysis stops
-        if not findings:
-            if not (fallback_blocks(raw) or CLOBBER_TEXT.search(LINE_JOIN.sub('', raw))):
-                return 'allow', '', '', ()
-            rule = 'unanalysable'
-            reason = 'the command could not be analysed safely (%s) and it mentions a kill verb or indirection' % \
-                     type(error).__name__
-            audit(rule, raw, (), home)
-            return ('block' if policy['mode'] == 'enforce' else 'warn'), rule, block_message(rule, reason), ()
-    if not findings:
+        if ps:
+            powershell_findings(raw)
+        else:
+            analyzer.script(raw)
+    except Finding as found:
+        message = one_line('kill_guard refused [%s]: %s. To proceed: %s' % (found.rule, found.reason, found.proceed), 900)
+        if policy['mode'] == 'warn':
+            audit(found.rule, raw, found.pids, home, verdict='warn')
+            return 'warn', found.rule, message.replace('refused', 'WARNING (would refuse)', 1), found.pids
+        audit(found.rule, raw, found.pids, home)
+        return 'block', found.rule, message, found.pids
+    except Exception as error:  # noqa: BLE001 - never block on "could not read"
+        audit('analysis-error:%s' % type(error).__name__, raw, (), home, verdict='allow')
         return 'allow', '', '', ()
-    rule, reason, pids = findings[0]
-    message = block_message(rule, reason)
-    if len(findings) > 1:  # name every finding, so the blocked command can be fixed in one pass
-        also = '; '.join('[%s] %s' % (r, one_line(t, 160)) for r, t, _p in findings[1:9])
-        more = ' (+%d more)' % (len(findings) - 9) if len(findings) > 9 else ''
-        message = one_line(message + ' Also found: ' + also + more, 1600)
-    if policy['mode'] == 'warn':
-        return 'warn', rule, message.replace('BLOCKED', 'WARNING'), pids
-    audit(rule, raw, pids, home)
-    return 'block', rule, message, pids
+    for note in ctx.notes[:4]:
+        audit('maintainer:' + one_line(note, 80), raw, (), home, verdict='allow')
+    if analyzer.unsure:
+        audit('unsure:' + one_line(analyzer.unsure[0], 80), raw, (), home, verdict='allow')
+    return 'allow', '', '', ()
 
 
 # --------------------------------------------------------------------------- hook entry points
 
-def is_edit_tool(payload):
-    """True for a file-edit tool (EDIT_TOOLS, exact name after casefold); a missing name is not one."""
-    return str(payload.get('tool_name') or payload.get('toolName') or '').casefold() in EDIT_TOOLS
-
-
-def guarded_text(raw):
-    """(is_shell_tool, command text) for a PreToolUse payload; unparsable input counts as guarded."""
-    try:
-        payload = json.loads(raw)
-    except ValueError:
-        return True, raw
-    if not isinstance(payload, dict):
-        return True, raw
-    if is_edit_tool(payload):  # file text is not a command, even under a `command` key
-        return False, ''
+def command_of(payload):
+    """(text, powershell) for a shell tool payload; (None, False) for anything else."""
     tool = str(payload.get('tool_name') or payload.get('toolName') or '').casefold()
+    if tool in EDIT_TOOLS:
+        return None, False
     tool_input = payload.get('tool_input') or payload.get('toolInput') or {}
-    has_command = isinstance(tool_input, dict) and any(k in tool_input for k in COMMAND_KEYS[:3])
-    if tool and tool not in GUARDED_TOOLS and not tool.startswith(('bash', 'shell', 'exec')) and not has_command:
-        return False, ''
-    if isinstance(tool_input, dict):
-        parts = []
-        for key in COMMAND_KEYS:
-            value = tool_input.get(key)
-            if isinstance(value, list):
-                parts.append(' '.join(str(v) for v in value))
-            elif isinstance(value, str):
-                parts.append(value)
-        return True, '\n'.join(parts) or raw
-    return True, raw if not isinstance(tool_input, str) else tool_input
+    if isinstance(tool_input, str):
+        return tool_input, tool == 'powershell'
+    if not isinstance(tool_input, dict):
+        return None, False
+    has_command = any(k in tool_input for k in COMMAND_KEYS[:3])
+    if tool and not tool.startswith(SHELL_TOOLS) and tool not in SHELL_TOOLS and not has_command:
+        return None, False
+    parts = []
+    for key in COMMAND_KEYS:
+        value = tool_input.get(key)
+        if isinstance(value, list):
+            parts.append(' '.join(_requote_text(str(v)) for v in value))
+        elif isinstance(value, str):
+            parts.append(value)
+    return ('\n'.join(parts) or None), tool == 'powershell'
+
+
+def _requote_text(text):
+    return text if re.fullmatch(r'[A-Za-z0-9_./:=@%+,-]+', text or 'x') else "'" + text.replace("'", "'\\''") + "'"
 
 
 def emit(verdict, message):
@@ -2241,118 +1646,80 @@ def emit(verdict, message):
     return 0
 
 
-def analyze_main(data=None):
-    """Child process: judge one payload. Exit 0 allow/warn, 2 block."""
-    policy = load_policy()
-    limit = int(policy['child_timeout_seconds'])
-    if hasattr(signal, 'SIGALRM'):
-        def _timeout(_s, _f):
-            raise TimeoutError('kill_guard wall-clock limit')
-        signal.signal(signal.SIGALRM, _timeout)
-        signal.alarm(max(2, limit - 2))
+def hook_main(data=None):
+    """PreToolUse: allow unless the command would stop a process the caller may not stop. Any failure allows."""
     raw = ''
     try:
+        try:
+            import ah_roles  # noqa: PLC0415
+            if ah_roles.harness_off():
+                return 0
+        except Exception:  # noqa: BLE001
+            pass
         data = data if data is not None else sys.stdin.buffer.read(MAX_STDIN + 1)
-        raw = data.decode('utf-8', 'replace')
+        raw = data[:MAX_STDIN].decode('utf-8', 'replace')
         try:
             payload = json.loads(raw)
         except ValueError:
-            payload = None
-        if payload is None:
-            if fallback_blocks(raw):
-                return emit('block', block_message('unparsable-payload', 'the hook payload is not valid JSON and '
-                                                   'mentions a kill verb or indirection'))
             return 0
-        if isinstance(payload, dict) and is_edit_tool(payload):  # writing a file runs nothing (GoodQA #15565)
+        if not isinstance(payload, dict):
             return 0
-        cg = _import_base()
-        command, ps = cg.extract_command(payload)
-        if command is None:
-            guarded, text = guarded_text(raw)
-            if not guarded:
-                return 0
-            command = text  # a tool the launcher treats as a shell tool (a command/cmd/script key): judge its text
-        cwd = cg.payload_cwd(payload)
-        import caller_identity  # noqa: PLC0415 - positive main proof, not the absence of agent_id (B7)
-        main = caller_identity.is_main(payload)
-        session = str(payload.get("session_id") or "") if main else ""
-        verdict, _rule, message, _pids = decide(command, cwd=cwd, ps=ps, policy=policy, main=main, session=session)
+        text, powershell = command_of(payload)
+        if not text or not MAYBE_STOP.search(text):
+            return 0
+        policy = load_policy()
+        if hasattr(signal, 'SIGALRM'):
+            def _timeout(_s, _f):
+                raise TimeoutError('kill_guard time limit')
+            signal.signal(signal.SIGALRM, _timeout)
+            signal.alarm(max(2, int(policy['child_timeout_seconds']) - 2))
+        verdict, _rule, message, _pids = decide(text, ps=powershell, policy=policy, payload=payload,
+                                                cwd=payload.get('cwd'))
         return emit(verdict, message)
-    except TimeoutError:
-        if fallback_blocks(raw):
-            return emit('block', block_message('timeout', 'analysis exceeded its time limit and the input mentions a '
-                                               'kill verb or indirection'))
-        return 0
-    except Exception as error:  # noqa: BLE001
-        if fallback_blocks(raw):
-            return emit('block', block_message('guard-error', 'the guard failed (%s) on input that mentions a kill '
-                                               'verb or indirection' % type(error).__name__))
-        sys.stderr.write('kill_guard: internal error (%s); the command looked harmless and was allowed\n' %
-                         type(error).__name__)
+    except BaseException as error:  # noqa: BLE001 - a timeout or a bug allows, with one line
+        audit('guard-failure:%s' % type(error).__name__, raw, (), verdict='allow')
         return 0
     finally:
         if hasattr(signal, 'SIGALRM'):
             signal.alarm(0)
 
 
-def hook_main():
-    """PreToolUse launcher: runs analyze in a child so a crash, hang or garbage answer cannot become a silent allow
-    (Codex treats a crashing hook as allow)."""
-    try:
-        data = sys.stdin.buffer.read(MAX_STDIN + 1)
-    except Exception:  # noqa: BLE001
-        return 0
-    oversized = len(data) > MAX_STDIN
-    raw = data[:MAX_STDIN].decode('utf-8', 'replace')
-    guarded, text = guarded_text(raw)
-    if not guarded:
-        return 0
-    if oversized:
-        return emit('block', block_message('oversized-input', 'the tool input is larger than the guard analyses; '
-                                           'put the commands in a script file'))
-    policy = load_policy()
-    if policy['mode'] == 'off':
-        return 0
-    try:
-        child = subprocess.run([sys.executable, '-I', os.path.abspath(__file__), 'analyze'], input=data,
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               timeout=float(policy['child_timeout_seconds']), check=False)
-    except subprocess.TimeoutExpired:
-        return _fallback(raw, text, 'timed out')
-    except Exception as error:  # noqa: BLE001
-        return _fallback(raw, text, 'could not start (%s)' % type(error).__name__)
-    if child.returncode in (0, 2):
-        out = child.stdout.decode('utf-8', 'replace')
-        if out.strip():
-            try:
-                json.loads(out)
-            except ValueError:
-                return _fallback(raw, text, 'printed invalid output')
-            sys.stdout.write(out)
-        err = child.stderr.decode('utf-8', 'replace')[:2000]
-        if child.returncode == 2 and ALTERNATIVE.split('<')[0] not in err:
-            return _fallback(raw, text, 'blocked without the standard message')
-        sys.stderr.write(err)
-        return child.returncode
-    return _fallback(raw, text, 'crashed (exit %d)' % child.returncode)
+# --------------------------------------------------------------------------- spawn and explain
 
-
-def _fallback(raw, text, why):
-    if fallback_blocks(raw) or fallback_blocks(text):
-        return emit('block', block_message('guard-failure', 'the analyser %s and the input mentions a kill verb or '
-                                           'indirection' % why))
-    sys.stderr.write('kill_guard: analyser %s; the command looked harmless and was allowed\n' % why)
+def spawn_remote_main(host, argv):
+    """`kill_guard.py spawn --host HOST [--log REMOTE_FILE] -- CMD ARGS...`: start CMD detached on HOST over ssh and
+    print the pid. The command is passed as single-quoted words, never re-parsed here."""
+    import shlex  # noqa: PLC0415
+    log, args = '/dev/null', list(argv)
+    if args[:1] == ['--log'] and len(args) >= 2:
+        log, args = args[1], args[2:]
+    if args[:1] == ['--']:
+        args = args[1:]
+    if not args or not re.match(r'^(?:[A-Za-z0-9._-]{1,64}@)?[A-Za-z0-9][A-Za-z0-9._-]{0,127}$', host) \
+            or not re.match(r'^[A-Za-z0-9._/-]{1,512}$', log):
+        sys.stderr.write('usage: kill_guard.py spawn --host HOST [--log REMOTE_FILE] -- CMD [ARGS...]\n')
+        return 2
+    script = ('nohup %s >%s 2>&1 </dev/null & p=$!; printf \'%%s\\n\' "$p"; ps -o lstart= -p "$p"'
+              % (' '.join(shlex.quote(a) for a in args), shlex.quote(log)))
+    try:
+        done = subprocess.run(['ssh', '-o', 'BatchMode=yes', host, script], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as error:
+        sys.stderr.write('kill_guard spawn: ssh to %s failed (%s)\n' % (host, type(error).__name__))
+        return 1
+    lines = [line.strip() for line in (done.stdout or '').splitlines() if line.strip()]
+    if done.returncode != 0 or not lines or not lines[0].isdigit():
+        sys.stderr.write('kill_guard spawn: %s did not report a pid (exit %s)\n' % (host, done.returncode))
+        return 1
+    start = ' '.join(lines[1].split()) if len(lines) > 1 else ''
+    append_ledger('remote:' + host, int(lines[0]), start)
+    print(json.dumps({'host': host, 'pid': int(lines[0]), 'start': start, 'log': log}))
     return 0
 
 
-# --------------------------------------------------------------------------- spawn and explain
-
 def spawn_main(argv):
-    """`kill_guard.py spawn [--log FILE] -- CMD ARGS...`: start CMD detached and record it in this worktree's ledger.
-
-    The guard only believes the ledger for PIDs it started itself: spawn takes a command, never a PID."""
-    log = None
-    args = list(argv)
+    """`kill_guard.py spawn [--log FILE] -- CMD ARGS...`: start CMD detached and record it in this worktree's ledger,
+    so a later `kill PID` from any shell of the caller is known to be its own."""
+    log, args = None, list(argv)
     if args[:1] == ['--host'] and len(args) >= 2:
         return spawn_remote_main(args[1], args[2:])
     if args[:1] == ['--log'] and len(args) >= 2:
@@ -2399,14 +1766,20 @@ def spawn_main(argv):
 
 
 def explain_main(argv):
-    """`kill_guard.py explain FILE [--cwd DIR]`: FILE holds a command (text) or a hook payload (JSON)."""
+    """`kill_guard.py explain FILE [--cwd DIR]`: FILE holds a command (text) or a hook payload (JSON). Runs nothing."""
     if not argv:
         sys.stderr.write('usage: kill_guard.py explain FILE [--cwd DIR]\n')
         return 2
     cwd = argv[argv.index('--cwd') + 1] if '--cwd' in argv and argv.index('--cwd') + 1 < len(argv) else os.getcwd()
     with open(argv[0], 'rb') as handle:
         text = handle.read(MAX_STDIN).decode('utf-8', 'replace')
-    verdict, rule, message, pids = decide(text, cwd=cwd)
+    payload = None
+    try:
+        payload = json.loads(text)
+        text = command_of(payload)[0] or '' if isinstance(payload, dict) else text
+    except ValueError:
+        pass
+    verdict, rule, message, pids = decide(text, cwd=cwd, payload=payload if isinstance(payload, dict) else None)
     print(json.dumps({'verdict': verdict, 'rule': rule, 'message': message, 'pids': list(pids)}))
     return 0
 
@@ -2417,10 +1790,8 @@ def main(argv=None):
         sys.stdout.write(__doc__.split('Entry points')[0] + 'Commands: hook | analyze | spawn | explain\n')
         return 0
     command, rest = argv[0], argv[1:]
-    if command == 'hook':
+    if command in ('hook', 'analyze'):
         return hook_main()
-    if command == 'analyze':
-        return analyze_main()
     if command == 'spawn':
         return spawn_main(rest)
     if command == 'explain':
@@ -2434,6 +1805,5 @@ if __name__ == '__main__':
         sys.exit(main())
     except SystemExit:
         raise
-    except BaseException:  # noqa: BLE001 - never let a launcher bug become a silent allow
-        sys.stderr.write(block_message('guard-failure', 'the launcher failed') + '\n')
-        sys.exit(2)
+    except BaseException:  # noqa: BLE001 - a launcher bug allows (the redesign: never block on "could not read")
+        sys.exit(0)
