@@ -248,7 +248,8 @@ def _snapshot(repo, session):
         env = {"GIT_INDEX_FILE": os.path.join(scratch, "index")}
         real = os.path.join(top, _must(top, "rev-parse", "--git-path", "index").strip())
         if os.path.isfile(real):
-            shutil.copyfile(real, env["GIT_INDEX_FILE"])   # keeps the stat cache, so only changed files are hashed
+            shutil.copy2(real, env["GIT_INDEX_FILE"])   # keeps the stat cache, so only changed files are hashed, and
+            # the index's own timestamp: with a newer one git would not re-read a same-size edit made in that second
         elif head:
             _must(top, "read-tree", head, env=env)
         hidden = [x[2:] for x in _must(top, "ls-files", "-v", "-z", env=env).split("\0") if x[:1] in ("h", "S", "s")]
