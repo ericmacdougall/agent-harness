@@ -26,6 +26,7 @@ TRAILERS = {"openai": "Co-Authored-By: Codex <noreply@openai.com>\n",
             "claude": "Co-Authored-By: Claude <noreply@anthropic.com>\n",
             "person": "Co-Authored-By: Test Person <person@example.invalid>\n",
             None: ""}
+TRAILERS["mixed"] = TRAILERS["openai"] + TRAILERS["claude"]
 VERIFIED = nc.OriginObservation("openai", True, "running_code_verified")
 UNSUPPORTED = nc.OriginObservation("unknown", False, "unsupported_platform")
 
@@ -161,9 +162,39 @@ class CurrentMessageAttribution(Fixtures):
     def test_markerless_current_hook_still_rejects_wrong_harness(self):
         self.assertEqual(self.hook("claude")[0], 2)
 
-    def test_mixed_markers_refuse_instead_of_silently_skipping_attribution(self):
+    def test_verified_openai_with_both_markers_accepts_truthful_claim(self):
         os.environ.update(CLAUDECODE="fixture", CODEX_THREAD_ID="fixture")
-        self.assertEqual(self.hook("openai")[0], 2)
+        for entry in (self.hook, self.backstop, self.check_message):
+            with self.subTest(entry=entry.__name__):
+                result = entry("openai")
+                self.assertEqual(result[0] if isinstance(result, tuple) else result, 0)
+
+    def test_verified_openai_with_both_markers_rejects_conflicting_claims(self):
+        os.environ.update(CLAUDECODE="fixture", CODEX_THREAD_ID="fixture")
+        for claim in ("claude", "mixed"):
+            with self.subTest(claim=claim):
+                self.assertEqual(self.hook(claim)[0], 2)
+                self.assertEqual(self.backstop(claim)[0], 1)
+                self.assertEqual(self.check_message(claim), 2)
+
+    def test_truthy_nonboolean_openai_lineage_with_both_markers_refuses(self):
+        os.environ.update(CLAUDECODE="fixture", CODEX_THREAD_ID="fixture")
+        for lineage in (1, "true"):
+            self.probe.return_value = replace(VERIFIED, native_lineage=lineage)
+            for entry, refusal in ((self.hook, 2), (self.backstop, 1), (self.check_message, 2)):
+                with self.subTest(lineage=lineage, entry=entry.__name__):
+                    result = entry("openai")
+                    self.assertEqual(result[0] if isinstance(result, tuple) else result, refusal)
+
+    def test_verified_openai_with_both_markers_still_checks_testing(self):
+        os.environ.update(CLAUDECODE="fixture", CODEX_THREAD_ID="fixture")
+        bad_testing = BODY.replace(
+            "Testing: `python3 -m unittest tests.test_fixture` -> 1 fixture passed.",
+            "Testing: passed.",
+        )
+        problems = cp.validate(bad_testing + TRAILERS["openai"], policy=POLICY,
+                               attribution=cp.current_commit_attribution())
+        self.assertTrue(any(problem.startswith("Testing:") for problem in problems), problems)
 
     def test_uncertain_native_and_nearer_runtime_never_fall_through(self):
         os.environ["CLAUDECODE"] = "fixture"
