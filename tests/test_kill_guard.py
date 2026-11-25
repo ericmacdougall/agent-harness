@@ -12,6 +12,7 @@ let `docker system prune` through).
 import ast
 import json
 import os
+from unittest import mock
 import subprocess
 import sys
 import tempfile
@@ -146,7 +147,7 @@ class Refusals(Base):
     def test_refusal_names_the_command_that_proceeds(self):
         message = self.decide('pkill -f vitest')[2]
         self.assertIn('kill 200', message)  # the one match that is the caller's
-        self.assertIn('ah.py kill --pid 300', self.decide('kill 300')[2])
+        self.assertIn('ah approve kill --pids 300', self.decide('kill 300')[2])
 
 
 class Roles(Base):
@@ -162,7 +163,7 @@ class Roles(Base):
 
     def test_protected_needs_approval_for_everyone(self):
         self.assertRefused(['kill 400', 'kill 410', 'docker compose -p log-backup down'], 'protected')
-        self.assertIn('--approved-by', self.decide('kill 400')[2])
+        self.assertIn('ah approve kill --pids 400', self.decide('kill 400')[2])
 
     def test_harness_maintainer_may_stop_harness_daemons_and_it_is_logged(self):
         self.assertAllowed(['kill 400', 'launchctl kickstart -k gui/501/com.ericmacdougall.ahd',
@@ -171,6 +172,41 @@ class Roles(Base):
         audit = Path(self.home) / '.agent-harness/state/kill-guard/audit.jsonl'
         rows = [json.loads(line) for line in audit.read_text().splitlines()]
         self.assertTrue(any(r['rule'].startswith('maintainer:') and r['verdict'] == 'allow' for r in rows))
+
+
+class ApprovalsLiftRoleRefusals(Base):
+    """2026-11-24: a live `ah approve kill` record lifts a role refusal (not-yours, protected); never the init, agent
+    or system list, and a staging/live service only on the owner's own record."""
+
+    def setUp(self):
+        super().setUp()
+        env = mock.patch.dict(os.environ, {'AH_HOME': self.home})
+        env.start()
+        self.addCleanup(env.stop)
+        import ah_approvals
+        self.approvals = ah_approvals
+
+    def grant(self, pids, by='user'):
+        self.approvals.grant('kill', {'pids': pids}, by, 'test', home=self.home)
+
+    def test_an_approval_lifts_not_yours_and_protected(self):
+        self.assertRefused(['kill 300'], 'not-yours')
+        self.grant([300, 400])
+        self.assertAllowed(['kill 300', 'kill 400'])
+        self.assertRefused(['kill 500'], 'not-yours')  # not covered
+
+    def test_never_the_never_list(self):
+        self.grant([1, 100, 101])
+        self.assertRefused(['kill 1', 'kill 100'], 'never')
+
+    def test_staging_live_needs_the_owners_own_record(self):
+        # a supervisor's record (written directly: grant() itself confines supervisors to their projects)
+        self.approvals._append({'op': 'grant', 'id': 'sup00001', 'kind': 'kill', 'scope': {'pids': [410]},
+                                'granted_by': 'supervisor:12345678-aaaa', 'reason': 't', 'created': '2026-11-24T00:00:00Z',
+                                'expires': None}, self.home)
+        self.assertRefused(['kill 410'], 'protected')
+        self.grant([410])
+        self.assertAllowed(['kill 410'])
 
 
 class TextIsNotEffect(Base):

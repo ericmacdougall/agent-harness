@@ -171,6 +171,23 @@ class Roles(Home):
                 self.assertIn('ah.py log-push', message, row)
                 self.assertIn('approve-delete', message, row)
 
+    def test_a_delete_approval_lifts_a_role_refusal_but_never_the_records_rule(self):
+        # 2026-11-24 integration: `ah approve delete --path P` covers a path a role would refuse; transcripts, WALs and
+        # audit logs keep needing a verified copy whatever the store says
+        import ah_approvals
+        other = 'rm -rf ~/.agent-harness/work/%s/tmpdir' % OTHER
+        verdict, message = self.decide(other)
+        self.assertEqual(verdict, 'block')
+        self.assertIn('ah approve delete --path', message)
+        with mock.patch.dict(os.environ, {'AH_HOME': str(self.home)}):
+            ah_approvals.grant('delete', {'path': str(self.home / '.agent-harness/work' / OTHER)}, 'user', 't',
+                               home=str(self.home))
+            ah_approvals.grant('delete', {'path': str(self.home / '.claude')}, 'user', 't', home=str(self.home))
+            self.assertEqual(self.decide(other)[0], 'allow')
+            self.assertEqual(self.decide('rm -rf ~/.claude/wals/%s' % SID)[0], 'block')
+            self.assertEqual(self.decide('rm ~/.claude/projects/p/%s.jsonl' % SID)[0], 'block')
+            self.assertEqual(self.decide('rm -rf ~/.claude/plugins/cache/x')[0], 'allow')
+
     def test_a_worktree_the_caller_made_elsewhere_is_its_own(self):
         outside = self.home / '.agent-harness/work' / OTHER / 'made-by-me'
         outside.mkdir(parents=True)
@@ -193,6 +210,25 @@ class Roles(Home):
     def test_an_unreadable_operand_is_allowed_with_a_note_unless_it_names_records(self):
         self.assertEqual(self.decide('rm -rf "$(mktemp -d)/x" "$BUILD_DIR/out"')[0], 'allow')
         self.assertEqual(self.decide('D=~/.claude/wals; rm -rf "$D"')[0], 'block')
+
+
+class RecordsWhenTheReadingsDisagree(Home):
+    """Integration 2026-11-24: a `>!` command the guard cannot judge under both shell readings is allowed with a note,
+    except when its visible text deletes, moves or overwrites a transcript, session WAL or audit-log path."""
+
+    def test_records_targets_still_block(self):
+        for row in ("cd ~/proj; eval '>! x cd /tmp'; echo > ../.claude/projects/p/%s.jsonl" % SID,
+                    "cd ~/proj; eval '>! x cd /tmp'; rm -rf ../.claude/projects",
+                    "R='rm -rf'; eval '>! x R=ls'; $R ~/.claude/wals"):
+            (self.home / 'proj').mkdir(exist_ok=True)
+            verdict, message = self.decide(row.replace('~/', str(self.home) + '/'), cwd=self.home)
+            self.assertEqual(verdict, 'block', (row, message))
+            self.assertIn('log-push', message)
+
+    def test_other_targets_only_warn(self):
+        (self.home / 'proj').mkdir(exist_ok=True)
+        for row in ("cd ~/proj; eval '>! x cd /tmp'; rm -rf build", "eval '>! x cd /tmp'; echo hi > notes.txt"):
+            self.assertNotEqual(self.decide(row.replace('~/', str(self.home) + '/'), cwd=self.home)[0], 'block', row)
 
 
 class Maintainer(Home):

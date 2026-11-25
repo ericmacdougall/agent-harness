@@ -371,27 +371,11 @@ DAEMON = re.compile(r"^harness daemon or backup job")
 LIVE = "staging/live service (kill_guard_policy.json staging_live)"
 
 
-def cli_payload(home, session, agent=""):
-    """A hook-shaped payload for ah_roles from what the CLI knows: the session id, the agent id and that session's
-    transcript (so the caller's model can be read). Unknown stays unknown, which is the least privilege."""
-    payload = {"session_id": session or ""}
-    if agent:
-        payload["agent_id"] = agent
-    if session and SESSION_ID.fullmatch(session):
-        try:
-            found = sorted((Path(home) / ".claude" / "projects").glob("*/%s.jsonl" % session))
-        except OSError:
-            found = []
-        if found:
-            payload["transcript_path"] = str(found[0])
-    return payload
-
-
 def caller_roles(home, session, agent=""):
     """{"top", "maintainer", "supervised": [real paths]} for the caller."""
     try:
         import ah_roles  # noqa: PLC0415
-        payload = cli_payload(home, session, agent)
+        payload = ah_roles.cli_payload(home=home, session=session or "", agent=agent)
         top = ah_roles.is_top_rung(payload)
         fn = getattr(ah_roles, "may_edit_harness", None)
         maintainer = bool(fn(payload) if fn else (top and ah_roles.is_supervisor(payload, home)))
@@ -420,6 +404,31 @@ def role_refusal(why, info, roles, approval_ok):
     if DAEMON.match(why):
         return None if approval_ok or roles.get("maintainer") else why
     return None if approval_ok or roles.get("top") else why
+
+
+def store_approval(pid, cwd, owner_only=False):
+    """A live `kill` record of the approvals store (ah_approvals) covering this pid (and its cwd as the project), or
+    None. owner_only: only a record the owner granted (staging/live services). Never raises."""
+    try:
+        import ah_approvals  # noqa: PLC0415 - a sibling module; absent on older installs
+        facts = {"pids": [int(pid)]}
+        if cwd:
+            facts["project"] = cwd
+        record = ah_approvals.allowed("kill", **facts)
+    except Exception:  # noqa: BLE001
+        return None
+    if record and owner_only and record.get("granted_by") != "user":
+        return None
+    return record
+
+
+def approve_hint(pid) -> str:
+    """The `ah approve kill ...` line a refusal names (ah_approvals.command_hint), or a fixed fallback."""
+    try:
+        import ah_approvals  # noqa: PLC0415
+        return ah_approvals.command_hint("kill", pids=[int(pid)])
+    except Exception:  # noqa: BLE001
+        return 'ah approve kill --pids %d --reason "<why>"' % int(pid)
 
 
 def in_supervised(info, cwd, roles):
@@ -610,12 +619,19 @@ def snapshot(probe, pid, my_uid, protected, root=None, role="target", scope=None
     approval = scope.get("approval")
     approved = bool(approval) and approval_problem(probe, info, pid, root, scope) is None
     first = refusal(info, my_uid, protected, probe if scope else None, table)
-    why = role_refusal(first, info, roles, approved)
+    stored = None  # an `ah approve kill` record covering this pid (never for a HARD refusal)
+    if first and not HARD.match(first) and not approved:
+        stored = store_approval(pid, rec["cwd"], owner_only=(first == LIVE))
+    why = role_refusal(first, info, roles, approved or bool(stored))
     if why:
         if approval and not approved and not HARD.match(why):
             why += "; --approved-by %s does not cover it: %s" % (approval["ask"], approval_problem(probe, info, pid, root, scope))
+        if not HARD.match(why):
+            why += "; the owner approves it with: " + approve_hint(pid)
         rec["status"], rec["detail"] = "refused", why
         return rec
+    if stored:
+        rec["approved_by"] = stored.get("id")
     if first:
         rec["lifted"] = first  # the refusal a role or the owner's approval lifted
     if info["stat"].startswith("Z"):
@@ -633,17 +649,20 @@ def snapshot(probe, pid, my_uid, protected, root=None, role="target", scope=None
     if approved:
         rec["scope"], rec["approved"], rec["approved_by"] = "approved", True, approval["ask"]
         return rec  # the owner's approval: one info notice for approved stops, not a foreign page
+    stored = stored or store_approval(pid, rec["cwd"])
+    if stored:
+        rec["scope"], rec["approved"], rec["approved_by"] = "approved", True, stored.get("id")
+        return rec  # an `ah approve kill` record covers it
     if not scope["foreign"]:
         rec["status"] = "refused"
         rec["detail"] = ("foreign: outside your worktree, process tree and supervised projects; "
                          + ("pass --foreign (audited, main is notified)" if roles.get("top") else
-                            "register an ask (wal_note.py --event ask), then after the owner answers: "
-                            "--foreign --approved-by <ask id>"))
+                            "the owner approves it with: " + approve_hint(pid)))
         return rec
     elif not roles.get("top"):
         rec["status"] = "refused"
         rec["detail"] = ("foreign: --foreign needs the owner's approval for this pid (or a supervisor or top-rung "
-                         "caller): register an ask (wal_note.py --event ask), then --approved-by <ask id>")
+                         "caller); the owner approves it with: " + approve_hint(pid))
         return rec
     owner = session_ancestor(probe, table, pid)
     rec["foreign"] = True
@@ -728,11 +747,13 @@ def kill_local(pids, reason, tree=False, grace=DEFAULT_GRACE, home=None, probe=N
                    "tree": tree, "grace": grace, **_public(rec)})
     approved_live = [r for r in live if r.get("approved") or (r.get("lifted") and scope.get("approval"))]
     if approved_live:
-        approval = scope["approval"]
+        # --approved-by <ask>, or an `ah approve kill` record of the approvals store (rec["approved_by"] is its id)
+        approval = scope.get("approval") or {"ask": ",".join(sorted({str(r.get("approved_by")) for r in approved_live})),
+                                             "source": "ah approvals"}
         # A verified user approval is a record, not a page: info, one aggregated row per caller session (fleet round item 3).
         event = {"host": _host(), "source": "ops-watch", "event": "raise", "severity": "info", "check": "ah-kill",
                  "key": "ah-kill:approved:" + _who(session, agent),
-                 "message": "ah kill --approved-by %s stopped/will stop %d user-approved stale process(es): %s (reason: %s)" % (
+                 "message": "ah kill approved by %s stopped/will stop %d user-approved stale process(es): %s (reason: %s)" % (
                      approval["ask"], len(approved_live), ", ".join(str(r["pid"]) for r in approved_live), _clip(reason, 120)),
                  "detail": {"run": run_id, "caller": caller, "reason": _clip(reason, 200), "ask": approval["ask"],
                             "source": approval["source"], "targets": [

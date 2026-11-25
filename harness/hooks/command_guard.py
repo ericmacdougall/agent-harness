@@ -7541,7 +7541,7 @@ class Analyzer:
                  'or worktree you made)' % (what, 'a path under ~/.claude, ~/.codex or ~/.agent-harness', name[:60]))[:400],
                 instead or ('a supervisor of the project that holds it, or a Fable/Astra agent, may run the same command; '
                             'a dead worktree is freed with `python3 ~/.claude/hooks/ah.py worktree-remove --host local '
-                            '--path <path>`') + self._clone_hint(path))
+                            '--path <path>`; or the owner approves it with `%s`' % delete_hint(path)) + self._clone_hint(path))
         return True
 
     WRITE_WORDS = ('overwrite', 'truncat', 'redirect', 'rewrite', 'dd of=', 'in-place', ' -i')
@@ -7684,7 +7684,11 @@ class Analyzer:
             except Exception:  # noqa: BLE001 - an unreadable transcript only means no extra own roots
                 self._own_extra = []
         if self._own_extra:
-            return ah_roles.may_delete(self.payload, path, extra_own_roots=self._own_extra)
+            allowed, why = ah_roles.may_delete(self.payload, path, extra_own_roots=self._own_extra)
+        if not allowed:
+            record = delete_approval(path)
+            if record:
+                return True, 'approved (ah approvals %s)' % record.get('id')
         return allowed, why
 
     LONE_RM = re.compile(r'^[ \t]*(?:/bin/|/usr/bin/)?(?:rm|rmdir)(?:[ \t]+-[A-Za-z-]+)*(?:[ \t]+--)?(?:[ \t]+[^ \t\x00-\x1f\x7f;&|<>`$()\\"\'*?\[\]{}~#!]+)+[ \t]*$')
@@ -7717,7 +7721,8 @@ class Analyzer:
                              'worktree' % (posixpath.basename(path.rstrip('/')) or path)[:60],
                              'a supervisor of the project or a Fable/Astra agent runs `python3 ~/.claude/hooks/ah.py '
                              'worktree-remove --host local --path <path> --rescue` (saves its commits and changes first); '
-                             'anyone may run it without --force when the worktree is clean')
+                             'anyone may run it without --force when the worktree is clean; or the owner approves it '
+                             'with `%s`' % delete_hint(path))
 
     def _clone_hint(self, path):
         reason = getattr(self.ctx, 'clone_reasons', {}).get(path)
@@ -8412,7 +8417,13 @@ def analyze(command, compiled=None, cwd=None, ps=False, marker=None, payload=Non
             findings.append(Finding(PARSE, 'unterminated', 'the command has an unterminated quote or substitution',
                                     'check the quoting'))
     if analyzer.ctx.readings_capped and not any(f.category in ALWAYS_ENFORCED for f in findings):
-        if raw_secret_sensitive(command):
+        if names_records_target(command):
+            # the one exception to "unsure allows" (2026-11-24): transcripts, session WALs and audit logs
+            findings.append(Finding(LOG_DELETE, 'unanalysable',
+                                    '`>!` cannot be judged under both shell readings and the command visibly deletes, '
+                                    'moves or overwrites a transcript, session WAL or harness audit log path',
+                                    'split the command and use `>|`; to remove records run `%s`' % LOG_PUSH_ROUTE))
+        elif raw_secret_sensitive(command):
             findings.append(Finding(_fail_closed_category(command), 'unanalysable',
                                     '`>!` cannot be judged under both shell readings (too large, too deeply nested, or '
                                     'they disagree on what a later command uses) and the command names a protected '
@@ -8427,6 +8438,41 @@ def analyze(command, compiled=None, cwd=None, ps=False, marker=None, payload=Non
 # Secret and credential text is not part of the raw probe (harness redesign, 2026-11-24): when the analysis cannot finish,
 # a command that only NAMES a secret source or a credential location is allowed with a note. The analyser judges effect;
 # its fallback must not refuse on words. The protected-location and exec-plus-destroy probes below are unchanged.
+
+
+RECORDS_TEXT = (r'(?:\.claude/(?:projects|wals|sessions|transcripts|history\.jsonl)|\.codex/(?:sessions|archived_sessions|'
+                r'history)|\.agent-harness/(?:codex-wals|logs|state)|(?<![\w.-])wals(?![\w.-])|main\.jsonl|\.wal\.jsonl)')
+RECORDS_REDIRECT = re.compile(r'(?i)>[>|!&]?\s*[\'"]?[^\s;&|<>]*' + RECORDS_TEXT)
+RECORDS_NAMED = re.compile('(?i)' + RECORDS_TEXT)
+
+
+def names_records_target(text):
+    """The visible text sends a redirect at a records path (transcripts, session WALs, harness audit logs), or names
+    such a path in a command that also holds a destructive verb. Used only where the analysis could not settle the
+    command (`>!` readings capped): there, records still block while everything else is allowed with a note."""
+    if not isinstance(text, str):
+        text = ' '.join(map(str, text or ()))
+    t = text[:1_000_000]
+    return bool(RECORDS_REDIRECT.search(t) or (RECORDS_NAMED.search(t) and DESTROY_TEXT.search(t)))
+
+
+def delete_approval(path):
+    """The live `delete` record of the approvals store (ah_approvals) covering `path`, or None. Consulted only where a
+    role refusal is produced, never for transcripts, WALs and audit logs (their verified-copy rule comes first).
+    Guarded import; never raises."""
+    try:
+        import ah_approvals  # noqa: PLC0415 - a sibling module; absent on older installs
+        return ah_approvals.allowed('delete', path=path)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def delete_hint(path):
+    try:
+        import ah_approvals  # noqa: PLC0415
+        return ah_approvals.command_hint('delete', path=path)
+    except Exception:  # noqa: BLE001
+        return 'ah approve delete --path %s --reason "<why>"' % path
 
 
 def raw_sensitive(text, compiled=None, cwd=None):
@@ -10324,7 +10370,7 @@ def worktree_rescue_refusal(command, payload):
                 continue
             if path and host == 'local':
                 real = os.path.realpath(os.path.expanduser(path))
-                if ah_roles.may_delete(payload, real)[0]:
+                if ah_roles.may_delete(payload, real)[0] or delete_approval(real):
                     continue
                 try:
                     common = os.path.realpath(_git_out(real, ['rev-parse', '--path-format=absolute', '--git-common-dir'],
@@ -10339,7 +10385,8 @@ def worktree_rescue_refusal(command, payload):
         except Exception:  # noqa: BLE001 - roles unknown: least privilege
             pass
         return ('`ah worktree-remove --rescue` removes a worktree with uncommitted changes or unpublished commits; only '
-                'its own session, a supervisor of the project or a Fable/Astra agent may run it')
+                'its own session, a supervisor of the project or a Fable/Astra agent may run it, or the owner approves it '
+                'with `%s`' % delete_hint(path or '<path>'))
     return None
 
 
@@ -10465,27 +10512,10 @@ def emit(verdict, message, fmt):
 
 # --------------------------------------------------------------------------- doctor, explain, replay
 
-MIN_CLAUDE_VERSION = (2, 1, 295)  # first Claude Code release with hook `onFailure: block`
 DOCTOR_PROBES = (  # (command text, expected verdict); data only, analysed and never executed
     ('rclone config show', 'block'), ('rm -rf ~/.claude/projects', 'block'), ('printenv', 'block'),
     ("cat <<'EOF'\nx\nEOF\nrm -rf ~/.codex/sessions", 'block'), ('git status', 'allow'), ('ls ~/.claude', 'allow'),
 )
-
-
-def _version_tuple(text):
-    m = re.search(r'(\d+)\.(\d+)\.(\d+)', text or '')
-    return tuple(int(x) for x in m.groups()) if m else None
-
-
-def claude_version(runner=None):
-    try:
-        if runner:
-            return _version_tuple(runner())
-        done = subprocess.run(['claude', '--version'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20,
-                              check=False)
-        return _version_tuple(done.stdout.decode('utf-8', 'replace'))
-    except (OSError, subprocess.SubprocessError):
-        return None
 
 
 def _hook_entries(data, needle):
@@ -10500,7 +10530,7 @@ def _hook_entries(data, needle):
 
 
 def doctor(home=None, version_runner=None):
-    """[(check, ok, detail)] for the installed guard on this machine."""
+    """[(check, ok, detail)] for the installed guard on this machine. version_runner is ignored (kept for callers)."""
     import safe_input
     home = Path(home or os.path.expanduser('~'))
     checks = [('python>=3.9', sys.version_info >= (3, 9), '%d.%d' % sys.version_info[:2])]
@@ -10518,14 +10548,10 @@ def doctor(home=None, version_runner=None):
         entries = _hook_entries(data, 'command_guard_hook.py')
         checks.append(('%s registered' % label, bool(entries), str(settings)))
         if label == 'claude' and entries:
-            group, hook = entries[0]
-            checks.append(('claude onFailure block', hook.get('onFailure') == 'block', 'hook entry'))
+            # no onFailure or Claude Code version check: the guard fails open since 2026-11-24
+            group, _hook = entries[0]
             matcher = str(group.get('matcher', ''))
             checks.append(('claude matcher covers Bash', matcher in ('', '*') or 'Bash' in matcher, matcher or '(all)'))
-            version = claude_version(version_runner)
-            ok = version is not None and version >= MIN_CLAUDE_VERSION
-            checks.append(('claude >= 2.1.295', ok, '.'.join(map(str, version)) if version else 'unknown: '
-                           'fail-closed then rests on the launcher alone'))
         if label == 'codex' and entries:
             group, _hook = entries[0]
             checks.append(('codex no matcher', not group.get('matcher'), 'every tool reaches the guard (write_stdin)'))

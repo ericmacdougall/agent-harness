@@ -157,28 +157,6 @@ class BindingTests(unittest.TestCase):
         with self.subTest("requested number differs"), self.assertRaises(OSError):
             self.bind(self.REPO, self.PR_URL, number=769)
 
-    def test_only_pure_cross_harness_pr_pass_is_eligible(self):
-        args = SimpleNamespace(stage="pr", author_harness="claude", main_stamp={"purpose": "review-auth"})
-        binding = {"repo": "o/r", "pr": 5}
-        selection = {"harness": "openai"}
-        self.assertTrue(review.review_merge_eligible(args, binding, "VERDICT: PASS\nReviewed", selection))
-        unstamped = SimpleNamespace(stage="pr", author_harness="claude", main_stamp=None)  # #134 red-team B2
-        self.assertFalse(review.review_merge_eligible(unstamped, binding, "VERDICT: PASS\nReviewed", selection))
-        negatives = (
-            ("pr", "claude", binding, "VERDICT: BLOCK\nF1: defect", selection),
-            ("pr", "claude", binding, "VERDICT: PASS-WITH-TICKETS\nF1: ticketed", selection),
-            ("pr", "claude", binding, "VERDICT: PASS\nF1: unresolved finding", selection),
-            ("pr", "unknown", binding, "VERDICT: PASS", selection),
-            ("pr", "claude", binding, "VERDICT: PASS", {"harness": "claude"}),
-            ("pr", "claude", None, "VERDICT: PASS", selection),
-            ("code-inspection", "claude", binding, "CODE_INSPECTION_RESULT: ACCEPT", selection),
-            ("pr", "claude", binding, "KIMI_ADVISORY: ACCEPT\nVERDICT: PASS", selection),
-        )
-        for stage, author, bound, report, selected in negatives:
-            with self.subTest(stage=stage, author=author, bound=bound, report=report, selected=selected):
-                local = SimpleNamespace(stage=stage, author_harness=author, main_stamp={"purpose": "review-auth"})
-                self.assertFalse(review.review_merge_eligible(local, bound, report, selected))
-
 
 class EvidenceFixture(unittest.TestCase):
     def setUp(self):
@@ -462,21 +440,6 @@ class EndToEndTests(unittest.TestCase):
     def test_explicit_base_equal_to_head_is_omitted(self):
         evidence = self.reviewed_evidence(self.repo, self.head, "--snapshot-base", self.head)
         self.assert_no_base(evidence, self.head)
-
-    def test_unstamped_review_mints_nothing(self):
-        # #134 red-team B2: a run no main hook saw (copied script, script file, sub-agent) gets no stamp
-        output = self.root / "unstamped.md"
-        env = dict(os.environ, HOME=str(self.root), PATH=str(self.bin) + os.pathsep + "/usr/bin:/bin",
-                   AGENT_HARNESS_USAGE_DIR=str(self.root / "usage"),
-                   AGENT_HARNESS_REVIEW_POLICY=str(ROOT / "harness" / "hooks" / "review_policy.json"))
-        result = subprocess.run([
-            sys.executable, str(HOOKS / "peer_review.py"), "pr", "--repo", str(self.repo),
-            "--packet", str(self.packet), "--output", str(output), "--expected-head", self.head,
-            "--github-repo", "o/r", "--pr", "5", "--author-harness", "claude"],
-            text=True, capture_output=True, env=env, timeout=45)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertNotIn("Merge authorization:", result.stdout)
-        self.assertIn("no main-agent stamp", result.stderr)
 
     def test_same_harness_fallback_does_not_inherit_primary_eligibility(self):
         self.fake("codex", "import sys\nsys.stdin.read()\n"

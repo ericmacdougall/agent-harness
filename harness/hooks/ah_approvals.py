@@ -14,6 +14,9 @@ STABLE API (sibling guards import this through a guarded import; keep these sign
         A record with no pr/path/task covers the whole project for that kind. exact_head, when the record has one,
         must equal the `head` fact (prefix of 7+ characters accepted); records have none by default, so a PR approval
         survives later commits.
+    command_hint(kind, **facts) -> str
+        The exact `ah approve ...` line that would record an approval covering `facts` (the same fact names as
+        allowed(); repo becomes --project). Refusal messages quote it. Never raises.
     grant(kind, scope, granted_by, reason, expires=None, exact_head=None, source=None, home=None) -> dict
     revoke(id, by, home=None) -> dict
     list(project=None, kind=None, live=True, home=None) -> [dict]
@@ -259,6 +262,28 @@ def allowed(kind, **facts):
     except Exception:  # noqa: BLE001 - a broken store is "no approval", never a crash in a guard
         return None
     return None
+
+
+def command_hint(kind, **facts) -> str:
+    """`ah approve <kind> --project .. --pr .. --path .. --task .. --pids .. --host .. --reason "<why>"` for `facts`.
+    `repo` stands in for --project when no project is given; head, now and unknown facts are left out (an approval
+    survives later commits unless the owner opts into --exact-head). Never raises."""
+    import shlex
+    try:
+        words = ["ah", "approve", str(kind if kind in KINDS else "other")]
+        project = facts.get("project") or facts.get("repo")
+        pids = facts.get("pids")
+        if pids is None and facts.get("pid") is not None:
+            pids = [facts.get("pid")]
+        for flag, value in (("--project", project), ("--pr", facts.get("pr")), ("--path", facts.get("path")),
+                            ("--task", facts.get("task")), ("--host", facts.get("host")), ("--what", facts.get("what"))):
+            if value not in (None, ""):
+                words += [flag, shlex.quote(str(value))]
+        if pids:
+            words += ["--pids"] + [str(int(p)) for p in pids]
+        return " ".join(words + ["--reason", '"<why>"'])
+    except Exception:  # noqa: BLE001
+        return 'ah approve %s --reason "<why>"' % (kind if kind in KINDS else "other")
 
 
 def list_approvals(project=None, kind=None, live=True, home=None) -> list:

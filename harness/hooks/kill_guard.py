@@ -765,6 +765,14 @@ class Context:
                 else:
                     out[pid] = (False, 'pid %d (%s) is not yours: not started by this session, not in your work dir '
                                 'or worktree' % (pid, one_line(proc.name, 40)))
+                if not out[pid][0]:
+                    # a role refusal (never the init/agent/system list above): a live `ah approve kill` lifts it; a
+                    # staging/live service needs one the owner granted
+                    live = protected and any(r.search(proc.command) for r in self.live)
+                    record = store_approval(pid, (paths or [None])[0], owner_only=live, home=self.home)
+                    if record:
+                        self.notes.append('approval %s covers pid %d' % (record.get('id'), pid))
+                        out[pid] = (True, 'approved (ah approvals %s)' % record.get('id'))
         return out
 
     def _descends(self, pid, root):
@@ -790,6 +798,34 @@ class Context:
                 return True, 'harness maintainer'
             return False, '%s is protected (harness daemon, log backup or staging/live)' % one_line(name, 60)
         return True, 'named unit'
+
+
+def store_approval(pid, project=None, owner_only=False, home=None):
+    """The live `kill` record of the approvals store covering `pid` (and `project`, the process's cwd), else None.
+    owner_only: a record the owner granted. Guarded import; never raises."""
+    try:
+        import ah_approvals  # noqa: PLC0415 - a sibling module; absent on older installs
+        facts = {'pids': [int(pid)]}
+        if project:
+            facts['project'] = project
+        if home:
+            facts['home'] = home
+        record = ah_approvals.allowed('kill', **facts)
+    except Exception:  # noqa: BLE001
+        return None
+    if record and owner_only and record.get('granted_by') != 'user':
+        return None
+    return record
+
+
+def approve_hint(pids) -> str:
+    """The `ah approve kill --pids ...` line (ah_approvals.command_hint), or a fixed fallback."""
+    pids = [int(p) for p in pids][:20]
+    try:
+        import ah_approvals  # noqa: PLC0415
+        return ah_approvals.command_hint('kill', pids=pids)
+    except Exception:  # noqa: BLE001
+        return 'ah approve kill --pids %s --reason "<why>"' % ' '.join(map(str, pids))
 
 
 def _compiles(pattern):
@@ -1535,11 +1571,9 @@ class Analyzer:
             proceed = ('kill %s' % ' '.join(map(str, good))) if good else 'nothing: these are never stopped from an agent'
             raise Finding('never', reason, proceed, [p for p, _w in bad])
         if protected:
-            proceed = ('register an ask (wal_note.py --event ask); after the owner answers: '
-                       + AH_KILL % ','.join(map(str, protected)) + ' --approved-by <ask id>')
+            proceed = 'the owner approves it with `%s`, then rerun the command' % approve_hint(protected)
             raise Finding('protected', reason, proceed, protected)
-        proceed = ('register an ask (wal_note.py --event ask); after the owner answers: '
-                   + AH_KILL % ','.join(str(p) for p, _w in bad[:20]) + ' --foreign --approved-by <ask id>')
+        proceed = 'the owner approves it with `%s`, then rerun the command' % approve_hint(p for p, _w in bad)
         raise Finding('not-yours', reason, proceed, [p for p, _w in bad])
 
 

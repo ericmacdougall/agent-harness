@@ -1203,7 +1203,8 @@ SEED = 14471
 # direct writes; a command the guard cannot read is allowed with a note). Rows of OVERWRITE_EXISTING, BANG_READINGS and
 # BANG_READINGS_CWD whose verdict changed, with the new verdict. Each was reviewed: overwrites of ordinary harness files
 # (work receipts, logs, kept folders, bin/) are allowed; `>!` readings the guard cannot reconcile warn instead of
-# blocking; a written script that removes a work folder of another (here: invalid) session follows the role rules.
+# blocking, except where the visible text deletes, moves or overwrites a transcript, WAL or audit-log path (those
+# rows keep their old block: command_guard.names_records_target); a written script that removes a work folder of another (here: invalid) session follows the role rules.
 REDESIGN_VERDICTS = {
     'echo {} > @TASK@/receipt.json': 'allow',  # was block
     'make &> @TASK@/kept/evidence.log': 'allow',  # was block
@@ -1259,11 +1260,6 @@ REDESIGN_VERDICTS = {
     '>| @TASK@/existing.log': 'allow',  # was block
     'cat > @TASK@/existing.log': 'allow',  # was block
     "cat > run.py <<'E'\nimport shutil\nshutil.rmtree('@TASK@/old')\nE\npython3 run.py": 'block',  # was allow
-    "R='rm -rf'; eval '>! x R=ls'; $R @HOME@/.claude/projects": 'warn',  # was block
-    "A=-delete; eval '>! x A=-print'; find @HOME@/.claude/projects $A": 'warn',  # was block
-    "F=b.sh; echo 'rm -rf @HOME@/.claude/projects' > b.sh; eval '>! x F=a.sh'; bash $F": 'warn',  # was block
-    'echo \'rm -rf @HOME@/.claude/projects\' > run.sh; eval \'>! run.sh printf "cat <<E"\'; bash run.sh': 'warn',  # was block
-    "cd @HOME@/proj; eval '>! x cd /tmp'; rm -rf ../.claude/projects": 'warn',  # was block
     "cd @HOME@; eval '>! x cd /tmp'; rm -rf .c*/projects": 'warn',  # was block
     "cd @HOME@; eval '>! x cd /tmp'; rm -rf *": 'warn',  # was block
     "cd @HOME@; bash -c '>! x cd /tmp'; rm -rf .c*/projects": 'warn',  # was block

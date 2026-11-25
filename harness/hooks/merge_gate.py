@@ -865,13 +865,6 @@ class Client:
             raise GateError("%s is not JSON" % what) from None
 
 
-def add_review_waiver(state_dir, reference, *, store=None, now=None):
-    """Compatibility for peer_review.py's stamped path: the settled receipt in the usage store IS the merge
-    evidence now (see receipts()), so nothing is written. Remove once peer_review drops its main-stamp path."""
-    sha = str((reference or {}).get("sha256") or "") if isinstance(reference, dict) else ""
-    return {"id": "review-receipt-" + (sha[:12] or "unknown")}
-
-
 def report_text(state_dir, policy):
     ttl = float(policy["waiver_ttl_hours"]) * 3600
     rows = [r for r in read_waivers(state_dir) if r.get("event") == "waive"][-30:]

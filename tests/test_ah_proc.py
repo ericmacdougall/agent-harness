@@ -464,11 +464,22 @@ class NarrowedScope(KillBase):
             probe = self.base(proc(3300 + n, 100, cmd=cmd))
             self.assertEqual(self.run_kill(probe, [3300 + n], foreign=True)["results"][0]["status"], "refused", cmd)
 
+    def test_an_approvals_store_record_covers_a_foreign_pid(self):
+        # 2026-11-24: `ah approve kill --pids N` lifts the foreign refusal; a HARD refusal (pid 1) stays
+        import ah_approvals
+        with mock.patch.dict(os.environ, {"AH_HOME": str(self.home)}):
+            ah_approvals.grant("kill", {"pids": [1101]}, "user", "test", home=self.home)
+            probe = self.foreign(1101)
+            out = self.run_kill(probe, [1101])
+            self.assertNotEqual(out["results"][0]["status"], "refused", out)
+            self.assertEqual(out["results"][0].get("scope"), "approved")
+            self.assertEqual(self.run_kill(self.foreign(1102), [1102])["results"][0]["status"], "refused")
+
     def test_foreign_target_without_flag_is_refused(self):
         probe = self.foreign(1100)
         out = self.run_kill(probe, [1100])
         self.assertEqual(out["results"][0]["status"], "refused")
-        self.assertIn("--foreign", out["results"][0]["detail"])
+        self.assertIn("ah approve kill --pids", out["results"][0]["detail"])  # the one command (2026-11-24)
         self.assertEqual(probe.sent, [])
         self.assertEqual(self.notices, [])
         self.assertFalse(out["ok"])
@@ -544,7 +555,7 @@ class NarrowedScope(KillBase):
         probe = self.foreign(1120, cwd="/work/nested/sub")
         out = self.run_kill(probe, [1120])
         self.assertEqual(out["results"][0]["status"], "refused")
-        self.assertIn("--foreign", out["results"][0]["detail"])
+        self.assertIn("ah approve kill --pids", out["results"][0]["detail"])  # the one command (2026-11-24)
 
     def test_audit_row_records_the_callers_cwd(self):
         probe = self.foreign(1121, cwd="/work/sub")
@@ -557,12 +568,12 @@ class NarrowedScope(KillBase):
         probe.cwds = {1105: "/elsewhere/x"}
         out = self.run_kill(probe, [1105])
         self.assertEqual(out["results"][0]["status"], "refused")
-        self.assertIn("--foreign", out["results"][0]["detail"])
+        self.assertIn("ah approve kill --pids", out["results"][0]["detail"])  # the one command (2026-11-24)
         probe = self.base(proc(1105, 4000, cmd="sleep 5"))
         probe.cwds = {1105: "/elsewhere/x"}
         out = self.run_kill(probe, [1105], foreign=True)  # an ordinary caller's --foreign needs the owner's approval
         self.assertEqual(out["results"][0]["status"], "refused")
-        self.assertIn("--approved-by", out["results"][0]["detail"])
+        self.assertIn("ah approve kill --pids", out["results"][0]["detail"])  # the one command (2026-11-24)
         probe = self.base(proc(1105, 4000, cmd="sleep 5"))
         probe.cwds = {1105: "/elsewhere/x"}
         self.assertEqual(self.run_kill(probe, [1105], foreign=True, roles=TOP)["results"][0]["status"], "exited")
