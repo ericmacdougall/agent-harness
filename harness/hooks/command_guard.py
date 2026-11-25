@@ -2884,7 +2884,7 @@ def _admin_hints(admin):
 def _clone_worktrees(path, gitdir, step):
     """(refusal or None, nested) for the linked worktrees the clone's registry names (goodqa#17119 C2). A worktree whose
     directory lies outside the clone and still exists is refused: removing the clone would orphan it. One whose
-    directory is gone (prunable) keeps only its admin entry. Every entry's HEAD and the commits its small files name
+    directory is gone (prunable), inside the clone or outside, keeps only its admin entry. Every entry's HEAD and the commits its small files name
     are local work (its HEAD reflog is in the clone's own reflog listing), and a prunable entry's index must equal its
     HEAD. One inside the clone is listed in nested['inside'] for its own checks.
     Every entry refuses when it has an operation in progress, refs of its own (bisect, worktree refs) or a lock held by
@@ -2913,8 +2913,8 @@ def _clone_worktrees(path, gitdir, step):
         work = pointer[:-len('/.git')] if pointer.endswith('/.git') else ''
         if not work.startswith('/') or '\x00' in work or os.path.normpath(work) != work:
             return 'linked worktree entry %s names an unusual path' % shown, nested
-        inside = work.startswith(path + os.sep)
-        if os.path.lexists(work) and not inside:
+        present = os.path.lexists(work)
+        if present and not work.startswith(path + os.sep):
             return ('it has a linked worktree outside the clone (%s); remove that one first with ah worktree-remove'
                     % shown), nested
         for marker in CLONE_WT_IN_PROGRESS:
@@ -2943,10 +2943,13 @@ def _clone_worktrees(path, gitdir, step):
         # its HEAD reflog needs no read here: the clone's `reflog show --all` already lists every worktree's (git
         # rev-list, --single-worktree: "By default, all working trees will be examined"), prunable ones included
         nested['tips'].add(_wt_git(path, admin_rel, None, ['rev-parse', '--verify', 'HEAD'], step(2.0)).strip())
-        if inside:
+        if present:  # inside the clone: its own checks follow
             nested['inside'].append((admin_rel, os.path.relpath(work, path)))
             continue
-        try:  # its directory is gone: only the index can still hold work
+        # its directory is gone, wherever it was (deleted without `git worktree prune`, or the clone itself was moved):
+        # only the index can still hold work. A worktree directory that moved within the clone is not in `homes`, so the
+        # clone's own status check refuses it
+        try:
             _wt_git(path, admin_rel, None, ['diff-index', '--cached', '--quiet', 'HEAD', '--'], step(3.0))
         except ValueError:
             return 'linked worktree %s (its directory is gone) has staged changes, or they cannot be read' % shown, nested

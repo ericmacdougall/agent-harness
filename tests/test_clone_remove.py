@@ -433,6 +433,14 @@ class NestedWorktrees(Base):
         self.commit_in(work)
         git(work, 'checkout', '-q', '--detach', 'refs/remotes/origin/main')
         self.assertRefused(self.verify(), '1 local commit(s) are not on the remote')
+        shutil.rmtree(work)  # prunable now: the clone's own reflog listing still reads the entry's HEAD reflog
+        self.assertRefused(self.verify(), '1 local commit(s) are not on the remote')
+        self.setUp()
+        work, _ = self.outside()
+        self.commit_in(work)
+        git(work, 'checkout', '-q', '--detach', 'refs/remotes/origin/main')
+        shutil.rmtree(work)
+        self.assertRefused(self.verify(), '1 local commit(s) are not on the remote')
 
     def test_a_commit_an_admin_file_names(self):
         work, admin = self.inside()
@@ -489,6 +497,44 @@ class NestedWorktrees(Base):
         git(work, 'add', 'a.txt')
         shutil.rmtree(work)
         self.assertRefused(self.verify(), 'has staged changes')
+
+    def test_an_inside_worktree_deleted_without_a_prune_is_checked_as_prunable(self):
+        work, _ = self.inside()
+        shutil.rmtree(work)
+        report = self.verify()
+        self.assertTrue(report['removable'], report)
+        self.assertEqual(report['nested_worktrees'], {'inside': 0, 'prunable': 1})
+        self.setUp()
+        work, admin = self.inside()
+        self.commit_in(work)
+        shutil.rmtree(work)
+        self.assertRefused(self.verify(), '1 local commit(s) are not on the remote')
+        self.setUp()
+        work, _ = self.inside()
+        (work / 'a.txt').write_text('staged only\n')
+        git(work, 'add', 'a.txt')
+        shutil.rmtree(work)
+        self.assertRefused(self.verify(), 'has staged changes')
+
+    def test_a_worktree_whose_pointer_no_longer_names_its_directory(self):
+        # the registry still names the old place, so the entry looks prunable, but the directory, dirty, is in the clone
+        for ignored, moved in ((True, 'clone'), (False, 'clone'), (True, 'worktree'), (False, 'worktree')):
+            with self.subTest(ignored=ignored, moved=moved):
+                self.setUp()
+                work, _ = self.inside(ignored=ignored)
+                (work / 'only-here.txt').write_text('uncommitted\n')
+                target = self.clone
+                if moved == 'clone':
+                    target = self.base / 'moved'
+                    os.rename(self.clone, target)
+                else:
+                    os.rename(work, work.parent / 'agent-y')
+                report = self.verify(str(target))
+                self.assertFalse(report['removable'], report)
+                self.assertIn('not a whole regenerable build directory: .claude/' if ignored else
+                              'the working tree is not clean', report['reason'])  # the clone's own status refuses it
+                self.assertTrue(os.path.isfile(target / '.claude' / 'worktrees' / (
+                    'agent-x' if moved == 'clone' else 'agent-y') / 'only-here.txt'))
 
     def test_a_change_inside_a_nested_worktree_after_the_verification(self):
         self.inside()
