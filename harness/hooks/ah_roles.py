@@ -225,6 +225,28 @@ def may_handle_secrets(payload) -> bool:
     return is_top_rung(payload)
 
 
+# ---- a command-line caller (no hook payload) -------------------------------------------------------------------
+# Added for `log_backup.py ack` (context-noise workstream): a CLI run from an agent's shell has no hook payload, so
+# its session comes from the runtime's environment and its transcript from the session's project file.
+
+def cli_payload(environ=None, home=None) -> dict:
+    """A payload-shaped dict for a CLI run inside a Claude Code shell: session_id from CLAUDE_CODE_SESSION_ID and the
+    session's transcript when one is found. {} when the environment names no session."""
+    environ = os.environ if environ is None else environ
+    session = environ.get("CLAUDE_CODE_SESSION_ID") or ""
+    if not SESSION_ID.match(session):
+        return {}
+    payload = {"session_id": session}
+    try:
+        for path in (Path(home or Path.home()) / ".claude" / "projects").glob(f"*/{session}.jsonl"):
+            if path.is_file():
+                payload["transcript_path"] = str(path)
+                break
+    except OSError:
+        pass
+    return payload
+
+
 def describe(payload, home=None) -> dict:
     return {"off": harness_off(home), "model": caller_model(payload), "top_rung": is_top_rung(payload),
             "supervisor": is_supervisor(payload, home),

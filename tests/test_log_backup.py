@@ -68,7 +68,10 @@ class Freshness(Base):
         os.symlink(real, path)
         self.assertEqual(lb.classify(self.home, NOW)["state"], "missing")
 
-    def run_cli(self, *args, stdin=""):
+    def run_cli(self, *args, stdin="", remembered=False):
+        if args[:1] == ("session-start",) and not remembered:
+            # the alert is shown at most once per 24 h per machine; these cases each judge a new day
+            (self.home / ".agent-harness" / "state" / "log-backup-alert.json").unlink(missing_ok=True)
         env = {"HOME": str(self.home), "PATH": "/usr/bin:/bin"}
         return subprocess.run([sys.executable, str(TOOL), *args], input=stdin.encode(), env=env,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
@@ -165,6 +168,7 @@ class Freshness(Base):
         self.assertNotIn("pwn", text)
         self.last_ok(stamp(time.time() - 7200))
         self.assertIn("2h", json.loads(self.run_cli("session-start").stdout)["systemMessage"])
+        self.assertEqual(self.run_cli("session-start", remembered=True).stdout, b"")  # once per 24 h
 
     def test_session_start_never_fails_even_with_unreadable_home(self):
         env = {"HOME": str(self.tmp / "does-not-exist"), "PATH": "/usr/bin:/bin"}
