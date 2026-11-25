@@ -190,6 +190,70 @@ class Freshness(Base):
         self.assertIn("LOG BACKUP ALERT", json.loads(done.stdout)["systemMessage"])
 
 
+class B2Freshness(Base):
+    """goodqa#17119: a verified B2 pass counts as fresh only under the user's standing-authority marker."""
+
+    MARK = "<!-- supervisor-standing-authority:begin -->"
+
+    def rules(self, text):
+        (self.home / ".claude").mkdir(exist_ok=True)
+        (self.home / ".claude" / "CLAUDE.md").write_text(text)
+
+    def b2(self, text):
+        (self.logs / "log-backup.b2-last-ok").write_text(text)
+
+    def test_b2_is_not_counted_without_the_marker(self):
+        self.last_ok(stamp(NOW - 90000) + "\n", bulk=False)
+        self.b2(stamp(NOW - 60) + " check=0 dest=b2-archive:prunebackup/x\n")
+        self.assertEqual(lb.classify(self.home, NOW)["state"], "stale")
+        self.rules("# rules\nsupervisor-standing-authority:begin mentioned in prose only\n")
+        self.assertEqual(lb.classify(self.home, NOW)["state"], "stale")
+        self.assertEqual(lb.bulk_classify(self.home, NOW)["state"], "missing")
+
+    def test_b2_counts_with_the_marker(self):
+        self.last_ok(stamp(NOW - 90000) + "\n", bulk=False)
+        self.b2(stamp(NOW - 60) + " check=0 dest=b2-archive:prunebackup/x\n")
+        self.rules("# rules\n  %s\nbody\n" % self.MARK)
+        r = lb.classify(self.home, NOW)
+        self.assertEqual((r["state"], r["via"]), ("fresh", "b2"))
+        b = lb.bulk_classify(self.home, NOW, max_age=6 * 3600)
+        self.assertEqual((b["state"], b["via"]), ("fresh", "b2"))
+
+    def test_dropbox_fresh_stays_dropbox_and_bad_b2_markers_never_count(self):
+        self.rules(self.MARK + "\n")
+        self.last_ok(stamp(NOW - 60) + "\n", bulk=False)
+        self.assertEqual(lb.classify(self.home, NOW)["via"], "dropbox")
+        self.last_ok(stamp(NOW - 90000) + "\n", bulk=False)
+        for text in (stamp(NOW - 60) + " check=3\n", stamp(NOW - 60) + "\n", "garbage check=0",
+                     stamp(NOW + 3600) + " check=0", stamp(NOW - 3601) + " check=0"):
+            self.b2(text)
+            self.assertEqual(lb.classify(self.home, NOW)["state"], "stale", text)
+
+    def test_a_symlinked_rules_file_or_b2_marker_never_counts(self):
+        self.last_ok(stamp(NOW - 90000) + "\n", bulk=False)
+        real = self.tmp / "rules.md"
+        real.write_text(self.MARK + "\n")
+        (self.home / ".claude").mkdir()
+        os.symlink(real, self.home / ".claude" / "CLAUDE.md")
+        self.b2(stamp(NOW - 60) + " check=0\n")
+        self.assertEqual(lb.classify(self.home, NOW)["state"], "stale")
+        os.unlink(self.home / ".claude" / "CLAUDE.md")
+        self.rules(self.MARK + "\n")
+        target = self.tmp / "b2.txt"
+        target.write_text(stamp(NOW - 60) + " check=0\n")
+        (self.logs / "log-backup.b2-last-ok").unlink()
+        os.symlink(target, self.logs / "log-backup.b2-last-ok")
+        self.assertEqual(lb.classify(self.home, NOW)["state"], "stale")
+
+    def test_status_names_the_b2_line(self):
+        self.last_ok(stamp(time.time() - 60) + "\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            lb.main(["--home", str(self.home), "status"])
+        self.assertIn("b2 verified  : never", out.getvalue())
+        self.assertIn("not counted (no standing-authority marker)", out.getvalue())
+
+
 class Status(Base):
     def test_status_with_no_state_files_does_not_raise(self):
         out = io.StringIO()

@@ -35,6 +35,13 @@ LAST_SKIP = "log-backup.last-skip"
 LAST_RUN = "log-backup.last-run"
 THROTTLED = "log-backup.throttled"   # a run that stopped early on the Dropbox rate limit (goodqa#15218)
 BULK_OK = "log-backup.bulk-last-ok"
+# A verified B2 pass (goodqa#17119): "<ISO> check=0 dest=<b2-archive prefix>", written only after rclone check
+# reported 0 differences. It counts toward freshness only while ~/.claude/CLAUDE.md holds the supervisor
+# standing-authority marker (the user's rule that a B2 copy may stand in for Dropbox); without it nothing is
+# removed on the strength of a B2 copy, and status says the B2 pass is not counted.
+B2_OK = "log-backup.b2-last-ok"
+B2_AUTHORITY_MARKER = "<!-- supervisor-standing-authority:begin -->"
+MAX_RULES_BYTES = 1 << 20
 FIRST_RUN = "log-backup.first-run"
 BULK_MAX_AGE_SECONDS = 6 * 3600
 LOCK_DIR = "log-backup.lock.d"
@@ -77,10 +84,50 @@ def parse_stamp(text: str | None) -> float | None:
         return None
 
 
+def b2_counts(home: Path) -> bool:
+    """True when ~/.claude/CLAUDE.md (a regular file, not followed through a symlink) has the marker on a line."""
+    try:
+        fd = os.open(home / ".claude" / "CLAUDE.md", os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return False
+    try:
+        import stat
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return False
+        data = os.read(fd, MAX_RULES_BYTES).decode("utf-8", "replace")
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+    return any(line.strip() == B2_AUTHORITY_MARKER for line in data.splitlines())
+
+
+def b2_classify(home: Path, now: float | None = None, max_age: int = MAX_AGE_SECONDS) -> dict:
+    """State of the last verified B2 pass, by the same rules as last-ok; a marker without check=0 is invalid."""
+    text = read_small(logs_dir(home) / B2_OK)
+    if text is not None and "check=0" not in text.split():
+        return {"state": "invalid", "age": None}
+    return _stamp_state(text, now, max_age)
+
+
+def _with_b2(result: dict, home: Path, now, max_age) -> dict:
+    """A tier that is not fresh is fresh via B2 when a verified B2 pass is fresh and the user's marker allows it."""
+    if result["state"] == "fresh" or not b2_counts(home):
+        return dict(result, via="dropbox")
+    b2 = b2_classify(home, now, max_age)
+    if b2["state"] == "fresh":
+        return dict(b2, via="b2")
+    return dict(result, via="dropbox")
+
+
 def classify(home: Path, now: float | None = None, max_age: int = MAX_AGE_SECONDS) -> dict:
-    """{'state': fresh|stale|missing|invalid, 'age': seconds or None, ...}. Only last-ok can make a backup fresh."""
+    """{'state': fresh|stale|missing|invalid, 'age': seconds or None, 'via': dropbox|b2}. last-ok makes a backup
+    fresh; a verified B2 pass does too, only under the standing-authority marker (b2_counts)."""
+    return _with_b2(_stamp_state(read_small(logs_dir(home) / LAST_OK), now, max_age), home, now, max_age)
+
+
+def _stamp_state(text, now, max_age: int) -> dict:
     now = time.time() if now is None else now
-    text = read_small(logs_dir(home) / LAST_OK)
     if text is None:
         return {"state": "missing", "age": None}
     stamp = parse_stamp(text)
@@ -98,7 +145,7 @@ def printable(text: str) -> str:
     return "".join(c if c.isprintable() or c == " " else "?" for c in text.strip())
 
 
-def bulk_classify(home: Path, now: float | None = None, max_age: int = BULK_MAX_AGE_SECONDS) -> dict:
+def _bulk_dropbox(home: Path, now: float | None = None, max_age: int = BULK_MAX_AGE_SECONDS) -> dict:
     """State of the bulk tier (archived sessions, narrowed work tree). A bulk marker that never appeared is only a
     problem once the backup has been installed for longer than max_age ('pending' before that)."""
     now = time.time() if now is None else now
@@ -115,6 +162,14 @@ def bulk_classify(home: Path, now: float | None = None, max_age: int = BULK_MAX_
     if age < -FUTURE_TOLERANCE_SECONDS:
         return {"state": "invalid", "age": age}
     return {"state": "fresh" if max(age, 0.0) <= max_age else "stale", "age": max(age, 0.0)}
+
+
+def bulk_classify(home: Path, now: float | None = None, max_age: int = BULK_MAX_AGE_SECONDS) -> dict:
+    """The bulk tier, with the same conditional B2 rule as classify."""
+    result = _bulk_dropbox(home, now, max_age)
+    if result["state"] == "pending":
+        return dict(result, via="dropbox")
+    return _with_b2(result, home, now, max_age)
 
 
 def bulk_alert_text(result: dict, max_age: int = BULK_MAX_AGE_SECONDS) -> str:
@@ -276,6 +331,10 @@ def cmd_status(args) -> int:
     print(f"last success : {printable(read_small(logs / LAST_OK) or 'never')} (age {human_age(result['age'])}, {result['state']})")
     bulk = bulk_classify(args.home)
     print(f"bulk success : {printable(read_small(logs / BULK_OK) or 'never')} (age {human_age(bulk['age'])}, {bulk['state']}; limit {BULK_MAX_AGE_SECONDS // 3600} h)")
+    b2 = b2_classify(args.home)
+    counted = "counted (standing-authority marker present)" if b2_counts(args.home) else "not counted (no standing-authority marker)"
+    print(f"b2 verified  : {printable(read_small(logs / B2_OK) or 'never')} ({b2['state']}; {counted}; "
+          f"fresh via {result['via']}, bulk via {bulk['via']})")
     print(f"last run     : {printable(read_small(logs / LAST_RUN) or 'never')}")
     print(f"last skipped : {printable(read_small(logs / LAST_SKIP) or 'never')} (a skipped run is not a backup)")
     print(f"throttled    : {printable(read_small(logs / THROTTLED) or 'never')} (a run that stopped early on the Dropbox rate limit)")
