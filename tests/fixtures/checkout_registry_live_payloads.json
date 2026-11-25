@@ -1,0 +1,92 @@
+{
+ "main_pretool_clone": {
+  "cwd": "/HOME/live/src",
+  "effort": {
+   "level": "medium"
+  },
+  "hook_event_name": "PreToolUse",
+  "permission_mode": "default",
+  "prompt_id": "prompt-1",
+  "scratchpad_dir": "/HOME/.agent-harness/scratch/claude-501/-HOME-live-src/session-1/scratchpad",
+  "session_id": "session-1",
+  "tool_input": {
+   "command": "git clone /HOME/live/src /HOME/live/c-main",
+   "description": "Clone repo into c-main"
+  },
+  "tool_name": "Bash",
+  "tool_use_id": "tool-2",
+  "transcript_path": "/HOME/.claude/projects/-HOME-live-src/session-1.jsonl"
+ },
+ "source": "AC-7 live run on the Mac, 2026-11-24, Claude Code hooks via --settings; redacted by tests/live/checkout_registry_live.py and trimmed by .inv-test/make_live_fixture.py",
+ "subagent_posttool": {
+  "agent_id": "a15",
+  "agent_type": "general-purpose",
+  "cwd": "/HOME/live/src/.claude/worktrees/agent-a15",
+  "duration_ms": 597,
+  "effort": {
+   "level": "medium"
+  },
+  "hook_event_name": "PostToolUse",
+  "permission_mode": "default",
+  "prompt_id": "prompt-1",
+  "scratchpad_dir": "/HOME/.agent-harness/scratch/claude-501/-HOME-live-src/session-13/scratchpad",
+  "session_id": "session-13",
+  "tool_input": {
+   "command": "pwd",
+   "description": "Print working directory"
+  },
+  "tool_name": "Bash",
+  "tool_response": "(dropped)",
+  "tool_use_id": "tool-16",
+  "transcript_path": "/HOME/.claude/projects/-HOME-live-src/session-13.jsonl"
+ },
+ "subagent_pretool_clone": {
+  "agent_id": "a10",
+  "agent_type": "general-purpose",
+  "cwd": "/HOME/live/src",
+  "effort": {
+   "level": "medium"
+  },
+  "hook_event_name": "PreToolUse",
+  "permission_mode": "default",
+  "prompt_id": "prompt-1",
+  "scratchpad_dir": "/HOME/.agent-harness/scratch/claude-501/-HOME-live-src/session-8/scratchpad",
+  "session_id": "session-8",
+  "tool_input": {
+   "command": "git clone /HOME/live/src /HOME/live/c-sub",
+   "description": "Clone source repo into c-sub"
+  },
+  "tool_name": "Bash",
+  "tool_use_id": "tool-11",
+  "transcript_path": "/HOME/.claude/projects/-HOME-live-src/session-8.jsonl"
+ },
+ "subagent_start": {
+  "agent_id": "a15",
+  "agent_type": "general-purpose",
+  "cwd": "/HOME/live/src/.claude/worktrees/agent-a15",
+  "hook_event_name": "SubagentStart",
+  "prompt_id": "prompt-1",
+  "scratchpad_dir": "/HOME/.agent-harness/scratch/claude-501/-HOME-live-src/session-13/scratchpad",
+  "session_id": "session-13",
+  "transcript_path": "/HOME/.claude/projects/-HOME-live-src/session-13.jsonl"
+ },
+ "subagent_stop": {
+  "agent_id": "a15",
+  "agent_transcript_path": "/HOME/.claude/projects/-HOME-live-src/session-13/subagents/agent-a15.jsonl",
+  "agent_type": "general-purpose",
+  "background_tasks": [],
+  "cwd": "/HOME/live/src/.claude/worktrees/agent-a15",
+  "effort": {
+   "level": "medium"
+  },
+  "hook_event_name": "SubagentStop",
+  "last_assistant_message": "(dropped)",
+  "permission_mode": "default",
+  "prompt_id": "prompt-1",
+  "scratchpad_dir": "/HOME/.agent-harness/scratch/claude-501/-HOME-live-src/session-13/scratchpad",
+  "session_crons": [],
+  "session_id": "session-13",
+  "stop_hook_active": false,
+  "transcript_path": "/HOME/.claude/projects/-HOME-live-src/session-13.jsonl"
+ }
+}

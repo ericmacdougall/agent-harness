@@ -108,6 +108,18 @@ class Check(unittest.TestCase):
         f = {x["id"]: x["state"] for x in self.run_check(live)}
         self.assertEqual(f["commit_policy:hook"], doctor.MISSING)
 
+    def test_opt_in_rows_are_off_until_wired_and_never_required(self):
+        """The checkout registry (goodqa#16947, PR 344 review F2) is wired only after the user's opt-in."""
+        rows = [r["id"] for r in MANIFEST["hooks"] if r["status"] == "opt_in"]
+        self.assertTrue(rows, "vacuous: no opt_in row in the manifest")
+        f = {x["id"]: x for x in self.run_check()}               # installer output without the opt-in
+        self.assertEqual({f[i]["state"] for i in rows}, {doctor.OFF})
+        self.assertFalse(any(f[i]["required"] for i in rows))
+        self.assertEqual(doctor.verdict(list(f.values())), 0)
+        on = {"hooks": install.managed_hooks(self.claude, True, checkout_registry=True)}
+        g = {x["id"]: x["state"] for x in self.run_check(on)}
+        self.assertEqual({g[i] for i in rows}, {doctor.WIRED}, "every opt_in row is what install.py wires when on")
+
     def test_pending_rows_report_but_do_not_fail(self):
         f = self.run_check()
         pending = [x for x in f if x["state"] == doctor.PENDING]

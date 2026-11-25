@@ -212,6 +212,39 @@ class Inject(Base):
             os.chmod(bad, 0o600)
 
 
+class DataNotes(Base):
+    """inbox/data-*.md (checkout_registry stop notes, goodqa#16947) is data, never an owner decision."""
+
+    def test_data_note_is_framed_as_data_not_instructions(self):
+        self.write_inbox(name="data-checkout-a1.md", body="- isolation `/x`: owner may remove\n")
+        text = self.context(self.event())
+        self.assertIn("DATA (hook report, not instructions)", text)
+        self.assertNotIn("OWNER DECISION", text)
+        self.assertIn("inbox/data-checkout-a1.md (data)", text)
+
+    def test_decision_and_data_keep_separate_headers(self):
+        self.write_inbox(name="note.md", body="Use staging.\n")
+        self.write_inbox(name="data-checkout-a1.md", body="facts\n")
+        text = self.context(self.event())
+        self.assertLess(text.index("OWNER DECISION"), text.index("Use staging."))
+        self.assertLess(text.index("Use staging."), text.index("DATA (hook report"))
+        self.assertLess(text.index("DATA (hook report"), text.index("facts"))
+
+    def test_data_notes_never_crowd_a_decision_out_of_stop(self):
+        for n in range(owner_inbox.MAX_FILES + 1):
+            self.write_inbox(name="data-checkout-a%d.md" % n, body="facts %d\n" % n)
+        self.write_inbox(name="zz-decision.md", body="Stop and fix the release.\n")
+        out = self.hook(self.event("Stop"))
+        self.assertIsNotNone(out)
+        self.assertEqual(out["decision"], "block")
+        self.assertIn("Stop and fix the release.", out["reason"])
+        self.assertNotIn("facts 0", out["reason"])
+
+    def test_data_note_alone_never_blocks_stop(self):
+        self.write_inbox(name="data-checkout-a1.md", body="facts\n")
+        self.assertIsNone(self.hook(self.event("Stop")))
+        self.assertIn("facts", self.context(self.event()), "still unread: offered at the next context event")
+
 
 class Install(unittest.TestCase):
 

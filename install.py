@@ -40,6 +40,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "dropped_gate.py", "ask_reminders.py",  # dropped-owner gate and ask reminders (goodqa#14791)
          "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py",  # Hawkeye ports (goodqa#14908)
          "copy_hygiene.py", "lifecycle_cleanup.py",  # reusable copies and scoped completed-task cleanup
+         "checkout_registry.py",  # hook-written ownership rows for the checkouts agents create (goodqa#16947)
          "backup_watch.py", "kimi_review.py", "installer_scan.py",
          "trivy_gate.py",  # pinned Trivy scan for deliver prepare --scan (goodqa#15295)
          "mc_chat.py", "mc_inbox.py",  # Mission Control chat store and inbox CLI/hook (goodqa#15585)
@@ -103,7 +104,8 @@ def managed_scripts(claude: Path) -> set[str]:
             for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py",
                          "command_guard_hook.py", "kill_guard.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py", "log_backup.py", "bg_lint.py",
                          "dropped_gate.py", "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py",
-                         "mc_inbox.py", "owner_inbox.py", "mission_gate.py", "status_truth.py", "idle_guard.py", "copy_hygiene.py")}
+                         "mc_inbox.py", "owner_inbox.py", "mission_gate.py", "status_truth.py", "idle_guard.py", "copy_hygiene.py",
+                         "checkout_registry.py")}
 
 
 # Every agent type: a narrower matcher left general-purpose, claude and Explore owners without any
@@ -156,8 +158,34 @@ def kill_guard_group(claude: Path) -> dict:
         "timeout": 30, "onFailure": "block"}]}
 
 
+CHECKOUT_REGISTRY_OPT_IN = Path(".agent-harness") / "state" / "checkouts" / "enabled.json"
+
+
+def checkout_registry_enabled(claude: Path) -> bool:
+    """The checkout registry's opt-in, read exactly as checkout_registry.enabled() reads it: a private regular file
+    (ours, no group or other bits, not a link, at most 4 KiB) holding a JSON object whose "enabled" is literally true.
+    The user writes it; until then the registry hooks are not wired and nothing treats a row as ownership."""
+    path = claude.parent / CHECKOUT_REGISTRY_OPT_IN
+    try:
+        folder = os.lstat(path.parent)
+        if not stat.S_ISDIR(folder.st_mode) or folder.st_uid != os.getuid() or folder.st_mode & 0o022:
+            return False
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077 or st.st_size > 4096:
+                return False
+            data = os.read(fd, 4097)
+        finally:
+            os.close(fd)
+        value = json.loads(data.decode("utf-8")) if len(data) <= 4096 else None
+        return isinstance(value, dict) and value.get("enabled") is True
+    except (OSError, ValueError, UnicodeDecodeError):
+        return False
+
+
 def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = True,
-                  log_backup: bool = True) -> dict[str, list[dict]]:
+                  log_backup: bool = True, checkout_registry: "bool | None" = None) -> dict[str, list[dict]]:
     script = str(claude / "hooks" / "wal.py")
     policy = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "commit_policy.py"), "hook"],
               "timeout": 60, "onFailure": "block"}  # gh pr create checks GitHub and GoodQA
@@ -321,6 +349,27 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
                    "args": [str(claude / "hooks" / "owner_inbox.py"), "hook"], "timeout": 5}
     for event in ("UserPromptSubmit", "SessionStart", "Stop", "PostToolUse"):
         managed.setdefault(event, []).append({"hooks": [dict(owner_inbox)]})
+    # Checkout registry (goodqa#16947, docs/checkout-registry.md): one signed ownership row per checkout an agent
+    # creates, written only from paired Pre/Post hook payloads; SubagentStop tells the parent what is still held.
+    # Never blocks, never prints; fails open, so no onFailure. Each timeout is above the hook's own budget (git calls
+    # 5 s each, the stop verdict 15 s in all); no hook starts an ssh (remote rows are a later PR).
+    # OPT-IN (PR 344 review F2): wired only when the user has turned the registry on (checkout_registry_enabled).
+    if checkout_registry is None:
+        checkout_registry = checkout_registry_enabled(claude)
+    if not checkout_registry:
+        return managed
+    registry = str(claude / "hooks" / "checkout_registry.py")
+
+    def registry_hook(event, timeout):
+        return {"type": "command", "command": "python3", "args": [registry, "hook", event], "timeout": timeout}
+    managed.setdefault("PreToolUse", []).append({"matcher": ".*", "hooks": [registry_hook("pretool", 10)]})
+    for event, verb in (("PostToolUse", "posttool"), ("PostToolUseFailure", "posttool-failure"),
+                        ("PermissionDenied", "denied")):
+        managed.setdefault(event, []).append({"matcher": "Bash", "hooks": [registry_hook(verb, 10)]})
+    managed.setdefault("SubagentStart", []).append({"matcher": SUBAGENT_MATCHER,
+                                                     "hooks": [registry_hook("subagent-start", 20)]})
+    managed.setdefault("SubagentStop", []).append({"matcher": SUBAGENT_MATCHER,
+                                                    "hooks": [registry_hook("subagent-stop", 20)]})
     return managed
 
 

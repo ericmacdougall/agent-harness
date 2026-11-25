@@ -1,6 +1,6 @@
 {
  "schema": 1,
- "note": "status installed = required on every listed flavor; pending = owner PR not merged, reported NOT-ENFORCED. tests/test_doctor.py fails when a pending row's script already ships in harness/hooks (promote it and make the installer wire it). known_gap marks a shipped script that one flavor does not wire yet; it names the batch that fixes it.",
+ "note": "status installed = required on every listed flavor; pending = owner PR not merged, reported NOT-ENFORCED; opt_in = wired only after the user's opt-in, reported OFF until then and never required. tests/test_doctor.py fails when a pending row's script already ships in harness/hooks (promote it and make the installer wire it). known_gap marks a shipped script that one flavor does not wire yet; it names the batch that fixes it.",
  "hooks": [
   {
    "id": "wal:session",
@@ -998,6 +998,100 @@
    ],
    "status": "installed",
    "rules": []
+  },
+  {
+   "id": "checkout_registry:pretool",
+   "script": "checkout_registry.py",
+   "arg": "hook",
+   "event": "PreToolUse",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "opt_in",
+   "rules": []
+  },
+  {
+   "id": "checkout_registry:posttool",
+   "script": "checkout_registry.py",
+   "arg": "hook",
+   "event": "PostToolUse",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "opt_in",
+   "rules": []
+  },
+  {
+   "id": "checkout_registry:posttool-failure",
+   "script": "checkout_registry.py",
+   "arg": "hook",
+   "event": "PostToolUseFailure",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "opt_in",
+   "rules": []
+  },
+  {
+   "id": "checkout_registry:denied",
+   "script": "checkout_registry.py",
+   "arg": "hook",
+   "event": "PermissionDenied",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "opt_in",
+   "rules": []
+  },
+  {
+   "id": "checkout_registry:subagent-start",
+   "script": "checkout_registry.py",
+   "arg": "hook",
+   "event": "SubagentStart",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "opt_in",
+   "rules": []
+  },
+  {
+   "id": "checkout_registry:subagent-stop",
+   "script": "checkout_registry.py",
+   "arg": "hook",
+   "event": "SubagentStop",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "opt_in",
+   "rules": []
+  },
+  {
+   "id": "checkout_registry:codex",
+   "script": "checkout_registry.py",
+   "arg": "hook",
+   "event": "PreToolUse",
+   "tools": [
+    "Bash"
+   ],
+   "flavors": [
+    "codex"
+   ],
+   "status": "pending",
+   "owner": "stream D (goodqa#16947)",
+   "rules": [],
+   "known_gap": "Codex has no PostToolUse, so Codex checkouts get no ownership rows (docs/checkout-registry.md)"
   }
  ]
 }
