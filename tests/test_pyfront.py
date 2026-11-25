@@ -164,6 +164,9 @@ SUBCOMMAND = {"wal.py": "wal", "commit_policy.py": "commit-policy", "spec_flow.p
               "command_guard_hook.py": "command-guard", "kill_guard.py": "kill-guard", "tier_gate.py": "tier-gate", "merge_gate.py": "merge-gate"}
 
 
+FAIL_OPEN = ("command_guard_hook.py", "kill_guard.py", "merge_gate.py")
+
+
 class GateTable(unittest.TestCase):
     """Every hook an installer registers as blocking is a fail-closed gate in the Go binary (gates.json)."""
 
@@ -201,6 +204,9 @@ class GateTable(unittest.TestCase):
                     argv = install_codex.command_argv(hook["command"])
                     if Path(argv[0]).name in ("heavy_job_guard.py", "owner_inbox.py"):
                         continue  # advisory by design: they fail open and never block (goodqa#14817), so no gate
+                    if Path(argv[0]).name in FAIL_OPEN:
+                        self.assertNotIn(SUBCOMMAND[Path(argv[0]).name], GATES)
+                        continue  # they refuse from inside but a crash allows (2026-11-24), so no gate
                     self.assert_gate(argv)
                     checked += 1
         self.assertGreaterEqual(checked, 3)

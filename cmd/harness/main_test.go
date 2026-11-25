@@ -59,8 +59,9 @@ func TestPanicIsRecovered(t *testing.T) {
 		{[]string{"deliver", "prepare"}, 1},
 		{[]string{"commit-policy", "hook"}, 2},
 		{[]string{"wal", "pretool"}, 2},
-		{[]string{"command-guard", "hook"}, 2},
-		{[]string{"kill-guard", "hook"}, 2},
+		{[]string{"command-guard", "hook"}, 1},
+		{[]string{"kill-guard", "hook"}, 1},
+		{[]string{"merge-gate", "hook"}, 1},
 		{[]string{"wal", "--verbose", "prompt"}, 2},
 		{[]string{"wal", "session"}, 1},
 	}
@@ -74,14 +75,14 @@ func TestPanicIsRecovered(t *testing.T) {
 }
 
 func TestGateTable(t *testing.T) {
-	for sub, verbs := range map[string][]string{"command-guard": {"hook"}, "kill-guard": {"hook"}, "commit-policy": {"hook"}, "merge-gate": {"hook"}, "spec-flow": {"hook"}, "tier-gate": {"hook"}, "wal": {"hook", "prompt", "pretool"}} {
+	for sub, verbs := range map[string][]string{"commit-policy": {"hook"}, "spec-flow": {"hook"}, "tier-gate": {"hook"}, "wal": {"hook", "prompt", "pretool"}} {
 		for _, v := range verbs {
 			if !isGate(sub, []string{v}) {
 				t.Errorf("%s %s is not a gate", sub, v)
 			}
 		}
 	}
-	for _, args := range [][]string{{"wal", "session"}, {"wal", "subagent"}, {"commit-policy", "check-message"}, {"deliver", "hook"}, {"tier-gate", "start"}, {"tier-gate", "stop"}} {
+	for _, args := range [][]string{{"wal", "session"}, {"wal", "subagent"}, {"commit-policy", "check-message"}, {"deliver", "hook"}, {"tier-gate", "start"}, {"tier-gate", "stop"}, {"command-guard", "hook"}, {"kill-guard", "hook"}, {"merge-gate", "hook"}} {
 		if isGate(args[0], args[1:]) {
 			t.Errorf("%v must not be a gate", args)
 		}
