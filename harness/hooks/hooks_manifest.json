@@ -618,18 +618,6 @@
    "rules": []
   },
   {
-   "id": "ledger-reminder:UserPromptSubmit",
-   "script": "ledger_reminder.py",
-   "arg": null,
-   "event": "UserPromptSubmit",
-   "tools": [],
-   "flavors": [
-    "claude"
-   ],
-   "status": "installed",
-   "rules": []
-  },
-  {
    "id": "bg_lint:pretool",
    "script": "bg_lint.py",
    "arg": null,
@@ -881,18 +869,6 @@
    ]
   },
   {
-   "id": "mc_inbox:stop",
-   "script": "mc_inbox.py",
-   "arg": "hook",
-   "event": "Stop",
-   "tools": [],
-   "flavors": [
-    "claude"
-   ],
-   "status": "installed",
-   "rules": []
-  },
-  {
    "id": "mc_inbox:prompt",
    "script": "mc_inbox.py",
    "arg": "hook",
@@ -921,18 +897,6 @@
    "script": "status_truth.py",
    "arg": "session-start",
    "event": "SessionStart",
-   "tools": [],
-   "flavors": [
-    "claude"
-   ],
-   "status": "installed",
-   "rules": []
-  },
-  {
-   "id": "status-truth:stop",
-   "script": "status_truth.py",
-   "arg": "stop",
-   "event": "Stop",
    "tools": [],
    "flavors": [
     "claude"
@@ -971,18 +935,6 @@
    "flavors": [
     "claude",
     "codex"
-   ],
-   "status": "installed",
-   "rules": []
-  },
-  {
-   "id": "owner_inbox:stop",
-   "script": "owner_inbox.py",
-   "arg": "hook",
-   "event": "Stop",
-   "tools": [],
-   "flavors": [
-    "claude"
    ],
    "status": "installed",
    "rules": []

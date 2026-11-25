@@ -231,7 +231,10 @@ class InstallerTests(unittest.TestCase):
                     for event in ("SessionStart", "UserPromptSubmit")}
 
         found = entries()
+        self.assertEqual(found["UserPromptSubmit"], [])  # SessionStart only since 2026-11-24
         for event, hooks in found.items():
+            if event == "UserPromptSubmit":
+                continue
             self.assertEqual(len(hooks), 1, event)  # registered once, not duplicated by a reinstall
             self.assertNotIn("onFailure", hooks[0])
             self.assertLessEqual(hooks[0]["timeout"], 3)
@@ -264,10 +267,7 @@ class InstallerTests(unittest.TestCase):
         install(self.home, apply=True)
         self.assertEqual([e for e in self.provenance_entries() if e[0] == "Stop"], [("Stop", None, "stop-lint")])
         stop = json.loads((self.claude / "settings.json").read_text())["hooks"]["Stop"]
-        self.assertEqual([h["timeout"] for g in stop for h in g["hooks"]], [10, 15, 15, 15, 10, 30, 20, 5, 5])  # managed stop-lint replaced the manual one; dropped-owner gate, mission gate, idle guard (goodqa#15943), status truth, WAL cadence, worktree hygiene, Mission Control inbox follow
-        self.assertEqual([hook_argv(h) for g in stop for h in g["hooks"]
-                          if (hook_argv(h) or [None])[0] == str(self.claude / "hooks" / "owner_inbox.py")],
-                         [[str(self.claude / "hooks" / "owner_inbox.py"), "hook"]])
+        self.assertEqual([h["timeout"] for g in stop for h in g["hooks"]], [10, 15, 15, 15, 30, 20])  # managed stop-lint replaced the manual one; dropped-owner gate, mission gate, idle guard (goodqa#15943), WAL cadence, worktree hygiene follow
 
     def test_foreign_hook_sharing_a_group_and_users_empty_event_list_survive(self):
         script = str(self.claude / "hooks" / "provenance_hooks.py")
@@ -277,12 +277,32 @@ class InstallerTests(unittest.TestCase):
         (self.claude / "settings.json").write_text(json.dumps(mixed))
         install(self.home, apply=True, provenance=False)
         hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
-        self.assertEqual([h["command"] for g in hooks["Stop"] for h in g["hooks"]], ["other-stop", "python3", "python3", "python3", "python3", "python3", "python3", "python3", "python3"])  # foreign kept; dropped gate, mission gate, idle guard (goodqa#15943), status truth (goodqa#15754), WAL cadence, worktree hygiene, Mission Control inbox are not provenance hooks
+        self.assertEqual([h["command"] for g in hooks["Stop"] for h in g["hooks"]], ["other-stop", "python3", "python3", "python3", "python3", "python3"])  # foreign kept; dropped gate, mission gate, idle guard (goodqa#15943), WAL cadence, worktree hygiene are not provenance hooks
         self.assertTrue(any("dropped_gate.py" in str(h.get("args")) for g in hooks["Stop"] for h in g["hooks"]))
-        self.assertEqual([hook_argv(h) for g in hooks["Stop"] for h in g["hooks"]
-                          if (hook_argv(h) or [None])[0] == str(self.claude / "hooks" / "owner_inbox.py")],
-                         [[str(self.claude / "hooks" / "owner_inbox.py"), "hook"]])
         self.assertEqual(hooks["Notification"], [])  # untouched, not ours
+
+    def test_an_upgrade_removes_the_retired_registrations(self):
+        # 2026-11-24: these four no longer do anything; an existing settings.json loses them on reinstall
+        hooks_dir = self.claude / "hooks"
+        old = {"Stop": [{"hooks": [{"type": "command", "command": "python3", "args": [str(hooks_dir / name), *rest]}]}
+                        for name, rest in (("status_truth.py", ["stop"]), ("mc_inbox.py", ["hook"]),
+                                           ("owner_inbox.py", ["hook"]))],
+               "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python3",
+                                                "args": [str(hooks_dir / "ledger_reminder.py")]}]},
+                                    {"hooks": [{"type": "command", "command": "other-prompt"}]}]}
+        (self.claude / "settings.json").write_text(json.dumps({"hooks": old}))
+        install(self.home, apply=True)
+        hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
+
+        def scripts(event):
+            return [os.path.basename(hook_argv(h)[0]) for g in hooks.get(event, []) for h in g["hooks"] if hook_argv(h)]
+        for name in ("status_truth.py", "mc_inbox.py", "owner_inbox.py"):
+            self.assertNotIn(name, scripts("Stop"))
+        self.assertNotIn("ledger_reminder.py", scripts("UserPromptSubmit"))
+        self.assertIn("ledger_reminder.py", scripts("SessionStart"))
+        for name in ("status_truth.py", "mc_inbox.py", "owner_inbox.py"):
+            self.assertIn(name, scripts("UserPromptSubmit"))  # their other registrations stay
+        self.assertTrue(any(h.get("command") == "other-prompt" for g in hooks["UserPromptSubmit"] for h in g["hooks"]))
 
     def test_idle_guard_registrations_survive_reinstall_once_each(self):  # goodqa#15943 (receipt r6 F2)
         def idle_entries():

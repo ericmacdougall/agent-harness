@@ -466,7 +466,7 @@ class Install(unittest.TestCase):
         import install
         claude = Path("/h/.claude")
         groups = [g for g in install.managed_hooks(claude)["PreToolUse"]
-                  if any(str(claude / "hooks" / "prod_delete_guard.py") in (h.get("args") or []) for h in g["hooks"])]
+                  if any(str(claude / "hooks" / "prod_delete_guard.py") in install.hook_argv(h) for h in g["hooks"])]
         self.assertEqual(len(groups), 1)
         self.assertEqual(groups[0]["matcher"], pdg.MATCHER)
         self.assertNotIn("onFailure", groups[0]["hooks"][0])

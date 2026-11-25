@@ -184,7 +184,7 @@ class Install(unittest.TestCase):
         hooks = install.managed_hooks(claude)
         script = str(claude / "hooks" / "wal_cadence.py")
         for event in ("Stop", "SubagentStop"):
-            handlers = [h for g in hooks[event] for h in g["hooks"] if script in (h.get("args") or [])]
+            handlers = [h for g in hooks[event] for h in g["hooks"] if script in install.hook_argv(h)]
             self.assertEqual(len(handlers), 1, event)
             self.assertNotIn("onFailure", handlers[0])
         self.assertIn("wal_cadence.py", install.HOOKS)

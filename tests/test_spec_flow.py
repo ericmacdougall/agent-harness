@@ -1549,12 +1549,12 @@ class Install(unittest.TestCase):
         claude = Path("/tmp/claude-home/.claude")
         settings = install.merged_settings(install.merged_settings({}, claude), claude)
         pre = [h for entry in settings["hooks"]["PreToolUse"] for h in entry["hooks"]
-               if (h.get("args") or [""])[0].endswith("spec_flow.py")]
+               if (install.hook_argv(h) or [""])[0].endswith("spec_flow.py")]
         stops = [h for entry in settings["hooks"]["SubagentStop"] for h in entry["hooks"]]
         # The model ladder (tier_gate.py stop) is a second, separate SubagentStop hook; each must appear once.
-        ladder = [h for h in stops if (h.get("args") or [""])[0].endswith("tier_gate.py")]
-        dropped = [h for h in stops if (h.get("args") or [""])[0].endswith("dropped_gate.py")]  # goodqa#14791 I7
-        ported = [h for h in stops if (h.get("args") or [""])[0].endswith(("wal_cadence.py", "worktree_hygiene.py"))]
+        ladder = [h for h in stops if (install.hook_argv(h) or [""])[0].endswith("tier_gate.py")]
+        dropped = [h for h in stops if (install.hook_argv(h) or [""])[0].endswith("dropped_gate.py")]  # goodqa#14791 I7
+        ported = [h for h in stops if (install.hook_argv(h) or [""])[0].endswith(("wal_cadence.py", "worktree_hygiene.py"))]
         self.assertEqual(len(ported), 2)  # Hawkeye ports, goodqa#14908: one each
         stops = [h for h in stops if h not in ladder and h not in dropped and h not in ported]
         self.assertEqual(len(ladder), 1)

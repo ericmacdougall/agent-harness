@@ -66,7 +66,10 @@ DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report
                     # Stall-watcher answer inbox (UserPromptSubmit + SessionStart only; appended so trust positions stay).
                     'owner_inbox.py',
                     # The launcher every Codex hook runs through (the off switch), roles, and the switch itself.
-                    'ah_hook.py', 'ah_roles.py', 'ah_switch.py')
+                    'ah_hook.py', 'ah_roles.py', 'ah_switch.py',
+                    # imported by the helpers above (tests/test_shipped_modules.py walks the imports)
+                    'ah_approvals.py', 'ah_secret.py', 'ah_log_push.py', 'ah_kill.py', 'ah_ticket.py', 'ah_chat.py',
+                    'ah_chat_send.py', 'central_decisions.py', 'gq_browser.py', 'successor.py', 'worktree_hygiene.py')
 GIT_HOOK_KEY = 'agent-harness-commit-policy-codex'  # independent of the Claude install's key
 HOOK_EVENTS = ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'SubagentStart', 'Stop', 'Interrupt')
 
@@ -105,13 +108,14 @@ def policy_command(codex_home: Path, launcher: bool = True) -> str:
     return launch(codex_home, 'commit_policy.py', ' hook', launcher)
 
 
-def gate_command(codex_home: Path, launcher: bool = True) -> str:
-    """Merge gate; `|| exit 2` because a crash (exit 1) would otherwise count as allow."""
-    return launch(codex_home, 'merge_gate.py', ' hook || exit 2', launcher)
+def gate_command(codex_home: Path, launcher: bool = True, legacy: bool = False) -> str:
+    """Merge gate. Fails open since 2026-11-24: a crash allows. legacy=True gives the older `|| exit 2` form (a crash
+    blocked), which known_commands still recognises so an upgrade replaces it."""
+    return launch(codex_home, 'merge_gate.py', ' hook || exit 2' if legacy else ' hook', launcher)
 
 
 def guard_command(codex_home: Path, verb: str = ' hook', launcher: bool = True) -> str:
-    # The hook verb marks a fail-closed gate for the Go front door (cmd/harness/gates.json); the launcher ignores it.
+    # The hook verb names the gate for the Go front door (cmd/harness/gates.json); the launcher ignores it.
     return launch(codex_home, 'command_guard_hook.py', verb, launcher)
 
 
@@ -141,7 +145,8 @@ def known_commands(codex_home: Path) -> set[str]:
     for launcher in (True, False):
         out |= {managed_command(codex_home, launcher), policy_command(codex_home, launcher),
                 guard_command(codex_home, launcher=launcher), guard_command(codex_home, '', launcher),
-                gate_command(codex_home, launcher), kill_guard_command(codex_home, launcher),
+                gate_command(codex_home, launcher), gate_command(codex_home, launcher, legacy=True),
+                kill_guard_command(codex_home, launcher),
                 heavy_guard_command(codex_home, launcher), owner_inbox_command(codex_home, launcher)}
     return out
 
@@ -191,8 +196,8 @@ def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) ->
             preserved.append({'hooks': [{'type': 'command', 'command': policy, 'timeout': 60}]})
             preserved.append({'hooks': [{'type': 'command', 'command': gate, 'timeout': 60}]})
         if event == 'PreToolUse' and command_guard:
-            # Command guard for every tool (no matcher): Codex fails open, so the launcher blocks by itself, and
-            # write_stdin text typed into a running shell is never checked again by the host. Appended last:
+            # Command guard for every tool (no matcher): write_stdin text typed into a running shell is never checked
+            # again by the host. It refuses on effect and allows with a note when it cannot read a command. Appended last:
             # Codex keys hook trust by position (hooks.state "<file>:pre_tool_use:<group>:<handler>"), so adding
             # it after the existing groups keeps their trusted hashes valid (GoodQA #14590). Codex runs every
             # matching hook, so position does not change whether the guard can block.

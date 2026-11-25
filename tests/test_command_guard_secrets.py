@@ -177,7 +177,7 @@ class AnalyserFailureAllowsSecretText(Base):
         with mock.patch.object(cg.Analyzer, 'run', boom), mock.patch('sys.stderr', new=err):
             self.assertEqual(self.decide('cat ~/.ssh/id_rsa')[0], 'allow')
             self.assertEqual(self.decide('printenv')[0], 'allow')
-            self.assertEqual(self.decide('rm -rf ~/.claude/projects')[0], 'block')
+            self.assertEqual(self.decide('rm -rf ~/.claude/projects')[0], 'allow')  # unread deletion text too (2026-11-24)
         self.assertIn('allowed', err.getvalue())
 
     def test_the_budget_stop_only_warns_on_secret_text(self):
@@ -191,7 +191,7 @@ class AnalyserFailureAllowsSecretText(Base):
             launcher.write_text((HOOKS / 'command_guard_hook.py').read_text())
             (Path(tmp) / 'command_guard.py').write_text('raise SystemExit(7)\n')
             for command, want in (('cat ~/.ssh/id_rsa', 0), ('printenv', 0), ('cat ~/.config/goodqa/token', 0),
-                                  ('rm -rf ~/.claude/projects', 2)):
+                                  ('rm -rf ~/.claude/projects', 0)):
                 payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}}).encode()
                 done = subprocess.run([sys.executable, str(launcher)], input=payload, capture_output=True, timeout=60,
                                       env={'PATH': '/usr/bin:/bin', 'HOME': tmp}, check=False)

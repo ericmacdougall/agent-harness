@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""Fail-closed launcher for command_guard.py (GoodQA #14471). Registered as the PreToolUse hook command.
+"""Launcher for command_guard.py (GoodQA #14471). Registered as the PreToolUse hook command.
 
-Codex treats a crashing or timing-out hook as "allow", and Claude Code does so unless the hook entry carries
-`onFailure: block`. This launcher therefore never relies on the host: it runs the analyser in a child process with
-a watchdog, passes its answer through, and when the child crashes, cannot start, prints garbage or runs out of
-time, it allows the command with one line on stderr (harness redesign, 2026-11-24: a guard that could not read a
-command never blocks it for the words it contains, whether they name a harness location, a deletion or a secret
-source). It imports nothing outside the standard library and never imports command_guard.
+It runs the analyser in a child process with a watchdog and passes its answer through. When the child is missing,
+crashes, cannot start, prints garbage or runs out of time, it allows the command with one line on stderr (harness
+redesign, 2026-11-24: a guard that could not read a command never blocks it for the words it contains, whether they
+name a harness location, a deletion or a secret source). It imports nothing outside the standard library and never imports command_guard.
 """
 
 import json
@@ -66,7 +64,6 @@ def payload_cwd(raw):
 
 def sensitive(text, cwd=None):
     """Always False: the fallback cannot see what a command does, so it blocks nothing. Kept for callers."""
-    t = text[:4_000_000]
     return False
 
 
@@ -111,6 +108,8 @@ def main():
         return 0
     if not guarded_text(raw)[0]:
         return 0  # Read, Write, Edit, MCP...: not a shell command, and Codex sends every tool here (no matcher)
+    if not os.path.isfile(GUARD):
+        return fallback(raw, 'is missing')  # python3 exits 2 for a missing script: never pass that on as a refusal
     try:
         child = subprocess.run([sys.executable, '-I', GUARD, 'hook'], input=data, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, timeout=CHILD_TIMEOUT, check=False)

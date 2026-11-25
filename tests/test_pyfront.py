@@ -181,7 +181,7 @@ class GateTable(unittest.TestCase):
             for group in groups:
                 for hook in group["hooks"]:
                     if hook.get("onFailure") == "block":
-                        self.assert_gate(hook["args"])
+                        self.assert_gate(install.hook_argv(hook))
                         checked += 1
         self.assertGreaterEqual(checked, 3)
 
@@ -198,9 +198,9 @@ class GateTable(unittest.TestCase):
                 continue  # Codex only blocks on these events
             for group in groups:
                 for hook in group["hooks"]:
-                    argv = shlex.split(hook["command"])[1:]
-                    if Path(argv[0]).name == "heavy_job_guard.py":
-                        continue  # advisory by design: it fails open on its own errors (goodqa#14817), so it is no gate
+                    argv = install_codex.command_argv(hook["command"])
+                    if Path(argv[0]).name in ("heavy_job_guard.py", "owner_inbox.py"):
+                        continue  # advisory by design: they fail open and never block (goodqa#14817), so no gate
                     self.assert_gate(argv)
                     checked += 1
         self.assertGreaterEqual(checked, 3)

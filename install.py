@@ -53,7 +53,9 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "ahc_contracts.py", "ahc_crash.py", "ahc_migrate.py", "ahc_clock.py", "ahc_scan.py", "ahc_shadow.py", "ahc_guard.py",
          "ahc_observe.py", "ahc_w21.py", "ahc_review.py",
          "ahc_release.json",  # imported or read by ahc_runner (goodqa#16049; ahc_release.json: AC-11 preflight)
-         "ah_hook.py", "ah_roles.py", "ah_switch.py")  # the launcher every hook runs through, roles, the off switch
+         "ahc_merge.py",  # the ahc E2 sender; runs as its own OS user (goodqa#16049)
+         "ah_hook.py", "ah_roles.py", "ah_switch.py",  # the launcher every hook runs through, roles, the off switch
+         "ah_approvals.py", "ah_secret.py", "ah_log_push.py")  # approvals store, `ah secret`, `ah log-push` (2026-11-24)
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
@@ -134,27 +136,29 @@ def provenance_hook_groups(claude: Path) -> dict[str, list[dict]]:
 
 
 def merge_gate_hook(claude: Path) -> dict:
-    """Merge gate (docs/operations.md#merge-gate): blocks PR merges unless every check on the head is green.
-    It rides in the WAL pretool group, whose matcher already covers Bash and the write tools (the waiver state
-    files must not be edited by hand). Its own deadline is 40 s; onFailure block turns a crash into a block."""
+    """Merge gate (docs/operations.md#merge-gate): a PR merge needs a PASS review of the head or an approval.
+    It rides in the WAL pretool group, whose matcher already covers Bash and the write tools. Its own deadline is
+    40 s. Fails open (2026-11-24): a crash or timeout allows the call, so no onFailure."""
     return {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "merge_gate.py"), "hook"],
-            "timeout": 60, "onFailure": "block"}
+            "timeout": 60}
 
 
 def command_guard_group(claude: Path) -> dict:
-    """Destructive and config-dump command guard (GoodQA #14471, docs/operations.md). The launcher blocks on its
-    own when the analyser fails; onFailure covers the launcher itself. The `hook` verb marks it a fail-closed
-    gate for the Go front door (cmd/harness/gates.json); the launcher ignores its arguments."""
+    """Destructive and config-dump command guard (GoodQA #14471, docs/operations.md). It refuses on what a command
+    does; when the analyser crashes, hangs or cannot read the command, the launcher allows it with one note
+    (2026-11-24), so no onFailure. The `hook` verb names the gate for the Go front door (cmd/harness/gates.json);
+    the launcher ignores its arguments."""
     return {"matcher": "Bash|PowerShell", "hooks": [{
         "type": "command", "command": "python3", "args": [str(claude / "hooks" / "command_guard_hook.py"), "hook"],
-        "timeout": 30, "onFailure": "block"}]}
+        "timeout": 30}]}
 
 
 def kill_guard_group(claude: Path) -> dict:
-    """Broad-kill and unowned-PID kill guard (GoodQA #14506). Its launcher fails closed on its own."""
+    """Broad-kill and unowned-PID kill guard (GoodQA #14506). It refuses on the effect of a stop; a crash or an
+    unreadable command allows (2026-11-24), so no onFailure."""
     return {"matcher": "Bash|PowerShell", "hooks": [{
         "type": "command", "command": "python3", "args": [str(claude / "hooks" / "kill_guard.py"), "hook"],
-        "timeout": 30, "onFailure": "block"}]}
+        "timeout": 30}]}
 
 
 def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = True,
@@ -257,33 +261,34 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
     if provenance:
         for event, groups in provenance_hook_groups(claude).items():
             managed.setdefault(event, []).extend(groups)
-    # Dropped-owner gate (goodqa#14791, docs/ah-query-spec.md): blocks the main agent's turn end while a DROPPED
-    # owner has no recorded disposition; bounded per problem signature; fails open on its own errors.
+    # Dropped-owner gate (goodqa#14791, docs/ah-query-spec.md): the one Stop block kept (2026-11-24), once per set of
+    # owners that stopped without a handoff and have no recorded disposition; anything else is one advisory line.
+    # Fails open on its own errors.
     managed.setdefault("Stop", []).append({"hooks": [{"type": "command", "command": "python3",
                                                        "args": [str(claude / "hooks" / "dropped_gate.py")], "timeout": 15}]})
     managed.setdefault("SubagentStop", []).append({"matcher": SUBAGENT_MATCHER, "hooks": [{
         "type": "command", "command": "python3", "args": [str(claude / "hooks" / "dropped_gate.py"), "subagent-stop"],
         "timeout": 15}]})
-    # Mission gate (goodqa#15565): blocks main's turn end while an active mission goal has no live owner, no live
-    # disposition and no done evidence. Main only, bounded per signature, silent where no goals file exists.
+    # Mission gate (goodqa#15565): one advisory line, on a change, while an active mission goal has no live owner, no
+    # live disposition and no done evidence. Never blocks; main only; silent where no goals file exists.
     managed.setdefault("Stop", []).append({"hooks": [{"type": "command", "command": "python3",
                                                        "args": [str(claude / "hooks" / "mission_gate.py")], "timeout": 15}]})
-    # Idle guard (goodqa#15943): blocks main's turn end while the session is idle with a non-user next step, and adds
-    # one reminder line after a user rejection. Main only, bounded per signature, fails open.
+    # Idle guard (goodqa#15943): one advisory line, on a change, while the session is idle with a non-user next step,
+    # and at most one reminder line per 30 min after a user rejection. Never blocks; main only; fails open.
     idle = str(claude / "hooks" / "idle_guard.py")
     managed.setdefault("Stop", []).append({"hooks": [{"type": "command", "command": "python3", "args": [idle, "stop"],
                                                        "timeout": 15}]})
     for event in ("PostToolUseFailure", "PermissionDenied", "UserPromptSubmit"):
         managed.setdefault(event, []).append({"hooks": [{"type": "command", "command": "python3",
                                                          "args": [idle, "reject"], "timeout": 5}]})
-    # Status truth (goodqa#15754): a status question gets the goal ledger, a compaction re-injects it, and main's Stop
-    # lint catches a goal-status answer that contradicts it. Mission session only; fails open; mode status_lint.
+    # Status truth (goodqa#15754): a status question gets the goal ledger and a compaction re-injects it. Mission
+    # session only; fails open. (Its Stop lint is no longer registered: 2026-11-24.)
     truth = str(claude / "hooks" / "status_truth.py")
-    for event, arg in (("UserPromptSubmit", "prompt"), ("SessionStart", "session-start"), ("Stop", "stop")):
+    for event, arg in (("UserPromptSubmit", "prompt"), ("SessionStart", "session-start")):
         managed.setdefault(event, []).append({"hooks": [{"type": "command", "command": "python3", "args": [truth, arg],
                                                          "timeout": 10}]})
-    # WAL cadence (rule W04, goodqa#14908): one bounded nudge when a big uncommitted diff has no recent WAL note.
-    # Fails open on its own errors, so no onFailure.
+    # WAL cadence (rule W04, goodqa#14908): one advisory line, once per diff, when a big uncommitted diff has no
+    # recent WAL note. Never blocks; fails open, so no onFailure.
     cadence = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "wal_cadence.py")], "timeout": 30}
     managed.setdefault("Stop", []).append({"hooks": [cadence]})
     managed.setdefault("SubagentStop", []).append({"matcher": SUBAGENT_MATCHER, "hooks": [dict(cadence)]})
@@ -307,20 +312,18 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
         managed.setdefault(event, []).append({"matcher": "Bash", "hooks": [{
             "type": "command", "command": "python3", "args": [str(claude / "hooks" / "mission_gate.py"), "posttool"],
             "timeout": 5}]})
-    # Local-ledger reminder (docs/ledger.md): rate limited and dismissible; fails open, so no onFailure.
+    # Local-ledger reminder (docs/ledger.md): SessionStart only (2026-11-24), rate limited and dismissible; fails open.
     reminder = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "ledger_reminder.py")], "timeout": 3}
-    for event in ("SessionStart", "UserPromptSubmit"):
-        managed.setdefault(event, []).append({"hooks": [reminder]})
+    managed.setdefault("SessionStart", []).append({"hooks": [reminder]})
     # Mission Control chat (goodqa#15585, docs/mission-control.md): acts only for the session registered with
-    # `mc_inbox.py wait`; its output is a fixed pointer, never dashboard text; fails open, so no onFailure.
+    # `mc_inbox.py wait`; its output is a fixed pointer, never dashboard text; never blocks; fails open.
     inbox = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "mc_inbox.py"), "hook"], "timeout": 5}
-    for event in ("Stop", "UserPromptSubmit"):
-        managed.setdefault(event, []).append({"hooks": [dict(inbox)]})
-    # Stall-watcher / owner decision inbox: inject unread OWNER-DECISION-*.md and inbox/ notes
-    # as additionalContext (or a one-time Stop block), then mark them read. Fails open, so no onFailure.
+    managed.setdefault("UserPromptSubmit", []).append({"hooks": [dict(inbox)]})
+    # Stall-watcher / owner decision inbox: inject unread OWNER-DECISION-*.md and inbox/ notes as additionalContext,
+    # then mark them read. Never blocks; fails open, so no onFailure.
     owner_inbox = {"type": "command", "command": "python3",
                    "args": [str(claude / "hooks" / "owner_inbox.py"), "hook"], "timeout": 5}
-    for event in ("UserPromptSubmit", "SessionStart", "Stop", "PostToolUse"):
+    for event in ("UserPromptSubmit", "SessionStart", "PostToolUse"):
         managed.setdefault(event, []).append({"hooks": [dict(owner_inbox)]})
     return through_launcher(managed, claude)
 
@@ -1260,23 +1263,11 @@ def local_profile_status(home: Path, policy_dir: Path | None = None) -> str:
 
 
 def command_guard_status(enabled: bool, runner=None) -> str:
-    """Claude Code before 2.1.295 ignores onFailure, so fail-closed then rests on the launcher alone."""
+    """One install line. The guard fails open since 2026-11-24, so the Claude Code version (onFailure) no longer
+    matters; `runner` is kept for callers."""
     if not enabled:
         return "command guard: not registered (--no-command-guard)"
-    import subprocess
-    try:
-        out = runner() if runner else subprocess.run(["claude", "--version"], capture_output=True, text=True,
-                                                     timeout=20).stdout
-    except (OSError, subprocess.SubprocessError):
-        out = ""
-    found = re.search(r"(\d+)\.(\d+)\.(\d+)", out or "")
-    version = tuple(int(x) for x in found.groups()) if found else None
-    if version is None:
-        return "command guard: registered; Claude Code version unknown, fail-closed rests on the launcher"
-    if version < (2, 1, 295):
-        return ("command guard: registered; WARNING Claude Code %s predates onFailure (2.1.295), fail-closed "
-                "rests on the launcher alone" % ".".join(map(str, version)))
-    return "command guard: registered with onFailure block"
+    return "command guard: registered (refuses on effect; allows with a note when it cannot read a command)"
 
 
 def log_backup_enabled(home: Path, flag) -> bool:

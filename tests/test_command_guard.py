@@ -382,16 +382,16 @@ class FailureModeTests(Fixture):
         self.assertEqual(self.decide('cat ~/{' + creds + '}/credentials')[0], 'block')
         self.assertEqual(self.decide('touch {' + ','.join('f%d' % k for k in range(40)) + '}')[0], 'allow')
 
-    def test_internal_error_fails_closed_only_for_secret_text(self):
-        """Red-team F6, revised 2026-11-24: an analyser bug fails closed for secret sources only; a deletion the guard
-        could not read is allowed (with a note), never blocked for its words."""
+    def test_internal_error_allows_with_a_note(self):
+        """Red-team F6, revised 2026-11-24: an analyser bug never refuses a command for its words, whether they name a
+        deletion or a secret source; the guard allows with a note."""
         original = cg.Analyzer.run
         def boom(self, *a, **k):
             raise ValueError('seeded analyser bug')
         cg.Analyzer.run = boom
         try:
             self.assertEqual(self.decide('rm -rf ~/.agent-harness/state')[0], 'allow')
-            self.assertEqual(self.decide('rclone config show')[0], 'block')
+            self.assertEqual(self.decide('rclone config show')[0], 'allow')
             self.assertEqual(self.decide('ls -la')[0], 'allow')
         finally:
             cg.Analyzer.run = original
@@ -586,7 +586,7 @@ SECRET_PAYLOAD = {'tool_name': 'Bash', 'tool_input': {'command': 'rclone config 
 
 
 class LauncherTests(unittest.TestCase):
-    """command_guard_hook.py turns an analyser crash, hang or garbage into a raw-text decision (AC-6)."""
+    """command_guard_hook.py allows, with one note, when the analyser crashes, hangs or prints garbage (2026-11-24)."""
 
     def launcher_dir(self, guard_source=None, child_timeout=None):
         tmp = tempfile.TemporaryDirectory(prefix='cg-launcher-')
@@ -617,38 +617,38 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(self.run_launcher(d, HARMLESS_PAYLOAD)[0], 0)
         self.assertEqual(self.run_launcher(d, READ_PAYLOAD)[0], 0)
 
-    def test_crashing_analyser_fails_closed_for_secret_text_only(self):
-        # 2026-11-24: a deletion the analyser could not judge is allowed with a note; secret sources still fail closed
+    def test_crashing_analyser_allows_with_a_note(self):
+        # 2026-11-24: a command the analyser could not judge is allowed with one note, for deletion and secret text alike
         d = self.launcher_dir('import sys\nraise SystemExit(7)\n')
-        code, err = self.run_launcher(d, SECRET_PAYLOAD)
-        self.assertEqual(code, 2, err)
-        code, err = self.run_launcher(d, PROTECTED_PAYLOAD)
-        self.assertEqual(code, 0, err)
-        self.assertIn('allowed', err)
-        self.assertEqual(self.run_launcher(d, EXEC_PAYLOAD)[0], 0)
+        for payload in (SECRET_PAYLOAD, PROTECTED_PAYLOAD, EXEC_PAYLOAD):
+            code, err = self.run_launcher(d, payload)
+            self.assertEqual(code, 0, err)
+            self.assertIn('allowed', err)
         self.assertEqual(self.run_launcher(d, HARMLESS_PAYLOAD)[0], 0)
         self.assertEqual(self.run_launcher(d, READ_PAYLOAD)[0], 0)
 
-    def test_missing_analyser_fails_closed(self):
+    def test_missing_analyser_allows_with_a_note(self):
         d = self.launcher_dir('')
         (d / 'command_guard.py').unlink()  # this test's own temp copy
-        self.assertEqual(self.run_launcher(d, PROTECTED_PAYLOAD)[0], 2)
+        code, err = self.run_launcher(d, PROTECTED_PAYLOAD)
+        self.assertEqual(code, 0, err)
+        self.assertIn('allowed', err)
 
-    def test_hanging_analyser_times_out_closed(self):
+    def test_hanging_analyser_times_out_open(self):
         d = self.launcher_dir('import time\ntime.sleep(30)\n', child_timeout=1.0)
         started = time.monotonic()
-        self.assertEqual(self.run_launcher(d, SECRET_PAYLOAD)[0], 2)
+        self.assertEqual(self.run_launcher(d, SECRET_PAYLOAD)[0], 0)
         self.assertEqual(self.run_launcher(d, PROTECTED_PAYLOAD)[0], 0)
         self.assertLess(time.monotonic() - started, 30)
 
-    def test_garbage_output_fails_closed(self):
+    def test_garbage_output_allows(self):
         d = self.launcher_dir('print("not json")\n')
-        self.assertEqual(self.run_launcher(d, SECRET_PAYLOAD)[0], 2)
+        self.assertEqual(self.run_launcher(d, SECRET_PAYLOAD)[0], 0)
         self.assertEqual(self.run_launcher(d, PROTECTED_PAYLOAD)[0], 0)
 
-    def test_unparsable_payload_is_probed(self):
+    def test_unparsable_payload_allows(self):
         d = self.launcher_dir('import sys\nraise SystemExit(7)\n')
-        self.assertEqual(self.run_launcher(d, b'{not json rclone config show')[0], 2)
+        self.assertEqual(self.run_launcher(d, b'{not json rclone config show')[0], 0)
         self.assertEqual(self.run_launcher(d, b'{not json rm -rf ~/.claude/wals')[0], 0)
 
     def test_large_non_shell_payload_is_fast(self):
@@ -1316,13 +1316,13 @@ class GuardCompositionTests(unittest.TestCase):
         sys.path.insert(0, str(ROOT))
         import install
         groups = install.managed_hooks(Path('/home/u/.claude'))['PreToolUse']
-        scripts = [[Path((h.get('args') or [''])[0]).name for h in g['hooks']] for g in groups]
+        scripts = [[Path((install.hook_argv(h) or [''])[0]).name for h in g['hooks']] for g in groups]
         self.assertEqual(scripts[0], ['command_guard_hook.py'])
-        self.assertEqual(groups[0]['hooks'][0]['onFailure'], 'block')
+        self.assertNotIn('onFailure', groups[0]['hooks'][0])  # fails open since 2026-11-24
         heavy = [g for g, s in zip(groups, scripts) if 'heavy_job_guard.py' in s]
         self.assertEqual(len(heavy), 1)
-        self.assertEqual([Path(h['args'][0]).name for h in heavy[0]['hooks']], ['heavy_job_guard.py'])
-        self.assertNotIn('onFailure', heavy[0]['hooks'][0])  # fail-open by design (#53); the guard stays fail-closed
+        self.assertEqual([Path(install.hook_argv(h)[0]).name for h in heavy[0]['hooks']], ['heavy_job_guard.py'])
+        self.assertNotIn('onFailure', heavy[0]['hooks'][0])  # fail-open by design (#53)
 
 
 class InstallTests(unittest.TestCase):
@@ -1337,7 +1337,7 @@ class InstallTests(unittest.TestCase):
 
     def guard_groups(self, settings):
         return [g for g in settings['hooks'].get('PreToolUse', [])
-                if any('command_guard_hook.py' in ' '.join(h.get('args') or [h.get('command', '')])
+                if any('command_guard_hook.py' in ' '.join(self.install.hook_argv(h) or [h.get('command', '')])
                        for h in g.get('hooks', []))]
 
     def test_claude_registration_and_rollback(self):
@@ -1346,7 +1346,7 @@ class InstallTests(unittest.TestCase):
         groups = self.guard_groups(settings)
         self.assertEqual(len(groups), 1)
         hook = groups[0]['hooks'][0]
-        self.assertEqual(hook['onFailure'], 'block')
+        self.assertNotIn('onFailure', hook)  # fails open since 2026-11-24
         self.assertEqual(hook['timeout'], 30)
         self.assertIn('Bash', groups[0]['matcher'])
         again = self.install.merged_settings(settings, claude)
@@ -1374,7 +1374,7 @@ class InstallTests(unittest.TestCase):
         # cmd/harness/gates.json lists command-guard as a fail-closed gate only when the hook verb is present.
         claude, codex = self.home / '.claude', self.home / '.codex'
         hook = self.guard_groups(self.install.merged_settings({}, claude))[0]['hooks'][0]
-        self.assertEqual(hook['args'][1:], ['hook'])
+        self.assertEqual(self.install.hook_argv(hook)[1:], ['hook'])
         guard = self.install_codex.guard_command(codex)
         self.assertTrue(guard.endswith(' hook'))
         legacy = {'hooks': {'PreToolUse': [{'hooks': [{'type': 'command', 'timeout': 30,
@@ -1405,9 +1405,10 @@ class InstallTests(unittest.TestCase):
         upgraded = self.install_codex.merge_hooks({'hooks': {'PreToolUse': old}}, codex)['hooks']['PreToolUse']
         self.assertEqual(upgraded, with_guard)
 
-    def test_old_claude_version_warns(self):
-        self.assertIn('WARNING', self.install.command_guard_status(True, runner=lambda: '2.1.200 (Claude Code)'))
-        self.assertNotIn('WARNING', self.install.command_guard_status(True, runner=lambda: '2.1.295 (Claude Code)'))
+    def test_status_line_no_longer_depends_on_the_claude_version(self):
+        # onFailure no longer matters (the guard fails open), so an old Claude Code is not a warning
+        self.assertNotIn('WARNING', self.install.command_guard_status(True, runner=lambda: '2.1.200 (Claude Code)'))
+        self.assertIn('registered', self.install.command_guard_status(True))
         self.assertIn('not registered', self.install.command_guard_status(False))
 
 
