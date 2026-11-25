@@ -77,6 +77,10 @@ DEFAULT_POLICY = {
                             '{home}/.codex/history*', '{home}/.agent-harness/state',
                             '{home}/.agent-harness/codex-wals', '{home}/.claude/.credentials.json',
                             '{home}/.codex/auth.json',
+                            # self-serve: delete and overwrite protection for the policy, keys, enabler, journals, kill-switch
+                            '{home}/.agent-harness/policy/self-serve*', '{home}/.agent-harness/policy/disabled',
+                            '{home}/.agent-harness/private/self-serve', '{home}/.agent-harness/work/self-serve',
+                            '{home}/.agent-harness/bin/ah_enable_self_serve*', '{home}/.agent-harness/bin/enable-agent-ops*',
                             # the guard itself: deleting or replacing it would switch the protection off
                             '{home}/.claude/hooks/command_guard*', '{home}/.claude/hooks/redact.py',
                             '{home}/.claude/hooks/safe_input.py',
@@ -117,7 +121,14 @@ DEFAULT_POLICY = {
     # path suffixes (/-separated, case-folded) of checkouts a timer or service builds from; a directory holding a
     # `.harness-owned` file is owned too. goodqa#15307
     'owned_checkouts': [],
+    # Self-serve (GoodQA goodqa#16753): the signed policy, its pinned public key, the signing key, the installed enabler
+    # and the run journals. Agents never write or delete these (patterns match a path or anything below it). The
+    # kill-switch policy/disabled is NOT here: an agent may create it (fail-safe revoke), see protected_log_roots.
+    'self_serve_files': ['{home}/.agent-harness/policy/self-serve*', '{home}/.agent-harness/private/self-serve',
+                         '{home}/.agent-harness/bin/ah_enable_self_serve*', '{home}/.agent-harness/bin/enable-agent-ops*',
+                         '{home}/.agent-harness/work/self-serve'],
     'credential_path_regexes': [
+        r'(^|/)\.agent-harness/private/self-serve(?:/|$)',
         r'(^|/)\.config/rclone/rclone\.conf$', r'(^|/)rclone\.conf$',
         r'(^|/)\.aws/credentials$', r'(^|/)\.aws/sso/cache/[^/]+$',
         r'(^|/)\.ssh/id_[^/]*$', r'(^|/)id_(?:rsa|dsa|ecdsa|ed25519)$',
@@ -187,7 +198,7 @@ ALWAYS_ENFORCED = (SECRET_DUMP, LOG_DELETE)
 ADDITIVE_LISTS = ('protected_log_roots', 'protected_segment_names', 'protected_file_names', 'protected_file_suffixes',
                   'protected_roots', 'keep_names', 'keep_suffixes', 'keep_segments', 'generic_homes', 'ancestor_roots',
                   'state_files', 'credential_path_regexes', 'credential_dirs', 'credential_parent_dirs', 'credential_samples',
-                  'rclone_blocked_config', 'guard_files', 'owned_checkouts')
+                  'rclone_blocked_config', 'guard_files', 'owned_checkouts', 'self_serve_files')
 
 
 def _merge(base, override):
@@ -283,6 +294,10 @@ class Compiled:
         self.ancestors = [self._segs(fmt(t, h)) for t in policy['ancestor_roots'] for h in homes]
         self.guard_globs = [fmt(t, h).casefold() for t in policy.get('guard_files', []) for h in homes]
         self.state_files = [fmt(t, h).casefold() for t in policy['state_files'] for h in homes]
+        self.self_serve = [self._segs(fmt(t, h)) for t in policy.get('self_serve_files', []) for h in homes]
+        # the signed policy folder, the key folder and the revoke flag: no mode, owner or attribute change (goodqa#16753)
+        self.perm_dirs = [self._segs(fmt(t, h)) for t in ('{home}/.agent-harness/policy', '{home}/.agent-harness/private',
+                                                          '{home}/.agent-harness/policy/disabled') for h in homes]
         # session transcripts are the record of user answers (approve-delete --no-backup reads them): Bash never
         # writes there, except memory notes under projects/<dir>/memory/
         self.transcript_roots = sorted({fmt('{home}/.claude/projects', h).casefold() for h in homes})
@@ -1344,6 +1359,51 @@ def _seg_eq(p, r):
 def _prefix_match(path_segs, root_segs):
     n = min(len(path_segs), len(root_segs))
     return all(_seg_eq(path_segs[k], root_segs[k]) for k in range(n))
+
+
+SELF_SERVE_ROUTE = ('self-serve state is changed only by the user running the enabler in their own terminal; agents use '
+                    'the sanctioned routes: `ah ops` recipes, and `ah install-files` (main agent only) for hook files. An '
+                    'agent may revoke at any time by creating ~/.agent-harness/policy/disabled, and can never re-enable')
+SELF_SERVE_TEXT = re.compile(r'\.agent-harness/(?:policy/self-serve|private/self-serve|work/self-serve|'
+                             r'bin/(?:ah_enable_self_serve|enable-agent-ops))')
+
+
+def self_serve_path(c, folded):
+    """True when the case-folded path is, or is inside, a self-serve policy, key, enabler or journal path."""
+    segs = Compiled._segs(folded)
+    return any(len(segs) >= len(root) and _prefix_match(segs, root) for root in c.self_serve)
+
+
+PERM_CMDS = {'chmod', 'chown', 'chgrp', 'chattr', 'setfacl', 'chflags', 'xattr', 'setfattr', 'lchmod', 'lchown'}
+_PERM_VERBS = r'(?:chmod|chown|chgrp|chattr|setfacl|chflags|xattr|setfattr|lchmod|fchmod|lchown|fchown)'
+# a permission verb in command position (after a separator, exec, xargs, sudo, find -exec) or as a method (os.chmod, .chmod)
+SELF_SERVE_PERM_VERB = re.compile(r'(?i)(?:(?:^|[;&|(`{\n])[ \t]*|\b(?:exec|xargs|sudo|do|then|time|nohup|env)\b[ \t]*|-exec(?:dir)?[ \t]+|'
+                                  r'\.)' + _PERM_VERBS + r'\b')
+SELF_SERVE_PERM_PATH = re.compile(r'(?i)\.agent-harness(?:/+(?:policy|private|work/self-serve|bin/(?:ah[_-]enable|enable[_-]agent))|'
+                                  r'/*(?=[\s\'";|&)]|$))')
+SELF_SERVE_PERM_WHY = ('a mode, owner or attribute change on the self-serve policy, its key, the enabler, the revoke flag or '
+                       'their folders can disable the revoke flag or widen the signed files: ' + SELF_SERVE_ROUTE)
+
+
+def self_serve_perm_target(c, folded, recursive):
+    """True when the case-folded path is, or is under, a self-serve path or the policy and key folders, or (with
+    -R) is a folder that contains them. One decision for chmod, chown, chgrp, chattr, setfacl, chflags and xattr."""
+    if self_serve_path(c, folded):
+        return True
+    segs = Compiled._segs(folded)
+    if any(len(segs) >= len(root) and _prefix_match(segs, root) for root in c.perm_dirs):
+        return True
+    return recursive and any(len(segs) < len(root) and _prefix_match(segs, root) for root in c.perm_dirs + c.self_serve)
+
+
+def self_serve_perm_refusal(command):
+    """None, or the refusal for text that changes the mode, owner or attributes of a self-serve path (the text probe:
+    it also covers find -exec and interpreter code, which the analyser resolves only for plain commands)."""
+    text = command if isinstance(command, str) else ' '.join(map(str, command))
+    flat = _unquoted(text)
+    if SELF_SERVE_PERM_VERB.search(flat) and SELF_SERVE_PERM_PATH.search(flat):
+        return SELF_SERVE_PERM_WHY
+    return None
 
 
 # Raw text that names a protected location: used for unresolved variables, substitutions and fallbacks.
@@ -4789,7 +4849,7 @@ class Analyzer:
             self.read_creds(name, args, pl, idx)
         if name in RM_CMDS or name in MV_CMDS or name in OVERWRITE_CMDS or name in (
                 'sed', 'perl', 'ruby', 'awk', 'gawk', 'rsync', 'scp', 'rclone', 'tar', 'zip', 'dd', 'truncate', 'set-content',
-                'out-file', 'curl', 'wget', 'touch', 'mkdir', 'unzip', 'bsdtar', 'gtar'):
+                'out-file', 'curl', 'wget', 'touch', 'mkdir', 'unzip', 'bsdtar', 'gtar') or name in PERM_CMDS:
             self.destructive(name, args, texts)
         if not (name in PRINT_FILE_CMDS or name in GREP_CMDS or name in EXFIL_CMDS):
             self.unlisted_cred_reader(name, args, cmd, pl, idx)
@@ -6752,6 +6812,11 @@ class Analyzer:
                      r'print\s+join\s*\([^)]*%env|\bkeys\s*%env\b|print[^;]*%env\b|'
                      r'for\s*\(\s*\w+\s+in\s+environ\s*\)|getenvironmentvariables\s*\(', low):
             ctx.add(SECRET_DUMP, 'interpreter-env-dump', 'script code prints the whole environment', 'print only specific non-secret names')
+        if SELF_SERVE_TEXT.search(low.replace('\\', '/')) and re.search(
+                r',\s*(?:mode\s*=\s*)?[\'"][rbt]*[wax+][rbt+]*[\'"]|write|copy|rename|replace|echo|\bdump\s*\(|unlink|'
+                r'remove|rmtree|chmod|symlink|\btee\b|\bsed\b', low):
+            ctx.add(LOG_DELETE, 'self-serve-forgery', 'script code writes the signed self-serve policy, its key, the '
+                    'enabler or its journal', SELF_SERVE_ROUTE)
         for sample in ctx.c.state_files:
             if sample in low.replace('\\', '/') and re.search(r'open|write|copy|rename|replace|echo|dump', low):
                 ctx.add(LOG_DELETE, 'state-forgery', 'writes the delete-approval marker or key directly', 'use command_guard.py approve-delete')
@@ -7455,6 +7520,10 @@ class Analyzer:
         ctx = self.ctx
         for alt in word.all_alts() or word.alts[:32]:
             folded = norm_path(alt, ctx).casefold()
+            if self_serve_path(ctx.c, folded):
+                ctx.add(LOG_DELETE, 'self-serve-forgery', 'writes the signed self-serve policy, its key, the enabler or '
+                        'its journal directly', SELF_SERVE_ROUTE)
+                return True
             if folded in ctx.c.state_files:
                 ctx.add(LOG_DELETE, 'state-forgery', 'writes the delete-approval marker or its key directly',
                         'use command_guard.py approve-delete after the backup on ' + APPROVE_REMOTES + ' is verified')
@@ -7520,6 +7589,15 @@ class Analyzer:
                     fake.dynamic, fake.subs, fake.vars = a.dynamic, a.subs, a.vars
                     if not self.state_dest(fake):
                         self.refuse('dd of=', fake, tiers=('log', 'root', 'unknown'), need_existing=True)
+        elif name in PERM_CMDS:
+            recursive = 'R' in _flag_letters(args) or '--recursive' in _longs(args)
+            for w in nd:
+                for alt in w.all_alts() or w.alts[:32]:
+                    if self_serve_perm_target(ctx.c, norm_path(alt, ctx).casefold(), recursive):
+                        ctx.add(LOG_DELETE, 'self-serve-forgery', '%s changes the mode, owner or attributes of the '
+                                'self-serve policy, its key, the enabler, the revoke flag or their folders' % name,
+                                SELF_SERVE_ROUTE)
+                        return
         elif name in ('touch', 'mkdir'):
             for w in nd:
                 self.note_created(w)
@@ -9802,6 +9880,249 @@ def install_files_refusal(command, is_main, home=None):
     return None
 
 
+ENABLER_NAME = re.compile(r'ah[_-]enable[_-]self[_-]serve|enable[_-]agent[_-]ops')
+ENABLER_SCRIPT = re.compile(r'(?:ah[_-]enable[_-]self[_-]serve|enable[_-]agent[_-]ops)(?:\.py)?')
+ENABLER_CANDIDATES = ('ah_enable_self_serve.py', 'ah_enable_self_serve', 'ah-enable-self-serve.py', 'enable-agent-ops.py',
+                      'enable-agent-ops', 'enable_agent_ops.py')
+ENABLER_READ_ONLY = {'--status', '--help', '-h', '--dry-run'}
+# Code handed to an interpreter that reads, imports, copies or runs the enabler.
+ENABLER_CODE = re.compile(r'import|runpy|exec|eval|compile|spec_from|load_source|__main__|main\s*\(|subprocess|system|popen|'
+                          r'shutil|copy|symlink|link\s*\(|rename|replace|write|\bos\.')
+# Commands that only read, list or statically check a file: naming the enabler to them is a mention, not a run.
+ENABLER_READERS = {'grep', 'egrep', 'fgrep', 'rg', 'ag', 'cat', 'ls', 'head', 'tail', 'wc', 'less', 'more', 'file', 'stat',
+                   'shellcheck', 'sha256sum', 'shasum', 'md5', 'md5sum', 'diff', 'cmp', 'echo', 'printf', 'test', '[', 'git',
+                   'gh', 'find', 'bat', 'realpath', 'readlink', 'basename', 'dirname', 'nl', 'xxd', 'od', 'strings', 'which',
+                   'type', 'sed', 'ruff', 'black', 'flake8', 'pylint', 'mypy', 'pyflakes', 'isort', 'pycodestyle',
+                   'codespell', 'tree', 'chmod'}
+ENABLER_STATIC_MODULES = {'py_compile', 'pyflakes', 'ruff', 'black', 'flake8', 'pylint', 'mypy', 'pytest', 'unittest',
+                          'compileall', 'pycodestyle', 'isort'}
+# What a pipeline that carries the enabler may continue into: filters that cannot write a file or run what they receive.
+ENABLER_FILTERS = {'head', 'tail', 'wc', 'grep', 'egrep', 'fgrep', 'rg', 'sort', 'uniq', 'cut', 'nl', 'less', 'more', 'cat',
+                   'tr', 'column', 'sha256sum', 'shasum', 'md5', 'md5sum', 'diff', 'cmp', 'bat', 'tac', 'rev', 'fold',
+                   'expand', 'xxd', 'od', 'strings', 'sed'}
+# A quoted sentence that names the file is prose (not code) after these commands or flags: commit and PR text, notes.
+ENABLER_PROSE_VERBS = {'git', 'gh', 'echo', 'printf', 'grep', 'egrep', 'fgrep', 'rg', 'ag'}
+ENABLER_PROSE_FLAGS = {'-m', '-b', '-t', '--message', '--note', '--body', '--title', '--description', '--text', '--comment',
+                       '--reason', '--summary', '--label', '--source', '--subject'}
+# The only things allowed in front of the script when it is run read-only: a few transparent wrappers, an interpreter,
+# bare flags, numbers (timeout 5) and env assignments. Anything else (script, cp, tar, ln, a flag with a value) refuses.
+ENABLER_WRAPPERS = INSTALL_FILES_WRAPPERS | {'timeout', 'nice', 'ionice'}
+ENABLER_INTERPRETER = re.compile(r'(?:python|pypy)[0-9.]*')
+ENABLER_CODE_VERBS = re.compile(r'(?:awk|gawk|mawk|nawk|perl|ruby|node|nodejs|deno|bun|php|lua|osascript|tclsh|expect|'
+                                r'pwsh|powershell|eval|source|exec|\.)')
+ENABLER_WHY = 'self-serve enable/undo/disable/resume is user-only: ' + SELF_SERVE_ROUTE
+
+
+def _unquoted(text):
+    return re.sub(r'[\'"\\]', '', text)
+
+
+def _enabler_pieces(text):
+    """[[tokens | None, raw, before, after]] for the simple commands of `text`. `before` and `after` are the separators
+    around the piece: `; & | newline` (and their doubles), `(` for a subshell, `<(` for a process substitution and
+    `$(:VERB` for a command substitution inside the command VERB. A brace group is ignored. A multi-line text, or one that
+    does not tokenize, is split on the separators first and each piece parsed alone."""
+    if '\n' not in text:
+        try:
+            lex = shlex.shlex(re.sub(r'([<>])&', r'\1@AMP@', text), posix=True, punctuation_chars=';&|')
+            lex.whitespace = ' \t\r'
+            lex.commenters = ''
+            lex.wordchars += '=:,./~$-+@%^<>[]'
+            pieces, current, before = [], [], ''
+            for token in lex:
+                token = token.replace('@AMP@', '&')
+                if token in ('(', ')') or (token and all(ch in ';&|' for ch in token)):
+                    if current:
+                        pieces.append([current, ' '.join(current), before, token])
+                    if token == '(' and current and current[-1] in ('<', '>'):
+                        marker = '<('
+                    elif token == '(' and current and current[-1].endswith('$'):
+                        marker = '$(:' + _enabler_verb(current)[1]
+                    else:
+                        marker = token
+                    current, before = [], marker
+                elif token not in ('{', '}'):
+                    current.append(token)
+            if current:
+                pieces.append([current, ' '.join(current), before, ''])
+            return pieces
+        except ValueError:
+            pass
+    pieces, parts = [], re.split(r'([;&|\n]+)', _strip_git_heredocs(text))  # parentheses stay: in code they are calls
+    for k in range(0, len(parts), 2):
+        raw = parts[k]
+        if not raw.strip():
+            continue
+        try:
+            tokens = [t for t in shlex.split(raw, comments=False, posix=True) if t not in ('{', '}')]
+        except ValueError:
+            tokens = None
+        pieces.append([tokens, raw, parts[k - 1].strip() if k else '', parts[k + 1].strip() if k + 1 < len(parts) else ''])
+    return pieces
+
+
+def _strip_git_heredocs(text):
+    """Drop the body of a heredoc that feeds git or gh (a commit or PR message is data, never run); the body of any other
+    heredoc (python3 - <<EOF) stays, because it may be code."""
+    lines, out, i = text.split('\n'), [], 0
+    while i < len(lines):
+        out.append(lines[i])
+        found = re.search(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1", lines[i])
+        i += 1
+        if found and re.match(r'\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:git|gh)\s', lines[i - 1]):
+            while i < len(lines) and lines[i].strip() != found.group(2):
+                i += 1
+    return '\n'.join(out)
+
+
+def _enabler_mention(token, bin_ctx=False):
+    """'script' (a bare path or name of the enabler), 'text' (code, a quoted string or an assignment that holds the
+    name), 'dynamic' (a glob or a variable that can expand to it) or None. A glob counts only when it carries a literal
+    piece of the name, or the command also names ~/.agent-harness/bin (so `cp build/* out/` is not a mention)."""
+    plain = _unquoted(token)
+    pathlike = re.sub(r'^[A-Za-z_-]+=', '', plain)  # if=PATH, --file=PATH
+    if not re.search(r'[\s()\'";|&<>]', pathlike):  # a glob or a variable, not a code string
+        base = posixpath.basename(pathlike)
+        if re.search(r'[*?\[]', base) and any(fnmatch.fnmatchcase(name, base) for name in ENABLER_CANDIDATES) \
+                and (bin_ctx or re.search(r'ah[_-]|enab|serve|self|agent|ops', base)):
+            return 'dynamic'
+        bin_tail = re.split(r'\.agent-harness/+bin/', pathlike, 1)
+        if len(bin_tail) == 2 and re.search(r'[$*?\[`]', bin_tail[1]):
+            return 'dynamic'
+    base = posixpath.basename(plain)
+    if ENABLER_NAME.search(plain):
+        if re.fullmatch(r'[\w.~/+@:-]+', plain):
+            return 'script' if ENABLER_SCRIPT.fullmatch(base) else None  # test_enable_agent_ops.py: another file
+        return 'text'
+    return None
+
+
+def _writes_a_file(tokens):
+    for k, token in enumerate(tokens):
+        found = re.match(r'^(?:[0-9]*|&)>>?(.*)$', token)
+        if found:
+            target = found.group(1) or (tokens[k + 1] if k + 1 < len(tokens) else '')
+            if target and not target.startswith('&') and target != '/dev/null':
+                return True
+    return False
+
+
+def _enabler_verb(tokens):
+    start = 0
+    while start < len(tokens) and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=.*', tokens[start]):
+        start += 1
+    return start, (os.path.basename(tokens[start]).lower() if start < len(tokens) else '')
+
+
+def _enabler_piece(tokens, raw, before, bin_ctx, depth):
+    """None when this simple command does not really name the enabler; otherwise True to refuse it or False when the
+    mention is a plain read. Decided by shape, never by the name of a wrapper: a mention is a read only when the command
+    is a reader (or a static check), and a run is allowed only as `[wrappers] [interpreter] SCRIPT [read-only flags]`;
+    everything else (a copy, a link, an archive, an unknown wrapper, a glob, a variable, code, a subshell, a redirect into
+    a file) refuses. A quoted word is judged again as a command line unless it is plainly prose."""
+    start, verb = _enabler_verb(tokens)
+
+    def executed(k):  # the token is code or a command line that an interpreter or shell will run
+        return bool(ENABLER_CODE_VERBS.fullmatch(verb)) or (k > 0 and bool(re.fullmatch(r'-[A-Za-z]*[ce]', tokens[k - 1])))
+
+    def prose(k):
+        return (not executed(k)) and (verb in ENABLER_PROSE_VERBS or (k > 0 and tokens[k - 1] in ENABLER_PROSE_FLAGS)
+                                      or re.match(r'--(?:note|body|title|message|description|text|comment|reason)=', tokens[k])
+                                      is not None)
+
+    real = []
+    for k, token in enumerate(tokens):
+        kind = _enabler_mention(token, bin_ctx)
+        if kind and not (kind == 'text' and re.search(r'\s', token) and prose(k)):
+            real.append((k, kind))
+    if not real:
+        return None
+    if before == '(' or before == '<(' or (before.startswith('$(:') and before[3:] not in ENABLER_READERS):
+        return True  # a subshell, a process substitution, or a substitution inside a command that may run its output
+    if _writes_a_file(tokens) or verb.startswith('-'):  # the latter: the rest of a command split at an escaped `\;`
+        return True
+    static = bool(ENABLER_INTERPRETER.fullmatch(verb)) and '-m' in tokens \
+        and tokens[tokens.index('-m') + 1:tokens.index('-m') + 2] and tokens[tokens.index('-m') + 1] in ENABLER_STATIC_MODULES
+    for k, kind in real:
+        text = _unquoted(tokens[k])
+        if kind == 'text' and re.search(r'\s', text):
+            if executed(k) and (ENABLER_CODE.search(text) or '$(' in text or '`' in text):
+                return True
+            if depth >= 4 or enabler_refusal(text, depth + 1):
+                return True  # env -S '...', ssh host '...', watch '...', bash -c '...': a command line inside a word
+    if verb in ENABLER_READERS or static:
+        return True if verb == 'find' and any(t in ('-exec', '-execdir', '-ok', '-okdir', '-delete') for t in tokens) \
+            else False
+    for k, kind in real:
+        text = _unquoted(tokens[k])
+        if kind == 'dynamic':
+            return True
+        if kind == 'text':
+            if re.search(r'\s', text):
+                continue  # judged above
+            if not executed(k):
+                return True  # dd if=PATH, an assignment, a --flag=PATH: a copy or a run in another shape
+            if ENABLER_CODE.search(text) or '$(' in text or '`' in text or depth >= 4:
+                return True
+            continue
+        prefix = tokens[start:k]
+        if not all(re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=.*', t) or os.path.basename(t) in ENABLER_WRAPPERS
+                   or ENABLER_INTERPRETER.fullmatch(os.path.basename(t)) or re.fullmatch(r'--?[A-Za-z][A-Za-z-]*', t)
+                   or re.fullmatch(r'[0-9]+[smhd]?', t) for t in prefix):
+            return True
+        if any(arg not in ENABLER_READ_ONLY and not re.match(r'^[0-9]*<', arg) for arg in tokens[k + 1:]):
+            return True
+    return False
+
+
+def _substitutions(text):
+    """The command lines inside `...`, $(...) and <(...) / >(...) of `text` (innermost first level only)."""
+    return re.findall(r'`([^`]*)`', text) + re.findall(r'\$\(([^()]*)\)', text) + re.findall(r'[<>]\(([^()]*)\)', text)
+
+
+def enabler_refusal(command, depth=0):
+    """None, or the refusal text for a command that would enable, undo, disable or resume agent self-serve.
+
+    Only the user runs the enabler, in their own terminal (no hook sees that). Every command an agent sends that names
+    the enabler, or a glob or variable that can expand to it, is judged by shape (`_enabler_piece`): a plain read
+    (grep, cat, ls, git, a static check) and a read-only run (`python3 ENABLER --status`) pass; everything else is
+    refused for every caller including main. Anything that carries the enabler into a pipeline may continue only into
+    filters. Substitutions are judged as commands of their own. ACCIDENT PREVENTION, NOT A BOUNDARY: this guard sees
+    command text only and cannot see a name built from a variable set in an earlier command; the enabler's own TTY
+    check and typed nonce (lane L5) are the access control."""
+    text = command if isinstance(command, str) else ' '.join(map(str, command))
+    flat = _unquoted(text)
+    if not (ENABLER_NAME.search(flat) or re.search(r'\.agent-harness/+bin|ah[_-][^\s]*[*?\[]|[*?\[][^\s]*(?:enab|serve|agent|ops)',
+                                                   flat)):
+        return None
+    if '\n' in text:
+        text = _strip_git_heredocs(text)  # a commit or PR message body is data, also inside $(cat <<EOF ...)
+    if depth < 4:
+        for inner in _substitutions(text):
+            if enabler_refusal(inner, depth + 1):
+                return ENABLER_WHY
+    bin_ctx = bool(re.search(r'\.agent-harness/+bin', flat))
+    carrying = False  # an earlier piece of this pipeline named the enabler
+    for tokens, raw, before, after in _enabler_pieces(text):
+        if tokens is None:
+            if ENABLER_NAME.search(_unquoted(raw)):
+                return ENABLER_WHY + ' (the command could not be parsed)'
+            carrying = False
+            continue
+        verdict = _enabler_piece(tokens, raw, before, bin_ctx, depth)
+        if before in ('|', '|&') and carrying:
+            verb = _enabler_verb(tokens)[1]
+            if verb not in ENABLER_FILTERS or _writes_a_file(tokens) or verdict:
+                return ENABLER_WHY
+            if any(t in ('-o', '--output') or t.startswith('--output=') for t in tokens):
+                return ENABLER_WHY
+            continue  # still carrying
+        if verdict:
+            return ENABLER_WHY
+        carrying = verdict is False
+    return None
+
+
 def _install_files_main(payload):
     """Prove a main caller for the installed hook-file deploy command only."""
     try:
@@ -9866,6 +10187,16 @@ def hook_main(fmt='exit2', stdin_bytes=None, compiled=None, marker=True):
         if command is None:
             return 0
         install_text = command if isinstance(command, str) else ' '.join(map(str, command))
+        refusal = enabler_refusal(command)
+        if refusal:
+            return emit('block', format_block(Finding(LOG_DELETE, 'self-serve-enabler', refusal,
+                                                      'ask the user to run the enabler; read-only: --status or the '
+                                                      'default dry run')), fmt)
+        refusal = self_serve_perm_refusal(install_text)
+        if refusal:
+            return emit('block', format_block(Finding(LOG_DELETE, 'self-serve-perm', refusal,
+                                                      'revoke by creating ~/.agent-harness/policy/disabled; nothing '
+                                                      'else changes these modes')), fmt)
         if 'install' in re.sub(r'[\'"\\]', '', install_text):  # after quote removal: install-file""s is still the command
             refusal = install_files_refusal(command, lambda: _install_files_main(payload))
             if refusal:
