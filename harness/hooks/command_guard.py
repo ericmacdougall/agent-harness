@@ -62,6 +62,30 @@ WHY_SET_SCRIPT_SHA256 = '92dcbb67993947506b9c139521a53e25d83cf9e8a2a127bf8e88237
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:  # python3 -I (3.11+) no longer puts the script's directory on sys.path
     sys.path.insert(0, str(HERE))
+try:
+    import wal_paths  # noqa: E402 - the WAL tree predicate wal.py shares (goodqa#17008)
+except ImportError:  # a partial install (doctor reports the missing file): keep every other rule, and treat any
+    # path with a `wals` segment as the tree, as wal.py's own fallback does, rather than drop the whole analyser
+    import types as _types
+    _WALS_SEGMENT = re.compile(r'(?i)[\\/]wals(?:[\\/]|$)')
+
+    def _fallback_own(session_id, agent_id):
+        return posixpath.join(os.path.expanduser('~'), '.claude', 'wals', str(session_id), 'agent-%s.jsonl' % agent_id)
+
+    def _fallback_owner(path, roots=None):
+        if not (isinstance(path, str) and _WALS_SEGMENT.search(path)):
+            return None
+        name = posixpath.basename(path).casefold()
+        return '', 'main' if name == 'main.jsonl' else None
+
+    wal_paths = _types.SimpleNamespace(
+        NAMES_TREE=re.compile(r'(?i)\.claude[\\/]+wals\b|\bwals[\\/]+[^\s\'"]*\.jsonl|CLAUDE_CONFIG_DIR'),
+        wal_roots=lambda homes=None: ['/'],
+        in_wal_tree=lambda path, roots=None: isinstance(path, str) and bool(_WALS_SEGMENT.search(path)),
+        wal_owner=_fallback_owner, own_wal=_fallback_own, below_toward_tree=lambda path, roots=None: None,
+        is_own_wal=lambda path, session_id, agent_id: bool(session_id and agent_id) and isinstance(path, str)
+        and posixpath.normpath(path) == _fallback_own(session_id, agent_id)
+        and posixpath.realpath(path) == posixpath.realpath(_fallback_own(session_id, agent_id)))
 POLICY_FILE = HERE / 'command_guard_policy.json'
 
 DEFAULT_POLICY = {
@@ -79,14 +103,15 @@ DEFAULT_POLICY = {
                             '{home}/.codex/auth.json',
                             # the guard itself: deleting or replacing it would switch the protection off
                             '{home}/.claude/hooks/command_guard*', '{home}/.claude/hooks/redact.py',
-                            '{home}/.claude/hooks/safe_input.py',
+                            '{home}/.claude/hooks/safe_input.py', '{home}/.claude/hooks/wal_paths.py',
                             '{home}/.codex/agent-harness/command_guard*', '{home}/.codex/agent-harness/redact.py',
-                            '{home}/.codex/agent-harness/safe_input.py'],
+                            '{home}/.codex/agent-harness/safe_input.py', '{home}/.codex/agent-harness/wal_paths.py'],
     # The guard's own files (and any policy file next to it): refused even when the target does not exist yet,
     # because creating one is how the protection would be replaced or reconfigured.
     'guard_files': ['{home}/.claude/hooks/command_guard*', '{home}/.claude/hooks/redact.py',
-                    '{home}/.claude/hooks/safe_input.py', '{home}/.codex/agent-harness/command_guard*',
-                    '{home}/.codex/agent-harness/redact.py', '{home}/.codex/agent-harness/safe_input.py'],
+                    '{home}/.claude/hooks/safe_input.py', '{home}/.claude/hooks/wal_paths.py',
+                    '{home}/.codex/agent-harness/command_guard*', '{home}/.codex/agent-harness/redact.py',
+                    '{home}/.codex/agent-harness/safe_input.py', '{home}/.codex/agent-harness/wal_paths.py'],
     # wal, wals, wal-*, wal_*, wal.* and *.wal.jsonl; not walker/ or wallet/
     'protected_work_wal_regex': r'^{home}/\.agent-harness/work/[^/]+/(?:.*/)?(?:wals?|wal[-_.][^/]*|[^/]*\.wal\.jsonl)(?:/.*)?$',
     # Tier A anywhere on disk: a `wals` directory segment, main.jsonl and *.wal.jsonl files.
@@ -286,6 +311,8 @@ class Compiled:
         # session transcripts are the record of user answers (approve-delete --no-backup reads them): Bash never
         # writes there, except memory notes under projects/<dir>/memory/
         self.transcript_roots = sorted({fmt('{home}/.claude/projects', h).casefold() for h in homes})
+        # session WALs (goodqa#17008): only the hooks and wal_note.py write there
+        self.session_wal_roots = wal_paths.wal_roots(homes)
         # every home form, not only this machine's: a WAL under another host's work dir is still a WAL
         self.wal_regexes = [re.compile(policy['protected_work_wal_regex'].replace(
             '{home}', re.escape(h).replace(r'\*', '[^/]+')), re.I)
@@ -1281,6 +1308,249 @@ TRANSCRIPT_CODE_WRITE = re.compile(r'open\s*\([^)]*,\s*[\'"][^\'"]*[wax+]|\.writ
                                    r'fs\.(?:write|append|symlink|copy|rename)|copyfile|hardlink')
 
 
+# goodqa#17008, the inverted rule: a command with an operand in the WAL tree is a write unless the program is proven to
+# read it. These read every operand (their output goes to stdout; a redirect is judged on its own).
+WAL_READERS = frozenset({
+    # (not less, more, most, zless or tree: they take an output-file option)
+    'cat', 'tac', 'head', 'tail', 'bat', 'batcat', 'nl', 'od', 'hexdump', 'strings', 'wc',
+    'ls', 'stat', 'file', 'du', 'eza', 'exa', 'lsd', 'jq', 'gron', 'grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack',
+    'zgrep', 'zcat', 'gzcat', 'bzcat', 'xzcat', 'zstdcat', 'diff', 'cmp', 'comm', 'join', 'paste', 'cut',
+    'column', 'fold', 'fmt', 'expand', 'unexpand', 'rev', 'sort', 'md5', 'md5sum', 'sha1sum', 'sha224sum', 'sha256sum',
+    'sha384sum', 'sha512sum', 'shasum', 'b2sum', 'cksum', 'sum', 'realpath', 'readlink', 'basename', 'dirname',
+    'test', '[', '[[', 'echo', 'printf', 'print', 'lsof', 'fuser', 'true', ':',
+    # no file operands at all: a word that reads as a relative path (cwd inside the tree) is text to them
+    'tr', 'date', 'df', 'read', 'sleep', 'seq', 'expr', 'pwd', 'id', 'whoami', 'hostname', 'uname', 'false', 'type',
+    'which', 'whence', 'hash', 'local', 'unset', 'shift', 'return', 'exit', 'break', 'continue', 'wait', 'jobs',
+    'getopts', 'let', 'mapfile', 'readarray', 'yes', 'tput', 'clear', 'readonly', 'export', 'declare', 'typeset',
+    'set', 'shopt', 'umask', 'alias', 'unalias', 'trap', 'history', 'fc', 'printenv',
+    # PowerShell (gc, get-content and type arrive as cat)
+    'select-string', 'sls', 'test-path', 'get-item', 'gi', 'get-childitem', 'gci', 'dir', 'measure-object',
+    'format-hex', 'get-filehash', 'resolve-path', 'rvpa', 'split-path',
+})
+# harness tools whose --wal is only read (spec_flow.py checks a native reviewer or a REALLY_TESTED row there); every
+# other command given --wal is judged by wal_writer_actor (tests/test_wal_write_guard.py lists each --wal tool)
+WAL_FLAG_READERS = frozenset({'spec_flow.py'})
+# the options harness tools take a WAL to write with: --wal, and escalation.py's --notify-wal (it runs wal_note.py on
+# that path); tests/test_wal_write_guard.py checks every option ending in `wal` that a hook declares is listed here or
+# only read
+WAL_OPTIONS = ('--wal', '--notify-wal')
+
+
+def wal_option(flag):
+    """`flag` is a WAL option or an argparse abbreviation of one (`--wa`, `--notify-w`)."""
+    return len(flag) >= 3 and flag.startswith('--') and any(o.startswith(flag) for o in WAL_OPTIONS)
+
+
+# environment variables a harness tool reads a WAL path from and then writes (escalation.py, and peer_review.py passing
+# it on); a sub-agent setting one is refused like a claim of the actor ah stamps
+WAL_ENV_CLAIM = re.compile(r'(?<![A-Za-z0-9_])AGENT_HARNESS_MAIN_WAL\s*\+?=')
+# the second operand is an output file (uniq IN OUT, xxd -r IN OUT)
+WAL_IN_OUT = frozenset({'uniq', 'xxd'})
+# their own handling already judges the destination (cp, rsync, scp, tee, dd, sed -i, ...) or what they run (launchers,
+# shells, remote and container commands); the harness's own `ah` and wal_note.py (wal_writer_actor) take WAL paths
+WAL_JUDGED_ELSEWHERE = frozenset({'cp', 'rsync', 'scp', 'tee', 'dd', 'install', 'mv', 'rm', 'truncate', 'ln', 'touch',
+                                  'sponge', 'unzip', 'ssh', 'mosh', 'ah', 'wal_note.py', 'cd', 'pushd', 'chdir',
+                                  'set-location', 'sl', 'add-content', 'ac'})
+# programs that run a command given as text or trailing words (Analyzer.launcher), and the user switchers that
+# Analyzer.wrapper unwraps besides WRAPPERS_SIMPLE
+LAUNCHER_PROGRAMS = frozenset({'flock', 'unshare', 'parallel', 'tmux', 'screen', 'osascript', 'at', 'batch', 'script'})
+SWITCH_USER = frozenset({'su', 'sg', 'runuser'})
+CONTAINER_CLIS = frozenset({'docker', 'podman', 'nerdctl', 'kubectl', 'oc'})
+# goodqa#17008: every program that runs another command, classified for the WAL operand rule. Only a quiet launcher
+# leaves a WAL path among its words to the command it runs: none of its own options writes a named file or moves the
+# command to another directory or root. Any other launcher may write an output, log, trace or lock file, edit a file,
+# mount a path, or change directory or root through an option, so a WAL path anywhere in its words (or a working
+# directory in the tree) is refused. tests/test_wal_write_guard.py fails when a program that runs another command is
+# missing here.
+WAL_QUIET, WAL_MAY_WRITE = 'quiet', 'may-write'
+WAL_LAUNCHER_CLASS = dict(
+    # their own options are numbers, names, modes, signals, users, environment, or a file they only read
+    {n: WAL_QUIET for n in ('command', 'builtin', 'exec', 'noglob', 'nice', 'ionice', 'chrt', 'taskset', 'setsid',
+                            'stdbuf', 'caffeinate', 'unbuffer', 'timeout', 'watch', 'arch', 'xargs', 'su', 'sg',
+                            'runuser', 'gosu', 'sshpass',
+                            'env',     # -C/--chdir is applied as a cd, which the working-directory rule judges
+                            'nohup')},  # nohup.out lands in the working directory, judged below
+    # an output, log, trace or lock file (time -o, script, strace -o, flock), an edit mode (sudo -e), a chdir or
+    # chroot (sudo -D, nsenter, unshare, chroot), a mount or copy (containers), a scheduler or terminal multiplexer
+    **{n: WAL_MAY_WRITE for n in ('time', 'sudo', 'doas', 'chroot', 'nsenter', 'unshare', 'firejail', 'sandbox-exec',
+                                  'strace', 'ltrace', 'dtruss', 'script', 'flock', 'parallel', 'tmux', 'screen',
+                                  'osascript', 'at', 'batch', 'start-process', 'start', 'call', 'invoke-expression',
+                                  'iex', 'invoke-command', 'icm', 'pwsh', 'powershell', 'docker', 'podman',
+                                  'nerdctl', 'kubectl', 'oc')})
+# options whose value an unknown program may run as shell text; judged as a script when it names the WAL tree
+WAL_TEXT_OPTIONS = frozenset({'-c', '--command', '--run', '--cmd', '--exec', '--execute', '--shell-command'})
+# a word that cannot be a program a launcher starts: a number or duration, or an environment assignment
+WAL_VALUE_WORD = re.compile(r'[0-9][0-9.]*[smhd]?|[A-Za-z_][A-Za-z0-9_]*=.*', re.S)
+WAL_READINGS_CAP = 8
+SED_WRITE = re.compile(r'(?:^|[;{}\n])\s*(?:\d+|\$|/[^/]*/)?(?:,\s*(?:\d+|\$|/[^/]*/))?\s*!?\s*[wW]\s|/[gpIiMme0-9]*w\s')
+AWK_WRITE = re.compile(r'\bprintf?\b[^;}]*(?:>|\|)|\bsystem\s*\(|\|\s*getline|\bclose\s*\(')
+TAR_WRITE_MODE = re.compile(r'^-?[A-Za-z]*[xurA]|^--(?:extract|get|update|append|delete|concatenate|catenate)\b')
+COMPRESS_CMDS = frozenset({'gzip', 'gunzip', 'bzip2', 'bunzip2', 'xz', 'unxz', 'zstd', 'unzstd', 'lz4', 'brotli'})
+
+
+# goodqa#17008, red-team R4 (5b1b372d): interpreter code that may reach the WAL tree is refused unless it is proven to
+# only read, the way the operand rule is inverted. The one shape the guard proves is Python that parses and uses only
+# the names, modules and attributes below; open() and Path.open() only to read, or to write a literal absolute path
+# outside the tree; write() and print(file=) only to stdout, stderr or such a file. A list of write calls (logging,
+# urlretrieve, pandas, File::Copy, ...) is never complete, so anything unlisted, and any other language, is a write.
+READ_ONLY_PY_MODULES = frozenset({
+    'json', 'sys', 're', 'collections', 'glob', 'itertools', 'functools', 'statistics', 'math', 'datetime', 'time',
+    'os', 'os.path', 'pathlib', 'csv', 'hashlib', 'textwrap', 'pprint', 'operator', 'string', 'heapq', 'bisect',
+    'fnmatch', 'typing', 'decimal', 'fractions', 'difflib', 'copy', 'unicodedata', 'calendar', 'zoneinfo', 'random',
+})
+READ_ONLY_PY_BUILTINS = frozenset({
+    'print', 'len', 'sum', 'sorted', 'min', 'max', 'enumerate', 'range', 'list', 'dict', 'set', 'tuple', 'str', 'int',
+    'float', 'bool', 'any', 'all', 'zip', 'map', 'filter', 'isinstance', 'repr', 'round', 'abs', 'iter', 'next',
+    'reversed', 'open', 'frozenset', 'bytes', 'divmod', 'format', 'chr', 'ord', 'hex', 'bin', 'oct', 'pow', 'hash',
+    'slice', 'object', 'Exception', 'ValueError', 'KeyError', 'OSError', 'IOError', 'StopIteration', 'TypeError',
+    'IndexError', 'UnicodeDecodeError', 'FileNotFoundError', 'AttributeError', 'RuntimeError', 'SystemExit',
+    'KeyboardInterrupt', 'BrokenPipeError', 'True', 'False', 'None',
+})
+READ_ONLY_PY_ATTRS = frozenset({
+    # parsing, strings, containers
+    'loads', 'load', 'dumps', 'dump', 'JSONDecodeError', 'read', 'readline', 'readlines', 'strip', 'lstrip', 'rstrip',
+    'split', 'rsplit', 'splitlines', 'get', 'items', 'keys', 'values', 'append', 'extend', 'insert', 'pop', 'update',
+    'add', 'sort', 'startswith', 'endswith', 'lower', 'upper', 'casefold', 'title', 'format', 'join', 'count', 'find',
+    'rfind', 'index', 'rindex', 'partition', 'rpartition', 'isdigit', 'isalpha', 'isalnum', 'isspace', 'zfill',
+    'ljust', 'rjust', 'center', 'encode', 'decode', 'setdefault', 'fromkeys', 'copy', 'deepcopy', 'discard',
+    'union', 'intersection', 'difference', 'issubset', 'issuperset',
+    # re, collections, itertools, statistics, hashing, csv on stdout
+    'compile', 'search', 'match', 'fullmatch', 'findall', 'finditer', 'sub', 'subn', 'group', 'groups', 'groupdict',
+    'span', 'start', 'end', 'escape', 'IGNORECASE', 'I', 'M', 'MULTILINE', 'S', 'DOTALL', 'X', 'VERBOSE',
+    'Counter', 'defaultdict', 'OrderedDict', 'deque', 'namedtuple', 'most_common', 'elements', 'chain', 'groupby',
+    'islice', 'product', 'combinations', 'permutations', 'accumulate', 'zip_longest', 'reduce', 'partial',
+    'itemgetter', 'attrgetter', 'mean', 'median', 'mode', 'pstdev', 'stdev', 'quantiles', 'sqrt', 'floor', 'ceil',
+    'log', 'log10', 'inf', 'nan', 'isnan', 'sha256', 'sha1', 'md5', 'blake2b', 'hexdigest', 'digest', 'reader',
+    'DictReader', 'writer', 'DictWriter', 'writerow', 'writerows', 'writeheader', 'shorten', 'wrap', 'dedent',
+    'indent', 'pformat', 'heappush', 'heappop', 'nlargest', 'nsmallest', 'bisect_left', 'bisect_right', 'fnmatch',
+    'normalize', 'Decimal', 'Fraction', 'unified_diff', 'ndiff', 'ascii_letters', 'digits', 'choice', 'seed',
+    # time
+    'date', 'datetime', 'timedelta', 'timezone', 'utc', 'now', 'utcnow', 'today', 'fromisoformat', 'isoformat',
+    'strftime', 'strptime', 'timestamp', 'fromtimestamp', 'total_seconds', 'days', 'seconds', 'year', 'month',
+    'day', 'hour', 'minute', 'second', 'tzinfo', 'astimezone', 'monotonic', 'perf_counter', 'ZoneInfo', 'time',
+    'gmtime', 'localtime',
+    # files and paths, reading
+    'path', 'environ', 'getenv', 'walk', 'listdir', 'scandir', 'getcwd', 'sep', 'linesep', 'exists', 'isfile',
+    'isdir', 'islink', 'basename', 'dirname', 'splitext', 'abspath', 'realpath', 'normpath', 'relpath', 'expanduser',
+    'expandvars', 'isabs', 'getsize', 'getmtime', 'stat', 'st_size', 'st_mtime', 'st_mode', 'Path', 'PurePath',
+    'name', 'stem', 'suffix', 'suffixes', 'parent', 'parents', 'parts', 'read_text', 'read_bytes', 'iterdir', 'glob',
+    'iglob', 'rglob', 'is_file', 'is_dir', 'is_symlink', 'resolve', 'absolute', 'as_posix', 'home', 'cwd',
+    'with_suffix', 'with_name', 'relative_to', 'is_relative_to', 'open',
+    # the process's own streams and arguments
+    'stdin', 'stdout', 'stderr', 'argv', 'exit', 'maxsize', 'flush', 'close', 'buffer', 'getpid', 'write', 'writelines',
+    'replace',
+})
+
+
+def python_reads_only(code, writable_path=None):
+    """True when `code` is Python the guard can prove only reads files (READ_ONLY_PY_*; see above). `writable_path(p)`
+    says whether a literal path may be opened for writing (outside the WAL tree)."""
+    import ast
+    if len(code) > 200000:
+        return False
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return False
+    bound, imported, writers = set(), set(), {'sys.stdout', 'sys.stderr'}
+
+    def mode_reads(call, pos):
+        mode = call.args[pos] if len(call.args) > pos else next(
+            (k.value for k in call.keywords if k.arg == 'mode'), None)
+        if mode is None:
+            return True
+        return isinstance(mode, ast.Constant) and isinstance(mode.value, str) and not set(mode.value) & set('wax+')
+
+    def dotted(node):
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            inner = dotted(node.value)
+            return inner and inner + '.' + node.attr
+        return None
+
+    def writable_open(call):
+        """open(<literal absolute path outside the tree>, <write mode>)."""
+        return (isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == 'open'
+                and call.args and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str)
+                and writable_path is not None and writable_path(call.args[0].value))
+
+    def may_write(node):
+        """A file argument code may write: stdout, stderr, a name bound to a writable_open, or such an open itself."""
+        return dotted(node) in writers or writable_open(node)
+
+    try:
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                base = node.module if isinstance(node, ast.ImportFrom) else None
+                if isinstance(node, ast.ImportFrom) and (node.level or base not in READ_ONLY_PY_MODULES):
+                    return False
+                for alias in node.names:
+                    if base is None and alias.name not in READ_ONLY_PY_MODULES:
+                        return False
+                    if base is not None and alias.name not in READ_ONLY_PY_ATTRS:
+                        return False
+                    local = alias.asname or alias.name.split('.')[0]
+                    bound.add(local)
+                    imported.add(local)
+                    if alias.asname is None and base is None and '.' in alias.name:
+                        imported.add(alias.name)  # `import os.path`: receiver `os.path`
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                bound.add(node.id)
+            elif isinstance(node, ast.arg):
+                bound.add(node.arg)
+            elif isinstance(node, (ast.FunctionDef, ast.Lambda)):
+                if isinstance(node, ast.FunctionDef):
+                    bound.add(node.name)
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                bound.add(node.name)
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                bound.update(node.names)
+            elif isinstance(node, (ast.AsyncFunctionDef, ast.ClassDef, ast.AsyncWith, ast.AsyncFor, ast.Await)):
+                return False
+            # a name bound to a file opened for writing at a literal path outside the tree may be written
+            if isinstance(node, ast.withitem) and writable_open(node.context_expr) and \
+                    isinstance(node.optional_vars, ast.Name):
+                writers.add(node.optional_vars.id)
+            if isinstance(node, ast.Assign) and writable_open(node.value):
+                writers.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                if node.id not in READ_ONLY_PY_BUILTINS and node.id not in bound:
+                    return False
+            elif isinstance(node, ast.Attribute):
+                if node.attr.startswith('_') or node.attr not in READ_ONLY_PY_ATTRS:
+                    return False
+            elif isinstance(node, ast.Call):
+                func = node.func
+                name = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else ''
+                receiver = dotted(func.value) if isinstance(func, ast.Attribute) else None
+                if name == 'open' and (receiver in imported or not (
+                        mode_reads(node, 1 if isinstance(func, ast.Name) else 0)
+                        or isinstance(func, ast.Name) and writable_open(node))):
+                    return False  # os.open and Path.open(p, ...) take flags or a path first: never proven
+                if name in ('write', 'writelines') and receiver not in writers:
+                    return False
+                if name == 'replace' and (len(node.args) < 2 or receiver in imported):
+                    return False  # str.replace(old, new); not os.replace or Path.replace
+                for k in node.keywords:
+                    if k.arg == 'file' and not may_write(k.value):
+                        return False
+                if name in ('writer', 'DictWriter') and node.args and not may_write(node.args[0]):
+                    return False
+                if name == 'dump' and len(node.args) > 1 and not may_write(node.args[1]):
+                    return False
+    except RecursionError:
+        return False
+    return True
+
+
+# code that reads a value from the environment or stdin, or from its arguments (where a WAL path could come from)
+CODE_TAKES_INPUT = re.compile(r'os\.environ|getenv|sys\.stdin|\binput\s*\(|fileinput|process\.env|%ENV|\$ENV\b'
+                              r'|\bENV\s*\[|STDIN|\breadline|\$_SERVER|\bstdin\b')
+CODE_TAKES_ARGV = re.compile(r'\bargv\b|@ARGV|\$ARGV|\bARGV\b|\$argv')
+
+
 def transcript_write(c, folded):
     """True when `folded` (an absolute casefolded path) is ~/.claude/projects or inside it, outside a memory folder."""
     for root in getattr(c, 'transcript_roots', ()):
@@ -1292,8 +1562,10 @@ def transcript_write(c, folded):
     return False
 
 
-def norm_path(text, ctx, cwd=None):
-    """Absolute, normalised path with / separators (case kept; match with casefold). Unresolved vars stay $NAME."""
+def norm_path(text, ctx, cwd=None, physical=False):
+    """Absolute, normalised path with / separators (case kept; match with casefold). Unresolved vars stay $NAME.
+    physical=True keeps `..` and `.` as written: the kernel resolves a symlink before the `..` after it, so the WAL
+    predicate (wal_paths) must see `link/../x`, not the logical `x`."""
     text = unicodedata.normalize('NFKC', text.replace('\\', '/') if ctx.ps else text)
     text = ''.join(ch for ch in text if unicodedata.category(ch) != 'Cf')
     if text == '~' or text.startswith('~/'):
@@ -1307,6 +1579,8 @@ def norm_path(text, ctx, cwd=None):
     text = re.sub(r'^(?:\$env:USERPROFILE|%USERPROFILE%)', lambda _m: ctx.home, text, flags=re.I)
     if not text.startswith('/') and not re.match(r'^[A-Za-z]:/', text):
         text = posixpath.join(cwd if cwd is not None else ctx.cwd_value(), text)
+    if physical:
+        return re.sub(r'/+', '/', text) if text else ''
     return posixpath.normpath(text) if text else ''
 
 
@@ -2829,7 +3103,12 @@ WRAPPERS_SIMPLE = {'command', 'builtin', 'exec', 'nohup', 'time', 'nice', 'ionic
                    'noglob', 'unbuffer', 'chrt', 'taskset', 'doas', 'sudo', 'env', 'xargs', 'timeout', 'watch', 'gosu',
                    'chroot', 'runuser', 'strace', 'ltrace', 'script', 'dtruss', 'arch', 'nsenter', 'firejail', 'sandbox-exec',
                    'start-process', 'invoke-expression', 'iex', 'invoke-command', 'icm', 'call', 'start', 'sshpass'}
-RM_CMDS = {'rm', 'unlink', 'rmdir', 'shred', 'srm', 'trash', 'trash-put', 'remove-item', 'ri', 'del', 'erase', 'rd',
+# programs the WAL operand rule (Analyzer.wal_operands) models by name; any other name is an unknown program there
+KNOWN_TO_WAL_RULE = frozenset(WAL_READERS | WAL_JUDGED_ELSEWHERE | WAL_IN_OUT | COMPRESS_CMDS | set(WAL_LAUNCHER_CLASS)
+                              | SHELLS | PS_SHELLS | INTERPRETERS
+                              | {'awk', 'gawk', 'mawk', 'nawk', 'sed', 'gsed', 'find', 'tar', 'bsdtar', 'gtar', 'zip',
+                                 'rclone', 'base64', 'iconv'})
+RM_CMDS ={'rm', 'unlink', 'rmdir', 'shred', 'srm', 'trash', 'trash-put', 'remove-item', 'ri', 'del', 'erase', 'rd',
            'rimraf', 'gio-trash'}
 MV_CMDS = {'mv', 'move-item', 'mi', 'move', 'rename-item', 'ren', 'rni'}
 OVERWRITE_CMDS = {'tee', 'set-content', 'out-file', 'sc', 'clear-content', 'clc', 'truncate', 'dd', 'cp', 'copy-item',
@@ -3882,6 +4161,10 @@ class Ctx:
         self.top_commands = 0
         self.cwd_unknown = False
         self.cwd_protected_unknown = False  # cd to an unresolved path whose text names a protected location
+        # goodqa#17008: the unknown directory may be inside the WAL tree (the cd target's own text, its variable or a
+        # CDPATH names the tree, or `cd -`/popd after a cd into it); wal_cwd_seen: a cd in this command reached it
+        self.cwd_wal = False
+        self.wal_cwd_seen = False
         self.var_hints = {}  # raw text of dynamic assignments, for variables the guard cannot resolve
         self.temp_vars = {}  # NAME=$(mktemp ...): name -> (its var_hints text, directories mktemp may create in)
         self.seen_texts = []  # every script text analysed (top command, -c strings, script files): goodqa#15122
@@ -3969,6 +4252,8 @@ class Ctx:
             elif k == 'cwd' and mine != theirs:
                 self.cwd_protected_unknown = self.cwd_protected_unknown or bool(
                     PROTECTED_TEXT.search((mine or '') + ' ' + (theirs or '') + '/'))
+                self.cwd_wal = self.cwd_wal or any(
+                    isinstance(p, str) and p.startswith('/') and wal_paths.in_wal_tree(p) for p in (mine, theirs))
                 self.cwd = theirs
                 self.cwd_unknown = True
             else:
@@ -4494,6 +4779,8 @@ class Analyzer:
                 if target:
                     self.write_target(r.target, truncating=r.op in ('>', '>|'), via='redirect', pure=pure)
                     is_write = True
+            elif r.op == '<>' and target and self.state_dest(r.target):
+                is_write = True  # opened read-write: a forgery destination is refused whatever the descriptor
             elif r.op == '<>' and target and (r.fd in ('1', '2') or name == 'exec' or any(
                     x.op == '>&' and x.target is not None and x.target.text == (r.fd or '0') for x in cmd.redirs)):
                 # `1<> f`: stdout opened read-write without truncation; what the command prints overwrites the file
@@ -4541,10 +4828,10 @@ class Analyzer:
                 self.script(body, depth + 1, tail_visible=True)
                 return
             if any(n in INTERPRETERS for n in inner):
-                self.code(body, depth)
+                self._code_with_args(body, depth, [self.resolve(w) for w in words[1:]])
                 return
         if name in INTERPRETERS:
-            self.code(body, depth)
+            self._code_with_args(body, depth, [self.resolve(w) for w in words[1:]])
             return
         if name == 'ssh':
             self.script(body, depth + 1, tail_visible=True)
@@ -4660,6 +4947,7 @@ class Analyzer:
         args = words[1:]
         texts = [a.text for a in args]
         self.credential_entry(cmd, name, words, args, texts)
+        self.wal_writer_actor(name, args)
         if ctx.ps:
             name = {'remove-item': 'rm', 'ri': 'rm', 'del': 'rm', 'erase': 'rm', 'rd': 'rm', 'move-item': 'mv',
                     'mi': 'mv', 'move': 'mv', 'gc': 'cat', 'get-content': 'cat', 'type': 'cat', 'clear-content': 'truncate',
@@ -4675,6 +4963,7 @@ class Analyzer:
                     k, _, v = t.partition('=')
                     ctx.aliases[k] = v
             return
+        self.wal_operands(name, words, args, depth, pl, idx)
         if name in ('cd', 'pushd', 'set-location', 'sl', 'chdir'):
             self.chdir(args)
             return
@@ -4689,6 +4978,7 @@ class Analyzer:
             return
         if name in ('popd', 'pop-location'):
             ctx.cwd_unknown = True
+            ctx.cwd_wal = ctx.cwd_wal or ctx.wal_cwd_seen  # back to a directory an earlier cd may have put in the tree
             return
         if name in ('eval', 'invoke-expression', 'iex'):
             self.eval_words(args, depth, pl, idx)
@@ -4706,7 +4996,7 @@ class Analyzer:
         if '/' in name or '/' in words[0].text:
             # ./run.sh or /path/to/script: analyse the script text when it is a shell script
             self.script_file(words[0], depth, require_shell=True, invocation=words, command=cmd)
-        if name in ('flock', 'unshare', 'parallel', 'tmux', 'screen', 'osascript', 'at', 'batch', 'script'):
+        if name in LAUNCHER_PROGRAMS:
             if self.launcher(name, args, depth, pl, idx):
                 return
         if name == 'busybox' and args and not args[0].text.startswith('-') \
@@ -4756,7 +5046,7 @@ class Analyzer:
         if name == 'goodqa':
             self.goodqa(args, depth, pl, idx)
             return
-        if name in WRAPPERS_SIMPLE or name in ('su', 'sg', 'runuser'):
+        if name in WRAPPERS_SIMPLE or name in SWITCH_USER:
             self.wrapper(name, args, depth, pl, idx)
             return
         if name == 'find':
@@ -4789,7 +5079,8 @@ class Analyzer:
             self.read_creds(name, args, pl, idx)
         if name in RM_CMDS or name in MV_CMDS or name in OVERWRITE_CMDS or name in (
                 'sed', 'perl', 'ruby', 'awk', 'gawk', 'rsync', 'scp', 'rclone', 'tar', 'zip', 'dd', 'truncate', 'set-content',
-                'out-file', 'curl', 'wget', 'touch', 'mkdir', 'unzip', 'bsdtar', 'gtar'):
+                'out-file', 'curl', 'wget', 'touch', 'mkdir', 'unzip', 'bsdtar', 'gtar') or (
+                ctx.ps and name in ('add-content', 'ac')):
             self.destructive(name, args, texts)
         if not (name in PRINT_FILE_CMDS or name in GREP_CMDS or name in EXFIL_CMDS):
             self.unlisted_cred_reader(name, args, cmd, pl, idx)
@@ -5081,7 +5372,23 @@ class Analyzer:
         return False
 
     # ---- wrappers
+    # where a command runs; `env -C DIR cmd` moves only cmd, so this is given back afterwards (goodqa#17008)
+    CWD_STATE = ('cwd', 'cwd_known', 'cwd_unknown', 'cwd_protected_unknown', 'cwd_wal', 'wal_cwd_seen', 'fixed_cwd')
+
     def wrapper(self, name, args, depth, pl, idx):
+        if name != 'env':
+            return self._wrapper(name, args, depth, pl, idx)
+        ctx = self.ctx
+        saved = {k: (v.copy() if isinstance(v, (set, dict, list)) else v) for k, v in vars(ctx).items()
+                 if k in self.CWD_STATE}
+        try:
+            return self._wrapper(name, args, depth, pl, idx)
+        finally:
+            for k, v in saved.items():
+                setattr(ctx, k, v)
+            ctx.fs_cache.clear()
+
+    def _wrapper(self, name, args, depth, pl, idx):
         ctx = self.ctx
         texts = [a.text for a in args]
         i = 0
@@ -5396,23 +5703,43 @@ class Analyzer:
         pos = _nondash(args)
         if not pos:
             ctx.cwd = ctx.home
-            ctx.cwd_unknown = ctx.cwd_protected_unknown = False
+            ctx.cwd_unknown = ctx.cwd_protected_unknown = ctx.cwd_wal = False
             ctx.cwd_known = True
             return
         word = pos[0]
         target = word.text
+        # goodqa#17008: whether an unknown directory may be inside the WAL tree is decided by the cd itself (its text,
+        # its variables' assignments, CDPATH, or `cd -` after a cd there), not by the command merely naming the tree
+        names_wal = self._names_wal_tree(' '.join([target, word.raw or ''] + [
+            ctx.var_hints.get(v.lstrip('!'), '') for v in word.vars]))
         if target == '-' or is_dynamic_path(target) or word.dynamic:
             ctx.cwd_unknown = True
             ctx.cwd_protected_unknown = bool(PROTECTED_TEXT.search(target) or self._hint_points_at_protected(word))
+            ctx.cwd_wal = names_wal or (target == '-' and ctx.wal_cwd_seen)
             return
         if ctx.cwd_unknown and not target.startswith(('/', '~')):
             # relative to a directory the guard could not resolve: still unknown, and a protected name stays visible
             ctx.cwd_protected_unknown = ctx.cwd_protected_unknown or bool(PROTECTED_TEXT.search(target))
+            ctx.cwd_wal = ctx.cwd_wal or names_wal
+            return
+        raw = getattr(ctx, 'raw_top', '') or ''
+        if (os.environ.get('CDPATH') or 'CDPATH' in raw) and not target.startswith(('/', '~', './', '../')) \
+                and target not in ('.', '..'):
+            # bash and zsh look a relative name up in CDPATH first: where it lands is not known here
+            value = ' '.join([os.environ.get('CDPATH', ''), ctx.var_hints.get('CDPATH', ''),
+                              str(ctx.vars.get('CDPATH', '')), raw if 'CDPATH' in raw else ''])
+            ctx.cwd_unknown = True
+            ctx.cwd_protected_unknown = bool(PROTECTED_TEXT.search(value + ' ' + target))
+            ctx.cwd_wal = names_wal or self._names_wal_tree(value) or any(
+                e.startswith('/') and wal_paths.in_wal_tree(posixpath.join(e, target))
+                for e in os.environ.get('CDPATH', '').split(':'))
             return
         if target.startswith(('/', '~')):
             ctx.cwd_known = True
         ctx.cwd = norm_path(target, ctx, ctx.cwd)
-        ctx.cwd_unknown = ctx.cwd_protected_unknown = False
+        ctx.cwd_unknown = ctx.cwd_protected_unknown = ctx.cwd_wal = False
+        if self._in_tree(ctx.cwd):
+            ctx.wal_cwd_seen = True
 
     # ---- find
     def find(self, args, depth, pl, idx):
@@ -6715,7 +7042,7 @@ class Analyzer:
             nd = [t for t in texts if not t.startswith('-')]
             code = nd[0] if nd else None
         if code:
-            self.code(code, depth)
+            self._code_with_args(code, depth, [a for a in (args or []) if a.text != code])
             return
         # `python3 file.py` for a script written earlier in this same command: judge its text. Existing files are
         # the repository's or harness's own tooling; a raw text scan of their source would block routine runs.
@@ -6733,6 +7060,16 @@ class Analyzer:
                                      'a line of a script written in this command names a harness root and a call that '
                                      'can destroy or replace a file',
                                      'edit the file with the editor tool, or keep the change out of the harness roots')
+
+    def _code_with_args(self, code, depth, args):
+        """code(), knowing whether the program's own arguments could hand it a WAL path (goodqa#17008)."""
+        ctx = self.ctx
+        before = getattr(ctx, 'code_argv_hit', None)
+        ctx.code_argv_hit = any(self._wal_hit(a) or a.dynamic and self._names_wal_tree() for a in args)
+        try:
+            self.code(code, depth)
+        finally:
+            ctx.code_argv_hit = before
 
     def code(self, code, depth):
         ctx = self.ctx
@@ -6758,6 +7095,22 @@ class Analyzer:
         if '.claude/projects' in low.replace('\\', '/') and TRANSCRIPT_CODE_WRITE.search(low):
             ctx.add(LOG_DELETE, 'transcript-forgery', 'script code writes under ~/.claude/projects (session '
                     'transcripts)', 'only Claude Code writes transcripts')
+        # the path may also come from the environment or stdin (then the command naming the tree is enough) or from
+        # argv (then an argument in the tree, or one the guard cannot resolve in a command that names it)
+        argv_hit = getattr(ctx, 'code_argv_hit', None)
+        if (self._names_wal_tree(code) or self._cwd_in_tree() or not self.disk_depth and self._names_wal_tree() and (
+                CODE_TAKES_INPUT.search(code) or CODE_TAKES_ARGV.search(code) and argv_hit is not False)) \
+                and not python_reads_only(code, self._code_may_write):
+            # inverted (red-team R4): only Python the guard proves reads is let through
+            self._wal_forgery('interpreter code the guard cannot show only reads, in a command that names the session '
+                              'WALs (read with plain Python open()/json and print, or cat/jq, and write output with a '
+                              'shell redirect outside ~/.claude/wals)')
+
+    def _code_may_write(self, path):
+        """A literal path interpreter code may open for writing: absolute, outside the WAL tree, not naming it, and the
+        directory is not one an unknown cd may have put in the tree (python_reads_only)."""
+        return isinstance(path, str) and path.startswith('/') and not self._in_tree(path) \
+            and not self._names_wal_tree(path)
 
     # ---- destructive
     #
@@ -7464,7 +7817,603 @@ class Analyzer:
                         '(the record of user answers) live', 'only Claude Code writes transcripts; memory notes go '
                         'under projects/<dir>/memory/')
                 return True
+            if self._in_tree(alt):
+                self._wal_forgery('writes into the session WALs under ~/.claude/wals')
+                return True
+        if word.dynamic and (self._names_wal_tree(' '.join([word.raw or ''] + list(word.alts[:32])
+                                                           + list(word.subs[:8])))
+                             or any(self._names_wal_tree(ctx.var_hints.get(v.lstrip('!'), '')) for v in word.vars)
+                             or not self.disk_depth and self._names_wal_tree() and any(
+                                 self.FLOW_POSITIONAL.fullmatch(v.lstrip('!'))
+                                 or v.lstrip('!') in getattr(ctx, 'flow_vars', ()) for v in word.vars)):
+            # a loop, read or positional variable carries a path from elsewhere in a command that names the tree
+            self._wal_forgery('writes to a path the guard cannot resolve in a command that names the session WALs')
+            return True
         return False
+
+    def wal_writer_actor(self, name, args):
+        """goodqa#17008: every harness tool that takes --wal writes rows there (wal_note.py, ah note, deliver, the
+        grant and waiver tools, through a child wal_note.py or directly; escalation.py's --notify-wal too), so ANY
+        command given a WAL_OPTIONS option (or an argparse abbreviation of one) is judged by who runs it: a sub-agent may aim it only at its own WAL, and a caller the hook
+        could not prove (neither main nor a sub-agent) never at a main.jsonl. Proven main aims it anywhere. A --wal value
+        the guard cannot resolve is refused. Tools that only read --wal are WAL_FLAG_READERS. Without a hook payload (a
+        direct decide() call) nothing is known about the caller and this rule does not apply."""
+        caller = getattr(self.c, 'caller', None)
+        if not caller or caller.get('kind') == 'main':
+            return
+        texts = [a.text for a in args]
+        tool = name
+        if name in INTERPRETERS:  # the script after interpreter options (`python3 -X dev wal_note.py`), or a module
+            k = next((i for i, t in enumerate(texts) if not t.startswith('-') and not (
+                i and texts[i - 1] in ('-X', '-W', '-Q'))), None)
+            tool = norm_name(texts[k]) if k is not None else name
+            if '-m' in texts and texts.index('-m') + 1 < len(texts):
+                tool = texts[texts.index('-m') + 1] + '.py'
+        if tool in WAL_FLAG_READERS:
+            return
+        kind = caller.get('kind')
+        mine = wal_paths.own_wal(caller.get('session'), caller.get('agent')) if kind == 'agent' else None
+        for i, w in enumerate(args):
+            prev = texts[i - 1] if i else ''
+            flag, eq, value = w.text.partition('=')
+            if eq and wal_option(flag):
+                exact, dynamic = flag in WAL_OPTIONS, w.dynamic
+            elif wal_option(prev):
+                exact, dynamic, value = prev in WAL_OPTIONS, w.dynamic, w.text
+            else:
+                continue
+            if dynamic and exact:
+                self._wal_actor_refusal(tool, mine, 'its --wal value cannot be resolved before it runs')
+                return
+            if dynamic or not value or not self._in_tree(value):
+                continue
+            path = norm_path(value, self.ctx, physical=True)
+            owner = wal_paths.wal_owner(path, self.c.session_wal_roots)
+            if kind == 'agent' and not wal_paths.is_own_wal(path, caller.get('session'), caller.get('agent')):
+                self._wal_actor_refusal(tool, mine, 'a sub-agent writes only its own WAL')
+                return
+            if kind != 'agent' and (owner is None or owner[1] == 'main'):
+                self._wal_actor_refusal(tool, mine, 'the hook could not prove this caller is main, so it may not '
+                                                    'write a main WAL')
+                return
+
+    def _in_tree(self, text):
+        """The one question every WAL rule asks (goodqa#17008): could writing `text` land in the WAL tree? The path is
+        taken as the kernel takes it (`..` after a link resolves from the link's target), and a relative path while the
+        directory is unknown counts when that directory may be inside the tree (ctx.cwd_wal, set by the cd itself)."""
+        if not text:
+            return False
+        ctx = self.ctx
+        cache = ctx.__dict__.setdefault('wal_hit_cache', {})
+        path = norm_path(text, ctx, physical=True)
+        if path not in cache:
+            cache[path] = wal_paths.in_wal_tree(path, self.c.session_wal_roots)
+        if cache[path]:
+            return True
+        if '/../' in path + '/' and self._dotdot_unresolvable(path) and self._names_wal_tree():
+            return True
+        relative = not text.startswith(('/', '~')) and not re.match(r'^[A-Za-z]:[\\/]', text) \
+            and '$' not in text and not text.isdigit()  # a variable is judged as a dynamic word; `>&1` is a descriptor
+        return relative and ctx.cwd_unknown and ctx.cwd_wal and not self.disk_depth
+
+    def _dotdot_unresolvable(self, path):
+        """red-team R1 (5b1b372d): a `..` after a component that does not exist yet, or that this command creates or
+        links, goes up from wherever that component will lead when the command runs, which the guard cannot know now
+        (`ln -s ~/.claude/x q && echo >> q/../wals/...`)."""
+        ctx = self.ctx
+        made = {p.casefold() for p in getattr(ctx, 'created', ())} | {
+            str(p).casefold() for p in (getattr(ctx, 'links', None) or {})}
+        parts = path.split('/')
+        for k, part in enumerate(parts):
+            if part != '..' or k < 2:
+                continue
+            head = '/'.join(parts[:k])
+            if head.casefold() in made or posixpath.normpath(head).casefold() in made:
+                return True
+            try:
+                if not os.path.lexists(head):
+                    return True
+            except (OSError, ValueError):
+                return True
+        return False
+
+    def _cwd_in_tree(self):
+        """The directory the command is in is inside the WAL tree, or unknown and possibly inside it (ctx.cwd_wal: the
+        cd's own text, its variable or CDPATH names the tree, or `cd -`/popd after a cd there)."""
+        ctx = self.ctx
+        if ctx.cwd_unknown:
+            return ctx.cwd_wal
+        return bool(ctx.cwd_known and ctx.cwd and self._in_tree(ctx.cwd))
+
+    def _names_wal_tree(self, text=None):
+        """True when `text` (default: the whole command as typed) names the WAL tree, as written or with quotes and
+        backslashes removed (`w''als`)."""
+        raw = (getattr(self.ctx, 'raw_top', '') or '') if text is None else text
+        raw = raw[:200000]
+        return bool(wal_paths.NAMES_TREE.search(raw)
+                    or wal_paths.NAMES_TREE.search(raw.replace("'", '').replace('"', '').replace('\\', '')))
+
+    def _wal_hit(self, word):
+        """True when an expansion of `word`, the value of its `--opt=value`, `key=value` or `-oVALUE` form, or (for a
+        word the guard cannot resolve) its raw text, is in the WAL tree."""
+        for alt in (word.all_alts() or word.alts)[:64]:
+            cands = [] if alt.startswith('-') and alt != '-' else [alt]  # an option is not a relative path
+            if '=' in alt:
+                cands.append(alt.split('=', 1)[1])
+            if alt.startswith('-') and len(alt) > 2 and alt[2] in '/~':
+                cands.append(alt[2:])
+            if any(s != '-' and self._in_tree(s) for s in cands):
+                return True
+        return bool(word.dynamic and self._names_wal_tree(' '.join([word.raw or ''] + list(word.subs[:8]))))
+
+    def _xargs_inner(self, args):
+        """The words of the command xargs runs, and its replacement token (None without -I/-i/--replace)."""
+        k, token = 0, None
+        with_value = ('-I', '-n', '-P', '-L', '-s', '-d', '-E', '-a', '-R', '-S', '--max-args', '--max-procs',
+                      '--delimiter', '--arg-file', '--replace', '--max-lines', '--max-chars', '--eof')
+        while k < len(args):
+            t = args[k].text
+            if t == '--':
+                k += 1
+                break
+            if not t.startswith('-') or t == '-':
+                break
+            if t in ('-I', '--replace') and k + 1 < len(args):
+                token = args[k + 1].text
+            elif t.startswith('-I') and len(t) > 2:
+                token = t[2:]
+            elif t.startswith('--replace='):
+                token = t.split('=', 1)[1] or '{}'
+            elif t in ('-i',):
+                token = '{}'
+            k += 2 if t in with_value else 1
+        return args[k:], token
+
+    def _wal_copy_reads(self, inner, token):
+        """True when `inner` (a command xargs or find -exec runs on WAL paths) is proven to only read them: a reader,
+        or a copy whose destination is not where the paths go."""
+        if not inner:
+            return True
+        name = norm_name(inner[0].text)
+        if name in WAL_READERS:
+            return True
+        if name not in ('cp', 'rsync', 'scp', 'rclone'):
+            return False
+        texts = [w.text for w in inner[1:]]
+        if '-t' in texts or any(t.startswith('--target-directory') for t in texts):
+            return True
+        nd = [t for t in texts if not t.startswith('-')]
+        return bool(token) and len(nd) >= 2 and token not in nd[-1]
+
+    def _is_script(self, name, words):
+        """A script file on disk (by extension, or a `#!` first line when given by path): its source is not judged.
+        A program given by path that is not a script (`/usr/bin/vim`) is judged by its name like any other."""
+        if re.search(r'\.(?:py|sh|bash|zsh|js|mjs|cjs|ts|rb|pl|php)$', name):
+            return True
+        first = words[0].text if words else ''
+        if '/' not in first:
+            return False
+        try:
+            with open(norm_path(first, self.ctx), 'rb') as handle:
+                return handle.read(2) == b'#!'
+        except (OSError, ValueError):
+            return False
+
+    ARCHIVE_LIST_BYTES = 256 << 20   # a larger archive is not listed: unprovable
+    ARCHIVE_LIST_MEMBERS = 20000
+    ARCHIVE_LIST_SECONDS = 1.0
+
+    def _archive_may_create(self, name, args, texts, nd, first):
+        """red-team R2 (5b1b372d), inverted: an extraction into a directory above the WAL tree is allowed only when the
+        archive provably cannot create the next component on the way to it (`first`: `.claude` under the home, `wals`
+        under the Claude home). Provable: a local regular tar or zip file, not made or written by this command, whose
+        members (after --strip-components) are listed within the bounds above, with no member named `first`, no
+        absolute or `..` member and no link member. An archive that does not exist and is not made here extracts
+        nothing. Anything else (stdin, a remote or computed archive, other formats, a listing past the bounds) may."""
+        archive, strip = None, 0
+        if name in ('tar', 'bsdtar', 'gtar'):
+            for k, t in enumerate(texts):
+                if t in ('-f', '--file') and k + 1 < len(args):
+                    archive = args[k + 1]
+                elif t.startswith('--file='):
+                    archive = _literal_word(t.split('=', 1)[1])
+                elif t.startswith('--strip-components'):
+                    value = t.split('=', 1)[1] if '=' in t else (texts[k + 1] if k + 1 < len(texts) else '')
+                    strip = int(value) if value.isdigit() else -1
+                elif re.fullmatch(r'-?[A-Za-z0-9]*f[A-Za-z0-9.]*', t) and (k == 0 or t.startswith('-')) \
+                        and not t.startswith('--'):
+                    rest = t[t.index('f') + 1:]
+                    archive = _literal_word(rest) if rest else (args[k + 1] if k + 1 < len(args) else None)
+        elif name == 'unzip' and nd:
+            archive = nd[0]
+        if archive is None or archive.dynamic or archive.glob or archive.text in ('-', '') or strip < 0:
+            return True
+        path = norm_path(archive.text, self.ctx)
+        raw = getattr(self.ctx, 'raw_top', '') or ''
+        if path.casefold() in self.ctx.created or path.casefold() in self.ctx.written or \
+                raw.count(posixpath.basename(archive.text)) > 1:
+            return True  # made, written or named elsewhere in this command (`tar -cf a.tar ... && tar -xf a.tar`)
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            return False  # nothing to extract, and this command does not make it
+        except (OSError, ValueError):
+            return True
+        if not stat.S_ISREG(info.st_mode) or info.st_size > self.ARCHIVE_LIST_BYTES:
+            return True
+        deadline = time.monotonic() + self.ARCHIVE_LIST_SECONDS
+        first = first.casefold()
+
+        def lands(member, is_link):
+            parts = [p for p in member.replace('\\', '/').split('/') if p not in ('', '.')]
+            if member.startswith('/') or '..' in parts or is_link:
+                return True
+            parts = parts[strip:]
+            return bool(parts) and parts[0].casefold() == first
+
+        try:
+            import tarfile
+            import zipfile
+            if zipfile.is_zipfile(path):
+                with zipfile.ZipFile(path) as z:
+                    for n, member in enumerate(z.infolist()):
+                        if n > self.ARCHIVE_LIST_MEMBERS or time.monotonic() > deadline:
+                            return True
+                        if lands(member.filename, (member.external_attr >> 16) & 0o170000 == 0o120000):
+                            return True
+                return False
+            if name == 'unzip':
+                return True
+
+            class Bounded:
+                """The raw archive, read in tar's 10 KiB records: each read checks the deadline, so a compressed
+                stream that expands without end stops at it (stream mode never seeks)."""
+
+                def __init__(self, handle):
+                    self.handle = handle
+
+                def read(self, size=-1):
+                    if time.monotonic() > deadline:
+                        raise TimeoutError('archive listing deadline')
+                    return self.handle.read(size if 0 <= size <= 1 << 20 else 1 << 20)
+
+            with open(path, 'rb') as raw, tarfile.open(fileobj=Bounded(raw), mode='r|*') as t:
+                for n, member in enumerate(t):
+                    if n > self.ARCHIVE_LIST_MEMBERS or time.monotonic() > deadline:
+                        return True
+                    if lands(member.name, member.issym() or member.islnk()):
+                        return True
+            return False
+        except Exception:  # noqa: BLE001 - an archive the guard cannot list is not proven harmless
+            return True
+
+    COPIERS = frozenset({'cp', 'install', 'ditto', 'rsync', 'scp', 'rclone', 'copy-item', 'cpi', 'robocopy'})
+    EXTRACTORS = frozenset({'tar', 'bsdtar', 'gtar', 'unzip', 'cpio', '7z', '7za', 'ar', 'pax', 'expand-archive'})
+
+    def _wal_landing(self, name, args, nd):
+        """Copies and extractions (goodqa#17008): refused when a destination is in the tree, or is an ancestor of it
+        (`cp -R stage/wals ~/.claude/`, `rsync -a stage/ ~/.claude/`, `tar -x -C ~/.claude`) and what lands there could
+        be the tree. True when it refused."""
+        if name not in self.COPIERS and name not in self.EXTRACTORS:
+            return False
+        texts = [a.text for a in args]
+        roots = self.c.session_wal_roots
+        dests, sources = [], []
+        if name in self.EXTRACTORS:
+            extracting = name in ('unzip', 'expand-archive') or (
+                name in ('7z', '7za') and nd and nd[0].text in ('x', 'e')) or (
+                name == 'ar' and nd and 'x' in nd[0].text) or (
+                name == 'cpio' and any(t in ('-i', '--extract') or re.fullmatch(r'-[A-Za-z]*i[A-Za-z]*', t)
+                                       for t in texts)) or (
+                name == 'pax' and '-r' in texts) or (
+                name in ('tar', 'bsdtar', 'gtar') and (
+                    any(re.fullmatch(r'-?[A-Za-z]*x[A-Za-z]*', t) and (k == 0 or t.startswith('-'))
+                        and not t.startswith('--') for k, t in enumerate(texts))
+                    or any(t.startswith(('--extract', '--get')) for t in texts)))
+            passing = (name == 'cpio' and any(t in ('-p', '--pass-through') or re.fullmatch(r'-[A-Za-z]*p[A-Za-z]*', t)
+                                              for t in texts)) or (
+                name == 'pax' and any(re.fullmatch(r'-[A-Za-z]*r[A-Za-z]*', t) for t in texts)
+                and any(re.fullmatch(r'-[A-Za-z]*w[A-Za-z]*', t) for t in texts))
+            if passing and nd:
+                # cpio -p DIR and pax -rw ... DIR copy the paths they are given (on stdin or as operands) under DIR,
+                # keeping each path: what lands is not known here (red-team R2)
+                dest = nd[-1].text
+                if not dest or self._in_tree(dest) or nd[-1].dynamic or wal_paths.below_toward_tree(
+                        norm_path(dest, self.ctx, physical=True), roots):
+                    self._wal_forgery('%s copies paths it reads into the session WALs or a directory above them' % name)
+                    return True
+                return False
+            if not extracting:
+                return False
+            for k, t in enumerate(texts):
+                if t in ('-C', '--directory', '-d', '-DestinationPath') and k + 1 < len(args):
+                    dests.append(args[k + 1].text)
+                elif t.startswith(('--directory=', '-C/', '-o/')) or name in ('7z', '7za') and t.startswith('-o'):
+                    dests.append(t.split('=', 1)[1] if '=' in t else t[2:])
+            # an unknown directory counts only when the cd that made it unknown ties it to the tree (ctx.cwd_wal)
+            dests = dests or [self.ctx.cwd_value() if not self.ctx.cwd_unknown else '']
+            if any(self._in_tree(d) if d else self.ctx.cwd_wal for d in dests):
+                self._wal_forgery('%s extracts into the session WALs' % name)
+                return True
+            for d in dests:
+                first = wal_paths.below_toward_tree(norm_path(d, self.ctx, physical=True), roots) if d else None
+                if first is not None and self._archive_may_create(name, args, texts, nd, first):
+                    self._wal_forgery('%s extracts into a directory above the session WALs an archive the guard cannot '
+                                      'show leaves them alone' % name)
+                    return True
+            return False
+        if name == 'rclone':
+            if not nd or nd[0].text not in ('copy', 'copyto', 'sync', 'move', 'moveto', 'bisync'):
+                return False
+            nd = nd[1:]
+        if name in ('rsync', 'scp'):
+            nd = self._copy_operands(name, args)  # an option value after the destination must not hide it
+        target = None
+        for k, t in enumerate(texts):
+            if t in ('-t', '--target-directory') and k + 1 < len(args):
+                target = args[k + 1]
+            elif t.startswith('--target-directory='):
+                target = _literal_word(t.split('=', 1)[1])
+            elif re.fullmatch(r'-[A-Za-z]*t', t) and name in ('cp', 'install') and k + 1 < len(args):
+                target = args[k + 1]
+        if target is not None:
+            dests, sources = [target], [a for a in nd if a is not target]
+        elif len(nd) >= 2:
+            dests, sources = [nd[-1]], nd[:-1]
+        else:
+            return False
+        contents = name in ('ditto', 'rclone') or '-T' in texts or '--no-target-directory' in texts
+        # red-team R2 (5b1b372d): sources whose landing paths the guard cannot see make every source unprovable:
+        # path-keeping copies (rsync -R/--relative and --files-from, cp --parents), ditto's archive modes, and a source
+        # on another host or remote (its contents cannot be checked from here)
+        keeps_paths = (name == 'rsync' and any(t in ('--relative', '-R') or t.startswith('--files-from')
+                                                or re.fullmatch(r'-[A-Za-z]*R[A-Za-z]*', t) for t in texts)) or (
+            name == 'cp' and any(t == '--parents' for t in texts)) or (
+            name == 'ditto' and any(re.fullmatch(r'-[A-Za-z]*[xk][A-Za-z]*', t) for t in texts))
+
+        def remote(text):
+            return name in ('rsync', 'scp', 'rclone') and bool(
+                re.match(r'^[^/]*:', text) or re.match(r'^[A-Za-z][A-Za-z0-9+.-]*://', text))
+        for dest in dests:
+            if self._wal_hit(dest):
+                self._wal_forgery('%s copies into the session WALs' % name)
+                return True
+            if dest.dynamic and self._names_wal_tree():
+                self._wal_forgery('%s copies to a destination the guard cannot resolve, in a command that names the '
+                                  'session WALs' % name)
+                return True
+            first = wal_paths.below_toward_tree(norm_path(dest.text, self.ctx, physical=True), roots)
+            if first is None:
+                continue
+            for src in sources:
+                text = src.text
+                if keeps_paths or src.dynamic or src.glob or any(ch in text for ch in '*?['):
+                    hit = True
+                elif contents or text.endswith(('/', '/.', ':')):
+                    if remote(text):  # a remote directory's contents cannot be checked from here (`host:dotfiles/`)
+                        self._wal_forgery('%s copies the contents of a remote directory into a directory above the '
+                                          'session WALs; sync into a staging directory and copy what you need' % name)
+                        return True
+                    path = norm_path(text, self.ctx, physical=True)
+                    hit = os.path.lexists(posixpath.join(path, first)) or any(
+                        k.startswith(path.casefold().rstrip('/') + '/') for k in self.ctx.created) or \
+                        any(k.startswith(path.casefold().rstrip('/') + '/') for k in self.ctx.written)
+                else:
+                    local = text.split(':', 1)[1] if remote(text) else text  # `host:.claude` lands as `.claude`
+                    hit = posixpath.basename(local.rstrip('/')).casefold() == first
+                if hit:
+                    self._wal_forgery('%s copies into a directory above the session WALs what could be the WAL tree'
+                                      % name)
+                    return True
+        return False
+
+    def wal_operands(self, name, words, args, depth=0, pl=None, idx=0):
+        """goodqa#17008, the inverted rule: a command given an operand in the WAL tree is refused unless the program is
+        proven to only read it (WAL_READERS and the source side of copies and archives). Unknown programs are refused.
+        Launchers, shells and wrappers are skipped here because the command they run is judged on its own."""
+        if not getattr(self.c, 'session_wal_roots', None) or self.disk_depth or name.startswith('-'):
+            return  # a script on disk is the accepted limit (its redirects are still judged); `-x` is not a program
+        nd = [a for a in args if not a.text.startswith('-') or a.text == '-']  # `-` (stdin/stdout) is an operand
+        refuse = lambda why: self._wal_forgery(why)  # noqa: E731
+        if self._wal_landing(name, args, nd):
+            return
+        if name == 'xargs':
+            inner, token = self._xargs_inner(args)
+            if self._names_wal_tree() and not self._wal_copy_reads(inner, token):
+                refuse('xargs runs %s on input in a command that names the session WALs, and the guard cannot show it '
+                       'only reads them' % (norm_name(inner[0].text)[:40] if inner else 'echo'))
+            return
+        if name == 'find':
+            texts = [a.text for a in args]
+            first_expr = next((k for k, t in enumerate(texts) if t.startswith('-') and t not in (
+                '-P', '-H', '-L', '-E', '-X', '-d', '-s', '-x', '--') or t in ('(', '!', ')')), len(texts))
+            if not any(self._wal_hit(a) for a in args[:first_expr]) and not (
+                    self._names_wal_tree() and any(a.dynamic for a in args[:first_expr])):
+                return
+            for k, t in enumerate(texts):
+                if t in ('-delete', '-fprint', '-fprint0', '-fprintf', '-fls'):
+                    refuse('find %s over the session WALs' % t)
+                    return
+                if t in ('-exec', '-execdir', '-ok', '-okdir'):
+                    end = next((j for j in range(k + 1, len(texts)) if texts[j] in (';', '+')), len(texts))
+                    if not self._wal_copy_reads(args[k + 1:end], '{}'):
+                        refuse('find %s runs a command on the session WALs that the guard cannot show only reads '
+                               'them' % t)
+                        return
+            return
+        if name in CONTAINER_CLIS and args and args[0].text == 'cp':
+            if len(nd) >= 3 and self._wal_hit(nd[-1]):
+                refuse('%s cp copies into the session WALs' % name)
+            return
+        here = self._cwd_in_tree()  # a relative name in a program's text lands in the tree
+        launcher = WAL_LAUNCHER_CLASS.get(name)
+        if launcher == WAL_MAY_WRITE:
+            # a path inside an option's text counts too (a mount's `src=DIR`, a log option's value)
+            if here or any(self._wal_hit(a) or self._names_wal_tree(a.raw or a.text) for a in args):
+                self._wal_forgery('%s is given a path in the session WALs, or runs there, and its own options may '
+                                  'write a file or move the command into them' % name[:40],
+                                  route='run the inner command without %s; the command on its own is judged, and a '
+                                        'read of a WAL is allowed' % name[:40])
+            return
+        if launcher == WAL_QUIET:
+            if name == 'nohup' and here:
+                refuse('nohup writes nohup.out into the working directory, which is in the session WALs')
+            elif here or self._names_wal_tree():
+                self._wal_launched_readings(name, args, depth, pl, idx)
+            return  # the command it runs is judged on its own
+        if name in WAL_JUDGED_ELSEWHERE or name in SHELLS or self._is_script(name, words):
+            return  # judged elsewhere, or a script on disk (an accepted limit: its source is not read)
+        if name in ('awk', 'gawk', 'mawk', 'nawk'):
+            texts = [a.text for a in args]
+            if '-f' in texts or any(t.startswith('--file') for t in texts):
+                if here or any(self._wal_hit(a) for a in args):
+                    refuse('%s runs a program file on the session WALs' % name)
+                return
+            prog = nd[0].text if nd else ''
+            if (here or self._names_wal_tree(prog) or any(self._wal_hit(a) for a in nd[1:])) \
+                    and AWK_WRITE.search(prog):
+                refuse('%s program writes output in a command on the session WALs' % name)
+            return
+        if name in ('sed', 'gsed'):
+            texts = [a.text for a in args]
+            scripts = [args[k + 1].text for k, t in enumerate(texts[:-1]) if t in ('-e', '--expression')] \
+                + [t.split('=', 1)[1] for t in texts if t.startswith('--expression=')]
+            files = nd if scripts else nd[1:]
+            scripts = scripts or ([nd[0].text] if nd else [])
+            if (here or any(self._names_wal_tree(s) for s in scripts) or any(self._wal_hit(a) for a in files)) and (
+                    any(SED_WRITE.search(s) for s in scripts) or '-f' in texts):
+                refuse('%s script writes a file in a command on the session WALs' % name)
+            return
+        if name == 'file' and any(a.text == '-C' or re.fullmatch(r'-[A-Za-z]*C[A-Za-z]*', a.text) for a in args) \
+                and here:
+            refuse('file -C writes a compiled magic file into the session WALs')
+            return
+        if name not in KNOWN_TO_WAL_RULE and self._names_wal_tree():
+            # an unknown program may run the value of a command option as shell text (`tool -c '...'`)
+            for k, a in enumerate(args):
+                t = a.text
+                value = args[k + 1].text if t in WAL_TEXT_OPTIONS and k + 1 < len(args) else \
+                    t.split('=', 1)[1] if t.split('=', 1)[0] in WAL_TEXT_OPTIONS and '=' in t else None
+                if value is not None and self._names_wal_tree(value):
+                    self.script(value, depth + 1, tail_visible=True)
+        hits = [a for a in args if self._wal_hit(a)]
+        if not hits:
+            return
+        texts = [a.text for a in args]
+        if name in INTERPRETERS:
+            if '-m' not in texts:
+                return  # -c/-e code is judged by code(); a script on disk is an accepted limit
+            k = texts.index('-m')
+            module = texts[k + 1] if k + 1 < len(texts) else ''
+            after = [a for a in args[k + 2:] if not a.text.startswith('-')]
+            if module == 'json.tool' and len(after) == 1 and hits == after:
+                return
+            refuse('%s -m %s is given a path in the session WALs' % (name, module[:40]))
+            return
+        if name in WAL_READERS:
+            return
+        if name in WAL_IN_OUT:
+            if len(nd) >= 2 and nd[1] in hits:
+                refuse('%s writes its second operand, which is in the session WALs' % name)
+            return
+        if name in ('base64', 'iconv'):
+            for k, t in enumerate(texts):
+                value = args[k + 1] if t in ('-o', '--output') and k + 1 < len(args) else None
+                if value is not None and value in hits or t.startswith(('--output=', '-o/')) and args[k] in hits:
+                    refuse('%s writes its output into the session WALs' % name)
+                    return
+            return
+        if name in ('tar', 'bsdtar', 'gtar'):
+            write_mode = any(re.fullmatch(r'-?[A-Za-z]*[xurA][A-Za-z]*', t) and (k == 0 or t.startswith('-'))
+                             and not t.startswith('--') for k, t in enumerate(texts)) \
+                or any(t.startswith(('--extract', '--get', '--update', '--append', '--delete', '--concatenate',
+                                     '--catenate')) for t in texts)
+            if write_mode:
+                refuse('%s extracts or updates an archive with the session WALs as a target' % name)
+                return
+            for k, a in enumerate(args):
+                prev = texts[k - 1] if k else ''
+                archive = prev in ('-f', '--file') or (re.fullmatch(r'-?[A-Za-z]*f', prev) and (k - 1 == 0 or
+                                                                                               prev.startswith('-'))) \
+                    or a.text.startswith(('--file=', '-f/'))
+                if archive and a in hits and any('c' in t for t in texts[:1] + [t for t in texts if
+                                                                               re.fullmatch(r'-[A-Za-z]+', t)]):
+                    refuse('%s writes its archive into the session WALs' % name)
+                    return
+            return
+        if name in ('zip',):
+            if nd and nd[0] in hits:
+                refuse('zip writes its archive into the session WALs')
+            return
+        if name in COMPRESS_CMDS:
+            if any(t in ('-c', '--stdout', '--to-stdout', '-l', '--list', '-t', '--test') or
+                   re.fullmatch(r'-[A-Za-z0-9]*[clt][A-Za-z0-9]*', t) for t in texts):
+                return
+            refuse('%s replaces a file in the session WALs' % name)
+            return
+        if name == 'rclone':
+            sub = nd[0].text if nd else ''
+            if sub in ('ls', 'lsl', 'lsd', 'lsf', 'lsjson', 'cat', 'size', 'md5sum', 'sha1sum', 'hashsum', 'check',
+                       'cryptcheck', 'tree', 'ncdu'):
+                return
+            if sub in ('copy', 'copyto', 'sync') and len(nd) >= 3 and nd[-1] not in hits:
+                return
+            refuse('rclone %s writes or removes in the session WALs' % sub[:40])
+            return
+        refuse('%s is given a path in the session WALs and the guard cannot show it only reads it' % name[:40])
+
+    def _wal_launched_readings(self, launcher, args, depth, pl, idx):
+        """A quiet launcher's command start comes from wrapper()'s one reading of its options, which can be wrong (a
+        flag read as taking a value, or a value option read as a flag, moves the start). In a command that names the
+        WAL tree, every word that could start the launched command, up to the first program the guard models and
+        before the first word naming the tree, is judged as the start too. Only WAL refusals are kept from these extra
+        readings, and the analysis state is given back after each one. A refusal from a word the guard does not model
+        (`gosu USER cat W` read with USER as the program) names the route: run the command without the launcher."""
+        ctx = self.ctx
+        stop = next((k for k, a in enumerate(args) if self._wal_hit(a) or self._names_wal_tree(a.raw or a.text)),
+                    len(args))
+        starts = []
+        for k in range(stop):
+            t = args[k].text
+            if not t or t.startswith('-') or WAL_VALUE_WORD.fullmatch(t):
+                continue  # an option, a number or duration, or an assignment: not a program
+            starts.append(k)
+            if norm_name(t) in KNOWN_TO_WAL_RULE or len(starts) >= WAL_READINGS_CAP:
+                break
+        for k in starts:
+            saved, before = ctx.state(), len(ctx.findings)
+            unmodelled = None
+            try:
+                self.inner_words(args[k:], depth, pl, idx)
+            finally:
+                kept = [f for f in ctx.findings[before:] if getattr(f, 'rule', None) == 'wal-forgery']
+                if kept and norm_name(args[k].text) not in KNOWN_TO_WAL_RULE:
+                    unmodelled, kept = args[k].text, []
+                ctx.findings[before:] = kept
+                ctx.restore(saved)
+            if unmodelled is not None:
+                self._wal_forgery('%s runs a command given a path in the session WALs, and the guard cannot tell which '
+                                  'of its words starts that command (one reading runs %s, which it cannot show only '
+                                  'reads)' % (launcher[:40], unmodelled[:40]),
+                                  route='if the command only reads, run it without %s; on its own it is judged, and a '
+                                        'read of a WAL is allowed' % launcher[:40])
+
+    def _wal_actor_refusal(self, tool, mine, why):
+        self.ctx.add(LOG_DELETE, 'wal-actor', '%s aimed at a WAL this caller may not write: %s' % (tool[:40], why),
+                     ('use --wal %s' % mine) if mine else 'run it from main, or record the row in your own WAL')
+
+    def _wal_forgery(self, what, route=None):
+        """goodqa#17008: a row in main.jsonl is read as main's (provenance, the chat-send allow-list, grants), so no
+        shell route writes the WAL tree; the sanctioned writer is wal_note.py, aimed at the caller's own WAL. `route`
+        names the working alternative first when the refusal has a narrower one (a launcher around a read)."""
+        if any(getattr(f, 'rule', None) == 'wal-forgery' for f in self.ctx.findings):
+            return  # one refusal per command: several rules may see the same write
+        caller = getattr(self.c, 'caller', None) or {}
+        mine = wal_paths.own_wal(caller['session'], caller['agent']) if caller.get('kind') == 'agent' else None
+        note = 'record a row with python3 ~/.claude/hooks/wal_note.py --wal %s --event <event> --note <text>' \
+            % (mine or '<your WAL>')
+        self.ctx.add(LOG_DELETE, 'wal-forgery', what + ' (main reads its rows as main\'s own)',
+                     route + '; to write a row, ' + note if route else note)
 
     def destructive(self, name, args, texts):
         ctx = self.ctx
@@ -7502,6 +8451,9 @@ class Analyzer:
                 if w.text.startswith('-'):
                     continue
                 self.refuse('truncate', w, tiers=('log', 'root', 'unknown'), need_existing=True)
+        elif name in ('add-content', 'ac') and ctx.ps:
+            for w in nd:  # appends: only a forgery destination (the WAL tree, transcripts, state) is refused
+                self.state_dest(w)
         elif name in ('tee', 'out-file', 'set-content'):
             if ctx.ps:  # -Value/-FilePath/-LiteralPath are not bundles of short flags in PowerShell
                 appending = any(len(t) >= 3 and '-append'.startswith(t.lower()) for t in texts)
@@ -7522,6 +8474,8 @@ class Analyzer:
                         self.refuse('dd of=', fake, tiers=('log', 'root', 'unknown'), need_existing=True)
         elif name in ('touch', 'mkdir'):
             for w in nd:
+                if name == 'touch' and self.state_dest(w):
+                    continue
                 self.note_created(w)
         elif name in ('curl', 'wget'):
             flags = ('-o', '--output') if name == 'curl' else ('-O', '--output-document')
@@ -7551,6 +8505,12 @@ class Analyzer:
                 ctx.add(LOG_DELETE, 'transcript-forgery', 'links to ~/.claude/projects, an alias Bash could write '
                         'transcripts through', 'only Claude Code writes transcripts')
                 return
+            if (name == 'ln' or name == 'cp' and (symbolic or _flag_letters(args) & {'l'} or '--link' in texts)) and \
+                    len(nd) >= (1 if name == 'ln' else 2) and any(
+                        self._in_tree(w.text)
+                        for w in (nd[:-1] if len(nd) >= 2 else nd)):
+                self._wal_forgery('links to a session WAL, an alias a later write could go through')
+                return
             if name == 'ln' and _flag_letters(args) & {'s'} and len(nd) >= 2:
                 target_path = norm_path(nd[0].text, ctx)
                 link = norm_path(nd[-1].text, ctx)
@@ -7577,8 +8537,12 @@ class Analyzer:
                         self.refuse(name + ' -i (rewrites in place)', w, tiers=('log', 'unknown'))
         elif name == 'scp':
             self.remote_copy_dest(name, args, texts)
+            if len(nd) >= 2 and not self._remote_spec(nd[-1].text):
+                self.state_dest(nd[-1])
         elif name == 'rsync':
             self.remote_copy_dest(name, args, texts)
+            if len(nd) >= 2 and not self._remote_spec(nd[-1].text):
+                self.state_dest(nd[-1])
             if any(t.startswith('--delete') or t.startswith('--del') or t == '--remove-source-files'
                    or t == '--remove-sent-files' for t in texts):
                 pos = [a for a in nd if not self._remote_spec(a.text)]
@@ -7937,6 +8901,15 @@ def analyze(command, compiled=None, cwd=None, ps=False, marker=None):
     if pinned_route(command):
         return []
     analyzer = Analyzer(compiled, cwd=cwd, ps=ps, marker=marker)
+    caller = getattr(compiled, 'caller', None) or {}
+    if caller.get('kind') == 'agent' and AGENT_ID_CLAIM.search(command):
+        analyzer._wal_actor_refusal('ah', wal_paths.own_wal(caller.get('session'), caller.get('agent')),
+                                    'a sub-agent may not set the actor ah stamps on the rows it writes '
+                                    '(AH_AGENT_ID, AGENT_ID)')
+    if caller.get('kind') == 'agent' and WAL_ENV_CLAIM.search(command):
+        analyzer._wal_actor_refusal('escalation.py', wal_paths.own_wal(caller.get('session'), caller.get('agent')),
+                                    'a sub-agent may not name the main WAL harness tools notify '
+                                    '(AGENT_HARNESS_MAIN_WAL)')
     try:
         findings = analyzer.run(command)
     except Exception as stop:  # noqa: BLE001 - re-raised: a budget stop, the hook's alarm or a bug
@@ -9827,6 +10800,28 @@ def payload_cwd(payload):
     return None
 
 
+def hook_caller(payload):
+    """Who runs the command (goodqa#17008): {'kind': 'agent', 'agent', 'session'} for a payload with an agent id,
+    {'kind': 'main'} only when caller_identity proves main, else {'kind': 'unknown'}. A payload without agent_id does
+    not prove main."""
+    if not isinstance(payload, dict):
+        return {'kind': 'unknown'}
+    session = str(payload.get('session_id') or '')
+    if payload.get('agent_id') or payload.get('agent_type'):
+        return {'kind': 'agent', 'agent': str(payload.get('agent_id') or ''), 'session': session}
+    try:
+        import caller_identity
+        if caller_identity.is_main(payload):
+            return {'kind': 'main', 'session': session}
+    except Exception:  # noqa: BLE001 - not proven, so not main
+        pass
+    return {'kind': 'unknown', 'session': session}
+
+
+# A sub-agent setting the actor ah stamps on the rows it writes for it (actor_id reads these names)
+AGENT_ID_CLAIM = re.compile(r'(?<![A-Za-z0-9_])(?:AH_)?AGENT_ID\s*\+?=')
+
+
 def hook_main(fmt='exit2', stdin_bytes=None, compiled=None, marker=True):
     """PreToolUse entry point. Exit 2 + stderr blocks; exit 0 allows (warnings go to stdout as context).
 
@@ -9872,6 +10867,7 @@ def hook_main(fmt='exit2', stdin_bytes=None, compiled=None, marker=True):
                 return emit('block', format_block(Finding(LOG_DELETE, 'install-files', refusal.replace('ah install-files: ', ''),
                                                           INSTALL_FILES_FORM)), fmt)
         approvals = Approvals(compiled=c) if marker else None
+        c.caller = hook_caller(payload)
         verdict, message = decide(command, c, cwd=cwd, ps=ps, marker=approvals)
         if verdict != 'block' and approvals is not None and approvals.used and not approvals.consume():
             verdict, message = 'block', format_block(Finding(LOG_DELETE, 'approval-used', 'the delete approval was '
@@ -9961,7 +10957,7 @@ def doctor(home=None, version_runner=None):
     for label, d in (('claude', home / '.claude' / 'hooks'), ('codex', home / '.codex' / 'agent-harness')):
         if not d.parent.is_dir():
             continue
-        names = ('command_guard.py', 'command_guard_hook.py', 'redact.py', 'safe_input.py')
+        names = ('command_guard.py', 'command_guard_hook.py', 'redact.py', 'safe_input.py', 'wal_paths.py')
         missing = [n for n in names if not (d / n).is_file()]
         checks.append(('%s files' % label, not missing, 'missing: ' + ', '.join(missing) if missing else str(d)))
         settings = home / '.claude' / 'settings.json' if label == 'claude' else home / '.codex' / 'hooks.json'

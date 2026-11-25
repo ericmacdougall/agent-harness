@@ -1,0 +1,20 @@
+SYNOPSIS
+     xargs [-0oprt] [-E eofstr] [-I replstr [-R replacements] [-S replsize]]
+	   [-J replstr] [-L number] [-n number [-x]] [-P maxprocs] [-s size]
+	   [utility [argument ...]]
+
+     -0, --null
+     -E eofstr
+     -I replstr
+     -J replstr
+     -L number
+     -n number, --max-args=number
+     -o      Reopen stdin as /dev/tty in the child process before executing
+     -P maxprocs, --max-procs=maxprocs
+     -p, --interactive
+     -r, --no-run-if-empty
+     -R replacements
+     -S replsize
+     -s size, --max-chars=size
+     -t, --verbose
+     -x, --exit

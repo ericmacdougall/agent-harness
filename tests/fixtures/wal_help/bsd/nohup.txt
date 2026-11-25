@@ -1,0 +1,2 @@
+SYNOPSIS
+     nohup [--] utility [arguments]

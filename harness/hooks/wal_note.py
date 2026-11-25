@@ -155,7 +155,8 @@ def sibling_ask_wal(path, ref: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    # no abbreviations: the command guard reads --wal by its full name to know which WAL a caller writes (goodqa#17008)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument('--wal', type=Path, required=True)
     parser.add_argument('--event', choices=sorted(EVENTS), required=True)
     parser.add_argument('--note', required=True)

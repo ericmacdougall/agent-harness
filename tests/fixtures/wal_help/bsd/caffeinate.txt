@@ -1,0 +1,10 @@
+SYNOPSIS
+     caffeinate [-disu] [-t timeout] [-w pid] [utility arguments...]
+
+     -d      Create an assertion to prevent the display from sleeping.
+     -i      Create an assertion to prevent the system from idle sleeping.
+     -m      Create an assertion to prevent the disk from idle sleeping.
+     -s      Create an assertion to prevent the system from sleeping. This
+     -u      Create an assertion to declare that user is active. If the
+     -t      Specifies the timeout value in seconds for which this assertion
+     -w      Waits for the process with the specified pid to exit. Once the

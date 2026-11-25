@@ -1,0 +1,6 @@
+SYNOPSIS
+     stdbuf [-e bufdef] [-i bufdef] [-o bufdef] [command [...]]
+
+     -e bufdef
+     -i bufdef
+     -o bufdef

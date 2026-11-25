@@ -1,0 +1,23 @@
+
+Usage:
+ ionice [options] -p <pid>...
+ ionice [options] -P <pgid>...
+ ionice [options] -u <uid>...
+ ionice [options] <command>
+
+Show or change the I/O-scheduling class and priority of a process.
+
+Options:
+ -c, --class <class>    name or number of scheduling class,
+                          0: none, 1: realtime, 2: best-effort, 3: idle
+ -n, --classdata <num>  priority (0..7) in the specified scheduling class,
+                          only for the realtime and best-effort classes
+ -p, --pid <pid>...     act on these already running processes
+ -P, --pgid <pgrp>...   act on already running processes in these groups
+ -t, --ignore           ignore failures
+ -u, --uid <uid>...     act on already running processes owned by these users
+
+ -h, --help             display this help
+ -V, --version          display version
+
+For more details see ionice(1).
