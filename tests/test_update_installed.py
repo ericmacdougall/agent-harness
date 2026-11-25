@@ -18,6 +18,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT / "harness" / "hooks"))
 import update_installed as U  # noqa: E402
+sys.path.insert(0, str(ROOT / "tests"))
+import test_ah_install as TAI  # noqa: E402  (its Base runs the real remote installer against a temporary host)
 
 GIT = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "init.defaultBranch=main",
        "-c", "commit.gpgsign=false"]
@@ -83,6 +85,7 @@ class Fixture(unittest.TestCase):
         self.remote = {"a.py": "already_current", "b.py": "replaced", "c.py": "new"}
         self.unregistered = []
         self.doctor = []                                    # [findings] the fake doctor answers; None: it does not answer
+        self.host_doctor = []                               # the same for `doctor.py check --ssh <host>`
         self.typed = []
 
     def commit_main(self, msg, files=None):
@@ -108,9 +111,12 @@ class Fixture(unittest.TestCase):
                 out["unregistered"] = self.unregistered
             return subprocess.CompletedProcess(argv, 0, json.dumps(out), "")
         if any(str(x).endswith("doctor.py") for x in argv):
-            if self.doctor is None:
+            answer = self.host_doctor if "--ssh" in argv else self.doctor
+            if answer is None:
                 return subprocess.CompletedProcess(argv, 2, "Traceback: doctor crashed", "")
-            return subprocess.CompletedProcess(argv, 0, json.dumps(self.doctor), "")
+            rows = [dict(r, required=r.get("required", r["state"] != "PENDING")) for r in answer]
+            rc = 1 if any(r["required"] and r["state"] != "WIRED" for r in rows) else 0   # = doctor.verdict
+            return subprocess.CompletedProcess(argv, rc, json.dumps(rows), "")
         if any(str(x).endswith("install.py") for x in argv):
             return subprocess.run(argv, **kw)              # the fixture installer, for real
         raise AssertionError("unexpected command %r" % (argv,))
@@ -125,8 +131,11 @@ class Fixture(unittest.TestCase):
         self.answer = self.main_sha[:12] if answer == "first12" else answer
         err, out = io.StringIO(), io.StringIO()
         with redirect_stderr(err), redirect_stdout(out):
-            rc = U.main(["--home", self.home, *args], runner=runner or self.runner, reader=self.reader,
-                        environ=CLEAN_ENV if environ is None else environ)
+            try:
+                rc = U.main(list(args), runner=runner or self.runner, reader=self.reader,
+                            environ=CLEAN_ENV if environ is None else environ, home=self.home)
+            except SystemExit as e:            # argparse: a bad option or value
+                rc = e.code
         return rc, out.getvalue(), err.getvalue()
 
     def snapshot(self):
@@ -156,12 +165,14 @@ class Refusals(Fixture):
         self.assertEqual(self.cache_runs(), [], "the run folder is removed after a stop")
 
     def test_malformed_inputs_stop_before_anything_runs(self):
-        for args, why in ((["--commit", self.main_sha[:12], "--preview"], "40-hex"),
-                          (["--commit", self.main_sha.upper(), "--preview"], "40-hex"),
-                          (["--ticket", "goodqa 1", "--preview"], "--ticket must"),
-                          ([], "--ticket 'GoodQA")):
+        """R5 F7: a bad value is usage (exit 2, as documented); a missing ticket for a real run is a stop (exit 1)."""
+        for args, why, code in ((["--commit", self.main_sha[:12], "--preview"], "40-hex", U.EXIT_USAGE),
+                                (["--commit", self.main_sha.upper(), "--preview"], "40-hex", U.EXIT_USAGE),
+                                (["--ticket", "goodqa 1", "--preview"], "--ticket must", U.EXIT_USAGE),
+                                (["--home", self.t, "--preview"], "unrecognized arguments", U.EXIT_USAGE),
+                                ([], "--ticket 'GoodQA", U.EXIT_STOP)):
             rc, _, err = self.run_main(*args)
-            self.assertEqual(rc, U.EXIT_STOP, args)
+            self.assertEqual(rc, code, args)
             self.assertIn(why, err)
         self.assertEqual(self.calls, [])
         self.assertFalse(Path(self.home, ".agent-harness").exists(), "nothing is fetched for a refused input")
@@ -309,9 +320,9 @@ class FreshSource(Fixture):
         inst = [(a, kw) for a, kw in self.calls if str(a[-1]).endswith(self.home) and "--apply" in a]
         self.assertEqual(len(inst), 1)
         argv, kw = inst[0]
-        self.assertEqual(argv[1:4], ["-B", "-E", "-s"])
+        self.assertEqual(argv[1:5], ["-B", "-E", "-s", "-S"])
         self.assertTrue(kw["cwd"].startswith(os.path.join(self.home, ".agent-harness", "update-cache", "run-")))
-        self.assertEqual(argv[4], os.path.join(kw["cwd"], "install.py"))
+        self.assertEqual(argv[5], os.path.join(kw["cwd"], "install.py"))
         self.assertEqual(self.cache_runs(), [], "the run folder is removed")
 
     def test_an_object_that_does_not_hash_to_its_id_stops(self):
@@ -585,7 +596,6 @@ class Registration(Fixture):
         self.assertEqual(rc, U.EXIT_REGISTER, err)
         self.assertEqual(self.typed, [], "nothing to install asks nothing")
         self.assertTrue([a for a, _ in self.calls if str(a[2]).endswith("doctor.py")], "the doctor ran")
-        self.assertIn("t2-dev: nothing was installed, so its hook registration was not re-checked", out)
         self.doctor = [{"id": "new", "state": "WIRED"}]
         rc, out, err = self.run_main("--ticket", "GoodQA goodqa#1")
         self.assertEqual(rc, U.EXIT_OK, err)
@@ -594,6 +604,49 @@ class Registration(Fixture):
         self.doctor = None
         rc, out, err = self.run_main("--ticket", "GoodQA goodqa#1")
         self.assertEqual(rc, U.EXIT_STOP, "no answer stops even when nothing was installed")
+
+    def test_a_host_where_nothing_was_installed_is_still_checked(self):
+        """R5 F4: after an exit 3 for t2-dev, a plain rerun installs nothing there; it must not exit 0 while the host
+        still has an unregistered hook, and a host doctor that does not answer stops."""
+        for n in ("b.py", "c.py"):
+            Path(self.home, ".claude", "hooks", n).write_text("print(%r)\n" % n)
+        self.remote = {n: "already_current" for n in self.HOOKS}
+        self.host_doctor = [{"id": "remote-new", "state": "MISSING"}, {"id": "a", "state": "WIRED"}]
+        rc, out, err = self.run_main("--ticket", "GoodQA goodqa#1")
+        self.assertEqual(rc, U.EXIT_REGISTER, err)
+        self.assertIn("t2-dev: declared but not registered in settings.json, so not running yet: remote-new", out)
+        ssh = [a for a, _ in self.calls if str(a[2]).endswith("doctor.py") and "--ssh" in a]
+        self.assertEqual(ssh[0][-2:], ["--ssh", "t2-dev"])
+        self.host_doctor = None
+        rc, out, err = self.run_main("--ticket", "GoodQA goodqa#1")
+        self.assertEqual(rc, U.EXIT_STOP)
+        self.assertIn("the doctor did not answer for t2-dev", err)
+        self.host_doctor = [{"id": "a", "state": "WIRED"}]
+        rc, out, err = self.run_main("--ticket", "GoodQA goodqa#1")
+        self.assertEqual(rc, U.EXIT_OK, err)
+        self.assertIn("the Mac's doctor and t2-dev's report every required hook wired", out)
+
+    def test_a_required_hook_that_is_broken_stops_and_a_pending_one_is_not_a_gap(self):
+        """R5 F5: SCRIPT_MISSING or CANARY_FAIL on a required hook is not a registration step; PENDING is not required."""
+        for state in ("SCRIPT_MISSING", "CANARY_FAIL"):
+            self.doctor = [{"id": "a", "state": "WIRED"}, {"id": "gone", "state": state}]
+            rc, out, err = self.run_main("--no-remote")
+            self.assertEqual(rc, U.EXIT_STOP, state)
+            self.assertIn("not working (%s)" % state, err)
+            self.assertNotIn("Done.", out)
+        self.doctor = [{"id": "a", "state": "WIRED"}, {"id": "later", "state": "PENDING"}]
+        rc, out, err = self.run_main("--no-remote")
+        self.assertEqual(rc, U.EXIT_OK, err)
+
+    def test_a_doctor_whose_exit_code_disagrees_with_its_rows_is_not_an_answer(self):
+        def lying(argv, **kw):
+            if any(str(x).endswith("doctor.py") for x in argv):
+                return subprocess.CompletedProcess(argv, 1, json.dumps([{"id": "a", "state": "WIRED",
+                                                                         "required": True}]), "")
+            return self.runner(argv, **kw)
+        rc, _, err = self.run_main("--no-remote", runner=lying)
+        self.assertEqual(rc, U.EXIT_STOP)
+        self.assertIn("registration is not proven", err)
 
     def test_a_hook_wired_before_and_not_after_stops(self):
         Path(self.home, ".claude", "hooks", "doctor.py").write_text("# fake\n")
@@ -795,29 +848,242 @@ class TamperedExport(Fixture):
         self.assertEqual(len(runs), 1)
         return runs[0] / "export"
 
+    def tamper_during_prompt(self, change):
+        """Run a real Mac update; `change(export)` runs while the person is at the prompt. Returns (rc, err)."""
+        def reader(prompt):
+            change(self.export_dir())
+            return self.main_sha[:12]
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
+            rc = U.main(["--no-remote"], runner=self.runner, reader=reader, environ=CLEAN_ENV, home=self.home)
+        return rc, err.getvalue()
+
+    def assertNothingRan(self, rc, err):
+        self.assertEqual(rc, U.EXIT_STOP)
+        self.assertIn("the export changed after it was verified", err)
+        self.assertFalse([a for a, _ in self.calls if any(str(x).endswith("install.py") for x in a)],
+                         "install.py never started")
+        self.assertFalse(Path(self.home, ".claude", "hooks", "c.py").exists(), "nothing was installed")
+
     def test_install_py_changed_during_the_prompt_is_never_run(self):
         marker = os.path.join(self.t, "tampered-ran")
-
-        def reader(prompt):
-            Path(self.export_dir(), "install.py").write_text("open(%r, 'w').write('x')\n" % marker)
-            return self.main_sha[:12]
-        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
-            rc = U.main(["--home", self.home, "--no-remote"], runner=self.runner, reader=reader, environ=CLEAN_ENV)
-        self.assertEqual(rc, U.EXIT_STOP)
-        self.assertIn("changed after it was verified", err.getvalue())
+        rc, err = self.tamper_during_prompt(
+            lambda e: Path(e, "install.py").write_text("open(%r, 'w').write('x')\n" % marker))
+        self.assertNothingRan(rc, err)
         self.assertFalse(os.path.exists(marker))
 
-    def test_a_harness_file_changed_during_the_prompt_is_caught_after_the_install(self):
+    def test_a_harness_file_changed_during_the_prompt_stops_before_install_py_starts(self):
+        """R5 F1: at 8bc05736 this installed the tampered c.py and only noticed afterwards."""
+        rc, err = self.tamper_during_prompt(lambda e: Path(e, "harness", "hooks", "c.py").write_text("tampered\n"))
+        self.assertNothingRan(rc, err)
+        self.assertIn("harness/hooks/c.py", err)
+
+    def test_a_module_planted_next_to_install_py_never_runs(self):
+        """R5 F1: the export folder is first on install.py's import path; a planted json.py would replace the stdlib."""
+        marker = os.path.join(self.t, "planted-ran")
+        for planted in ("json.py", "__pycache__/json.cpython-39.pyc", "harness/hooks/extra.py"):
+            with self.subTest(planted=planted):
+                self.calls.clear()
+                rc, err = self.tamper_during_prompt(lambda e: (Path(e, planted).parent.mkdir(exist_ok=True),
+                                                               Path(e, planted).write_text(
+                                                                   "open(%r, 'w').write('x')\n" % marker)))
+                self.assertNothingRan(rc, err)
+                self.assertFalse(os.path.exists(marker))
+
+    def test_a_symlink_or_extra_folder_in_the_export_stops(self):
+        for change in (lambda e: (os.remove(Path(e, "harness", "hooks", "c.py")),
+                                  os.symlink(Path(e, "harness", "hooks", "a.py"), Path(e, "harness", "hooks", "c.py"))),
+                       lambda e: os.mkdir(Path(e, "harness", "extra")),
+                       lambda e: os.remove(Path(e, "harness", "hooks", "c.py"))):
+            self.calls.clear()
+            self.assertNothingRan(*self.tamper_during_prompt(change))
+
+    def test_verify_export_accepts_the_untouched_export(self):
+        repo, _ = U.fetch_main(Path(self.t), self.home)
+        d = Path(self.t, "exp-ok")
+        _, digests = U.export_commit(repo, self.home, self.main_sha, d)
+        U.verify_export(d, digests)              # positive control: no Stop
+        with self.assertRaises(U.Stop):
+            U.verify_export(d, dict(digests, **{"harness/hooks/zz.py": "0" * 64}))   # a commit file is missing
+
+
+class OpenRuns(Fixture):
+    """R5 F3: an unfinished run on a host stops the whole update before anything is installed anywhere."""
+    OPEN = [{"event": "start", "run": "ins-0123456789ab", "host": "t2-dev", "kind": "install"},
+            {"event": "result", "run": "ins-0123456789ab", "host": "t2-dev", "kind": "install", "result": "unknown"}]
+
+    def write_audit(self, rows):
+        audit = Path(self.home, ".agent-harness", "install-audit.jsonl")
+        audit.parent.mkdir(parents=True, exist_ok=True)
+        audit.write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+    def test_an_open_run_stops_a_preview_and_a_real_run_before_any_dry_run_or_install(self):
+        self.write_audit(self.OPEN)
+        before = self.snapshot()
+        for args in (["--preview"], ["--ticket", "GoodQA goodqa#1"]):
+            self.calls.clear()
+            rc, out, err = self.run_main(*args)
+            self.assertEqual(rc, U.EXIT_STOP, args)
+            self.assertIn("unfinished install run; nothing was installed on this Mac or any host", err)
+            self.assertIn("--host t2-dev --resume ins-0123456789ab", err)
+            self.assertIn("--host t2-dev --rollback ins-0123456789ab", err)
+            self.assertEqual(self.calls, [], "no dry run, no doctor, no install.py")
+        self.assertEqual(self.snapshot(), before, "the Mac is untouched")
+        rc, _, err = self.run_main("--no-remote")
+        self.assertEqual(rc, U.EXIT_OK, "a Mac-only update does not depend on a host's open run: " + err)
+
+    def test_a_run_opened_while_waiting_at_the_prompt_stops_before_the_mac_install(self):
         def reader(prompt):
-            Path(self.export_dir(), "harness", "hooks", "c.py").write_text("tampered\n")
+            self.write_audit(self.OPEN)
             return self.main_sha[:12]
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
-            rc = U.main(["--home", self.home, "--no-remote"], runner=self.runner, reader=reader, environ=CLEAN_ENV)
+            rc = U.main(["--ticket", "GoodQA goodqa#1"], runner=self.runner, reader=reader, environ=CLEAN_ENV,
+                        home=self.home)
         self.assertEqual(rc, U.EXIT_STOP)
-        self.assertIn("still differ from the commit: hooks/c.py", err.getvalue())
+        self.assertIn("unfinished install run", err.getvalue())
+        self.assertFalse(Path(self.home, ".claude", "hooks", "c.py").exists())
+
+    def test_an_unreadable_audit_stops(self):
+        audit = Path(self.home, ".agent-harness", "install-audit.jsonl")
+        audit.parent.mkdir(parents=True)
+        audit.mkdir()                                   # reading a folder fails
+        rc, _, err = self.run_main("--preview")
+        self.assertEqual(rc, U.EXIT_STOP)
+        self.assertIn("cannot be read", err)
 
 
-@unittest.skipUnless((ROOT / ".git").exists(), "needs a git checkout of the repository (run from a clone or worktree)")
+class RealRemoteAnswers(TAI.Base):
+    """R5 F2: the host path fed by the REAL answers, not by answers the author wrote. `ah install-files` runs in-process
+    through ah.main with the argv the updater builds (so ah's own parser reads it), ah_install runs its real
+    REMOTE_SCRIPT through a fake ssh against a temporary host home (test_ah_install.Base), and the real audit file is
+    what the updater's open-run rule reads. The doctor runs for real with `--ssh`, its ssh transport pointed at the
+    same temporary host home. Ticket comments are captured, never posted."""
+
+    def setUp(self):
+        super().setUp()
+        import ah_install
+        import ah
+        self.ai, self.ah = ah_install, ah
+        self.posted = []
+        real_remote = ah_install.Remote
+        for target, attr, value in (
+                (ah_install, "post_comment", lambda ticket, text, poster: self.posted.append((ticket, text)) or True),
+                (ah_install, "Remote", lambda host, runner: real_remote(host, self.runner))):
+            p = mock.patch.object(target, attr, value)
+            p.start()
+            self.addCleanup(p.stop)
+        self.home = str(self.mac)
+        Path(self.home, ".claude", "hooks").mkdir(parents=True)
+        shutil.copy(TAI.HOOKS / "doctor.py", Path(self.home, ".claude", "hooks", "doctor.py"))
+
+    def ah_runner(self, argv, **kw):
+        """The updater's `ah install-files` call, run by the real ah.main in this process."""
+        self.assertEqual(argv[:4], [sys.executable, "-I", str(Path(self.home, ".claude", "hooks", "ah.py")),
+                                    "install-files"])
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"AH_HOME": self.home}), redirect_stdout(out):
+            rc = self.ah.main(argv[3:])
+        return subprocess.CompletedProcess(argv, rc, out.getvalue(), "")
+
+    def test_a_real_dry_run_and_install_parse_and_finish_current(self):
+        names = list(TAI.NAMES)
+        self.assertEqual(U.remote_changes(self.home, "t2-dev", self.c1, names, self.ah_runner),
+                         ["doctor.py", "ah.py", "extra.py", "command_guard.py"])
+        self.assertEqual(U.remote_install(self.home, "t2-dev", self.c1, ["ah.py", "extra.py"], TAI.TICKET,
+                                          self.ah_runner), [])
+        self.assertEqual(U.remote_changes(self.home, "t2-dev", self.c1, ["ah.py", "extra.py"], self.ah_runner), [])
+        self.assertEqual(self.live("ah.py"), TAI.sha(TAI.Path(self.work, "harness", "hooks", "ah.py").read_bytes()))
+        self.assertTrue(self.posted, "the real install wrote its ticket comment (captured)")
+        self.assertEqual(U.unfinished_runs(self.home, "t2-dev"), self.ai.unfinished_runs(self.home, "t2-dev"))
+
+    def test_a_real_install_that_reports_unregistered_hooks(self):
+        ref = TAI.SelfTest.manifest_commit(self, [TAI.SelfTest.ROW])
+        got = U.remote_install(self.home, "t2-dev", ref, ["hooks_manifest.json", "extra.py"], TAI.TICKET,
+                               self.ah_runner)
+        self.assertEqual(got, ["newhook:stop"])
+
+    def unknown_run(self):
+        """A real `unknown`: the host ran the commit step and the answer was lost (ah exits 5 and prints two JSON
+        documents)."""
+        self.inject = ("commit", 1, "after")
+        with self.assertRaises(U.Stop) as cm:
+            U.remote_install(self.home, "t2-dev", self.c1, ["ah.py", "extra.py"], TAI.TICKET, self.ah_runner)
+        self.inject = None
+        open_runs = self.ai.unfinished_runs(self.home, "t2-dev")
+        self.assertEqual(len(open_runs), 1)
+        return open_runs[0], str(cm.exception)
+
+    def test_a_real_run_ending_unknown_gives_guidance_that_real_ah_accepts_and_that_clears_the_host(self):
+        run, msg = self.unknown_run()
+        self.assertIn("failed with exit 5", msg)
+        self.assertEqual(U.unfinished_runs(self.home, "t2-dev"), [run], "the mirror reads the real audit the same way")
+        resume = [ln.strip() for ln in msg.splitlines() if "--resume" in ln]
+        self.assertEqual(len(resume), 1, msg)
+        argv = shlex_split(resume[0])
+        self.assertEqual(argv[:4], ["python3", "-I", "~/.claude/hooks/ah.py", "install-files"])
+        self.ah.build_parser().parse_args(argv[3:])          # ah's own parser takes the printed line
+        rc = self.ah_runner([sys.executable, "-I", str(Path(self.home, ".claude", "hooks", "ah.py"))] + argv[3:]).returncode
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.ai.unfinished_runs(self.home, "t2-dev"), [])
+        self.assertEqual(U.unfinished_runs(self.home, "t2-dev"), [])
+        U.check_no_open_runs(self.home, ["t2-dev"], TAI.TICKET)    # passes once the host is clear
+
+    def test_the_real_refusal_for_an_unfinished_run_and_the_planning_check_agree(self):
+        run, _ = self.unknown_run()
+        with self.assertRaises(U.Stop) as planning:
+            U.check_no_open_runs(self.home, ["t2-dev"], TAI.TICKET)
+        self.assertIn("--host t2-dev --rollback %s" % run, str(planning.exception))
+        with self.assertRaises(U.Stop) as cm:               # what the remote installer itself answers
+            U.remote_install(self.home, "t2-dev", self.c1, ["extra.py"], TAI.TICKET, self.ah_runner)
+        self.assertIn("unfinished run", str(cm.exception))
+        rollback = [ln.strip() for ln in str(planning.exception).splitlines() if "--rollback" in ln][0]
+        argv = shlex_split(rollback)
+        rc = self.ah_runner([sys.executable, "-I", str(Path(self.home, ".claude", "hooks", "ah.py"))] + argv[3:]).returncode
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.ai.unfinished_runs(self.home, "t2-dev"), [])
+
+    def fake_ssh(self, argv, **kw):
+        """doctor's ssh transport, pointed at the temporary host home (the remote half runs for real in sh)."""
+        self.assertEqual(argv[0], "ssh")
+        rest = argv[argv.index("--") + 2:]
+        return subprocess.run(["sh", "-c", " ".join(rest)], env=self.env(), capture_output=True,
+                              text=kw.get("text", False), timeout=60)
+
+    def doctor_runner(self, argv, **kw):
+        import doctor
+        self.assertEqual(argv[-2:], ["--ssh", "t2-dev"])
+        out = io.StringIO()
+        fake = mock.Mock(run=self.fake_ssh, TimeoutExpired=subprocess.TimeoutExpired)
+        with mock.patch.object(doctor, "subprocess", fake), redirect_stdout(out), redirect_stderr(io.StringIO()):
+            rc = doctor.main(argv[3:])
+        return subprocess.CompletedProcess(argv, rc, out.getvalue(), "")
+
+    def test_the_real_doctor_over_ssh_reports_a_host_with_nothing_registered(self):
+        import doctor
+        self.assertEqual((U.WIRED, U.UNREGISTERED), (doctor.WIRED, doctor.MISSING))
+        self.assertIn(doctor.PENDING, U.NOT_REGISTERED_BEFORE)
+        rows = U.doctor_check(self.doctor_runner, self.home, "t2-dev")
+        self.assertIsNotNone(rows, "the real doctor's answer is accepted (exit code agrees with its rows)")
+        required = sorted(i for i, (state, req) in rows.items() if req)
+        self.assertTrue(required)
+        self.assertEqual({rows[i][0] for i in required}, {doctor.MISSING}, "settings.json {} registers nothing")
+        lost, new, old = U.registration(None, rows, "t2-dev")
+        self.assertEqual((lost, new, old), ([], required, []))
+
+
+def shlex_split(line):
+    import shlex
+    return shlex.split(line)
+
+
+def full_checkout():
+    """R5 F6: a shallow clone (CI's default checkout, a review snapshot) cannot be pushed into an empty repository."""
+    if not (ROOT / ".git").exists():
+        return False
+    r = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--is-shallow-repository"], capture_output=True, text=True)
+    return r.returncode == 0 and r.stdout.strip() == "false"
+
+
+@unittest.skipUnless(full_checkout(), "needs a full (not shallow) git checkout of the repository")
 class RealTree(unittest.TestCase):
     """End to end against the repository's own tree: its HEAD stands in for main (a local bare repository), a
     temporary home stands in for ~, and the repository's own install.py and doctor.py run for real. No remote host and
@@ -842,10 +1108,27 @@ class RealTree(unittest.TestCase):
         mock.patch.object(U, "ALLOW_FILE", True).start()
         self.addCleanup(mock.patch.stopall)
 
+    def test_a_tampered_log_backup_install_in_the_export_never_runs(self):
+        """R5 F1: install.py imports the export's own log_backup_install.py on the --hooks-only path; a copy changed
+        during the prompt must never run (the review: it ran unverified at 8bc05736)."""
+        marker = os.path.join(self.t, "log-backup-install-ran")
+
+        def reader(prompt):
+            exp = list(Path(self.home, ".agent-harness", "update-cache").glob("run-*/export"))[0]
+            Path(exp, "log_backup_install.py").write_text("open(%r, 'w').write('x')\n" % marker)
+            return self.head[:12]
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = U.main(["--no-remote"], reader=reader, environ=CLEAN_ENV, home=self.home)
+        self.assertEqual(rc, U.EXIT_STOP, err.getvalue())
+        self.assertIn("the export changed after it was verified (log_backup_install.py)", err.getvalue())
+        self.assertFalse(os.path.exists(marker))
+        self.assertFalse(Path(self.home, ".claude", "hooks").exists(), "nothing was installed")
+
     def test_preview_then_real_run_into_a_temporary_home(self):
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
-            rc = U.main(["--home", self.home, "--preview", "--no-remote"], environ=CLEAN_ENV)
+            rc = U.main(["--preview", "--no-remote"], environ=CLEAN_ENV, home=self.home)
         print("\n--- real-tree preview (temp home) ---\n" + out.getvalue() + err.getvalue())
         self.assertEqual(rc, U.EXIT_OK, err.getvalue())
         self.assertIn("Commit %s" % self.head, out.getvalue())
@@ -853,7 +1136,7 @@ class RealTree(unittest.TestCase):
         self.assertFalse(Path(self.home, ".claude").exists(), "a preview writes nothing under ~/.claude")
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
-            rc = U.main(["--home", self.home, "--no-remote"], reader=lambda p: self.head[:12], environ=CLEAN_ENV)
+            rc = U.main(["--no-remote"], reader=lambda p: self.head[:12], environ=CLEAN_ENV, home=self.home)
         print("--- real-tree run (temp home, no settings.json) ---\n" + out.getvalue()[-800:] + err.getvalue()[-800:])
         # The real doctor exits 2 when it cannot read settings.json, so registration is not proven: STOP, not Done.
         self.assertEqual(rc, U.EXIT_STOP, err.getvalue())
@@ -864,8 +1147,8 @@ class RealTree(unittest.TestCase):
         Path(self.home, ".claude", "settings.json").write_text("{}\n")
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
-            rc = U.main(["--home", self.home, "--no-remote"], reader=lambda p: self.fail("nothing to install asks"),
-                        environ=CLEAN_ENV)
+            rc = U.main(["--no-remote"], reader=lambda p: self.fail("nothing to install asks"),
+                        environ=CLEAN_ENV, home=self.home)
         print("--- real-tree rerun (settings.json with no hooks) ---\n" + out.getvalue()[-800:] + err.getvalue()[-800:])
         self.assertEqual(rc, U.EXIT_REGISTER, err.getvalue())
         self.assertIn("Mac: 0 file(s) differ", out.getvalue())

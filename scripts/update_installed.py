@@ -20,29 +20,34 @@ Steps, each of which stops the run when it fails (nothing after a failed step ru
      ancestor of that main. With an older commit and a remote host, a hook main changed after it stops the run (the
      remote installer refuses an older commit for such a hook).
   3. Export the commit's tree into the run folder. Every object is re-hashed against its id; only regular files and
-     folders are accepted.
-  4. Derive the file lists, never hand-kept: every name in install.py's AGENTS, HOOKS, TOOLS and SKILLS literal tuples
+     folders are accepted. The sha256 of every exported file is kept in memory; later steps trust only those digests.
+  4. Each remote host: an install, resume or rollback run with no definite result in ~/.agent-harness/
+     install-audit.jsonl (the remote installer's own rule) stops the run before anything is installed anywhere, for a
+     preview too, with the resume and rollback commands. Checked again after the confirmation.
+  5. Derive the file lists, never hand-kept: every name in install.py's AGENTS, HOOKS, TOOLS and SKILLS literal tuples
      at the commit (bare names; SKILLS also <folder>/<file>) whose copy under ~/.claude is missing, a symlink, or
-     differs from the commit's bytes (the sha256 kept in memory at export time); for each remote
-     host, every HOOKS name that `ah install-files --dry-run` does not report as already current. A Mac file that main
-     changed after the commit stops the run (it would be a downgrade); ah_install refuses the same for the host.
-  5. A real run asks for the first 12 characters of the commit on /dev/tty (a person at a terminal); no flag skips it.
-  6. Mac: `python3 -B -E -s install.py --apply --hooks-only --home H` from the export, after install.py's bytes are
-     checked against the export digest (CLAUDE.md and settings.json are not touched; replaced files are backed up).
-     Every listed file is then compared with the commit's digests.
-  7. Each remote host: `ah install-files --host H --from-ref <sha> --file ... --ticket T` in batches of 20, with
+     differs from the commit's digests; for each remote host, every HOOKS name that `ah install-files --dry-run` does
+     not report as already current. A Mac file that main changed after the commit stops the run (it would be a
+     downgrade); ah_install refuses the same for the host.
+  6. A real run asks for the first 12 characters of the commit on /dev/tty (a person at a terminal); no flag skips it.
+  7. Mac: the doctor runs; then, immediately before install.py, the whole export is checked against the digests: the
+     same files and folders as the commit and nothing else (no extra module, no __pycache__, no symlink), every byte
+     equal. Then `python3 -B -E -s -S install.py --apply --hooks-only --home H` runs from the export (CLAUDE.md and
+     settings.json are not touched; replaced files are backed up under ~/.claude/agent-harness-backups). Every listed
+     file is compared with the digests again, and the doctor runs again.
+  8. Each remote host: `ah install-files --host H --from-ref <sha> --file ... --ticket T` in batches of 20, with
      command_guard.py in the last batch; each batch's run id is printed. A second dry run must report every file current.
-  8. Registration: the Mac's doctor runs at the end of every real run, whether or not anything was installed. A doctor
-     that does not answer stops the run (registration not proven). Any declared hook the doctor reports MISSING, or
-     any `unregistered` name a host's install reports, gives exit 3. A host where nothing was installed is not
-     re-checked (the remote installer reports registration only when it installs), and the output says so.
+  9. Registration, for the Mac and for every host whether or not anything was installed there: the doctor (for a host
+     `doctor.py check --ssh H`, read-only) must answer, with an exit code that agrees with its rows; otherwise the run
+     stops (registration not proven). A required hook that is unregistered (MISSING) gives exit 3; any other required
+     hook that is not WIRED (SCRIPT_MISSING, CANARY_FAIL) stops the run.
 
 Run time: a preview makes ceil(N/20) dry runs per host, N = the HOOKS count at the commit (about 110 today, so 6);
 a real run makes those, one install per batch of changed files, and the same dry runs again.
 
-Exit: 0 every listed file matches the commit and the Mac's doctor reports no declared hook unregistered (or a clean
+Exit: 0 every listed file matches the commit and every doctor reports every required hook wired (or a clean
 preview); 1 stopped (files installed before the failed step stay installed, and the message says what was done);
-2 usage, or not started with -I -S; 3 installed, with hooks that need registering.
+2 usage (a bad option or value), or not started with -I -S; 3 installed, with hooks that need registering.
 """
 import sys
 
@@ -82,8 +87,10 @@ INSTALL_TIMEOUT = 1800
 DOCTOR_TIMEOUT = 300
 MAX_EXPORT_BYTES = 256 << 20
 MAX_EXPORT_FILES = 20000
-UNREGISTERED = "MISSING"        # doctor's state for a declared, required hook that settings.json does not register
+WIRED = "WIRED"                 # = doctor.WIRED (contract test)
+UNREGISTERED = "MISSING"        # = doctor.MISSING: a declared, required hook that settings.json does not register
 NOT_REGISTERED_BEFORE = ("PENDING",)  # = ah_install.NOT_REGISTERED_BEFORE (contract test)
+BACKUPS = "~/.claude/agent-harness-backups"   # where install.py keeps the files it replaced (contract test)
 CLEARING = ("installed", "rolled_back", "restored", "already_current", "refused")  # = ah_install.CLEARING (contract)
 EXIT_OK, EXIT_STOP, EXIT_USAGE, EXIT_REGISTER = 0, 1, 2, 3
 
@@ -234,7 +241,10 @@ def export_commit(repo, home, commit, dest):
     blobs, todo, digests = [], [(m.group(1).decode(), dest)], {}
     while todo:
         oid, path = todo.pop()
-        os.mkdir(path, 0o700)
+        try:
+            os.mkdir(path, 0o700)
+        except OSError as e:
+            raise Stop("could not export %s (%s); nothing was installed" % (path, e.strerror or e))
         for mode, name, child in tree_entries(read_object(repo, home, "tree", oid)):
             if name in ("", ".", "..", ".git") or "/" in name or "\0" in name:
                 raise Stop("the commit has an unsafe path entry %r" % name)
@@ -260,8 +270,11 @@ def export_commit(repo, home, commit, dest):
         content = verified("blob", oid, data[nl + 1:nl + 1 + size])
         pos = nl + 2 + size
         digests[path.relative_to(dest).as_posix()] = hashlib.sha256(content).hexdigest()
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                     0o755 if mode == "100755" else 0o644)
+        try:
+            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                         0o755 if mode == "100755" else 0o644)
+        except OSError as e:   # e.g. two names that differ only in case on a case-insensitive file system
+            raise Stop("could not export %s (%s); nothing was installed" % (path.relative_to(dest), e.strerror or e))
         try:
             os.write(fd, content)
         finally:
@@ -269,6 +282,50 @@ def export_commit(repo, home, commit, dest):
     msg = body.split(b"\n\n", 1)
     subject = msg[1].decode("utf-8", "replace").splitlines()[0][:120] if len(msg) == 2 and msg[1].strip() else ""
     return subject, digests
+
+
+def verify_export(export, digests):
+    """R5 F1, the one choke point before anything from the export runs: the export holds exactly the commit's files
+    and the folders above them, nothing else (no planted module, no __pycache__, no symlink, no device), and every
+    file's sha256 equals the digest taken at export time. lstat only; nothing is followed."""
+    export = Path(export)
+    want_dirs = {""}
+    for rel in digests:
+        parts = rel.split("/")[:-1]
+        for i in range(1, len(parts) + 1):
+            want_dirs.add("/".join(parts[:i]))
+    seen_files, seen_dirs, problems = set(), {""}, []
+    stack = [""]
+    while stack:
+        rel_dir = stack.pop()
+        try:
+            entries = list(os.scandir(export / rel_dir if rel_dir else export))
+        except OSError as e:
+            raise Stop("the export cannot be read (%s); nothing was installed" % (e.strerror or e))
+        for entry in entries:
+            rel = (rel_dir + "/" + entry.name) if rel_dir else entry.name
+            try:
+                st = entry.stat(follow_symlinks=False)
+            except OSError:
+                problems.append(rel)
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                seen_dirs.add(rel)
+                stack.append(rel)
+            elif entry.is_file(follow_symlinks=False) and st.st_nlink == 1:
+                seen_files.add(rel)
+                try:
+                    with open(export / rel, "rb") as fh:
+                        if hashlib.sha256(fh.read()).hexdigest() != digests.get(rel):
+                            problems.append(rel)
+                except OSError:
+                    problems.append(rel)
+            else:
+                problems.append(rel)   # a symlink, fifo, device, socket, or a hard link to something else
+    problems += sorted((seen_files ^ set(digests)) | (seen_dirs ^ want_dirs))
+    if problems:
+        raise Stop("the export changed after it was verified (%s); nothing from it ran and nothing was installed"
+                   % ", ".join(sorted(set(problems))[:8]))
 
 
 # ----------------------------------------------------------------------------- derivation
@@ -283,10 +340,14 @@ def valid_name(folder, name):
     return len(parts) == 1 and bool(NAME_RE.fullmatch(name))
 
 
-def installer_lists(export):
-    """{folder: [names]} from the exported install.py (literal tuples only; anything else stops)."""
+def installer_lists(export, digests=None):
+    """{folder: [names]} from the exported install.py (literal tuples only; anything else stops). With `digests`, the
+    bytes parsed must be the ones verified at export time."""
+    data = (Path(export) / "install.py").read_bytes()
+    if digests is not None and hashlib.sha256(data).hexdigest() != digests.get("install.py"):
+        raise Stop("the exported install.py changed after it was verified; nothing was installed")
     found = {}
-    for stmt in ast.parse((Path(export) / "install.py").read_bytes().decode("utf-8")).body:
+    for stmt in ast.parse(data.decode("utf-8")).body:
         if not isinstance(stmt, ast.Assign):
             continue
         for target in stmt.targets:
@@ -451,6 +512,43 @@ def remote_install(home, host, commit, names, ticket, runner):
     return unregistered
 
 
+def finish_commands(host, run, ticket):
+    """The two commands that finish an open run, exactly as ah's parser takes them (contract test runs them)."""
+    t = ticket or "GoodQA <project>#<n>"
+    return ["python3 -I ~/.claude/hooks/ah.py install-files --host %s %s %s --ticket '%s'" % (host, verb, run, t)
+            for verb in ("--resume", "--rollback")]
+
+
+def open_run_lines(home, host):
+    """[] when the host has no open run; else the lines that say which run and how to finish it. Stops when the audit
+    cannot be read: nothing may be installed on a host whose state is unknown."""
+    open_runs = unfinished_runs(home, host)
+    if open_runs is None:
+        raise Stop("the remote installer's audit ~/.agent-harness/install-audit.jsonl cannot be read, so whether %s "
+                   "has an unfinished run is unknown; nothing was installed" % host)
+    return open_runs
+
+
+def guidance(host, ticket, open_runs):
+    lines = []
+    for run in open_runs:
+        lines.append("Run %s on %s is unfinished (no result yet, or `unknown`); the remote installer refuses a new "
+                     "install there until it is finished. Finish it with one of:" % (run, host))
+        lines += ["  " + c for c in finish_commands(host, run, ticket)]
+    return lines
+
+
+def check_no_open_runs(home, hosts, ticket):
+    """R5 F3: before any dry run, and again after the confirmation: an open run on any host stops the whole update
+    before anything is installed anywhere (otherwise the Mac would be updated and the host refused)."""
+    lines = []
+    for h in hosts:
+        lines += guidance(h, ticket, open_run_lines(home, h))
+    if lines:
+        raise Stop("\n".join(["a remote host has an unfinished install run; nothing was installed on this Mac or any "
+                              "host."] + lines + ["Then rerun this command."]))
+
+
 def resume_guidance(home, host, ticket, done):
     lines = ["", "Batches already installed on %s: %s" % (
         host, "; ".join("run %s (%s)" % (run, " ".join(g)) for run, g in done) or "none")]
@@ -458,51 +556,64 @@ def resume_guidance(home, host, ticket, done):
     if open_runs is None:
         lines.append("the remote installer's audit could not be read; check it before anything else: "
                      "~/.agent-harness/install-audit.jsonl")
-    for run in open_runs or []:
-        lines.append("Run %s is unfinished (no result yet, or `unknown`); the remote installer refuses a new install "
-                     "on %s until it is finished. Finish it with one of:" % (run, host))
-        for verb in ("--resume", "--rollback"):
-            lines.append("  python3 -I ~/.claude/hooks/ah.py install-files %s %s --ticket %r" % (verb, run, ticket))
+    lines += guidance(host, ticket, open_runs or [])
     lines.append("Then rerun this command: its dry run lists only what still differs.")
     return "\n".join(lines)
 
 
-def doctor_states(runner, home, doctor):
-    """{check id: state} from a doctor at `doctor`, or None when it is missing or does not answer."""
-    if not Path(doctor).is_file():
-        return None
+def doctor_argv(home, host=None):
     claude = Path(home) / ".claude"
+    argv = [sys.executable, "-I", str(claude / "hooks" / "doctor.py"), "check", "--json", "--no-canary"]
+    if host:   # read-only over ssh: the host's own settings.json and hooks folder, judged by this Mac's manifest
+        return argv + ["--ssh", host]
+    return argv + ["--settings", str(claude / "settings.json"), "--hooks-dir", str(claude / "hooks")]
+
+
+def doctor_check(runner, home, host=None):
+    """{check id: (state, required)} from the installed doctor, or None when it is missing, does not answer, or its
+    exit code disagrees with its own rows (doctor.verdict: 0 exactly when every required row is WIRED)."""
+    if not (Path(home) / ".claude" / "hooks" / "doctor.py").is_file():
+        return None
     try:
-        r = runner([sys.executable, "-I", str(doctor), "check", "--json", "--no-canary", "--settings",
-                    str(claude / "settings.json"), "--hooks-dir", str(claude / "hooks")],
-                   capture_output=True, text=True, timeout=DOCTOR_TIMEOUT)
+        r = runner(doctor_argv(home, host), capture_output=True, text=True, timeout=DOCTOR_TIMEOUT)
         items = json.loads(r.stdout)
     except (subprocess.TimeoutExpired, OSError, TypeError, ValueError):
         return None
-    if not isinstance(items, list):
+    if not isinstance(items, list) or not all(isinstance(i, dict) and i.get("id") for i in items):
         return None
-    return {str(i.get("id")): str(i.get("state")) for i in items if isinstance(i, dict) and i.get("id")}
+    rows = {str(i["id"]): (str(i.get("state")), i.get("required") is True) for i in items}
+    gaps = any(req and state != WIRED for state, req in rows.values())
+    if r.returncode != (1 if gaps else 0):
+        return None
+    return rows
 
 
-def registration(before, after):
-    """(lost, new, old) doctor ids: wired before and not after (a regression); declared now and unregistered, and not
-    registered before either (ah_install.newly_declared_unregistered); unregistered before and after. `after` must be
-    an answer: a doctor that did not answer after the install means registration is not proven (F2a)."""
+def registration(before, after, where="the Mac"):
+    """(lost, new, old): ids wired before and not after (a regression); required and unregistered now, and not
+    registered before either (ah_install.newly_declared_unregistered); unregistered before and after. A doctor that
+    did not answer means registration is not proven, and a required row that is neither WIRED nor MISSING
+    (SCRIPT_MISSING, CANARY_FAIL, ...) is a broken install, not a registration step: both stop."""
     if after is None:
-        raise Stop("the doctor did not answer after the install, so hook registration is not proven. The files are "
-                   "installed (install.py backed up the ones it replaced); run `python3 -I ~/.claude/hooks/doctor.py "
-                   "check` and fix it before relying on this install.")
+        raise Stop("the doctor did not answer for %s (or its exit code disagreed with its rows), so hook registration "
+                   "is not proven. Files already installed stay installed (install.py backed up the ones it replaced "
+                   "under %s); run `python3 -I ~/.claude/hooks/doctor.py check%s` and fix it before relying on this "
+                   "install." % (where, BACKUPS, "" if where == "the Mac" else " --ssh " + where))
     before = before or {}
-    lost = sorted(i for i, s in before.items() if s == "WIRED" and after.get(i) != "WIRED")
-    unreg = [i for i, s in after.items() if s == UNREGISTERED]
-    new = sorted(i for i in unreg if i not in before or before[i] in NOT_REGISTERED_BEFORE)
+    lost = sorted(i for i, (s, _r) in before.items() if s == WIRED and after.get(i, ("", False))[0] != WIRED)
+    broken = sorted(i for i, (s, req) in after.items() if req and s not in (WIRED, UNREGISTERED))
+    if broken:
+        raise Stop("on %s these required hooks are not working (%s); this is not fixed by registering them: %s"
+                   % (where, ", ".join(sorted({after[i][0] for i in broken})), " ".join(broken)))
+    unreg = [i for i, (s, req) in after.items() if req and s == UNREGISTERED]
+    new = sorted(i for i in unreg if i not in before or before[i][0] in NOT_REGISTERED_BEFORE)
     old = sorted(i for i in unreg if i not in new)
     return lost, new, old
 
 
 # ----------------------------------------------------------------------------- main
 
-def main(argv=None, runner=subprocess.run, reader=read_tty, environ=None):
+def main(argv=None, runner=subprocess.run, reader=read_tty, environ=None, home=None):
+    """`home` is for tests only (no command-line flag: the home also decides which ah.py and doctor.py run)."""
     environ = os.environ if environ is None else environ
     ap = argparse.ArgumentParser(description="User-run: update the installed harness to one commit on origin/main.")
     ap.add_argument("--commit", help="full 40-hex lowercase sha on origin/main (default: origin/main HEAD)")
@@ -510,8 +621,12 @@ def main(argv=None, runner=subprocess.run, reader=read_tty, environ=None):
     ap.add_argument("--host", action="append", choices=REMOTE_HOSTS, help="remote host (default: t2-dev)")
     ap.add_argument("--no-remote", action="store_true", help="update this Mac only")
     ap.add_argument("--ticket", help="GoodQA project#N; required for a real run with a remote host")
-    ap.add_argument("--home", default=str(Path.home()), help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
+    if a.commit is not None and not SHA_RE.fullmatch(a.commit):
+        ap.error("--commit must be a full 40-hex lowercase sha")
+    if a.ticket is not None and not TICKET_RE.fullmatch(a.ticket):
+        ap.error("--ticket must look like 'GoodQA project#123'")
+    home = str(home or Path.home())
     hosts = [] if a.no_remote else (a.host or list(REMOTE_HOSTS))
     run = None
     try:
@@ -519,31 +634,28 @@ def main(argv=None, runner=subprocess.run, reader=read_tty, environ=None):
         if markers:
             raise Stop("an agent is running this (%s is set). The updater is user-run: its installs and its remote dry "
                        "runs are main-only commands. Ask the user to run it." % ", ".join(markers))
-        if a.commit is not None and not SHA_RE.fullmatch(a.commit):
-            raise Stop("--commit must be a full 40-hex lowercase sha")
-        if a.ticket is not None and not TICKET_RE.fullmatch(a.ticket):
-            raise Stop("--ticket must look like 'GoodQA project#123'")
         if not a.preview and hosts and not a.ticket:
             raise Stop("--ticket 'GoodQA project#N' is required for a real run")
-        run = new_run_dir(a.home)
-        repo, main_sha = fetch_main(run, a.home)
-        check_self(repo, a.home)
-        commit = resolve_commit(repo, a.home, main_sha, a.commit)
+        check_no_open_runs(home, hosts, a.ticket)
+        run = new_run_dir(home)
+        repo, main_sha = fetch_main(run, home)
+        check_self(repo, home)
+        commit = resolve_commit(repo, home, main_sha, a.commit)
         export = run / "export"
-        subject, digests = export_commit(repo, a.home, commit, export)
-        lists = installer_lists(export)
-        mac = local_changes(digests, a.home, lists)
-        older = downgrades(repo, a.home, commit, main_sha, mac)
+        subject, digests = export_commit(repo, home, commit, export)
+        lists = installer_lists(export, digests)
+        mac = local_changes(digests, home, lists)
+        older = downgrades(repo, home, commit, main_sha, mac)
         if older:
             raise Stop("main changed these files after %s, so installing it would put older versions in place: %s. "
                        "Use a newer --commit." % (commit[:12], " ".join(older)))
         if hosts and commit != main_sha:
-            older = downgrades(repo, a.home, commit, main_sha, ["hooks/" + n for n in lists["hooks"]])
+            older = downgrades(repo, home, commit, main_sha, ["hooks/" + n for n in lists["hooks"]])
             if older:
                 raise Stop("main changed these hooks after %s, and the remote installer refuses an older commit for "
                            "them (even where the host already has them): %s. Use a newer --commit, or --no-remote."
                            % (commit[:12], " ".join(older)))
-        remote = {h: remote_changes(a.home, h, commit, lists["hooks"], runner) for h in hosts}
+        remote = {h: remote_changes(home, h, commit, lists["hooks"], runner) for h in hosts}
         print("Commit %s (%s)" % (commit, subject))
         print("Mac: %d file(s) differ: %s" % (len(mac), " ".join(mac) or "-"))
         for h, names in remote.items():
@@ -554,54 +666,54 @@ def main(argv=None, runner=subprocess.run, reader=read_tty, environ=None):
             return EXIT_OK
         if mac or any(remote.values()):
             confirm(commit, reader)
-        claude_hooks = Path(a.home) / ".claude" / "hooks"
-        before = doctor_states(runner, a.home, claude_hooks / "doctor.py")
+            check_no_open_runs(home, hosts, a.ticket)   # the wait at the prompt may have been long
+        before = doctor_check(runner, home)
         if mac:
-            if file_sha(export / "install.py") != digests.get("install.py"):
-                raise Stop("the exported install.py changed after it was verified; nothing was installed")
+            verify_export(export, digests)               # nothing slow between this walk and the exec below
             try:
-                r = runner([sys.executable, "-B", "-E", "-s", str(export / "install.py"), "--apply", "--hooks-only",
-                            "--home", a.home], cwd=str(export), capture_output=True, text=True, timeout=INSTALL_TIMEOUT)
+                r = runner([sys.executable, "-B", "-E", "-s", "-S", str(export / "install.py"), "--apply",
+                            "--hooks-only", "--home", home], cwd=str(export), capture_output=True, text=True,
+                           timeout=INSTALL_TIMEOUT)
             except subprocess.TimeoutExpired:
-                raise Stop("install.py timed out after %d s; replaced files were backed up by install.py. Run "
-                           "--preview to see what still differs." % INSTALL_TIMEOUT)
+                raise Stop("install.py timed out after %d s; replaced files were backed up under %s. Run --preview "
+                           "to see what still differs." % (INSTALL_TIMEOUT, BACKUPS))
             if r.returncode != 0:
                 raise Stop("install.py failed with exit %s: %s" % (r.returncode, (r.stderr or r.stdout or "")[-400:]))
-            still = local_changes(digests, a.home, lists)
+            still = local_changes(digests, home, lists)
             if still:
-                raise Stop("after install.py these Mac files still differ from the commit: %s" % " ".join(still))
-        lost, new, old = registration(before, doctor_states(runner, a.home, claude_hooks / "doctor.py"))
+                raise Stop("after install.py these Mac files are live but are NOT the commit's bytes: %s. The files "
+                           "they replaced are under %s; restore them or rerun this command." % (" ".join(still), BACKUPS))
+        lost, new, old = registration(before, doctor_check(runner, home))
         if lost:
-            raise Stop("hooks wired before this install are not wired now: %s. install.py backed up the replaced "
-                       "files under ~/.claude." % " ".join(lost))
+            raise Stop("hooks wired before this install are not wired now: %s. The replaced files are under %s."
+                       % (" ".join(lost), BACKUPS))
         print("Mac: every listed file matches %s" % commit[:12])
-        unregistered, unchecked = {}, []
+        gaps = [("Mac", new), ("Mac (already before this run)", old)]
         for h, names in remote.items():
             if names:
-                unregistered[h] = remote_install(a.home, h, commit, names, a.ticket, runner)
-            else:
-                unchecked.append(h)
-            left = remote_changes(a.home, h, commit, lists["hooks"], runner)
+                reported = remote_install(home, h, commit, names, a.ticket, runner)
+                if reported:
+                    print("%s: the remote installer reports these hooks unregistered: %s" % (h, " ".join(reported)))
+            left = remote_changes(home, h, commit, lists["hooks"], runner)
             if left:
                 raise Stop("%s: these hook files still differ after the install: %s" % (h, " ".join(left)))
             print("%s: every hook file matches %s" % (h, commit[:12]))
-        for h in unchecked:
-            print("%s: nothing was installed, so its hook registration was not re-checked (the remote installer "
-                  "reports it only when it installs)." % h)
-        gaps = [("Mac", new), ("Mac (already before this run)", old)] + \
-               [(h, sorted(set(u))) for h, u in unregistered.items()]
+            # R5 F4: every host is checked, whether or not anything was installed there
+            _lost, h_new, h_old = registration(None, doctor_check(runner, home, h), h)
+            gaps.append((h, sorted(set(h_new + h_old))))
         gaps = [(where, ids) for where, ids in gaps if ids]
         if gaps:
             for where, ids in gaps:
                 print("%s: declared but not registered in settings.json, so not running yet: %s" % (where, " ".join(ids)))
             print("Commit %s: files in place, NOT fully active: register these hooks with install.py --apply (without "
-                  "--hooks-only) from a checkout of that commit." % commit)
+                  "--hooks-only) from a checkout of that commit, on each host named." % commit)
             return EXIT_REGISTER
+        checked = "the Mac's doctor" + "".join(" and %s's" % h for h in hosts)
         if mac or any(remote.values()):
-            print("Done. Installed commit %s; the Mac's doctor reports every declared hook registered." % commit)
+            print("Done. Installed commit %s; %s report every required hook wired." % (commit, checked))
         else:
-            print("Nothing to install: everything listed already matches %s; the Mac's doctor reports every declared "
-                  "hook registered." % commit)
+            print("Nothing to install: everything listed already matches %s; %s report every required hook wired."
+                  % (commit, checked))
         return EXIT_OK
     except Stop as e:
         print("STOP: %s" % e, file=sys.stderr)
