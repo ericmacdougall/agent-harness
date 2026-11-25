@@ -100,6 +100,27 @@ WRITES_NEXT = [
     ('N15c', "sed -n 'e cat >>{w}' /tmp/rows"),
     ('N15d', "sed --expression='1e tee -a {w}' /tmp/rows"),
     ('N15e', "gsed -n '1{{e tee -a {w}\n}}' /tmp/rows"),
+    # N2c-N2d, N16: a reader's option that runs a program or writes a file (N2c, N2d and N16a hold at 29421873)
+    ('N2c', "ag --pager 'tee -a {w}' x /tmp/rows"),
+    ('N2d', "ack --pager='tee -a {w}' x /tmp/rows"),
+    ('N16a', 'cd {d} && file -C -m /tmp/rows'),
+    ('N16b', 'sort -T {d} /tmp/rows'),
+    ('N16c', 'sort --temporary-directory={d} /tmp/rows'),
+    ('N16d', 'sort --outp={w} /tmp/rows'),
+    # N17: a builtin that names a variable evaluates its array subscript, and bash and zsh run a command substitution
+    # there; (( )) and [[ -eq ]] do it to a variable's value (allowed at 29421873; probe: subscript_probe.sh)
+    ('N17a', "let 'x[$(tee -a {w} <<< ROW)]=1'"),
+    ('N17b', "declare 'x[$(tee -a {w} <<< ROW)]=1'"),
+    ('N17c', "read 'x[$(tee -a {w} <<< ROW)]' <<< v"),
+    ('N17d', "printf -v 'x[$(tee -a {w} <<< ROW)]' v"),
+    ('N17e', "export 'x[$(tee -a {w} <<< ROW)]=1'"),
+    ('N17f', "t='a[$(tee -a {w} <<< ROW)]'; (( t ))"),
+    ('N17g', "test -v 'x[$(tee -a {w} <<< ROW)]'"),
+    ('N17h', "mapfile 'x[$(tee -a {w} <<< ROW)]' < /dev/null"),
+    ('N17i', "t='a[$(tee -a {w} <<< ROW)]'; [[ $t -eq 0 ]]"),
+    # N18: bash's mapfile -C evaluates its callback every -c lines; N19: zsh's print -P under prompt_subst runs $(...)
+    ('N18', "mapfile -C 'tee -a {w} <<<' -c 1 rows < /tmp/rows"),
+    ('N19', "setopt prompt_subst; print -P '$(tee -a {w} <<< ROW)'"),
     # W1D: a program the guard cannot resolve, linked to the tree by its own words or the line's dataflow
     ('W1Da', 'python3 x.py {w}'),
     ('W1Db', 'bash x.sh {d}'),
@@ -160,6 +181,12 @@ READS_NEXT = [
     ('N12r3', 'ls -li {w}'),
     ('N15r', "sed -n '/x/p' {w}"),
     ('N15r2', "sed -n '1,5p;$=' {w}"),
+    ('N16r', 'sort -o /tmp/s {w}'),
+    ('N16r2', 'file {w}'),
+    ('N16r3', 'uniq -c {w}'),
+    ('N16r4', 'xxd -l 64 {w}'),
+    ('N17r', 'mapfile -t rows < {w}'),
+    ('N17r2', "printf '%s\\n' {w}"),
     ('W1Dr', 'cat {w} | python3 x.py'),
     ('W1Dr2', 'python3 x.py < {w}'),
     ('W1Dr3', 'python3 x.py /tmp/out'),
@@ -178,9 +205,11 @@ PENDING_WRITES = frozenset({
     'F2a', 'F2b', 'F2c', 'F2d', 'F2e', 'F2f', 'F2g', 'F3a', 'F3b', 'F3c', 'F3d', 'F4a',
     'F4b', 'F5a', 'F5b', 'F5c', 'F6a', 'F6b', 'F7a', 'F7b', 'F7c', 'F8a', 'F8b', 'F9a', 'F9b', 'F10', 'N1a', 'N1b',
     'N1c', 'N1d', 'N1e', 'N1f', 'N1g', 'N1h', 'N2a', 'N2b', 'N3', 'N4', 'N5', 'N6', 'N9', 'N10d', 'N10e', 'N11', 'N12a',
-    'N12b', 'N12c', 'N12d', 'N14a', 'N14b', 'N15a', 'N15b', 'N15c', 'N15d', 'N15e', 'W1Da', 'W1Db', 'W1Dc', 'W1Dd', 'W1De', 'W1Df', 'W1Dg', 'C1', 'C2', 'C3',
-    'C4', 'C5', 'C6', 'C7', 'C8', 'C9', 'C10', 'C11', 'C12'})
-PENDING_READS = frozenset({'F11a', 'F11b', 'F11c', 'F11d', 'F11e', 'F11f', 'F11g'})
+    'N12b', 'N12c', 'N12d', 'N14a', 'N14b', 'N15a', 'N15b', 'N15c', 'N15d', 'N15e', 'N16b', 'N16c', 'N16d', 'N17a',
+    'N17b', 'N17c', 'N17d', 'N17e', 'N17f', 'N17g', 'N17h', 'N17i', 'N18', 'N19', 'W1Da', 'W1Db', 'W1Dc', 'W1Dd',
+    'W1De', 'W1Df', 'W1Dg', 'C1', 'C2', 'C3', 'C4', 'C5', 'C6', 'C7', 'C8', 'C9', 'C10', 'C11', 'C12'})
+# N16r4: the old in-out rule takes `64` for xxd's input and the WAL for its output
+PENDING_READS = frozenset({'F11a', 'F11b', 'F11c', 'F11d', 'F11e', 'F11f', 'F11g', 'N16r4'})
 
 
 def _ratchet(pending):
