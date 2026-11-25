@@ -350,6 +350,53 @@ class NeverBlocks(Base):
         self.assertIn("not safe to write", self.context(result))
         self.assertEqual(list(real.iterdir()), [])  # never written through the symlink
 
+    # The real hook entry point with os.open faulted for the WAL name only: argv is [mode, wal.py, event].
+    FAULT_DRIVER = """
+import errno, os, runpy, sys
+mode, script, event = sys.argv[1:4]
+session = os.path.join(os.environ["HOME"], ".claude", "wals", "linksession")
+real_open = os.open
+def faulted(path, flags, *args, **kwargs):
+    if path == "main.jsonl":
+        if mode == "replaced" and not os.path.exists(session + "-moved"):
+            os.rename(session, session + "-moved")
+            os.mkdir(session)
+        raise FileNotFoundError(errno.ENOENT, "fault", path)
+    return real_open(path, flags, *args, **kwargs)
+os.open = faulted
+sys.path.insert(0, os.path.dirname(script))
+sys.argv = [script, event]
+runpy.run_path(script, run_name="__main__")
+"""
+
+    def faulted_hook(self, mode):
+        payload = {"session_id": SESSION, "tool_name": "Bash", "tool_input": {"command": "ls"}, "tool_use_id": "t1"}
+        before = {p.relative_to(self.home) for p in self.home.rglob("*")}
+        result = subprocess.run([sys.executable, "-c", self.FAULT_DRIVER, mode, str(WAL_PY), "pretool"], text=True,
+                                input=json.dumps(payload), capture_output=True, env=self.env)
+        added = {p.relative_to(self.home) for p in self.home.rglob("*")} - before
+        return result, added
+
+    def test_a_session_directory_replaced_at_open_warns_and_allows(self):
+        self.wal_dir.mkdir(parents=True)
+        result, added = self.faulted_hook("replaced")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("not safe to write", self.context(result))
+        moved = self.wal_dir.with_name(SESSION + "-moved")
+        self.assertEqual(added, {moved.relative_to(self.home)})  # the fault's own rename; the hook wrote nothing
+        self.assertEqual(list(moved.iterdir()) + list(self.wal_dir.iterdir()), [])
+        self.assertIn('"tool_use_id":"t1"', result.stderr)  # the row is printed, not lost silently
+
+    def test_a_wal_that_can_never_be_created_diverts_and_allows(self):
+        self.wal_dir.mkdir(parents=True)
+        result, added = self.faulted_hook("missing")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("could not be created", self.context(result))
+        self.assertEqual({p.parent for p in added}, {self.wal_dir.relative_to(self.home)})
+        self.assertEqual([p.name.startswith("main.jsonl.pending-") for p in added], [True])
+        self.invoke("pretool", {"tool_use_id": "later"})
+        self.assertEqual([r.get("tool_use_id") for r in self.rows() if r.get("event") == "pretool"], ["t1", "later"])
+
     def test_a_held_lock_diverts_the_row_instead_of_stalling_the_hook(self):
         self.make_wal()
         holder = os.open(self.wal, os.O_RDWR)

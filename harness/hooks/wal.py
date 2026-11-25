@@ -359,8 +359,10 @@ def append(path: Path, record: dict) -> bool:
             except FileNotFoundError:
                 # A concurrent first write has occasionally observed ENOENT on macOS despite O_CREAT. Retry only
                 # while the named session directory still resolves to the pinned inode.
-                if attempt == 3 or not current_directory():
-                    raise
+                if not current_directory():
+                    return _no_safe_directory(path, record, ValueError("the session directory changed while it was in use"))
+                if attempt == 3:
+                    return _divert(directory, path, record, "could not be created (it stays missing)")
                 time.sleep(0.01 * (attempt + 1))
                 continue
             except OSError as exc:  # ELOOP (symlink), EISDIR (directory), ENXIO...: never followed, never fatal

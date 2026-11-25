@@ -366,10 +366,10 @@ class WalTests(unittest.TestCase):
             return original_open(path, flags, *args, **kwargs)
 
         with patch.dict(os.environ, {'HOME': str(self.home)}), patch.object(module.os, 'open', side_effect=replace_directory):
-            with self.assertRaises(FileNotFoundError):
-                module.append(target, {'event': 'fixture'})
-        self.assertFalse(target.exists())
-        self.assertFalse((session.with_name('moved') / 'main.jsonl').exists())
+            self.assertFalse(module.append(target, {'event': 'fixture'}))  # warns and allows; never raises (goodqa#17145)
+        self.assertIn('not safe to write', ' '.join(module.NOTICES))
+        self.assertEqual(list(session.iterdir()), [])
+        self.assertEqual(list(session.with_name('moved').iterdir()), [])
 
     def test_repeated_missing_file_is_bounded(self):
         spec = importlib.util.spec_from_file_location('wal_retry_test', WAL)
@@ -386,10 +386,11 @@ class WalTests(unittest.TestCase):
             return original_open(path, flags, *args, **kwargs)
 
         with patch.dict(os.environ, {'HOME': str(self.home)}), patch.object(module.os, 'open', side_effect=never_create):
-            with self.assertRaises(FileNotFoundError):
-                module.append(target, {'event': 'fixture'})
+            self.assertFalse(module.append(target, {'event': 'fixture'}))  # diverted to a side file, no lockout (goodqa#17145)
         self.assertEqual(len(attempts), 4)
         self.assertFalse(target.exists())
+        self.assertIn('could not be created', ' '.join(module.NOTICES))
+        self.assertEqual([p.name.startswith('main.jsonl.pending-') for p in target.parent.iterdir()], [True])
 
     def test_retry_refuses_directory_moved_during_backoff(self):
         spec = importlib.util.spec_from_file_location('wal_retry_test', WAL)
