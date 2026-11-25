@@ -146,9 +146,23 @@ def resolve(name, dirs):
     return None
 
 
-def form_env(name, dirs, home, gh_auth=None):
-    """The minimal environment of one executable's form: fixed keys and values only."""
+USER_BUS_FORMS = ("systemctl", "systemd-run")
+
+
+def user_bus_env(uid=None):
+    """The daemon's own user manager bus (goodqa#16386): XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS derived from
+    the running uid, never read from the caller's environment. Without them a guarded `systemctl --user` or
+    `systemd-run --user` fails with "Failed to connect to bus: No medium found"."""
+    runtime = "/run/user/%d" % (os.getuid() if uid is None else uid)
+    return {"XDG_RUNTIME_DIR": runtime, "DBUS_SESSION_BUS_ADDRESS": "unix:path=%s/bus" % runtime}
+
+
+def form_env(name, dirs, home, gh_auth=None, unit_scope=""):
+    """The minimal environment of one executable's form: fixed keys and values only. systemctl and systemd-run in
+    the --user scope also get the uid-derived user bus (user_bus_env); nothing else does."""
     base = {"PATH": ":".join(dirs), "HOME": str(home), "LC_ALL": "C"}
+    if name in USER_BUS_FORMS and unit_scope == "--user":
+        base.update(user_bus_env())
     if name == "git":
         base.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0"})
     elif name == "gh":
@@ -230,7 +244,7 @@ class Policy:
     # ------------------------------------------------------------ the forms' environments and argv
 
     def env(self, name):
-        return form_env(name, self.trusted, self.home, self.gh_auth)
+        return form_env(name, self.trusted, self.home, self.gh_auth, self.unit_scope)
 
     def argv(self, name, args):
         if name not in self.exe:
