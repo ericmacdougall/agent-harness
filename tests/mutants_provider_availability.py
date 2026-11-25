@@ -91,6 +91,11 @@ MUTANTS = {
         'peer_review.py', '                    late = availability_skip(availability, provider, pool)\n',
         '                    late = availability_skip(availability, provider, pool) if waited else None\n',
         ['BusyPool']),
+    'a late limit on the primary ends the run instead of falling back': (
+        'peer_review.py', '                        if len(order) == 1 or provider != primary:\n'
+                          '                            raise ReviewFailure(outcome, source)\n',
+        '                        if True:\n'
+        '                            raise ReviewFailure(outcome, source)\n', ['BusyPool']),
     'a live holder past its deadline gets reconcile advice': (
         'peer_review.py', "    if status.get('finished') is True or status.get('state') == 'DEAD':",
         "    if status.get('finished') is True or status.get('state') == 'DEAD' or status.get('past_deadline') is True:",

@@ -1429,6 +1429,12 @@ def skip_attempt(options, provider, pool, skipped):
     return {**provider_failure({}), 'reason': 'QUOTA', 'fallback_allowed': True, 'skipped': True}
 
 
+def skip_fallback_text(provider, pool, skipped):
+    """The receipt's fallback reason for a skipped primary, from the top-of-loop check or the one after acquire."""
+    return ('Primary reviewer skipped (%s pool %s out of quota until %s; not launched); used authorized '
+            'independent fallback.' % (provider, pool, utc_text(skipped['until'])))
+
+
 def record_availability(availability, provider, pool, outcome, launched):
     """After a launched attempt: a QUOTA refusal records (provider, pool) as unavailable, a verdict clears any record.
     Returns True when a record was written. Failures only warn: availability never changes a review outcome."""
@@ -1654,8 +1660,7 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
             outcome = skip_attempt(options, provider, pool, skipped)
             if len(order) == 1 or provider != primary:
                 raise ReviewFailure(outcome, source)
-            failure = ('Primary reviewer skipped (%s pool %s out of quota until %s; not launched); used authorized '
-                       'independent fallback.' % (provider, pool, utc_text(skipped['until'])))
+            failure = skip_fallback_text(provider, pool, skipped)
             continue
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -1703,10 +1708,15 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                     # out of quota and release the pool between the check at the top of the loop and this lease.
                     late = availability_skip(availability, provider, pool)
                     if late is not None:
-                        # The holder recorded this provider out of quota meanwhile: do not launch into it.
+                        # The holder recorded this provider out of quota meanwhile: do not launch into it. The same
+                        # rule as the skip at the top of the loop: a primary with a fallback falls back (PR 353 F1).
                         store.release_pool(provider, pool, run_record.run_id, reason='NONE')
                         leased = False
-                        raise ReviewFailure(skip_attempt(options, provider, pool, late), source)
+                        outcome = skip_attempt(options, provider, pool, late)
+                        if len(order) == 1 or provider != primary:
+                            raise ReviewFailure(outcome, source)
+                        failure = skip_fallback_text(provider, pool, late)
+                        continue
                 if not resolution['path']:
                     outcome = normalize_provider(provider, 127, '', 'HARNESS_PROVIDER_UNAVAILABLE')
                 else:

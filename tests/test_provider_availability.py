@@ -599,6 +599,25 @@ class BusyPool(LoopFixture):
         self.assertEqual(store.released, [('codex', {'reason': 'NONE'})])
         self.assertIn('Provider skipped: codex pool codex-harness', stderr)
 
+    def test_a_late_limit_on_the_primary_falls_back_like_the_top_of_loop_skip(self):
+        # PR 353 gate F1: in the default order the late check after acquire must not end the run while Claude is open.
+        store = self.Store()
+        original = store.acquire_pool
+
+        def acquire(provider, pool, run_id):
+            if provider == 'codex':
+                self.records.record('codex', 'codex-harness')
+            return original(provider, pool, run_id)
+        store.acquire_pool = acquire
+        options = self.options(store)
+        result, error, stderr = self.review(options)
+        self.assertIsNone(error)
+        self.assertEqual(self.calls, ['claude'], 'codex is not launched; the fallback is')
+        self.assertEqual(store.released[0], ('codex', {'reason': 'NONE'}))
+        self.assertIn('Provider skipped: codex pool codex-harness', stderr)
+        self.assertIn('Primary reviewer skipped (codex pool codex-harness out of quota', result[2])
+        self.assertEqual(options['actual_reviewer'], 'claude')
+
     def test_the_busy_message_names_the_holder_repo_and_pr(self):
         selections = pr.ladder.state_root() / 'selections'
         selections.mkdir(mode=0o700, exist_ok=True)
