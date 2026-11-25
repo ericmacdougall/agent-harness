@@ -23,7 +23,8 @@ def tuples_from_hooks(hooks: dict):
         for g in groups:
             for h in g["hooks"]:
                 toks = doctor.flatten(h)
-                script = next((Path(t).name for t in toks if t.endswith(".py")), None)
+                # the hook script, not the off-switch launcher it runs through (python3 <hooks>/ah_hook.py <script>)
+                script = next((Path(t).name for t in toks if t.endswith(".py") and Path(t).name != doctor.LAUNCHER), None)
                 names = [Path(t).name for t in toks]
                 # the verb right after the script; a Codex handler may end in `|| exit 2`
                 arg = toks[names.index(script) + 1] if script and names.index(script) + 1 < len(toks) else None
@@ -113,6 +114,23 @@ class Check(unittest.TestCase):
         pending = [x for x in f if x["state"] == doctor.PENDING]
         self.assertTrue(pending)
         self.assertEqual(doctor.verdict(f), 0)
+
+    def test_launcher_form_is_wired_and_a_missing_launcher_is_not(self):
+        hooks = {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "python3",
+                 "args": [str(self.claude / "hooks" / "ah_hook.py"), "commit_policy.py", "hook"]}]}]}
+        hd = self.claude / "hooks"
+        self.assertIsNotNone(doctor.find_hook(hooks, "PreToolUse", "commit_policy.py", "hook", ["Bash"], hd))
+        self.assertIsNone(doctor.find_hook(hooks, "PreToolUse", "commit_policy.py", "other", ["Bash"], hd))
+        self.assertIsNone(doctor.find_hook(hooks, "PreToolUse", "spec_flow.py", "hook", ["Bash"], hd))
+        other = {"PreToolUse": [{"hooks": [{"type": "command", "command": "python3",
+                 "args": ["/elsewhere/ah_hook.py", "commit_policy.py", "hook"]}]}]}
+        self.assertIsNone(doctor.find_hook(other, "PreToolUse", "commit_policy.py", "hook", ["Bash"], hd))
+        self.assertTrue(all("ah_hook.py" in h["args"][0] for g in self.live["hooks"]["PreToolUse"] for h in g["hooks"]
+                            if h.get("command") == "python3"), "installer output is not wired through the launcher")
+        self.assertEqual(doctor.verdict(self.run_check()), 0)
+        (self.claude / "hooks" / "ah_hook.py").unlink()
+        f = {x["id"]: x["state"] for x in self.run_check()}
+        self.assertEqual(f["commit_policy:hook"], doctor.SCRIPT_MISSING)
 
     def test_codex_command_string_form_is_understood(self):
         live = {"hooks": {"PreToolUse": [{"hooks": [{"type": "command",

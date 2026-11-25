@@ -149,6 +149,39 @@ class Inputs(Base):
         self.assertEqual(self.calls, [])
 
 
+class ReleaseFloor(Base):
+    """A ref whose harness/RELEASE is below the host's ~/.agent-harness/floor.json is refused before any write."""
+
+    def set_floor(self, release):
+        floor = self.host_home / ".agent-harness" / "floor.json"
+        floor.parent.mkdir(parents=True, exist_ok=True)
+        floor.write_text(json.dumps({"flavors": {"claude": {"release": release}}}))
+
+    def commit_release(self, release):
+        (self.work / "harness" / "RELEASE").write_text("%d\n" % release)
+        self.write_commit({n: self.base_bytes(n) + b"\n# c2\n" for n in NAMES}, "c2")
+        git(self.work, "push", "-q", str(self.origin), "main")
+        return git(self.work, "rev-parse", "HEAD")
+
+    def test_a_ref_below_the_floor_is_refused_and_nothing_changes(self):
+        self.set_floor(1000)
+        error = self.refused()  # c1 has no harness/RELEASE: release 0
+        self.assertEqual(error.code, "below_floor")
+        self.assertIn("release 1000", str(error))
+        self.assertEqual(self.live("ah.py"), sha(self.base_bytes("ah.py")))
+        self.assertFalse(set(self.counts) & {"lock", "stage", "commit", "selftest"})
+        older = self.commit_release(999)
+        self.assertEqual(self.refused(ref=older).code, "below_floor")
+
+    def test_at_or_above_the_floor_or_with_allow_older_it_proceeds(self):
+        self.set_floor(1000)
+        ref = self.commit_release(1000)
+        self.assertEqual(self.install(ref=ref, dry_run=True, ticket=None)["result"], "dry_run")
+        out = ai.install_files("t2-dev", self.c1, ["ah.py"], None, True, self.mac, "s", "a", self.runner,
+                               lambda t, x: None, allow_older=True)
+        self.assertEqual(out["result"], "dry_run")
+
+
 class Listed(Base):
     def test_a_blob_that_exists_but_is_not_in_the_installer_list_refuses(self):  # AC-1, NEG-1
         side = Path(self.tmp, "side-unlisted")

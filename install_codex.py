@@ -17,8 +17,8 @@ try:
 except ModuleNotFoundError:  # Codex installer requires Python 3.11+.
     tomllib = None
 
-from install import (DirectoryPins, local_profile_status, migrate_local_profiles, netwatch_status, atomic_write, git_hook_status, markdown_marker_lines, read_regular,
-                     safe_unlink)
+from install import (DirectoryPins, DowngradeRefused, local_profile_status, migrate_local_profiles, netwatch_status, atomic_write,
+                     git_hook_status, markdown_marker_lines, read_regular, safe_unlink, switch_module)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -64,7 +64,9 @@ DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report
                     # No Codex Stop hook: Codex keys hook trust by position and the dashboard's Codex chat uses codex exec.
                     'mc_chat.py', 'mc_inbox.py',
                     # Stall-watcher answer inbox (UserPromptSubmit + SessionStart only; appended so trust positions stay).
-                    'owner_inbox.py')
+                    'owner_inbox.py',
+                    # The launcher every Codex hook runs through (the off switch), roles, and the switch itself.
+                    'ah_hook.py', 'ah_roles.py', 'ah_switch.py')
 GIT_HOOK_KEY = 'agent-harness-commit-policy-codex'  # independent of the Claude install's key
 HOOK_EVENTS = ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'SubagentStart', 'Stop', 'Interrupt')
 
@@ -84,34 +86,68 @@ def merge_marked(existing: str, addition: str) -> str:
     return existing.rstrip() + ('\n\n' if existing.strip() else '') + block + '\n'
 
 
-def managed_command(codex_home: Path) -> str:
-    return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'wal.py')) + ' hook'
+LAUNCHER = 'ah_hook.py'  # exits 0 at once while ~/.agent-harness/OFF exists (docs/off-switch.md)
 
 
-def policy_command(codex_home: Path) -> str:
-    return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'commit_policy.py')) + ' hook'
+def launch(codex_home: Path, script: str, rest: str = '', launcher: bool = True) -> str:
+    """`python3 <harness>/ah_hook.py <script><rest>`; launcher=False gives the direct form old installers wrote."""
+    harness = codex_home / 'agent-harness'
+    if launcher:
+        return 'python3 ' + shlex.quote(str(harness / LAUNCHER)) + ' ' + script + rest
+    return 'python3 ' + shlex.quote(str(harness / script)) + rest
 
 
-def gate_command(codex_home: Path) -> str:
+def managed_command(codex_home: Path, launcher: bool = True) -> str:
+    return launch(codex_home, 'wal.py', ' hook', launcher)
+
+
+def policy_command(codex_home: Path, launcher: bool = True) -> str:
+    return launch(codex_home, 'commit_policy.py', ' hook', launcher)
+
+
+def gate_command(codex_home: Path, launcher: bool = True) -> str:
     """Merge gate; `|| exit 2` because a crash (exit 1) would otherwise count as allow."""
-    return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'merge_gate.py')) + ' hook || exit 2'
+    return launch(codex_home, 'merge_gate.py', ' hook || exit 2', launcher)
 
 
-def guard_command(codex_home: Path, verb: str = ' hook') -> str:
+def guard_command(codex_home: Path, verb: str = ' hook', launcher: bool = True) -> str:
     # The hook verb marks a fail-closed gate for the Go front door (cmd/harness/gates.json); the launcher ignores it.
-    return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'command_guard_hook.py')) + verb
+    return launch(codex_home, 'command_guard_hook.py', verb, launcher)
 
 
-def kill_guard_command(codex_home: Path) -> str:
-    return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'kill_guard.py')) + ' hook'
+def kill_guard_command(codex_home: Path, launcher: bool = True) -> str:
+    return launch(codex_home, 'kill_guard.py', ' hook', launcher)
 
 
-def heavy_guard_command(codex_home: Path) -> str:
-    return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'heavy_job_guard.py'))
+def heavy_guard_command(codex_home: Path, launcher: bool = True) -> str:
+    return launch(codex_home, 'heavy_job_guard.py', '', launcher)
 
 
-def owner_inbox_command(codex_home: Path) -> str:
-    return 'python3 ' + shlex.quote(str(codex_home / 'agent-harness' / 'owner_inbox.py')) + ' hook'
+def owner_inbox_command(codex_home: Path, launcher: bool = True) -> str:
+    return launch(codex_home, 'owner_inbox.py', ' hook', launcher)
+
+
+def command_argv(command: str) -> list[str]:
+    """[script path, *args] of a Codex command string, direct or through the launcher (shell words after python3)."""
+    words = shlex.split(command)[1:]
+    if len(words) > 1 and Path(words[0]).name == LAUNCHER:
+        return [str(Path(words[0]).parent / words[1]), *words[2:]]
+    return words
+
+
+def known_commands(codex_home: Path) -> set[str]:
+    """Every command string this installer owns, in the launcher form and in the direct form of older installs."""
+    out = set()
+    for launcher in (True, False):
+        out |= {managed_command(codex_home, launcher), policy_command(codex_home, launcher),
+                guard_command(codex_home, launcher=launcher), guard_command(codex_home, '', launcher),
+                gate_command(codex_home, launcher), kill_guard_command(codex_home, launcher),
+                heavy_guard_command(codex_home, launcher), owner_inbox_command(codex_home, launcher)}
+    return out
+
+
+MANAGED_SCRIPTS = ('wal.py', 'commit_policy.py', 'command_guard_hook.py', 'merge_gate.py', 'kill_guard.py',
+                   'heavy_job_guard.py', 'owner_inbox.py')
 
 
 def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) -> dict:
@@ -128,6 +164,7 @@ def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) ->
     heavy_guard = heavy_guard_command(codex_home)
     gate = gate_command(codex_home)
     owner_inbox = owner_inbox_command(codex_home)
+    known = known_commands(codex_home)
     for event in HOOK_EVENTS:
         lifecycle = event in {'Stop', 'Interrupt'}
         managed = {'hooks': [{'type': 'command', 'command': command,
@@ -141,10 +178,9 @@ def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) ->
                 raise ValueError(f'hooks.json {event} has an invalid hook group')
             handlers = [handler for handler in group['hooks']
                         if not (isinstance(handler, dict) and handler.get('type') == 'command'
-                                and handler.get('command') in (command, policy, guard,
-                                                               guard_command(codex_home, ''), gate, kill_guard,
-                                                               heavy_guard, owner_inbox))]
-            if lifecycle and len(handlers) != len(group['hooks']) and group != managed:
+                                and handler.get('command') in known)]
+            legacy = {'hooks': [{**managed['hooks'][0], 'command': managed_command(codex_home, False)}]}
+            if lifecycle and len(handlers) != len(group['hooks']) and group not in (managed, legacy):
                 raise ValueError(f'hooks.json has a custom {event} hook invoking the managed command; '
                                  'reconcile that group explicitly before installing')
             if handlers:
@@ -309,9 +345,18 @@ def merge_config(existing: str, wal_dir: Path, *, default_full_access: bool = Fa
 
 
 def install(home: Path, apply: bool, *, default_full_access: bool = False, command_guard: bool = True,
-            hooks_only: bool = False) -> list[str]:
-    """hooks_only: install the harness files only; AGENTS.md, hooks.json and config.toml are never read or written."""
+            hooks_only: bool = False, allow_downgrade: bool = False, release: int | None = None) -> list[str]:
+    """hooks_only: install the harness files only; AGENTS.md, hooks.json and config.toml are never read or written.
+
+    Like install.py: refuses a release below the host's Codex floor unless allow_downgrade; while OFF the AGENTS.md
+    block waits in the off stash; a successful --apply records the release and snapshots the files and hook groups."""
     home = home.expanduser().resolve()
+    switch = switch_module()
+    release = switch.read_release(ROOT) if release is None else release
+    refusal = switch.downgrade_refusal(home, 'codex', release, allow_downgrade)
+    if refusal:
+        raise DowngradeRefused(refusal)
+    stash_record = None
     codex_home = home / '.codex'
     skill_dir = codex_home / 'skills' / 'agent-harness'
     harness_dir = codex_home / 'agent-harness'
@@ -349,7 +394,12 @@ def install(home: Path, apply: bool, *, default_full_access: bool = False, comma
             existing_instructions = originals[instructions_path][0].decode() if originals[instructions_path] else ''
             existing_hooks = json.loads(originals[hooks_path][0].decode()) if originals[hooks_path] else {}
             existing_config = originals[config_path][0].decode() if originals[config_path] else ''
-            instructions = merge_marked(existing_instructions, (SOURCE / 'AGENTS.md').read_text())
+            addition = (SOURCE / 'AGENTS.md').read_text()
+            if switch.is_off(home):  # files and wiring go in; the rules wait in the off stash until `harness on`
+                instructions, stash_record = switch.plan_stash(home, 'codex', existing_instructions,
+                                                               block=f'{START}\n{addition.rstrip()}\n{END}\n')
+            else:
+                instructions = merge_marked(existing_instructions, addition)
             hooks = merge_hooks(existing_hooks, codex_home, command_guard)
             config = merge_config(existing_config, wal_dir, default_full_access=default_full_access)
             payloads += [(instructions_path, instructions.encode()),
@@ -365,6 +415,7 @@ def install(home: Path, apply: bool, *, default_full_access: bool = False, comma
             if directory != codex_home:
                 os.fchmod(pins.fd(directory), 0o700)
             pins.verify(directory)
+        switch.mark_pending(home, 'codex', release)  # after ~/.agent-harness is created under its pin
         backups = backup_root / (datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
                                  + '-' + secrets.token_hex(4))
         pins.create(backups)
@@ -392,6 +443,10 @@ def install(home: Path, apply: bool, *, default_full_access: bool = False, comma
                     expected_mode=original[1] if original else None,
                     published=published, retain_published_fd=pins.file_fds)
         except BaseException as error:
+            try:
+                switch.clear_pending(home, 'codex')
+            except OSError:
+                pass
             failures = []
             for path in reversed(published):
                 try:
@@ -411,13 +466,31 @@ def install(home: Path, apply: bool, *, default_full_access: bool = False, comma
                 raise RuntimeError(f'Codex install failed; rollback incomplete for {", ".join(failures)}; '
                                    f'restore from {backups}') from error
             raise
+        if stash_record is not None:
+            switch.save_stash(home, 'codex', stash_record)
+            changes.append('harness is OFF: the AGENTS.md block is kept in ~/.agent-harness/off-stash until `harness on`')
+        if hooks_only:
+            prior = switch.latest_snapshot(home, 'codex') or {}
+            settings_spec, instructions_spec = prior.get('settings'), prior.get('instructions')
+        else:
+            settings_spec = {'path': '.codex/hooks.json', 'hooks_dir': str(harness_dir), 'names': list(MANAGED_SCRIPTS),
+                             'groups': {event: [g for g in hooks['hooks'][event]
+                                                if any(h.get('command') in known_commands(codex_home)
+                                                       for h in g.get('hooks', []) if isinstance(h, dict))]
+                                        for event in HOOK_EVENTS}}
+            instructions_spec = {'block': f'{START}\n{(SOURCE / "AGENTS.md").read_text().rstrip()}\n{END}\n'}
+        commit = switch.source_commit(ROOT)
+        switch.record_install(home, 'codex', release, commit, [d for _, d in files], settings_spec, instructions_spec,
+                              backups.name)
+        changes.append(f'release {release} ({commit[:12]}) recorded; floor snapshot in '
+                       f'{home / ".agent-harness" / "releases" / str(release)}')
         return changes
     finally:
         pins.close()
 
 
 def install_git_backstop(home: Path, apply: bool) -> str:
-    home = home.expanduser().resolve()
+    home = home.expanduser().resolve()  # runs through ah_hook.py beside the script (install.git_hook_status)
     return git_hook_status(home, GIT_HOOK_KEY, home / '.codex' / 'agent-harness' / 'commit_policy.py', apply=apply)
 
 
@@ -438,12 +511,18 @@ def main() -> None:
     parser.add_argument('--no-command-guard', dest='command_guard', action='store_false',
                         help='do not register the command guard and remove an earlier registration (rollback); '
                              'the files stay installed; not remembered')
+    parser.add_argument('--allow-downgrade', action='store_true',
+                        help="install even though this checkout's harness/RELEASE is below the host's Codex floor "
+                             '(~/.agent-harness/floor.json); the floor then moves down to this release')
     args = parser.parse_args()
     try:
         if args.hooks_only and args.default_full_access:
             raise ValueError('--hooks-only cannot be combined with --default-full-access')
         changes = install(args.home, args.apply, default_full_access=args.default_full_access,
-                          command_guard=args.command_guard, hooks_only=args.hooks_only)
+                          command_guard=args.command_guard, hooks_only=args.hooks_only,
+                          allow_downgrade=args.allow_downgrade)
+    except DowngradeRefused as error:
+        parser.exit(1, f'install_codex.py: {error}\n')
     except (ValueError, RuntimeError) as error:
         parser.exit(2, f'error: {error}\n')
     print(('Installed' if args.apply else 'Would install') + f' Codex Agent Harness in {args.home / ".codex"}')

@@ -72,15 +72,22 @@ def is_interpreter(tok: str) -> bool:
     return re.fullmatch(r"python[0-9.]*", Path(tok).name) is not None
 
 
+LAUNCHER = "ah_hook.py"  # the off-switch launcher every hook is wired through: python3 <hooks>/ah_hook.py <script> ...
+
+
 def wired_path_ok(toks: list[str], script: str, arg, hooks_dir: Path) -> bool:
-    """The handler must run an interpreter on exactly hooks_dir/script (then arg), not merely mention its name."""
+    """The handler must run an interpreter on exactly hooks_dir/script (then arg), not merely mention its name.
+    The launcher form `python3 hooks_dir/ah_hook.py script [arg]` counts: the launcher runs hooks_dir/script."""
     want = os.path.normpath(str(hooks_dir / script))
     if not toks or not is_interpreter(toks[0]):
         return False
     i = 1
     while i < len(toks) and toks[i].startswith("-"):
         i += 1
-    if i >= len(toks) or os.path.normpath(os.path.expanduser(toks[i])) != want:
+    if (i + 1 < len(toks) and script != LAUNCHER and toks[i + 1] == script
+            and os.path.normpath(os.path.expanduser(toks[i])) == os.path.normpath(str(hooks_dir / LAUNCHER))):
+        i += 1  # the launcher form; the script name stands where the path would
+    elif i >= len(toks) or os.path.normpath(os.path.expanduser(toks[i])) != want:
         return False
     rest = toks[i + 1:]
     return rest == [] if arg is None else rest[:1] == [arg]
@@ -143,6 +150,9 @@ def check_hooks(manifest: dict, flavor: str, live: dict, hooks_dir: Path, canary
             detail = "disableAllHooks is true in this settings file" if disabled else "not in live hooks (or wired to another path/interpreter)"
         elif not (exists(row["script"]) if exists else script.exists()):
             state, detail = SCRIPT_MISSING, f"wired but {script} does not exist (hook would exit 0 silently)"
+        elif LAUNCHER in [Path(t).name for t in flatten(found)[1:3]] and not (
+                exists(LAUNCHER) if exists else (hooks_dir / LAUNCHER).exists()):
+            state, detail = SCRIPT_MISSING, f"wired through {hooks_dir / LAUNCHER}, which does not exist"
         else:
             state, detail = WIRED, "wired"
             if canary:
