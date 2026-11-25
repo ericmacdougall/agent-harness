@@ -21,14 +21,9 @@ BASE = 'd56a8cb0'  # main before the rule
 # each mutant is a list of (old, new) replacements in command_guard.py
 MUTANTS = {
     'the expanded text is read, not the source': [
-        ("    return not word.quoted and word.raw == name and not word.odd_edge",
-         "    return word.text == name and not word.odd_edge")],
-    'a word glued at \\r, \\f or \\v is a keyword': [
-        ("    return not word.quoted and word.raw == name and not word.odd_edge",
-         "    return not word.quoted and word.raw == name")],
-    'the lexer never marks a glued word': [
-        ("            w.odd_edge = s[j:j + 1] in ODD_WS or (i > 0 and s[i - 1] in ODD_WS)",
-         "            w.odd_edge = False")],
+        ("    return not word.quoted and word.raw == name\n", "    return word.text == name\n")],
+    # replaces two mutants of the removed odd_edge flag, which no shell text could set (both passed: equivalent)
+    '\\r, \\f and \\v end a shell word': [("WS = ' \\t'\n", "WS = ' \\t\\r\\f\\v'\n")],
     'any word leads to a command start': [
         ("        if kind != 'w' or not start or not any(_keyword_word(val, w) for w in LEAD_WORDS):",
          "        if kind != 'w':")],
@@ -49,7 +44,7 @@ MUTANTS = {
         ("i + 2 < n and tokens[i + 1][0] == 'w' \\\n                and tokens[i + 2][0] == 'w'",
          "i + 2 < n \\\n                and tokens[i + 2][0] == 'w'")],
     'PowerShell text is stripped': [
-        ("    if ps or _aliases_a_keyword(tokens):", "    if _aliases_a_keyword(tokens):")],
+        ("    if ps:\n        return list(tokens)\n    out, stack", "    if False:\n        return list(tokens)\n    out, stack")],
     'a redirection keeps the command start': [
         ("        if kind == 'op':\n            return val in START_OPS\n",
          "        if kind == 'op':\n            return val in START_OPS\n        if kind == 'redir':\n            return start\n")],
@@ -57,10 +52,20 @@ MUTANTS = {
         ("        if kind == 'op':\n            return val in START_OPS\n",
          "        if kind == 'op':\n            return val in START_OPS\n"
          "        if kind == 'w' and '=' in (val.raw or ''):\n            return start\n")],
-    'an alias is ignored': [
-        ("    if ps or _aliases_a_keyword(tokens):\n        return list(tokens)", "    if ps:\n        return list(tokens)")],
-    'a subscripted alias is read from the expanded text only': [
-        ("        for text in (w.text, w.raw or ''):", "        for text in (w.text,):")],
+    'a changer word is ignored': [
+        ("        changed = changed or (token[0] == 'w' and _changes_keywords(token[1]))",
+         "        changed = changed or False")],
+    'a changer anywhere keeps the whole text strict (the old reach)': [
+        ("    if ps:\n        return list(tokens)\n    out, stack",
+         "    if ps or any(k == 'w' and _changes_keywords(w) for k, w in tokens):\n        return list(tokens)\n"
+         "    out, stack")],
+    'a plain pattern word counts as a changer': [
+        ("            elif kind == 'w' and not _runs_nothing(val) and _changes_keywords(val):",
+         "            elif kind == 'w' and _changes_keywords(val):")],
+    'a pattern that assigns does not count': [
+        ("            elif kind == 'w' and not _runs_nothing(val) and _changes_keywords(val):", "            elif False:")],
+    'a substitution-made word is read from the expanded text only': [
+        ("    for text in (word.text, word.raw or ''):", "    for text in (word.text,):")],
     'a quoted in is accepted': [
         ("and _keyword_word(tokens[i + 2][1], 'in'):", "and tokens[i + 2][1].text == 'in':")],
 }

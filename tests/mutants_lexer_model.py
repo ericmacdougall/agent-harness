@@ -15,7 +15,7 @@ MUTANTS = {
     '\\r, \\f and \\v are blanks again': [("WS = ' \\t'\n", "WS = ' \\t\\r\\f\\v'\n")],
     'a backslash before \\r\\n joins lines': [("LINE_JOIN = re.compile(r'\\\\\\n')", "LINE_JOIN = re.compile(r'\\\\\\r?\\n')")],
     'only the word alias changes a keyword': [
-        ("            if 'alias' in text.lower() or text in KEYWORD_CHANGERS:", "            if text == 'alias':")],
+        ("        if 'alias' in text.lower() or text in KEYWORD_CHANGERS:", "        if text == 'alias':")],
     'zsh `}` does not end a case': [
         ("(_closes_case(val) or (not val.quoted and val.text == '}'))", '_closes_case(val)')],
     '`function NAME` is a function header': [

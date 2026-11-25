@@ -69,6 +69,12 @@ NOT_THE_KEYWORD = {
     'aliased': "alias case='echo'; case y in; {X}",
     'aliased in zsh': "aliases[case]=echo; case y in; {X}",
     'lead word aliased': "alias then='echo'; if true; then case y in; {X}",
+    # the name only in the source: the command word is made by a substitution
+    'aliased by a substituted command word': "$(echo alias) case='echo'\ncase y in; {X}",
+    # a pattern that assigns when it is tried; a later case is no longer provably the keyword
+    'a pattern assigns the name': 'case x in ${a:=alias}) true ;; esac\n$a case=echo\ncase y in; {X}',
+    # a changer after one case statement still counts for the next one
+    'aliased between two cases': "case x in x) true ;; esac\nalias case='echo'\ncase y in; {X}",
 }
 
 # a real case statement whose closing word is not the keyword `esac` (the shell reports a syntax error); the pass ends
@@ -234,6 +240,54 @@ class Property(Guards):
         self.assertTrue(all(before == 'allow' and after == 'block' for _r, before, after in changed), changed)
         self.assertTrue(all('case' in r and r not in REAL_CASES.values() for r, _b, _a in changed), changed)
         self.assertGreater(len(changed), 0)  # the old pass hid them: not vacuous
+
+
+CASE_GLOB = 'case "$1" in a|b) echo ab ;; *) echo other ;; esac'
+CASE_SIGNALS = 'case "$s" in TERM|KILL) echo sig ;; *) true ;; esac'
+# Item 1 of the lexer repair (goodqa#17059): a real case statement next to a word that only holds a changer's
+# spelling. At 2c8b1b34 both guards refused every one of these, because any such word anywhere put the whole text
+# under the strict reading, and the strict reading of a real case statement is refused.
+CHANGER_AFTER = {
+    'enable after the case': '%s; echo enable',
+    'the name in a path after the case': '%s; cat ~/.bash_aliases',
+    'eval after the case, on the next line': '%s\nmake eval',
+}
+CHANGER_PATTERNS = {
+    'changer words as patterns': 'case "$1" in enable|disable|eval) echo x ;; *) echo y ;; esac',
+    'the name as a pattern': 'case "$1" in alias|unalias) echo x ;; *) echo y ;; esac',
+}
+# The cost that stays: a changer's spelling before the case keeps the strict reading, wherever the word stands,
+# because whether an argument can reach an alias (through read, a pipe into a builtin, a file later sourced, a
+# variable later run as a command) is not modelled.
+CHANGER_BEFORE = {
+    'enable before the case, an argument': 'echo enable; %s',
+    'enable before the case, a systemctl argument': 'systemctl --user enable x.service; %s',
+    'eval before the case, a make target': 'make eval; %s',
+    'the name inside a file name, before': 'cat notes/test_aliases.txt; %s',
+    'the name in a quoted note, before': "echo 'the alias rule'; %s",
+}
+
+
+class ChangerReach(Guards):
+    """A word that may change keywords counts only for the text after it (goodqa#17059, lexer repair item 1)."""
+
+    def rows(self, forms):
+        return [('%s [%s]' % (label, name), form % case) for label, form in forms.items()
+                for name, case in (('glob', CASE_GLOB), ('signals', CASE_SIGNALS))]
+
+    def verdicts(self, rows):
+        return [(label, self.cg_verdict(cmd), self.kg_verdict(cmd)) for label, cmd in rows]
+
+    def test_the_bare_case_statements_are_allowed_so_the_rows_are_not_vacuous(self):
+        self.assertEqual(self.verdicts([('glob', CASE_GLOB), ('signals', CASE_SIGNALS)]),
+                         [('glob', 'allow', 'allow'), ('signals', 'allow', 'allow')])
+
+    def test_a_changer_after_the_case_or_as_a_plain_pattern_leaves_it_the_keyword(self):
+        rows = self.rows(CHANGER_AFTER) + list(CHANGER_PATTERNS.items())
+        self.assertEqual([r for r in self.verdicts(rows) if r[1:] != ('allow', 'allow')], [])
+
+    def test_a_changer_before_the_case_keeps_the_strict_reading(self):
+        self.assertEqual([r for r in self.verdicts(self.rows(CHANGER_BEFORE)) if r[1:] != ('block', 'block')], [])
 
 
 @unittest.skipUnless(shutil.which('bash'), 'needs bash')

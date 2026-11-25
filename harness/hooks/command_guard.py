@@ -539,12 +539,9 @@ class Budget:
 
 
 class Word:
-    __slots__ = ('alts', 'subs', 'vars', 'glob', 'quoted', 'dynamic', 'single_only', 'overflow', 'raw', 'odd_edge')
+    __slots__ = ('alts', 'subs', 'vars', 'glob', 'quoted', 'dynamic', 'single_only', 'overflow', 'raw')
 
     def __init__(self):
-        # the lexer ended or started this word at \r, \f or \v, where bash and zsh do not split words: the shell's
-        # word is longer than this one, so it is never a reserved word (goodqa#17059)
-        self.odd_edge = False
         self.alts = ['']
         self.subs = []       # inner scripts of $(..), `..`, <(..)
         self.vars = []       # variable names expanded inside the word (for secret-print checks)
@@ -612,7 +609,6 @@ WS = ' \t'
 WS_PS = ' \t\r\f\v'
 LINE_JOIN = re.compile(r'\\\n')
 LINE_JOIN_PS = re.compile(r'`\r?\n')
-ODD_WS = ('\r', '\f', '\v')
 RESERVED = {'if', 'then', 'else', 'elif', 'do', 'while', 'until', '{', '}', '!', 'time', 'fi', 'done', 'esac',
             'function', 'coproc', ';;'}
 NONEXEC_HEADS = {'for', 'case', 'select'}
@@ -1290,7 +1286,6 @@ class Lexer:
                 i += 1
                 continue
             w.raw = s[i:j]
-            w.odd_edge = s[j:j + 1] in ODD_WS or (i > 0 and s[i - 1] in ODD_WS)
             if wait_target is not None:
                 wait_target.target = w
                 if wait_target.op in ('<<', '<<-'):
@@ -1414,8 +1409,10 @@ def _mktemp_base(text, cwd, env_tmp):
 
 def _keyword_word(word, name):
     """`word` is the reserved word `name` as bash and zsh read it: its source text exactly, unquoted, not a brace
-    expansion or other text that only expands to it, and not glued to a neighbour at \\r, \\f or \\v."""
-    return not word.quoted and word.raw == name and not word.odd_edge
+    expansion or other text that only expands to it. In shell text \\r, \\f and \\v are word characters (WS), so a
+    `case` glued to one is a longer word whose source is not `case`. Only the shell passes call this; PowerShell
+    text, where those characters are blanks, never reaches it."""
+    return not word.quoted and word.raw == name
 
 
 # goodqa#17059: where a command provably starts. Inverted: a position counts only where bash and zsh both read the
@@ -1477,20 +1474,23 @@ class CommandStart:
 KEYWORD_CHANGERS = frozenset(('disable', 'enable', 'eval'))
 
 
-def _aliases_a_keyword(tokens):
-    """The text may change what a reserved word means: any word that names aliases (`alias`, bash `BASH_ALIASES[..]`,
-    zsh `aliases`/`galiases`, in any case), or a `disable`, `enable` or `eval` word (zsh `disable -r case` turns the
-    keyword into a command name; `eval 'alias case=…'` defines one where the word is not `alias`). An alias is
-    expanded before a word is read as a keyword, so no keyword reading is safe, and the case pass keeps the strict
-    reading (pattern words are read as commands). Deliberately broad (PR 348 review F2): it costs only over-refusal."""
-    for k, w in tokens:
-        if k != 'w':
-            continue
-        # source text as well as the expanded text: kill_guard rewrites a subscripted assignment's text before parse()
-        for text in (w.text, w.raw or ''):
-            if 'alias' in text.lower() or text in KEYWORD_CHANGERS:
-                return True
+def _changes_keywords(word):
+    """`word` may change what a reserved word means for the text after it: any word that names aliases (`alias`,
+    bash `BASH_ALIASES[..]`, zsh `aliases`/`galiases`, in any case), or a `disable`, `enable` or `eval` word (zsh
+    `disable -r case` turns the keyword into a command name; `eval 'alias case=…'` defines one where the word is not
+    `alias`). Deliberately broad (PR 348 review F2): it costs only over-refusal."""
+    # the source text as well as the expanded text: a word made by a substitution, such as `$(echo alias)`, holds the
+    # name only in its source
+    for text in (word.text, word.raw or ''):
+        if 'alias' in text.lower() or text in KEYWORD_CHANGERS:
+            return True
     return False
+
+
+def _runs_nothing(word):
+    """A pattern word with no expansion in it: the shell only compares it, so it can define nothing."""
+    raw = word.raw or ''
+    return not (word.subs or word.vars or word.dynamic or '$' in raw or '`' in raw)
 
 
 def _closes_case(word):
@@ -1503,21 +1503,30 @@ def _strip_case_patterns(tokens, ps=False):
     """`case X in a|b) cmd;; *) cmd;; esac`: drop the pattern lists so `a|b` is not a pipeline and `*` is not a
     command whose name is a glob. The bodies stay as ordinary commands. Only a `case` that is provably the keyword
     (unquoted source text at a command start, goodqa#17059) starts pattern mode; any other `case` is a word.
+
+    After a word that may change keywords (_changes_keywords), no `case` is read as the keyword: from there on, the
+    pattern words are read as commands. A `case` before that word keeps its keyword reading. The shell expands an
+    alias, and honours a disabled keyword, only for text it reads after the defining command has run, and it reads a
+    whole case statement before running any of it. A pattern word with no expansion is only compared, never run, so it
+    does not count (goodqa#17059, item 1 of the lexer repair).
     PowerShell has no case statement, so its text is never stripped."""
-    if ps or _aliases_a_keyword(tokens):
+    if ps:
         return list(tokens)
     out, stack, i, n = [], [], 0, len(tokens)
     starts = CommandStart()
+    changed = False  # a word that may change keywords has been seen
 
     def emit(token):
+        nonlocal changed
         starts.feed(token)
         out.append(token)
+        changed = changed or (token[0] == 'w' and _changes_keywords(token[1]))
 
     while i < n:
         kind, val = tokens[i]
         at_start = starts.next_is_start()
-        if kind == 'w' and at_start and _keyword_word(val, 'case') and i + 2 < n and tokens[i + 1][0] == 'w' \
-                and tokens[i + 2][0] == 'w' and _keyword_word(tokens[i + 2][1], 'in'):
+        if kind == 'w' and at_start and not changed and _keyword_word(val, 'case') and i + 2 < n \
+                and tokens[i + 1][0] == 'w' and tokens[i + 2][0] == 'w' and _keyword_word(tokens[i + 2][1], 'in'):
             emit(tokens[i])
             emit(tokens[i + 1])
             stack.append('patterns')
@@ -1534,6 +1543,8 @@ def _strip_case_patterns(tokens, ps=False):
             # pattern words, `|` and a leading `(` are dropped; newlines between items are kept
             elif kind == 'op' and val == '\n':
                 emit(tokens[i])
+            elif kind == 'w' and not _runs_nothing(val) and _changes_keywords(val):
+                changed = True  # `${a:=alias}` assigns in this shell when the pattern is tried
             i += 1
             continue
         if stack and kind == 'op' and val == ';' and i + 1 < n and tokens[i + 1] == ('op', ';'):
