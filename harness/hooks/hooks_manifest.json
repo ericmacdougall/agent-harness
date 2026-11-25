@@ -354,6 +354,25 @@
    ]
   },
   {
+   "id": "protected_write:hook",
+   "script": "protected_write_hook.py",
+   "arg": "hook",
+   "event": "PreToolUse",
+   "tools": [
+    "Write",
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit"
+   ],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": [
+    "S01"
+   ]
+  },
+  {
    "id": "tier_gate:hook",
    "script": "tier_gate.py",
    "arg": "hook",
