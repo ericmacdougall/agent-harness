@@ -897,7 +897,13 @@ class RealSources(Base):
         for name in names:
             entry = json.loads((folder / name).read_text())
             self.assertIsInstance(entry.get("pid"), int, name)
-            self.assertIsNotNone(ah._retire_parse_start(entry.get("procStart")), name)
+            text = str(entry.get("procStart"))
+            # macOS writes a UTC date string we compare; Linux writes /proc starttime ticks, which we do not compare: it
+            # does not parse, so the entry counts as live while its pid exists (fail closed, documented)
+            if text.isdigit():
+                self.assertIsNone(ah._retire_parse_start(text), name)
+            else:
+                self.assertIsNotNone(ah._retire_parse_start(text), name)
 
 
 class PartialFailure(Base):
