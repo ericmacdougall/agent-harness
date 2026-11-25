@@ -10,6 +10,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import wal as wal_module
 from wal import append
 
 
@@ -289,12 +290,15 @@ def main():
         if not re.fullmatch(r'w[0-9a-f]{11}', args.recites) or not args.source:
             parser.error('--recites needs an entry id (w + 11 hex) and a --source on this row')
         record['recites'] = args.recites
-    append(path, record)
+    landed = append(path, record)
     for warning in warnings:
         print('wal_note: provenance warning: ' + warning, file=sys.stderr)
-    print(json.dumps({'status': 'WROTE', 'event': args.event, 'id': record['id'], 'wal': str(path),
+    # goodqa#17145: wal.append keeps a row it cannot write safely in a side file (DEFERRED) or, when even the directory is
+    # unsafe, only prints it (NOT_SAVED, exit 1): a caller must never read either as a recorded row
+    outcome = 'WROTE' if landed else ('NOT_SAVED' if getattr(wal_module, 'LAST_RESULT', '') == 'not_saved' else 'DEFERRED')
+    print(json.dumps({'status': outcome, 'event': args.event, 'id': record['id'], 'wal': str(path),
                       **({'warnings': warnings} if warnings else {})}))
-
+    return 1 if outcome == 'NOT_SAVED' else 0
 
 if __name__ == '__main__':
     sys.exit(main())

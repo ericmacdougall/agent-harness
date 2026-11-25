@@ -1121,7 +1121,8 @@ def record_target_override_in_wal(args, bypassed):
               "note": f"deliver.py prepare --target-policy warn for task {override['task']}: bypassed {names}",
               "target_policy_override": override}
     try:
-        wal_log.append(args.wal.expanduser().absolute(), record)
+        if wal_log.append(args.wal.expanduser().absolute(), record) is False:  # kept in a side file (goodqa#17145)
+            raise ValueError("the WAL only took the row into a side file")
     except (OSError, ValueError):
         raise DeliveryError("BLOCKED_POLICY", "--target-policy warn could not be recorded in the WAL; nothing was done",
                             code=2, reason="TARGET_OVERRIDE_UNRECORDED",
