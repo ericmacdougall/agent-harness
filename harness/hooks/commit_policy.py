@@ -10,9 +10,15 @@ Subcommands:
   notify          comment delivery evidence on referenced tickets
 
 Rules live in commit_policy.json beside this file; personal values (your org, repos) live in the
-untracked commit_policy.local.json, which may set only backstop_repos and ticket_systems. There is no
-environment bypass: the only exception path is `waive`, which records a reason in the WAL. (The
-AGENT_HARNESS_POLICY_LOCAL test variable is honoured only for files under the repository's tests/data,
+untracked commit_policy.local.json, which may set only backstop_repos, ticket_systems, mode and merge_gate.
+
+Modes (the user, 2026-11-24: form checks warn, they never block):
+  warn (default)  subject length, type/scope spelling, missing Why/What/Testing/Refs, trailer order and ticket
+                  format print at most three short warnings and exit 0. Only an empty message and a message
+                  holding a secret value (redact.py's scan) are refused.
+  strict          "mode": "strict" in commit_policy.local.json, or --strict on check-message: every rule blocks
+                  as before, and `waive` records a reasoned exception.
+(The AGENT_HARNESS_POLICY_LOCAL test variable is honoured only for files under the repository's tests/data,
 so on an installed copy it does nothing.)
 Runs on Python 3.9 with the standard library only.
 """
@@ -73,7 +79,9 @@ def _deep_merge(base: dict, extra: dict) -> dict:
     return merged
 
 
-LOCAL_PROFILE_KEYS = ("backstop_repos", "ticket_systems")
+LOCAL_PROFILE_KEYS = ("backstop_repos", "ticket_systems", "mode", "merge_gate")
+MODES = ("warn", "strict")
+MAX_WARNINGS = 3
 LOCAL_TICKET_KEYS = ("repos", "org_id", "key_file", "key_secret", "default_project", "projects",
                      "unreachable_projects", "unreachable_reason")
 
@@ -143,7 +151,57 @@ def load_policy(path: Path = POLICY_FILE) -> dict:
     for key in ("subject", "body", "refs", "exempt", "ticket_systems", "waivers"):
         if not isinstance(policy.get(key), dict):
             raise ValueError(f"{path} lacks the {key!r} object")
+    return apply_mode(policy)
+
+
+def apply_mode(policy: dict, strict: bool = False) -> dict:
+    """Derive `enforcement` (what every caller, deliver.py included, reads) from `mode`. "off" stays off; an
+    unknown mode is read as warn, never as a reason to refuse."""
+    mode = "strict" if strict else str(policy.get("mode") or "warn").lower()
+    policy["mode"] = mode if mode in MODES else "warn"
+    if policy.get("enforcement") != "off":
+        policy["enforcement"] = "enforce" if policy["mode"] == "strict" else "warn"
     return policy
+
+
+def hard_problems(message: str) -> list:
+    """The two refusals that hold in every mode: an empty message, and one that holds a secret value."""
+    text = normalize(message, strip_comments=False)
+    if not text.strip():
+        return ["message: empty commit message"]
+    try:
+        import redact  # sibling module; the harness's one secret-shape list
+        kinds = sorted({kind for kind, _start, _end in redact.find(text)})
+    except Exception:  # noqa: BLE001 - a missing scanner must not turn into a form refusal
+        kinds = []
+    if kinds:
+        return ["message: holds what looks like a secret (%s); remove it before committing" % ", ".join(kinds)]
+    return []
+
+
+HARD_PREFIXES = ("message: empty commit message", "message: holds what looks like a secret")
+
+
+def is_hard(problem: str) -> bool:
+    return problem.startswith(HARD_PREFIXES)
+
+
+def strict_mode(policy: dict) -> bool:
+    """Blocking for form only when the repo asked for it. A policy dict without `mode` (tests, old callers)
+    keeps its old reading of `enforcement`."""
+    if "mode" in policy:
+        return policy["mode"] == "strict" and policy.get("enforcement") != "warn"
+    return policy.get("enforcement") not in ("warn", "off")
+
+
+def warning_text(problems, limit: int = MAX_WARNINGS) -> str:
+    """At most `limit` short lines; the rest are counted, not printed."""
+    shown = [p if len(p) <= 120 else p[:117] + "..." for p in problems[:limit]]
+    more = len(problems) - len(shown)
+    lines = ["commit-policy: note (not blocking): " + item for item in shown]
+    if more > 0:
+        lines.append(f"commit-policy: {more} more; run commit_policy.py check-message to see them")
+    return "\n".join(lines)
 
 
 def normalize(message: str, *, strip_comments: bool = False) -> str:
@@ -457,8 +515,9 @@ def validate(message: str, *, policy: dict, previous: str | None = None, is_merg
     without it `Ledger` refs never count. They never satisfy tickets_required.
     """
     text = normalize(message, strip_comments=strip_comments)
-    if not text:
-        return ["message: empty commit message"]
+    hard = hard_problems(text)
+    if hard:
+        return hard
     subject_line = text.split("\n", 1)[0]
     exempt = policy["exempt"]
     # Only a real merge (MERGE_HEAD present, or more than one parent) is exempt. A subject
@@ -619,7 +678,7 @@ def validate_pr(title: str, body: str, policy: dict, *, tickets_required: bool =
     message = title.strip() + "\n\n" + body
     problems += ["PR " + item for item in validate(message, policy=policy, tickets_required=tickets_required,
                                                    ledger=ledger)
-                 if not item.startswith("message:")]
+                 if not item.startswith("message:") or "looks like a secret" in item]
     return problems
 
 
@@ -1502,6 +1561,8 @@ def find_waiver(kind: str, subject: str, policy: dict, *, session_dir: Path | No
             continue
         if now - when > max_age:
             continue
+        if not entry.get("wal"):
+            return entry  # recorded without a session WAL (the ledger row carries the reason)
         wal = Path(entry.get("wal", ""))
         if not any(wal.parent.parent == root for root in wal_roots()):
             continue
@@ -1519,21 +1580,25 @@ def record_waiver(wal: Path, kind: str, subject: str, reason: str, policy: dict)
         from wal_note import SECRET_PATTERN  # Claude install
     except ImportError:
         from wal import SECRET_PATTERN  # Codex install keeps it in wal.py
-    reason = reason.strip()
-    if len(reason) < int(policy["waivers"]["min_reason_chars"]) or len(reason) > 1000:
-        raise ValueError(f"reason must be {policy['waivers']['min_reason_chars']} to 1000 characters")
-    if SECRET_PATTERN.search(reason):
-        raise ValueError("reason appears to contain a credential; redact it")
-    wal = wal.absolute()
-    if not any(wal.parent.parent == root for root in wal_roots()) or wal.suffix != ".jsonl":
-        raise ValueError("--wal must be your session WAL under ~/.claude/wals or ~/.agent-harness/codex-wals")
+    reason = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", " ", str(reason or "")).strip()[:4000] or "(no reason given)"
+    try:
+        import redact  # normalise instead of refusing: a credential in the reason is redacted, not an error
+        reason = redact.redact(reason)
+    except ImportError:
+        if SECRET_PATTERN.search(reason):
+            reason = "(reason withheld: it looked like it held a credential)"
     waiver_id = secrets.token_hex(8)
     at = datetime.now(timezone.utc).isoformat()
-    append(wal, {"at": at, "event": "waiver", "waiver_id": waiver_id, "kind": kind,
-                 "subject": subject, "note": "COMMIT_POLICY_WAIVER: " + reason})
+    wal = Path(wal).absolute() if wal else None
+    if wal is not None and not (any(wal.parent.parent == root for root in wal_roots()) and wal.suffix == ".jsonl"):
+        wal = None  # not a session WAL: the ledger row alone records it
+    if wal is not None:
+        append(wal, {"at": at, "event": "waiver", "waiver_id": waiver_id, "kind": kind,
+                     "subject": subject, "note": "COMMIT_POLICY_WAIVER: " + reason})
     with _open_ledger(LEDGER) as handle:
         handle.write(json.dumps({"at": at, "id": waiver_id, "kind": kind, "subject": subject,
-                                 "wal": str(wal)}, separators=(",", ":")) + "\n")
+                                 "wal": str(wal) if wal else "", "reason": reason},
+                                separators=(",", ":")) + "\n")
     return waiver_id
 
 
@@ -1579,10 +1644,11 @@ def run_hook(payload: dict, policy: dict) -> tuple:
         return 0, ""
     if policy.get("enforcement") == "off":
         return 0, ""
+    strict = strict_mode(policy)
     command = command_text(payload.get("tool_input"))
     if not command:
         raw = json.dumps(payload.get("tool_input"), ensure_ascii=False) if payload.get("tool_input") else ""
-        if shell_like(payload) and re.search(r"\bgit\b", raw) and re.search(r"\bcommit\b", raw):
+        if strict and shell_like(payload) and re.search(r"\bgit\b", raw) and re.search(r"\bcommit\b", raw):
             return 2, ("Commit policy: this tool call looks like it runs git commit, but its input shape is not "
                        "a shell command the policy can check (e.g. interactive stdin). Run git commit as a "
                        "single shell command: git commit -F <message-file>.")
@@ -1595,17 +1661,24 @@ def run_hook(payload: dict, policy: dict) -> tuple:
     try:
         invocations = analyze(command, cwd)
     except Unresolvable as error:
+        if not strict:  # a message the hook cannot read is not refused; the commit-msg backstop still sees it
+            return 0, ""
         return 2, ("Commit blocked by the Agent Harness commit policy: the message cannot be checked before "
                    f"running ({error}).\nSupported forms: git commit -m '<literal>' (repeat -m per paragraph), "
                    "git commit -F <existing file>, git commit -F - <<'EOF' ... EOF, or "
                    "git commit -m \"$(cat <<'EOF' ... EOF)\". Write message files in an earlier step.")
     except Exception as error:  # never crash into an unexplained block
+        if not strict:
+            return 0, f"commit-policy: could not read this command ({type(error).__name__}); not checked."
         return 2, f"Commit policy hook could not analyze this command ({type(error).__name__}); use git commit -F <file>."
+    notes = []
     for message, repo, context in invocations:
         if context.get("pr_create"):
             code, text = _check_pr_create(context["pr_create"], policy, session_dir)
             if code:
                 return code, text
+            if text:
+                notes.append(text)
             continue
         facts = context.get("facts")
         if facts is None and repo and not context.get("remote"):
@@ -1624,21 +1697,32 @@ def run_hook(payload: dict, policy: dict) -> tuple:
                             allow_autosquash=bool(facts and not facts["published"]
                                                   and facts["branch"] not in ("main", "master", "")),
                             tickets_required=required, ledger=ledger, attribution=current_commit_attribution())
-        if problems:
+        hard = [item for item in problems if is_hard(item)]
+        if hard:
+            return 2, "Commit refused by the commit policy: " + "; ".join(hard)
+        if problems and not strict:
+            notes.append(warning_text(problems))
+        elif problems:
             subject = digest(message)
             if session_dir is not None and find_waiver("message", subject, policy, session_dir=session_dir):
                 continue
-            text = block_text(problems, message, policy, wal=wal, subject=subject)
-            if policy.get("enforcement") == "warn":
-                return 0, "commit-policy (warn mode, not blocking):\n" + text
-            return 2, text
-    return 0, ""
+            return 2, block_text(problems, message, policy, wal=wal, subject=subject)
+    return 0, "\n".join(notes)
 
 
 def _check_pr_create(target, policy, session_dir):
     """gh pr create publishes: check the branch range on GitHub and the PR text first."""
     slug, head = target["repo"], target["head"]  # keep owner:branch for forks
     base = target["base"]
+    if not strict_mode(policy):  # warn mode: the title and body only, locally; no GitHub round trip
+        if target["title"] is None or target["body"] is None:
+            return 0, ""
+        problems = validate_pr(target["title"], target["body"], policy,
+                               tickets_required=tickets_required_for(f"https://github.com/{slug}", policy))
+        hard = [item for item in problems if is_hard(item.removeprefix("PR "))]
+        if hard:
+            return 2, "PR refused by the commit policy: " + "; ".join(hard)
+        return 0, warning_text(problems) if problems else ""
     try:
         if base is None:
             info = subprocess.run(["gh", "api", f"repos/{slug}", "--jq", ".default_branch"],
@@ -1745,12 +1829,16 @@ def run_git_hook(path: str, policy: dict) -> tuple:
                         tickets_required=ticket_context["tracked"],
                         ledger=ledger_checker(policy, ticket_context, int(time.time() * 1000)),
                         attribution=current_commit_attribution())
-    if not problems or find_waiver("message", digest(message), policy):
+    hard = [item for item in problems if is_hard(item)]
+    if hard:
+        return 1, "commit-policy: commit refused: " + "; ".join(hard)
+    if not problems:
         return 0, ""
-    text = block_text(problems, message, policy, subject=digest(message))
-    if policy.get("enforcement") == "warn":
-        return 0, "commit-policy (warn mode, not blocking):\n" + text
-    return 1, text
+    if not strict_mode(policy):
+        return 0, warning_text(problems)
+    if find_waiver("message", digest(message), policy):
+        return 0, ""
+    return 1, block_text(problems, message, policy, subject=digest(message))
 
 
 # --------------------------------------------------------------------------- range and tickets
@@ -1869,7 +1957,10 @@ def evaluate(commits, policy, *, base, head, exclude, previous, tickets_required
                                       "wal": waiver["wal"]})
         report["commits"].append({"sha": commit["sha"], "subject": normalize(commit["message"]).split("\n")[0],
                                   "problems": problems, "waived": bool(waiver), "legacy": legacy})
-        if problems and not waiver and not legacy:
+        warned = bool(problems) and not waiver and not legacy and not strict_mode(policy) \
+            and not any(is_hard(item) for item in problems)
+        report["commits"][-1]["warned"] = warned
+        if problems and not waiver and not legacy and not warned:
             report["status"] = "BLOCKED"
         if not merge:
             previous = commit["message"]
@@ -1936,7 +2027,8 @@ def format_report(report) -> str:
     lines = [f"Commit policy {report['status']} for {report['base'][:12]}..{report['head'][:12]}"]
     for item in report["commits"]:
         if item["problems"]:
-            tag = "waived" if item["waived"] else ("legacy (before enforce_after)" if item.get("legacy") else "BLOCKED")
+            tag = "waived" if item["waived"] else ("legacy (before enforce_after)" if item.get("legacy") else
+                                                   "warning (not blocking)" if item.get("warned") else "BLOCKED")
             lines.append(f"  {item['sha'][:12]} {tag}: {item['subject'][:72]}")
             lines += [f"      - {p}" for p in item["problems"]]
     for item in report["tickets"]:
@@ -1952,7 +2044,7 @@ def format_report(report) -> str:
     if report["status"] != "PASS":
         script = HERE / "commit_policy.py"
         bad_commits = any(item["problems"] and not item["waived"] and not item.get("legacy")
-                          for item in report["commits"])
+                          and not item.get("warned") for item in report["commits"])
         stale = any(item.get("status") in ("STALE", "MISSING") for item in report["tickets"])
         if bad_commits:
             lines.append("  Fix commits: reword them (git rebase -i <base>, then git commit --amend -F <file>).")
@@ -2130,6 +2222,7 @@ def main(argv=None) -> int:
     check.add_argument("--file")
     check.add_argument("--previous-file")
     check.add_argument("--repo", help="apply this repository's ticket rule (N11) and resolve Ledger refs in it")
+    check.add_argument("--strict", action="store_true", help="block on every rule (the default only warns)")
     rng = sub.add_parser("check-range")
     rng.add_argument("--repo", required=True)
     rng.add_argument("--base", required=True)
@@ -2145,11 +2238,11 @@ def main(argv=None) -> int:
     gh_check.add_argument("--head", required=True)
     gh_check.add_argument("--no-tickets", action="store_true")
     gh_check.add_argument("--json", action="store_true")
-    waive = sub.add_parser("waive")
-    waive.add_argument("--wal", required=True, type=Path)
-    waive.add_argument("--kind", required=True, choices=("message", "commit", "tickets"))
+    waive = sub.add_parser("waive", help="record an exception (needed only in strict mode)")
+    waive.add_argument("--wal", type=Path, default=None)
+    waive.add_argument("--kind", default="message")
     waive.add_argument("--subject", required=True)
-    waive.add_argument("--reason", required=True)
+    waive.add_argument("--reason", default="")
     note = sub.add_parser("notify")
     note.add_argument("--repo", required=True)
     note.add_argument("--base", required=True)
@@ -2174,8 +2267,8 @@ def main(argv=None) -> int:
         try:
             payload = json.loads(_HOOK_STATE["raw"])
         except ValueError:
-            print("commit-policy: hook payload is not JSON", file=sys.stderr)
-            return 2
+            print("commit-policy: hook payload is not JSON; not checked", file=sys.stderr)
+            return 0
         payload = payload if isinstance(payload, dict) else {}
         _HOOK_STATE["payload"] = payload
         _HOOK_STATE["may_commit"] = may_commit(payload)
@@ -2184,9 +2277,10 @@ def main(argv=None) -> int:
     try:
         policy = load_policy()
     except (OSError, ValueError) as error:
-        print(f"commit-policy: cannot load {POLICY_FILE}: {error}; refusing to guess. Fix the JSON, or set "
-              '"enforcement": "off" there to stop enforcement.', file=sys.stderr)
-        return 2
+        print(f"commit-policy: cannot load {POLICY_FILE}: {error}; nothing checked. Fix the JSON.", file=sys.stderr)
+        return 0 if args.command in ("hook", "git-hook") else 2
+    if getattr(args, "strict", False):
+        apply_mode(policy, strict=True)
     if args.command == "hook":
         code, text = run_hook(payload, policy)
         if text:
@@ -2212,9 +2306,13 @@ def main(argv=None) -> int:
         else:
             problems = validate(message, policy=policy, previous=previous,
                                 attribution=current_commit_attribution() if agent_environment() else None)
-        print(json.dumps({"status": "BLOCKED" if problems else "PASS", "problems": problems,
-                          "digest": digest(message)}, indent=1))
-        return 2 if problems else 0
+        hard = [item for item in problems if is_hard(item)]
+        if hard or (problems and strict_mode(policy)):
+            print(json.dumps({"status": "BLOCKED", "problems": problems, "digest": digest(message)}, indent=1))
+            return 2
+        print(json.dumps({"status": "WARN" if problems else "PASS", "problems": [], "warnings": problems[:MAX_WARNINGS],
+                          "more": max(0, len(problems) - MAX_WARNINGS), "digest": digest(message)}, indent=1))
+        return 0
     if args.command == "check-range":
         sys.path.insert(0, str(HERE))
         report = check_range(args.repo, args.base, args.head, policy, branch=args.branch, pr=args.pr,
@@ -2231,14 +2329,17 @@ def main(argv=None) -> int:
         print(json.dumps(report, indent=1) if args.json else format_report(report))
         return {"PASS": 0, "BLOCKED": 2, "UNVERIFIED": 4}[report["status"]]
     if args.command == "waive":
-        if not re.fullmatch(r"[0-9a-f]{20}|[0-9a-f]{40}|[0-9a-f]{64}", args.subject):
-            parser.error("--subject must be the message digest or a full commit SHA printed by the checker")
         sys.path.insert(0, str(HERE))
+        kind = args.kind if args.kind in ("message", "commit", "tickets") else "message"
+        subject = args.subject.strip().lower()
+        if not subject:
+            parser.error("--subject must name the message digest or commit the checker printed")
         try:
-            waiver_id = record_waiver(args.wal, args.kind, args.subject, args.reason, policy)
-        except ValueError as error:
+            waiver_id = record_waiver(args.wal, kind, subject, args.reason, policy)
+        except (ValueError, OSError) as error:
             parser.error(str(error))
-        print(json.dumps({"status": "WAIVED", "id": waiver_id, "kind": args.kind, "subject": args.subject}))
+        print(json.dumps({"status": "WAIVED", "id": waiver_id, "kind": kind, "subject": subject,
+                          "note": "" if strict_mode(policy) else "warn mode: no waiver is needed"}))
         return 0
     if args.command == "notify":
         sys.path.insert(0, str(HERE))
@@ -2275,6 +2376,11 @@ def crash_exit_code(argv) -> int:
     """
     if not argv or argv[0] != "hook":
         return 1
+    try:
+        if not strict_mode(load_policy()):
+            return 0  # warn mode: a bug in the checker never blocks a commit
+    except Exception:  # noqa: BLE001 - an unreadable policy is not strict
+        return 0
     if _HOOK_STATE["may_commit"] is not None:
         return 2 if _HOOK_STATE["may_commit"] else 0
     raw, payload = _HOOK_STATE["raw"], _HOOK_STATE["payload"]

@@ -173,10 +173,15 @@ class SparseSafety(unittest.TestCase):
         path.symlink_to(target)
         with self.assertRaises(OSError): self.guard()
 
-    def test_metadata_stderr_warning_refused(self):
-        with self.assertRaises(OSError):
-            git_safety._bounded_git(self.repo, ['not-a-real-command'], self.env,
-                                   timeout=2, limit=1024, reject_stderr=True)
+    def test_stderr_text_alone_does_not_refuse_the_sparse_proof(self):
+        # 2026-11-24: git diagnostics on stderr (here GIT_TRACE lines) are text, not an effect; the proof decides on
+        # exit codes and what the index and rules hold. It used to refuse ('metadata emitted a warning').
+        self.sparse()
+        require_safe_source(self.repo, dict(self.env, GIT_TRACE='2'), timeout=5)
+
+    def test_failing_git_metadata_still_reports_its_exit_code(self):
+        code, _ = git_safety._bounded_git(self.repo, ['not-a-real-command'], self.env, timeout=2, limit=1024)
+        self.assertNotEqual(code, 0)
 
     def test_sparse_inspection_shared_deadline_refused(self):
         self.sparse()
