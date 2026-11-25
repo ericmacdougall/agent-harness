@@ -17,7 +17,8 @@ sys.path.insert(0, str(HOOKS))
 import commit_policy as cp
 import native_context as nc
 
-POLICY = json.loads((HOOKS / "commit_policy.json").read_text())
+# strict mode: since 2026-11-24 a wrong-harness trailer only warns in the default warn mode; these tests pin the rule
+POLICY = cp.apply_mode(json.loads((HOOKS / "commit_policy.json").read_text()), strict=True)
 BODY = ("fix(example): preserve truthful source attribution\n\n"
         "Why: inherited flags can misidentify the current runtime.\n\n"
         "What: classify this current message from defensible evidence.\n\n"

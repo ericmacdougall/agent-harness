@@ -1,5 +1,9 @@
 {
-  "_comment": "Copy to commit_policy.local.json beside commit_policy.json (untracked; never overwritten by the installer). Any key here replaces the shipped value; objects merge.",
+  "_comment": "Copy to commit_policy.local.json beside commit_policy.json (untracked; never overwritten by the installer). Any key here replaces the shipped value; objects merge. mode: warn (default, form problems never block) or strict (every rule blocks). merge_gate: override any merge-gate number, e.g. small_change_lines.",
+  "mode": "warn",
+  "merge_gate": {
+    "small_change_lines": 150
+  },
   "backstop_repos": [
     "github\\.com[:/]your-org/"
   ],

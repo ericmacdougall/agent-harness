@@ -20,7 +20,9 @@ sys.path.insert(0, str(HOOKS))
 import commit_policy as cp  # noqa: E402
 import ticket_adapters  # noqa: E402
 
-os.environ["AGENT_HARNESS_POLICY_LOCAL"] = str(Path(__file__).resolve().parent / "data" / "policy_profile_fixture.json")  # hermetic profile (GoodQA #14538)
+# hermetic profile (GoodQA #14538) in strict mode: these tests pin every rule, which blocks only in strict mode since
+# the 2026-11-24 redesign (warn mode is covered by tests/test_commit_policy_warn.py)
+os.environ["AGENT_HARNESS_POLICY_LOCAL"] = str(Path(__file__).resolve().parent / "data" / "policy_profile_strict_fixture.json")
 POLICY = cp.load_policy()
 
 # Hermetic: no test may reach the real Secret Manager. A fake gcloud first on PATH fails and
@@ -392,7 +394,7 @@ class Fixture(unittest.TestCase):
         for name in ("commit_policy.py", "commit_policy.json", "native_context.py", "safe_input.py",
                      "ticket_adapters.py", "process.py", "wal.py", "wal_note.py"):
             copy_fixture_file(HOOKS / name, copy / name)
-        profile = Path(__file__).resolve().parent / "data" / "policy_profile_fixture.json"
+        profile = Path(__file__).resolve().parent / "data" / "policy_profile_strict_fixture.json"
         copy_fixture_file(profile, copy / cp.LOCAL_PROFILE_NAME)
         with (copy / "native_context.py").open("a", encoding="utf-8") as handle:
             handle.write("\n\ndef probe_commit_runtime_origin():\n"
@@ -504,11 +506,9 @@ class PreToolUseHook(Fixture):
         ledger.write_text(json.dumps({"at": datetime.now(timezone.utc).isoformat(), "id": "f" * 16,
                                       "kind": "message", "subject": digest, "wal": str(self.wal)}) + "\n")
         self.assertEqual(self.run_cli("hook", stdin=self.payload(command)).returncode, 2)
-        short = self.run_cli("waive", "--wal", str(self.wal), "--kind", "message", "--subject", digest,
-                             "--reason", "too short")
-        self.assertNotEqual(short.returncode, 0)
+        # 2026-11-24: any non-empty reason is accepted on the first try (it used to need 20+ characters)
         waived = self.run_cli("waive", "--wal", str(self.wal), "--kind", "message", "--subject", digest,
-                              "--reason", "production outage hotfix authorized by Eric in GoodQA #14151")
+                              "--reason", "hotfix; ok")
         self.assertEqual(waived.returncode, 0, waived.stderr)
         self.assertIn('"event":"waiver"', self.wal.read_text())
         self.assertEqual(self.run_cli("hook", stdin=self.payload(command)).returncode, 0)
@@ -642,9 +642,9 @@ class InspectionRegressions(Fixture):
                                                     "tool_input": {"command": command}}),
                                   capture_output=True, env=self.env, timeout=60)
         self.assertEqual(run("ls -la && npm test").returncode, 0)
-        broken = run("git commit -m wip")
-        self.assertEqual(broken.returncode, 2)
-        self.assertIn("enforcement", broken.stderr)
+        broken = run("git commit -m wip")  # 2026-11-24: an unreadable policy checks nothing and blocks nothing
+        self.assertEqual(broken.returncode, 0)
+        self.assertIn("cannot load", broken.stderr)
 
     def test_edit_tools_mentioning_commit_are_not_blocked(self):
         payload = {"session_id": "s", "cwd": str(self.repo), "tool_name": "apply_patch",
@@ -710,7 +710,7 @@ class GitBackstop(Fixture):
         # (_override_allowed), so give the copy the same profile as the production local
         # overlay beside the script: the backstop must be able to block before its
         # script goes missing, or the missing-script half proves nothing.
-        shutil.copy(Path(__file__).resolve().parent / "data" / "policy_profile_fixture.json",
+        shutil.copy(Path(__file__).resolve().parent / "data" / "policy_profile_strict_fixture.json",
                     copy / cp.LOCAL_PROFILE_NAME)
         git("config", "--global", "hook.agent-harness-commit-policy.event", "commit-msg", cwd=self.repo, env=self.env)
         git("config", "--global", "hook.agent-harness-commit-policy.command",
@@ -1158,7 +1158,7 @@ sys.exit(cp.entry(["hook"]))
     def test_undecodable_stdin_is_a_json_error_not_a_crash(self):
         result = subprocess.run([sys.executable, str(HOOKS / "commit_policy.py"), "hook"], input=b"\xff\xfe",
                                 capture_output=True, env=self.env, timeout=60)
-        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.returncode, 0)  # 2026-11-24: unreadable hook input is not checked, never refused
         self.assertIn(b"not JSON", result.stderr)
 
 
@@ -1230,7 +1230,7 @@ class AuthorTrailerHarness(unittest.TestCase):
                 for dest in copies:
                     with self.subTest(copy=dest.parent.name, origin=origin, marker=marker, trailer=trailer):
                         out = subprocess.run([sys.executable, "-I", "-B", "-c", fixture, str(dest), "check-message",
-                                              "--file", str(msg)], capture_output=True, text=True, timeout=60,
+                                              "--strict", "--file", str(msg)], capture_output=True, text=True, timeout=60,
                                              env=dict(base, **marker))
                         self.assertEqual("this commit is made from the" in out.stdout, refused, out.stdout[-400:])
                         self.assertEqual(out.returncode, 2 if refused else 0, out.stderr[-400:])

@@ -28,7 +28,7 @@ PROFILE = Path(__file__).resolve().parent / "data" / "ledger_local_profile.json"
 def load_policy_with_repos():
     """The shipped policy tracks no repository (the list lives in each user's local profile), so these tests
     give it the pattern they exercise."""
-    policy = cp.load_policy()
+    policy = cp.apply_mode(cp.load_policy(), strict=True)  # these tests pin the rules, which block in strict mode
     policy["ticket_systems"]["goodqa"]["repos"] = [r"github\.com[:/]ericmacdougall/"]
     return policy
 import ticket_adapters  # noqa: E402
@@ -108,7 +108,7 @@ class LedgerWorld(unittest.TestCase):
     def check_message(self, message, *, repo=True):
         path = self.root / "msg.txt"
         path.write_text(message)
-        args = [sys.executable, str(HOOKS / "commit_policy.py"), "check-message", "--file", str(path)]
+        args = [sys.executable, str(HOOKS / "commit_policy.py"), "check-message", "--strict", "--file", str(path)]
         if repo:
             args += ["--repo", str(self.repo)]
         result = run(args, cwd=self.root, env=self.env, check=False)
