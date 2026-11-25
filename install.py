@@ -30,6 +30,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "heavy_job_guard.py", "dropbox_budget.conf", "run_capped.py", "run_probe.py", "resource_budget.py", "agent_gate.py", "ops_watch.py", "resource_limits.json",
          "domain_gates.py", "domain_checklists.json",
          "command_guard.py", "command_guard_hook.py", "redact.py", "kill_guard.py", "kill_guard_policy.json",
+         "protected_paths.py", "protected_write_hook.py",  # agents never write CLAUDE.md or settings files (goodqa#17155)
          "doctor.py", "hooks_manifest.json", "rules.json", "ah.py", "ah_kill.py", "ah_worktree.py", "ah_install.py", "guard_selftest.py", "ah_ticket.py", "ah_chat.py", "ah_chat_send.py", "liveness.py",
          "ah_export.py",  # ah export: redacted local HTML of a session (goodqa#15788)
          "remote_delete.py", "remote_delete_agent.py",
@@ -101,7 +102,7 @@ def record_gate_epoch(home: Path, prior_mtime=None, now=None) -> bool:
 def managed_scripts(claude: Path) -> set[str]:
     return {str(claude / "hooks" / name)
             for name in ("wal.py", "commit_policy.py", "spec_flow.py", "provenance_hooks.py", "heavy_job_guard.py", "agent_gate.py",
-                         "command_guard_hook.py", "kill_guard.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py", "log_backup.py", "bg_lint.py",
+                         "command_guard_hook.py", "protected_write_hook.py", "kill_guard.py", "tier_gate.py", "merge_gate.py", "ledger_reminder.py", "log_backup.py", "bg_lint.py",
                          "dropped_gate.py", "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py",
                          "mc_inbox.py", "owner_inbox.py", "mission_gate.py", "status_truth.py", "idle_guard.py", "copy_hygiene.py")}
 
@@ -147,6 +148,17 @@ def command_guard_group(claude: Path) -> dict:
     return {"matcher": "Bash|PowerShell", "hooks": [{
         "type": "command", "command": "python3", "args": [str(claude / "hooks" / "command_guard_hook.py"), "hook"],
         "timeout": 30, "onFailure": "block"}]}
+
+
+PROTECTED_WRITE_MATCHER = "Write|Edit|MultiEdit|NotebookEdit"
+
+
+def protected_write_group(claude: Path) -> dict:
+    """Refuses file-tool writes to CLAUDE.md, settings and the Codex config (goodqa#17155). It fails open on its own
+    errors (no onFailure): a bug here must never stop the file tools, and Bash has its own guard."""
+    return {"matcher": PROTECTED_WRITE_MATCHER, "hooks": [{
+        "type": "command", "command": "python3", "args": [str(claude / "hooks" / "protected_write_hook.py"), "hook"],
+        "timeout": 10}]}
 
 
 def kill_guard_group(claude: Path) -> dict:
@@ -242,6 +254,7 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
     if command_guard:
         managed["PreToolUse"].insert(0, command_guard_group(claude))
         managed["PreToolUse"].insert(1, kill_guard_group(claude))
+        managed["PreToolUse"].insert(2, protected_write_group(claude))
     # Copy hygiene report (t2-dev disk full 2026-11-21): one line when idle test copies pile up, and a detached
     # report-only reap at most every 6 h. Never deletes; fails open.
     managed["SessionStart"].append({"hooks": [{

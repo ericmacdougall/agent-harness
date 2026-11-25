@@ -1529,8 +1529,11 @@ def record_waiver(wal: Path, kind: str, subject: str, reason: str, policy: dict)
         raise ValueError("--wal must be your session WAL under ~/.claude/wals or ~/.agent-harness/codex-wals")
     waiver_id = secrets.token_hex(8)
     at = datetime.now(timezone.utc).isoformat()
-    append(wal, {"at": at, "event": "waiver", "waiver_id": waiver_id, "kind": kind,
-                 "subject": subject, "note": "COMMIT_POLICY_WAIVER: " + reason})
+    landed = append(wal, {"at": at, "event": "waiver", "waiver_id": waiver_id, "kind": kind,
+                          "subject": subject, "note": "COMMIT_POLICY_WAIVER: " + reason})
+    if landed is False:  # wal.py kept the row in a side file (goodqa#17145): the gate cannot see it yet
+        raise ValueError("the WAL could not take the waiver row (it is not a plain single-link file; the row waits in a "
+                         "side file). Heal it with the wal.py recover command printed above, then record the waiver again")
     with _open_ledger(LEDGER) as handle:
         handle.write(json.dumps({"at": at, "id": waiver_id, "kind": kind, "subject": subject,
                                  "wal": str(wal)}, separators=(",", ":")) + "\n")

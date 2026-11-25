@@ -188,7 +188,14 @@ class WalTests(unittest.TestCase):
                         outside.mkdir(mode=0o755)
                     link.symlink_to(outside)
                     result = self.append_with(writer)
-                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    # goodqa#17145: nothing is written through a symlink and no hook is locked out. The note writer says
+                    # DEFERRED (row kept in a side file) or NOT_SAVED (exit 1: no safe directory to keep it in).
+                    if writer == "hook":
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                    elif component.endswith(".jsonl"):
+                        self.assertEqual((result.returncode, json.loads(result.stdout)["status"]), (0, "DEFERRED"))
+                    else:
+                        self.assertEqual((result.returncode, json.loads(result.stdout)["status"]), (1, "NOT_SAVED"))
                     if outside.is_file():
                         self.assertEqual(outside.read_text(), "preserve\n")
                     else:
@@ -212,8 +219,11 @@ class WalTests(unittest.TestCase):
                         reader = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
                     try:
                         result = self.append_with(writer)
-                        self.assertNotEqual(result.returncode, 0, result.stdout)
+                        # goodqa#17145: never written through, never a lockout; the row waits in a side file
+                        self.assertEqual(result.returncode, 0, result.stderr)
                         self.assertEqual(outside.read_text(), "preserve\n")
+                        if writer == "note":
+                            self.assertIn("DEFERRED", result.stdout)
                     finally:
                         if reader is not None:
                             os.close(reader)
@@ -316,8 +326,7 @@ class WalTests(unittest.TestCase):
         original = b'x' * 65_537
         target.write_bytes(original)
         with patch.dict(os.environ, {'HOME': str(self.home)}):
-            with self.assertRaisesRegex(ValueError, 'recovery budget'):
-                module.append(target, {'event': 'after-restart'})
+            self.assertFalse(module.append(target, {'event': 'after-restart'}))  # diverted, never blocks (goodqa#17145)
         self.assertEqual(target.read_bytes(), original)
 
     def test_transient_missing_file_during_create_retries_without_losing_record(self):
@@ -357,10 +366,10 @@ class WalTests(unittest.TestCase):
             return original_open(path, flags, *args, **kwargs)
 
         with patch.dict(os.environ, {'HOME': str(self.home)}), patch.object(module.os, 'open', side_effect=replace_directory):
-            with self.assertRaises(FileNotFoundError):
-                module.append(target, {'event': 'fixture'})
-        self.assertFalse(target.exists())
-        self.assertFalse((session.with_name('moved') / 'main.jsonl').exists())
+            self.assertFalse(module.append(target, {'event': 'fixture'}))  # warns and allows; never raises (goodqa#17145)
+        self.assertIn('not safe to write', ' '.join(module.NOTICES))
+        self.assertEqual(list(session.iterdir()), [])
+        self.assertEqual(list(session.with_name('moved').iterdir()), [])
 
     def test_repeated_missing_file_is_bounded(self):
         spec = importlib.util.spec_from_file_location('wal_retry_test', WAL)
@@ -377,10 +386,11 @@ class WalTests(unittest.TestCase):
             return original_open(path, flags, *args, **kwargs)
 
         with patch.dict(os.environ, {'HOME': str(self.home)}), patch.object(module.os, 'open', side_effect=never_create):
-            with self.assertRaises(FileNotFoundError):
-                module.append(target, {'event': 'fixture'})
+            self.assertFalse(module.append(target, {'event': 'fixture'}))  # diverted to a side file, no lockout (goodqa#17145)
         self.assertEqual(len(attempts), 4)
         self.assertFalse(target.exists())
+        self.assertIn('could not be created', ' '.join(module.NOTICES))
+        self.assertEqual([p.name.startswith('main.jsonl.pending-') for p in target.parent.iterdir()], [True])
 
     def test_retry_refuses_directory_moved_during_backoff(self):
         spec = importlib.util.spec_from_file_location('wal_retry_test', WAL)
@@ -407,8 +417,7 @@ class WalTests(unittest.TestCase):
         with patch.dict(os.environ, {'HOME': str(self.home)}), \
              patch.object(module.os, 'open', side_effect=fail_first), \
              patch.object(module.time, 'sleep', side_effect=move_during_sleep):
-            with self.assertRaises((OSError, ValueError)):
-                module.append(target, {'event': 'fixture'})
+            self.assertFalse(module.append(target, {'event': 'fixture'}))  # warns and allows; never raises (goodqa#17145)
         self.assertFalse(target.exists())
         self.assertFalse((moved / 'main.jsonl').exists())
 
@@ -431,8 +440,7 @@ class WalTests(unittest.TestCase):
 
         with patch.dict(os.environ, {'HOME': str(self.home)}), \
              patch.object(module.os, 'open', side_effect=move_after_open):
-            with self.assertRaises((OSError, ValueError)):
-                module.append(target, {'event': 'fixture'})
+            self.assertFalse(module.append(target, {'event': 'fixture'}))  # warns and allows; never raises (goodqa#17145)
         self.assertFalse(target.exists())
         self.assertEqual((moved / 'main.jsonl').read_text(), '')
 
@@ -453,8 +461,7 @@ class WalTests(unittest.TestCase):
 
         with patch.dict(os.environ, {'HOME': str(self.home)}), \
              patch.object(module.os, 'fsync', side_effect=move_after_fsync):
-            with self.assertRaises((OSError, ValueError)):
-                module.append(target, {'event': 'fixture'})
+            self.assertFalse(module.append(target, {'event': 'fixture'}))  # warns and allows; never raises (goodqa#17145)
         self.assertFalse(target.exists())
         self.assertEqual(json.loads((moved / 'main.jsonl').read_text()), {'event': 'fixture'})
 
@@ -477,10 +484,9 @@ class WalTests(unittest.TestCase):
 
         with patch.dict(os.environ, {'HOME': str(self.home)}), \
              patch.object(module.os, 'open', side_effect=replace_after_open):
-            with self.assertRaises((OSError, ValueError)):
-                module.append(target, {'event': 'fixture'})
+            self.assertFalse(module.append(target, {'event': 'fixture'}))  # diverted to a side file, no lockout
         self.assertEqual(target.read_text(), 'replacement')
-        self.assertEqual(moved.read_text(), '')
+        self.assertNotIn('fixture', moved.read_text())  # nothing was written through a swapped file
 
     def test_write_refuses_log_file_replacement_before_success(self):
         spec = importlib.util.spec_from_file_location('wal_retry_test', WAL)
@@ -492,15 +498,18 @@ class WalTests(unittest.TestCase):
         moved = session / 'moved.jsonl'
         original_fsync = os.fsync
 
+        swapped = []
+
         def replace_after_fsync(fd):
             original_fsync(fd)
-            target.rename(moved)
-            target.write_text('replacement')
+            if not swapped:  # the side file's own fsync (goodqa#17145) must not swap again
+                swapped.append(True)
+                target.rename(moved)
+                target.write_text('replacement')
 
         with patch.dict(os.environ, {'HOME': str(self.home)}), \
              patch.object(module.os, 'fsync', side_effect=replace_after_fsync):
-            with self.assertRaises((OSError, ValueError)):
-                module.append(target, {'event': 'fixture'})
+            self.assertFalse(module.append(target, {'event': 'fixture'}))  # diverted to a side file, no lockout
         self.assertEqual(target.read_text(), 'replacement')
         self.assertEqual(json.loads(moved.read_text()), {'event': 'fixture'})
 
@@ -530,8 +539,7 @@ class WalTests(unittest.TestCase):
         with patch.dict(os.environ, {'HOME': str(self.home)}), \
              patch.object(module.os, 'open', side_effect=fail_first), \
              patch.object(module.time, 'sleep', side_effect=redirect_during_sleep):
-            with self.assertRaises((OSError, ValueError)):
-                module.append(target, {'event': 'fixture'})
+            self.assertFalse(module.append(target, {'event': 'fixture'}))  # warns and allows; never raises (goodqa#17145)
         self.assertFalse((moved / 'concurrent/main.jsonl').exists())
 
     def test_open_refuses_claude_ancestor_symlink_before_write(self):
@@ -554,8 +562,7 @@ class WalTests(unittest.TestCase):
 
         with patch.dict(os.environ, {'HOME': str(self.home)}), \
              patch.object(module.os, 'open', side_effect=redirect_after_open):
-            with self.assertRaises((OSError, ValueError)):
-                module.append(target, {'event': 'fixture'})
+            self.assertFalse(module.append(target, {'event': 'fixture'}))  # warns and allows; never raises (goodqa#17145)
         self.assertEqual((moved / 'wals/concurrent/main.jsonl').read_text(), '')
 
     def test_write_refuses_wals_ancestor_symlink_before_success(self):
@@ -576,8 +583,7 @@ class WalTests(unittest.TestCase):
 
         with patch.dict(os.environ, {'HOME': str(self.home)}), \
              patch.object(module.os, 'fsync', side_effect=redirect_after_fsync):
-            with self.assertRaises((OSError, ValueError)):
-                module.append(target, {'event': 'fixture'})
+            self.assertFalse(module.append(target, {'event': 'fixture'}))  # warns and allows; never raises (goodqa#17145)
         self.assertEqual(json.loads((moved / 'concurrent/main.jsonl').read_text()),
                          {'event': 'fixture'})
 
