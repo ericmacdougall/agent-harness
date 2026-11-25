@@ -2162,6 +2162,62 @@ class StageSpace(Case):
         self.assertEqual(staged.read_bytes(), body)
         self.assertTrue([c for c in self.copies() if ".agent-harness/backup-stage" in " ".join(c)])
 
+    def test_source_symlink_to_a_directory_is_not_written_through_on_later_runs(self):
+        if not self._clone_works():
+            self.skipTest("clonefile/reflink is not available on this volume")
+        outside = self.tmp / "outside-dir"
+        outside.mkdir()
+        (outside / "keep.txt").write_text("keep")
+        before = sorted(p.name for p in outside.iterdir())
+        link = self.home / ".claude/projects/p1/dirlink"
+        link.symlink_to(outside)
+        for i in range(2):
+            done = self.run_script(LOG_BACKUP_STAGE_ENGINE="clone")
+            self.assertEqual(set(p.name for p in outside.iterdir()), set(before), (i, done.stderr, list(outside.iterdir())))
+        staged = self.home / ".agent-harness/backup-stage/.claude/projects/p1/dirlink"
+        self.assertTrue(staged.is_symlink())
+        self.assertEqual(os.readlink(staged), os.readlink(link))
+        self.assertEqual(sorted(p.name for p in outside.iterdir()), before)
+
+    def test_a_deadline_stopped_clone_pass_makes_progress_and_converges(self):
+        if not self._clone_works():
+            self.skipTest("clonefile/reflink is not available on this volume")
+        for i in range(30):
+            self.put(".claude/projects/p1/f%03d.jsonl" % i, b"x" * 80)
+        stage_root = self.home / ".agent-harness/backup-stage/.claude/projects"
+
+        def staged():
+            if not stage_root.exists():
+                return set()
+            return {p.relative_to(stage_root) for p in stage_root.rglob("*") if p.is_file()}
+
+        want = {p.relative_to(self.home / ".claude/projects")
+                for p in (self.home / ".claude/projects").rglob("*") if p.is_file()}
+        counts = []
+        saw_cap = False
+        last = None
+        for i in range(6):
+            last = self.run_script(LOG_BACKUP_STAGE_ENGINE="clone", LOG_BACKUP_STAGE_MAX_PLACE="10")
+            n = len(staged())
+            counts.append(n)
+            log = (self.logs / "log-backup.log").read_text() if (self.logs / "log-backup.log").exists() else ""
+            if "snapshot stopped after LOG_BACKUP_STAGE_MAX_PLACE files" in log:
+                saw_cap = True
+            if staged() >= want and "snapshot stopped after LOG_BACKUP_STAGE_MAX_PLACE files: .claude/projects" not in log.splitlines()[-50:]:
+                break
+        self.assertTrue(saw_cap, counts)
+        self.assertGreater(counts[0], 0, counts)
+        # Each capped run must add files until the tree is complete (resume, not restart from zero).
+        for a, b in zip(counts, counts[1:]):
+            if a < len(want):
+                self.assertGreater(b, a, counts)
+        self.assertTrue(want <= staged(), (sorted(want - staged()), counts))
+        self.assertIsNotNone(last)
+        # once every source has been fully staged, a later run can be fresh
+        done = self.run_script(LOG_BACKUP_STAGE_ENGINE="clone")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue(self.last_ok().exists())
+
     def test_a_full_copy_is_skipped_when_free_space_is_below_the_threshold(self):
         done = self.run_script(LOG_BACKUP_STAGE_ENGINE="rsync", LOG_BACKUP_STAGE_MIN_FREE_GIB="999")
         self.assertNotEqual(done.returncode, 0)
@@ -2170,12 +2226,12 @@ class StageSpace(Case):
         self.assertIn("snapshot skipped (full copy)", log)
         self.assertIn("need 999 GiB", log)
         # single files also go through the free-space check; trees must not have been rsync-copied
-        staged_dirs = [p for p in (self.home / ".agent-harness/backup-stage").glob(".claude/projects/*") if p.is_dir() or p.is_file()]
         self.assertFalse(any(p.is_dir() and any(p.rglob("*")) for p in (self.home / ".agent-harness/backup-stage").glob(".claude/*")))
 
     def test_bad_stage_engine_and_min_free_are_refused(self):
         for k, v in (("LOG_BACKUP_STAGE_ENGINE", "hardlink"), ("LOG_BACKUP_STAGE_MIN_FREE_GIB", "x1"),
-                     ("LOG_BACKUP_STAGE_MIN_FREE_GIB", "1000"), ("LOG_BACKUP_STAGE_MIN_FREE_GIB", "020")):
+                     ("LOG_BACKUP_STAGE_MIN_FREE_GIB", "1000"), ("LOG_BACKUP_STAGE_MIN_FREE_GIB", "020"),
+                     ("LOG_BACKUP_STAGE_MAX_PLACE", "x1"), ("LOG_BACKUP_STAGE_MAX_PLACE", "020")):
             done = self.run_script(**{k: v})
             self.assertEqual(done.returncode, 2, (k, v))
             self.assertEqual(self.copies(), [], (k, v))

@@ -24,6 +24,9 @@
 #                           leaves the stage in place: clonefile snapshots share extents with the source
 #                           (so they do not take a second allocation), and a full-copy fallback stays
 #                           incremental. A first clone pass replaces leftover full copies with clones.
+#   LOG_BACKUP_STAGE_MAX_PLACE  optional cap on file/symlink placements per source in the clone loop
+#                           (unset or 0: no cap). Hitting the cap is treated like the run deadline:
+#                           last-ok is withheld and the next run resumes from files not yet staged.
 #   LOG_BACKUP_TPSLIMIT     rclone --tpslimit per host (default 1; the account's write budget is shared by all hosts) and
 #   LOG_BACKUP_TRANSFERS    --transfers (default 2), both whole numbers 1-99
 #   LOG_BACKUP_BULK_EVERY_SECONDS  minimum gap between bulk-tier attempts (default 3600); transcripts run every time
@@ -119,6 +122,10 @@ case "$STAGE_ENGINE" in auto|clone|rsync) ;; *) echo "log-backup: LOG_BACKUP_STA
 STAGE_MIN_FREE_GIB=${LOG_BACKUP_STAGE_MIN_FREE_GIB:-20}
 if ! printf '%s' "$STAGE_MIN_FREE_GIB" | grep -Eq '^(0|[1-9][0-9]{0,2})$'; then
   echo "log-backup: LOG_BACKUP_STAGE_MIN_FREE_GIB must be a whole number 0-999 without leading zeros" >&2; exit 2
+fi
+STAGE_MAX_PLACE=${LOG_BACKUP_STAGE_MAX_PLACE:-0}
+if ! printf '%s' "$STAGE_MAX_PLACE" | grep -Eq '^(0|[1-9][0-9]{0,4})$'; then
+  echo "log-backup: LOG_BACKUP_STAGE_MAX_PLACE must be a whole number 0-99999 without leading zeros" >&2; exit 2
 fi
 case "$LANE" in 0|1) ;; *) echo "log-backup: LOG_BACKUP_BULK_LANE must be 0 or 1" >&2; exit 2 ;; esac
 case "$TIER" in
@@ -536,6 +543,31 @@ stage_place_file() { # stage_place_file SRC DEST: clone when possible, else a fu
     [ -d "$dest" ] && { rm -f "$tmp"; say "refusing to replace a directory with a staged file"; return 1; }
   fi
   mv -f "$tmp" "$dest"
+}
+stage_place_symlink() { # stage_place_symlink SRC DEST: copy a symlink; never follow DEST if it is a link to a directory
+  # BSD mv -f into an existing symlink-to-dir moves the temp *into* the target (outside the stage).
+  local src="$1" dest="$2" tmp src_t dest_t
+  [ -L "$src" ] || return 1
+  stage_dest_safe "$(dirname "$dest")" || { say "refusing to write a staged path that is not plain under the stage"; return 1; }
+  mkdir -p "$(dirname "$dest")" "$STAGE/.rsync-tmp" || return 1
+  if [ -L "$dest" ]; then
+    src_t=$(readlink "$src") || return 1
+    dest_t=$(readlink "$dest") || return 1
+    [ "$src_t" = "$dest_t" ] && return 0
+    # Remove the staged link itself; rm of a symlink does not follow it.
+    rm -f -- "$dest"
+  elif [ -d "$dest" ]; then
+    say "refusing to replace a directory with a staged symlink"
+    return 1
+  elif [ -e "$dest" ]; then
+    stage_dest_safe "$dest" || { say "refusing to replace a staged path that is not plain under the stage"; return 1; }
+    rm -f -- "$dest"
+  fi
+  tmp="$STAGE/.rsync-tmp/l.$$.$RANDOM"
+  rm -f "$tmp"
+  if ! cp -P "$src" "$tmp"; then rm -f "$tmp"; return 1; fi
+  # dest does not exist (or was removed), so mv cannot follow a symlink-to-dir.
+  mv -f "$tmp" "$dest" || { rm -f "$tmp"; return 1; }
 }
 stage_drop_after_upload() { # remove the staged copy of $1 only when KEEP is exactly 0
   local snap="$1"
@@ -961,29 +993,31 @@ for src in "${LIVE[@]}"; do
         say "snapshot failed (rsync exit $rc): $src"; ok=1; continue
       fi
     else
-      # Clonefile/reflink snapshot: list with the same rsync excludes, then place each file as a COW clone.
-      # The tree is kept and updated in place (unchanged files are skipped after the first conversion pass)
-      # so a 15-minute run is not spent re-cloning tens of thousands of files.
-      empty="$STAGE/.rsync-tmp/empty.$$"
+      # Clonefile/reflink snapshot: list with the same rsync excludes against the existing
+      # snapshot (not an empty tree) so only new or changed files are placed. A deadline-stopped
+      # pass therefore resumes on the next run instead of re-cloning from the top. Unchanged
+      # files are also skipped in the loop as a backstop.
+      mkdir -p "$snap" || { say "cannot stage $src"; ok=1; continue; }
+      stage_dest_safe "$snap" || { say "refusing to use a staged $src that is not a plain path under the stage"; ok=1; continue; }
       list="$STAGE/.rsync-tmp/list.$$"
-      mkdir -p "$empty" || { say "cannot create the stage list directory"; ok=1; continue; }
-      rsync -a -n $RSYNC_8 --out-format='%n' --temp-dir="$STAGE/.rsync-tmp" --exclude='.[gG][oO][oO][dD][qQ][aA]-[tT][rR][aA][sS][hH]/' --include='*/' --exclude-from="$RSYNC_EXCLUDES" -- "$HOME/$src/" "$empty/" > "$list" </dev/null; rc=$?
-      rm -rf "$empty"
+      rsync -a -n $RSYNC_8 --out-format='%n' --temp-dir="$STAGE/.rsync-tmp" --exclude='.[gG][oO][oO][dD][qQ][aA]-[tT][rR][aA][sS][hH]/' --include='*/' --exclude-from="$RSYNC_EXCLUDES" -- "$HOME/$src/" "$snap/" > "$list" </dev/null; rc=$?
       list_ok=1
       if [ $rc -eq 23 ]; then
         say "snapshot partial (rsync exit 23): $src"; ok=1; list_ok=0
       elif [ $rc -ne 0 ] && [ $rc -ne 24 ]; then
-        say "snapshot failed (rsync exit $rc): $src"; ok=1; continue
+        say "snapshot failed (rsync exit $rc): $src"; ok=1; rm -f "$list"; continue
       fi
-      mkdir -p "$snap" || { say "cannot stage $src"; ok=1; continue; }
-      stage_dest_safe "$snap" || { say "refusing to use a staged $src that is not a plain path under the stage"; ok=1; continue; }
       snap_done=1
       src_ok=1
+      placed=0
       while IFS= read -r rel || [ -n "$rel" ]; do
         [ -n "$rel" ] || continue
         case "$rel" in .|./) continue ;; esac
-        if [ "$(time_left)" -lt $(( MIN_SLICE + DEADLINE_GRACE + KILL_GRACE )) ]; then
+        if [ "$(time_left)" -lt $(( MIN_SLICE + DEADLINE_GRACE + KILL_GRACE + RESERVE )) ]; then
           say "snapshot stopped at the run deadline: $src"; ok=1; snap_done=0; break
+        fi
+        if [ "$STAGE_MAX_PLACE" != 0 ] && [ "$placed" -ge "$STAGE_MAX_PLACE" ]; then
+          say "snapshot stopped after LOG_BACKUP_STAGE_MAX_PLACE files: $src"; ok=1; snap_done=0; break
         fi
         srcp="$HOME/$src/$rel"
         destp="$snap/$rel"
@@ -1014,26 +1048,26 @@ for src in "${LIVE[@]}"; do
         stage_dest_safe "$(dirname "$destp")" || { say "snapshot partial (unsafe dest): $src/$rel"; ok=1; src_ok=0; continue; }
         mkdir -p "$(dirname "$destp")" || { say "snapshot partial (mkdir): $src/$rel"; ok=1; src_ok=0; continue; }
         if [ -L "$srcp" ]; then
-          tmp="$STAGE/.rsync-tmp/l.$$.$RANDOM"
-          rm -f "$tmp"
-          if cp -P "$srcp" "$tmp" && mv -f "$tmp" "$destp"; then
-            :
+          if stage_place_symlink "$srcp" "$destp"; then
+            placed=$((placed + 1))
           else
-            rm -f "$tmp"
             say "snapshot partial (symlink): $src/$rel"; ok=1; src_ok=0
           fi
         elif [ -f "$srcp" ]; then
-          if stage_converted "$src" && stage_unchanged "$srcp" "$destp"; then
+          if stage_unchanged "$srcp" "$destp"; then
             continue
           fi
-          if ! stage_place_file "$srcp" "$destp"; then
+          if stage_place_file "$srcp" "$destp"; then
+            placed=$((placed + 1))
+          else
             say "snapshot partial (file): $src/$rel"; ok=1; src_ok=0
           fi
         fi
       done < "$list"
       rm -f "$list"
-      # Mark a finished conversion so later runs can skip unchanged files. Do not mark a partial
-      # pass: leftover full copies with the same size and mtime would then never be replaced.
+      # Mark a finished conversion so a later engine or stage change can still be told apart.
+      # Do not mark a partial pass: leftover full copies with the same size and mtime would then
+      # never be replaced by a dedicated conversion pass.
       if [ "$snap_done" = 1 ] && [ "$src_ok" = 1 ] && [ "$list_ok" = 1 ]; then
         stage_note_converted "$src"
       fi
