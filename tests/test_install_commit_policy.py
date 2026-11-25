@@ -21,7 +21,7 @@ class Installers(unittest.TestCase):
             status = install.install_git_backstop(home, True)
         settings = json.loads((home / ".claude" / "settings.json").read_text())
         handlers = [hook for group in settings["hooks"]["PreToolUse"] for hook in group["hooks"]
-                    if (hook.get("args") or [""])[0].endswith("commit_policy.py")]
+                    if "commit_policy.py" in [Path(a).name for a in (hook.get("args") or [])[:2]]]  # direct or launcher form
         self.assertEqual(len(handlers), 1)
         self.assertEqual(handlers[0]["onFailure"], "block")
         self.assertTrue((home / ".claude" / "hooks" / "commit_policy.json").exists())

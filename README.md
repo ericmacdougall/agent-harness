@@ -76,10 +76,14 @@ It also installs the pinned [netwatch](https://github.com/ericmacdougall/netwatc
 
 Claude Code's `--safe-mode` disables `CLAUDE.md` and hooks, including the WAL gate. Use a normal session when relying on harness enforcement.
 
+### Turning the harness off
+
+`~/.agent-harness/bin/harness off` (or `python3 ~/.claude/hooks/ah_switch.py off`) silences every harness hook at once, in running sessions too, and moves the harness block out of `CLAUDE.md`. `harness on` puts everything back, and `harness status` says which state you are in. A release floor stops installers from old checkouts from putting older hooks back. See [docs/off-switch.md](docs/off-switch.md).
+
 To uninstall, follow these steps:
 
 1. Remove the marked block from `CLAUDE.md`.
-2. Remove the harness entries from `settings.json`: the hook entries pointing at `~/.claude/hooks/wal.py`, `~/.claude/hooks/commit_policy.py`, `~/.claude/hooks/spec_flow.py`, `~/.claude/hooks/merge_gate.py`, `~/.claude/hooks/command_guard_hook.py` or `~/.claude/hooks/kill_guard.py`, and the harness permission rules.
+2. Remove the floor watcher with `python3 install.py --apply --no-floor-watch` (or by hand, see [docs/off-switch.md](docs/off-switch.md)), or it puts the wiring back. Then remove the harness entries from `settings.json`: the hook entries that run `~/.claude/hooks/ah_hook.py`, and on older installs those pointing at `~/.claude/hooks/wal.py`, `~/.claude/hooks/commit_policy.py`, `~/.claude/hooks/spec_flow.py`, `~/.claude/hooks/merge_gate.py`, `~/.claude/hooks/command_guard_hook.py` or `~/.claude/hooks/kill_guard.py`, and the harness permission rules.
 3. Run `python3 ~/.claude/hooks/commit_policy.py uninstall-git-hook`.
 4. If installed, run `~/.agent-harness/bin/netwatch uninstall`, delete the binary, and pass `--no-netwatch` to any later install.
 5. Remove the copied agents and helper scripts. Restore a backup if you want the exact earlier state.

@@ -1,6 +1,6 @@
 {
  "schema": 1,
- "note": "status installed = required on every listed flavor; pending = owner PR not merged, reported NOT-ENFORCED. tests/test_doctor.py fails when a pending row's script already ships in harness/hooks (promote it and make the installer wire it). known_gap marks a shipped script that one flavor does not wire yet; it names the batch that fixes it.",
+ "note": "status installed = required on every listed flavor; pending = owner PR not merged, reported NOT-ENFORCED. tests/test_doctor.py fails when a pending row's script already ships in harness/hooks (promote it and make the installer wire it). known_gap marks a shipped script that one flavor does not wire yet; it names the batch that fixes it. script is the hook script itself: the installers wire every row through the off-switch launcher (python3 <hooks>/ah_hook.py <script> <arg>), and doctor counts that form as wired.",
  "hooks": [
   {
    "id": "wal:session",

@@ -4082,6 +4082,9 @@ def main(argv=None) -> int:
     if given[:2] in (["task", "kit"], ["task", "succeed"], ["task", "kits"]):  # goodqa#15565: successor kit (successor.py)
         import successor  # noqa: PLC0415
         return successor._cli(["list" if given[1] == "kits" else given[1]] + given[2:])
+    if given[:1] in (["off"], ["on"], ["switch-status"]):  # the harness off switch (ah_switch.py, docs/off-switch.md)
+        import ah_switch  # noqa: PLC0415
+        return ah_switch.main(["status" if given[0] == "switch-status" else given[0]] + given[1:])
     if given[:1] == ["decision"]:  # goodqa#16651: signed central top-rung decisions (central_decisions.py)
         import central_decisions  # noqa: PLC0415
         return central_decisions.main(given[1:])

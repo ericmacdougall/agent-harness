@@ -52,7 +52,8 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "ahc_core.py", "ahc_fs.py", "ahc_packet.py", "ahc_clone.py", "ahc_runner.py", "ahc_install.py",  # ahc daemon (goodqa#16034)
          "ahc_contracts.py", "ahc_crash.py", "ahc_migrate.py", "ahc_clock.py", "ahc_scan.py", "ahc_shadow.py", "ahc_guard.py",
          "ahc_observe.py", "ahc_w21.py", "ahc_review.py",
-         "ahc_release.json")  # imported or read by ahc_runner (goodqa#16049; ahc_release.json: AC-11 preflight)
+         "ahc_release.json",  # imported or read by ahc_runner (goodqa#16049; ahc_release.json: AC-11 preflight)
+         "ah_hook.py", "ah_roles.py", "ah_switch.py")  # the launcher every hook runs through, roles, the off switch
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
 TOOLS = ("watch-tests.py",)
@@ -321,7 +322,49 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
                    "args": [str(claude / "hooks" / "owner_inbox.py"), "hook"], "timeout": 5}
     for event in ("UserPromptSubmit", "SessionStart", "Stop", "PostToolUse"):
         managed.setdefault(event, []).append({"hooks": [dict(owner_inbox)]})
+    return through_launcher(managed, claude)
+
+
+LAUNCHER = "ah_hook.py"  # harness/hooks/ah_hook.py: exits 0 at once while ~/.agent-harness/OFF exists
+
+
+def through_launcher(managed: dict[str, list[dict]], claude: Path) -> dict[str, list[dict]]:
+    """Every managed handler `python3 <hooks>/<script> [args]` becomes `python3 <hooks>/ah_hook.py <script> [args]`,
+    so `harness off` silences running sessions too (they read the command at start; the launcher reads the flag on
+    every call). Everything else in the handler (timeout, onFailure) stays."""
+    hooks_dir = str(claude / "hooks")
+    launcher = str(claude / "hooks" / LAUNCHER)
+    managed = json.loads(json.dumps(managed))  # some handler dicts are shared between events: wrap each copy once
+    for groups in managed.values():
+        for group in groups:
+            for handler in group["hooks"]:
+                args = handler.get("args") or []
+                if (handler.get("command") == "python3" and args and os.path.dirname(args[0]) == hooks_dir
+                        and os.path.basename(args[0]) != LAUNCHER):
+                    handler["args"] = [launcher, os.path.basename(args[0]), *args[1:]]
     return managed
+
+
+def hook_argv(hook: dict) -> list[str]:
+    """[script path, *args] of a Claude handler whether it is wired directly or through the launcher; for tests and
+    tools that ask "which script does this run" (the launcher form names the script beside ah_hook.py)."""
+    args = [str(a) for a in hook.get("args") or []]
+    if len(args) > 1 and os.path.basename(args[0]) == LAUNCHER:
+        return [os.path.join(os.path.dirname(args[0]), args[1]), *args[2:]]
+    return args
+
+
+def is_managed_handler(hook: dict, claude: Path, scripts: set[str] | None = None) -> bool:
+    """A handler install.py owns: the direct form old installers wrote (`python3 <hooks>/<script>`) or the launcher
+    form (`python3 <hooks>/ah_hook.py <script>`), for the scripts in managed_scripts()."""
+    scripts = managed_scripts(claude) if scripts is None else scripts
+    if hook.get("type") != "command" or hook.get("command") != "python3":
+        return False
+    args = hook.get("args") or [None]
+    if args[0] in scripts:
+        return True
+    return (args[0] == str(claude / "hooks" / LAUNCHER) and len(args) > 1
+            and str(claude / "hooks" / str(args[1])) in scripts)
 
 
 def durable_scratch(claude: Path) -> Path:
@@ -359,12 +402,7 @@ def merged_settings(current: dict, claude: Path, durable_tmp: bool = True, prove
             if not isinstance(item, dict) or not isinstance(item.get("hooks", []), list) \
                     or not all(isinstance(hook, dict) for hook in item.get("hooks", [])):
                 raise ValueError(f"settings.json hooks.{event} has an invalid hook group")
-            remaining = [
-                hook for hook in item.get("hooks", [])
-                if not (hook.get("type") == "command"
-                        and hook.get("command") == "python3"
-                        and (hook.get("args") or [None])[0] in scripts)
-            ]
+            remaining = [hook for hook in item.get("hooks", []) if not is_managed_handler(hook, claude, scripts)]
             if remaining == item.get("hooks", []):
                 preserved.append(item)
             elif remaining:
@@ -409,6 +447,9 @@ def merged_settings(current: dict, claude: Path, durable_tmp: bool = True, prove
     rule = "Bash(python3 ~/.claude/hooks/workdir.py prune)"  # dry run only; --apply still asks
     if rule not in allowed:
         allowed.append(rule)
+    rule = "Bash(python3 ~/.claude/hooks/ah_switch.py status*)"  # read-only; off/on are the user's to run
+    if rule not in allowed:
+        allowed.append(rule)
     return settings
 
 
@@ -432,7 +473,10 @@ def git_hook_status(home: Path, key: str, script: Path, *, apply: bool, git: str
     version = (int(match.group(1)), int(match.group(2))) if match else (0, 0)
     if version < MIN_GIT_HOOKS:
         return f"commit-msg backstop inactive: git {out.strip()} lacks config-based hooks (needs 2.54+)"
-    command = f'f={shlex.quote(str(script))}; [ -f "$f" ] || exit 0; exec python3 "$f" git-hook'
+    # Through the launcher next to the script, so `harness off` silences the backstop too; the launcher skips a
+    # missing script by itself, and a host without the launcher (never installed) skips the hook.
+    launcher = script.parent / LAUNCHER
+    command = f'f={shlex.quote(str(launcher))}; [ -f "$f" ] || exit 0; exec python3 "$f" {shlex.quote(script.name)} git-hook'
     if not apply:
         return f"would register git hook.{key} (commit-msg)"
     def get(name):
@@ -792,11 +836,41 @@ def install_services(claude: Path, runner=None) -> list[str]:
     return done
 
 
+class DowngradeRefused(ValueError):
+    """This checkout's harness/RELEASE is below the host's floor (~/.agent-harness/floor.json)."""
+
+
+def switch_module():
+    """harness/hooks/ah_switch.py from this checkout: the off flag, the stash and the release floor."""
+    hooks = str(ROOT / "harness" / "hooks")
+    if hooks not in sys.path:
+        sys.path.insert(0, hooks)
+    import ah_switch  # noqa: PLC0415
+    return ah_switch
+
+
+def instruction_block(text: str) -> str:
+    return f"{START}\n{text.rstrip()}\n{END}\n"
+
+
 def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool = True,
-            command_guard: bool = True, log_backup=None, services: bool = False, hooks_only: bool = False) -> list[str]:
+            command_guard: bool = True, log_backup=None, services: bool = False, hooks_only: bool = False,
+            allow_downgrade: bool = False, release: int | None = None) -> list[str]:
     """hooks_only: install the hook, agent, tool and skill files only; CLAUDE.md and settings.json are never read or
-    written (their review happens separately). The per-file backups are kept."""
+    written (their review happens separately). The per-file backups are kept.
+
+    Refuses (DowngradeRefused) a release below the host's floor unless allow_downgrade. While the harness is OFF
+    (~/.agent-harness/OFF) the files and wiring are installed but the instruction block goes to the off stash, not
+    into CLAUDE.md. A successful --apply records the release and commit in install state, snapshots the installed
+    files and wiring to ~/.agent-harness/releases/<release>/claude and moves the floor to this release."""
     claude = home.expanduser().resolve() / ".claude"
+    switch = switch_module()
+    release = switch.read_release(ROOT) if release is None else release
+    refusal = switch.downgrade_refusal(claude.parent, "claude", release, allow_downgrade)
+    if refusal:
+        raise DowngradeRefused(refusal)
+    off = switch.is_off(claude.parent)
+    stash_record = None
     if log_backup is None:
         log_backup = log_backup_alert(home, None)
     files = [
@@ -828,7 +902,12 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
             existing_instructions = read_regular(instructions_path, pinned_parent=pins.fd(claude),
                                                  retain_fd=pins.file_fds)
             current_text = existing_instructions[0].decode() if existing_instructions else ""
-            instructions = merged_instructions(current_text, (ROOT / "HARNESS.md").read_text())
+            harness_text = (ROOT / "HARNESS.md").read_text()
+            if off:  # installed files and wiring, but the rules wait in the off stash until `harness on`
+                instructions, stash_record = switch.plan_stash(claude.parent, "claude", current_text,
+                                                               block=instruction_block(harness_text))
+            else:
+                instructions = merged_instructions(current_text, harness_text)
             existing_settings = read_regular(settings_path, pinned_parent=pins.fd(claude),
                                              retain_fd=pins.file_fds)
             current_settings = json.loads(existing_settings[0].decode()) if existing_settings else {}
@@ -844,6 +923,7 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
             return changes
         for note in migrate_local_profiles(claude):
             print(f"  {note}")
+        switch.mark_pending(claude.parent, "claude", release)  # the floor watcher leaves a running install alone
         originals = {path: read_regular(path, pinned_parent=pins.fd(path.parent),
                                         retain_fd=pins.file_fds)
                      for path in managed}
@@ -889,6 +969,8 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
                                                        published=installed,
                                                        retain_published_fd=pins.file_fds)
         except BaseException as error:
+            with contextlib.suppress(OSError):
+                switch.clear_pending(claude.parent, "claude")
             failures = []
             for path in reversed(installed):
                 try:
@@ -909,11 +991,84 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, provenance: bool 
             raise
         if record_gate_epoch(claude.parent, prior_gate):
             changes.append("recorded the dropped-owner gate install time")
+        if stash_record is not None:
+            switch.save_stash(claude.parent, "claude", stash_record)
+            changes.append("harness is OFF: the instruction block is kept in ~/.agent-harness/off-stash until `harness on`")
+        changes.append(record_release(claude, switch, release, [d for _, d in files], hooks_only, provenance,
+                                      command_guard, log_backup, backups.name))
         if apply and services:  # host services last, after every file is in place (goodqa#14791 S1d)
             changes.extend("service: " + c for c in install_services(claude))
         return changes
     finally:
         pins.close()
+
+
+def record_release(claude: Path, switch, release: int, files: list[Path], hooks_only: bool, provenance: bool,
+                   command_guard: bool, log_backup: bool, backup: str) -> str:
+    """Install state, the floor snapshot (installed files, managed hook groups, instruction block) and the floor.
+    --hooks-only never reads settings.json, so it carries the wiring of the newest earlier snapshot forward."""
+    home = claude.parent
+    if hooks_only:
+        prior = switch.latest_snapshot(home, "claude") or {}
+        settings_spec, instructions_spec = prior.get("settings"), prior.get("instructions")
+    else:
+        settings_spec = {"path": ".claude/settings.json", "hooks_dir": str(claude / "hooks"),
+                         "names": sorted(Path(p).name for p in managed_scripts(claude)),
+                         "groups": managed_hooks(claude, provenance, command_guard, log_backup)}
+        instructions_spec = {"block": instruction_block((ROOT / "HARNESS.md").read_text())}
+    commit = switch.source_commit(ROOT)
+    switch.record_install(home, "claude", release, commit, files, settings_spec, instructions_spec, backup)
+    return f"release {release} ({commit[:12]}) recorded; floor snapshot in {home / '.agent-harness' / 'releases' / str(release)}"
+
+
+def floor_watch_status(home: Path, apply: bool, flag, run=None, system=None) -> str:
+    """The floor watcher (com.agent-harness.floor / agent-harness-floor.path) puts the floor back when an old
+    checkout's installer overwrites it. On by default for the real home; --no-floor-watch removes it (remembered)."""
+    try:
+        switch = switch_module()
+        home = home.expanduser().resolve()
+        state = switch.read_state(home)
+        enabled = flag if flag is not None else state.get("floor_watch", True) is not False
+        if apply and flag is not None:
+            switch.update_state(home, lambda s: s.__setitem__("floor_watch", flag))
+        import pwd  # noqa: PLC0415
+        if home != Path(pwd.getpwuid(os.getuid()).pw_dir).resolve() and run is None:
+            return "floor watcher: skipped (non-default --home)"
+        if not enabled:
+            return switch.remove_floor_watch(home, run, system) + " (--no-floor-watch)" if apply else \
+                "floor watcher: would stay off (--no-floor-watch)"
+        stopped = switch.read_json(switch.services_path(home)) or []
+        if switch.is_off(home) and any(isinstance(i, dict) and i.get("name") in (switch.FLOOR_LABEL, switch.FLOOR_UNIT + ".path")
+                                       for i in stopped):
+            return "floor watcher: stays stopped while the harness is OFF (`harness on` restarts it)"
+        if not apply:
+            return "floor watcher: would install and load it"
+        return switch.install_floor_watch(home, run, system)
+    except Exception as error:  # noqa: BLE001 - optional; never fails the harness install
+        return f"floor watcher: skipped ({error.__class__.__name__}: {str(error)[:160]})"
+
+
+SHIM_MARK = b"agent-harness switch shim"
+
+
+def shim_status(home: Path, apply: bool) -> str:
+    """~/.agent-harness/bin/harness: `harness off|on|status|floor-check`; other words go to a Go `harness` on PATH.
+    Never replaces a file there that is not this shim."""
+    home = home.expanduser().resolve()
+    target = home / ".agent-harness" / "bin" / "harness"
+    data = (ROOT / "harness" / "bin" / "harness").read_bytes()
+    if target.is_symlink() or (target.exists() and SHIM_MARK not in target.read_bytes()[:4096]):
+        return f"switch shim: {target} exists and is not the harness shim; left alone (use python3 ~/.claude/hooks/ah_switch.py)"
+    if not apply:
+        return f"switch shim: would write {target}"
+    try:
+        switch = switch_module()
+        switch.private_dir(home / ".agent-harness")
+        switch.private_dir(home / ".agent-harness" / "bin")
+        switch.write_atomic(target, data, 0o755)
+    except OSError as error:
+        return f"switch shim: could not write {target} ({error.__class__.__name__})"
+    return f"switch shim: {target} (`harness off`, `harness on`, `harness status`)"
 
 
 def _private_harness_dir(home: Path) -> int:
@@ -946,8 +1101,14 @@ def save_durable_tmp_choice(home: Path, value: bool) -> None:
     try:
         temporary = f".{INSTALL_STATE}.{secrets.token_hex(4)}"
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+        try:  # keep the release record and other keys: only this choice changes
+            state = json.loads((home.expanduser().resolve() / ".agent-harness" / INSTALL_STATE).read_text())
+        except (OSError, ValueError):
+            state = {}
+        state = state if isinstance(state, dict) else {}
+        state.update(schema=state.get("schema", 1), durable_tmp=value)
         with os.fdopen(fd, "w") as handle:
-            json.dump({"schema": 1, "durable_tmp": value}, handle)
+            json.dump(state, handle)
             handle.write("\n")
         os.replace(temporary, INSTALL_STATE, src_dir_fd=directory, dst_dir_fd=directory)
     finally:
@@ -1189,7 +1350,20 @@ def main() -> None:
     backup.add_argument("--no-log-backup", dest="log_backup", action="store_false",
                         help="remember not to install it; where installed, stop its scheduler job (files and "
                              "remote copies stay; see docs/operations.md, Agent log backup, for rollback)")
+    parser.add_argument("--allow-downgrade", action="store_true",
+                        help="install even though this checkout's harness/RELEASE is below the host's floor "
+                             "(~/.agent-harness/floor.json); the floor then moves down to this release")
+    floor = parser.add_mutually_exclusive_group()
+    floor.add_argument("--no-floor-watch", dest="floor_watch", action="store_false", default=None,
+                       help="do not install the floor watcher (com.agent-harness.floor) and remove an installed one "
+                            "(remembered)")
+    floor.add_argument("--floor-watch", dest="floor_watch", action="store_true",
+                       help="install the floor watcher (the default on macOS and Linux; remembered)")
     args = parser.parse_args()
+    refusal = switch_module().downgrade_refusal(args.home.expanduser().resolve(), "claude",
+                                                switch_module().read_release(ROOT), args.allow_downgrade)
+    if refusal:  # before anything is written, the remembered choices included
+        parser.exit(1, f"install.py: {refusal}\n")
     durable_tmp = durable_tmp_choice(args.home, args.durable_tmp)
     if args.apply and args.durable_tmp is not None:
         # Save the choice first, so a later failure cannot let a plain reinstall undo an opt-out.
@@ -1204,7 +1378,9 @@ def main() -> None:
     try:
         changes = install(args.home, args.apply, durable_tmp=durable_tmp, provenance=args.provenance,
                           command_guard=args.command_guard, log_backup=log_backup_alert(args.home, args.log_backup),
-                          services=args.services, hooks_only=args.hooks_only)
+                          services=args.services, hooks_only=args.hooks_only, allow_downgrade=args.allow_downgrade)
+    except DowngradeRefused as error:
+        parser.exit(1, f"install.py: {error}\n")
     except DirectoryPublicationError as error:
         parser.exit(1, f'Install failed: {error}\n')
     action = "Installed" if args.apply else "Would install"
@@ -1212,6 +1388,7 @@ def main() -> None:
     for path in changes:
         print(f"  {path}")
     print(f"  {install_git_backstop(args.home, args.apply)}")
+    print(f"  {shim_status(args.home, args.apply)}")
     if args.hooks_only:
         print("  CLAUDE.md and settings.json: not touched (--hooks-only)")
         if not args.apply:
@@ -1223,6 +1400,7 @@ def main() -> None:
     print(f"  {command_guard_status(args.command_guard)}")
     print(f"  {log_backup_status(args.home, args.apply, args.log_backup)}")
     print(f"  {mission_control_status(args.home, args.apply, args.mission_control)}")
+    print(f"  {floor_watch_status(args.home, args.apply, args.floor_watch)}")
     if not args.apply:
         print("Run with --apply to install. Existing files will be backed up.")
 
