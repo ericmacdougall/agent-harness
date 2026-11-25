@@ -3,12 +3,12 @@
 
   status_truth.py prompt          UserPromptSubmit: a status question ("whats left", "where are we") gets the
                                   `ah goals` text as additional context
-  status_truth.py stop            Stop (main): the final message states goal status without `ah goals` (or the
-                                  injection) this turn, or contradicts the ledger -> block once (enforce) or warn
+  status_truth.py stop            Stop: no-op (harness redesign 2026-11-24: provenance and status never block or nag
+                                  at the end of a turn; the prompt injection below is the control)
   status_truth.py session-start   SessionStart: after a compaction (source "compact") the goals text is re-injected
   status_truth.py calibrate <transcript> [--uuid U ...] [--limit N]
-                                  replay the lint over a transcript, each message judged against the ledger as of
-                                  its own timestamp; JSON lines, no hook payload
+                                  replay the contradiction rules over a transcript offline, each message judged
+                                  against the ledger as of its own timestamp; JSON lines, no hook payload
 
 Why: on 2026-11-12 main answered "whats left" from memory: it said prod move could not be called done, nobody worked
 on the 1000 leads and self-update had no work, while the WALs held live proofs of all three (w16dc0f5dd6b,
@@ -21,12 +21,8 @@ evidence or a live owner, "nobody is working" for a goal a live owner holds; "do
 over-claim below DONE_LIVE, "live / shipped" for a goal with no live record. Skip rule: the answer states goal status (two or more goals, or any goal in reply to a status question)
 with no `ah goals` call and no goals injection since the human prompt that opened the turn (a typed prompt or a queued
 one; task notifications and peer messages do not open a turn).
-Mode: provenance_policy.json `status_lint` (off | warn | enforce). In warn mode (shipped) the finding is a
-systemMessage the user sees and the model does not, so a wrong answer still goes out; the prompt injection is the
-control until enforce. In enforce mode stop_blocks.allow bounds blocks per human turn (once for this hook), independent
-of stop_hook_active. Limits: only the last assistant text of the turn is linted, so a status answer followed by a
-short closing message escapes. Every command fails open on its own errors (stderr note, exit 0). Output is capped at
-4 KB and redacted.
+Mode: provenance_policy.json `status_lint` (off | warn) switches the injections off. Every command fails open on its
+own errors (stderr note, exit 0). Output is capped at 4 KB and redacted.
 """
 from __future__ import annotations
 
@@ -436,30 +432,6 @@ def _remembered_mission() -> str:
         return ""
 
 
-FLAG_LOG_MAX = 1 << 20
-
-
-def _log_flags(payload: dict, turn: dict, mode: str, rules: list) -> None:
-    """Every flag (warn or enforce) to a local log: ids and rule names only, never message text (main's rev-3 ruling
-    M4); the data for the enforce decision (a Wilson lower bound of at least 0.8 over at least 30 flags). At 1 MiB the
-    log stops growing and says so in stderr; it is never rotated or truncated by this hook."""
-    try:
-        path = _state_dir() / "flags.jsonl"
-        try:
-            if path.stat().st_size > FLAG_LOG_MAX:
-                print("status_truth: flag log full (1 MiB); not logging", file=sys.stderr)
-                return
-        except OSError:
-            pass
-        row = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-               "session": str(payload.get("session_id") or "")[:64],
-               "prompt_id": str(turn.get("prompt_id") or "")[:80], "answer_id": str(turn.get("answer_id") or "")[:64],
-               "mode": mode, "rules": rules[:12]}
-        _write_private(path, json.dumps(row) + "\n", append=True)
-    except Exception:  # noqa: BLE001 - logging never breaks the hook
-        pass
-
-
 # ------------------------------------------------------------------ hook commands
 
 def _redactor_ok() -> bool:
@@ -515,48 +487,9 @@ def cmd_session_start(payload: dict) -> dict:
 
 
 def cmd_stop(payload: dict) -> dict:
-    mode = _policy_mode()
-    if mode == "off":
-        return {}
-    turn = current_turn(payload)
-    if not turn["answer"]:
-        return {}
-    if not STATUS_WORD.search(turn["answer"]):
-        return {}  # cheap gate before reading the ledger
-    doc = goals_doc()
-    if not in_scope(payload, doc):
-        return {}
-    asked = is_status_question(turn["prompt"])
-    if doc.get("state") != "ok":
-        if asked:
-            return {"systemMessage": "status-truth: " + UNAVAILABLE.format(doc.get("state"))}
-        return {}
-    verdict = classify(turn["answer"], doc)
-    states_status = verdict["status_answer"] or (asked and bool(verdict["goals"]))
-    problems, rules = [], []
-    for c in verdict["contradictions"][:6]:
-        problems.append(f"- {c['goal']}: you wrote \"{c['claim']}\" but ah goals shows {c['state']}")
-        rules.append({"rule": c["rule"], "goal": c["goal"], "state": c["state"]})
-    if states_status and not turn["consulted"]:
-        problems.append("- this answer states goal status but `ah goals` was not run this turn")
-        rules.append({"rule": "skip", "goal": "", "state": ""})
-    if not problems:
-        return {}
-    _log_flags(payload, turn, mode, rules)
-    text = ("Status-truth: your answer disagrees with or skipped the goal ledger. Run `python3 ~/.claude/hooks/ah.py "
-            "goals` and restate from it. Only DONE_LIVE is done; for anything below it say the state and name the "
-            "unmet part of the target:\n" + "\n".join(problems))
-    if mode == "enforce" and turn["prompt_id"]:  # no known turn: fail open to a warning (receipt r1 F2)
-        import stop_blocks  # noqa: PLC0415
-        if stop_blocks.allow(str(payload.get("session_id") or ""), turn["prompt_id"], "status_truth"):
-            return {"decision": "block", "reason": text[:LIMIT]}
-    if mode != "enforce":
-        lead = "status-truth warning: "
-    elif not turn["prompt_id"]:
-        lead = "status-truth (turn unknown, not blocked): "
-    else:
-        lead = "status-truth (already blocked once): "
-    return {"systemMessage": lead + text[:1500]}
+    """Never blocks and prints nothing (it used to block once per turn in enforce mode, or warn the user, on a status
+    answer that contradicted or skipped the ledger). `calibrate` keeps the rules for offline replay."""
+    return {}
 
 
 # ------------------------------------------------------------------ calibration

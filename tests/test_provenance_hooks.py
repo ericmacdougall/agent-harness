@@ -26,10 +26,13 @@ class Detector(unittest.TestCase):
     def test_sections_and_inline_asks_are_found(self):
         text = "Status.\n\n**What I need from you:**\n- the staging key\n- a go/no-go on the release\n\nDone.\n"
         self.assertEqual(self.flagged(text), ["the staging key", "a go/no-go on the release"])
-        self.assertEqual(len(self.flagged("Decisions needed:\n1. Which region?\n2. Which plan?\n")), 2)
-        self.assertEqual(len(self.flagged("Your call: pick A or B.")), 1)
-        self.assertEqual(len(self.flagged("Please provide the OpenRouter key.")), 1)
-        self.assertEqual(len(self.flagged("Tell me if you want it moved into Applications.")), 1)
+        self.assertEqual(len(self.flagged("Decisions needed from you:\n1. Which region?\n2. Which plan?\n")), 2)
+        self.assertEqual(len(self.flagged("I need you to send the OpenRouter key.")), 1)
+        self.assertEqual(len(self.flagged("Needed from you: the staging key.")), 1)
+        # 2026-11-24: offers, suggestions and questions in passing are not asks (these used to be flagged)
+        for text in ("Your call: pick A or B.", "Please provide the OpenRouter key.",
+                     "Tell me if you want it moved into Applications.", "Decisions needed:\n1. Which region?\n"):
+            self.assertEqual(self.flagged(text), [], text)
 
     def test_status_updates_are_not_flagged(self):
         for text in ("Nothing needs you.", "Two decisions came up and I made both, so nothing is waiting on you.",
@@ -115,11 +118,15 @@ class Hooks(base.Env):
         return {"session_id": SID, "tool_name": "AskUserQuestion", "tool_input": {"questions": [{"question": text, "header": "h", "options": []}]}}
 
     def test_ask_gate(self):
-        denied = self.run_hook("ask-gate", self.ask_payload("Which key should I use?"))
-        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
-        self.assertIn("no [ask:<id>]", denied["hookSpecificOutput"]["permissionDecisionReason"])
+        """2026-11-24: advisory only; it used to deny a question without a traced [ask:<id>]."""
+        advised = self.run_hook("ask-gate", self.ask_payload("Which key should I use?"))
+        self.assertNotIn("permissionDecision", advised["hookSpecificOutput"])
+        self.assertIn("names no registered ask", advised["hookSpecificOutput"]["additionalContext"])
         fake = self.run_hook("ask-gate", self.ask_payload("Which key? [ask:wnotreal0001]"))
-        self.assertIn("not in this session's ledger", fake["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertNotIn("permissionDecision", fake["hookSpecificOutput"])
+        self.set_policy(ask_user_question="enforce")  # an old installed "enforce" reads as warn
+        self.assertNotIn("permissionDecision", self.run_hook("ask-gate", self.ask_payload("Which key?"))["hookSpecificOutput"])
+        self.set_policy()
         allowed = self.run_hook("ask-gate", self.ask_payload(f"Which key? [ask:{self.ask_id}]"))
         self.assertNotIn("permissionDecision", allowed["hookSpecificOutput"])
         self.assertIn("Confirm the staging key", allowed["hookSpecificOutput"]["additionalContext"])  # the ask's note is shown
@@ -138,13 +145,15 @@ class Hooks(base.Env):
         stop = "Decisions needed:\n- pick [src: " + self.user(HUMAN, QUOTE) + "] (see [docs])\n"
         self.assertEqual(self.run_hook("stop-lint", self.stop_payload(stop)), {})
 
-    def test_ask_gate_rejects_ledger_ask_with_untraceable_source(self):
+    def test_ask_gate_accepts_a_registered_ask_with_an_unsourced_source(self):
+        """2026-11-24: an unsourced ask stays usable (it used to be denied as untraceable)."""
         main = self.wals / "main.jsonl"
-        bad = {"id": "wbadsrc0001", "event": "ask", "note": "n", "source": self.user(HUMAN, "words never said by the user")}
+        bad = {"id": "wbadsrc0001", "event": "ask", "note": "pick a region", "source": self.user(HUMAN, "words never said by the user")}
         with open(main, "a") as handle:
             handle.write(json.dumps(bad, separators=(",", ":")) + "\n")
         out = self.run_hook("ask-gate", self.ask_payload("Which? [ask:wbadsrc0001]"))
-        self.assertIn("untraceable source", out["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertNotIn("permissionDecision", out["hookSpecificOutput"])
+        self.assertIn("pick a region", out["hookSpecificOutput"]["additionalContext"])
 
     def stop_payload(self, text):
         return {"session_id": SID, "last_assistant_message": text, "stop_hook_active": False}
@@ -183,17 +192,16 @@ class Hooks(base.Env):
     def test_stop_lint_modes(self):
         message = "Update.\n\nWhat I need from you:\n- the OpenRouter key\n- " + f"approve the plan [ask:{self.ask_id}]\n"
         warn = self.run_hook("stop-lint", self.stop_payload(message))
-        self.assertIn("provenance warning", warn["systemMessage"])
+        self.assertIn("the OpenRouter key", warn["systemMessage"])
+        self.assertEqual(len(warn["systemMessage"].splitlines()), 1)
         prompt = self.run_hook("prompt", {"session_id": SID})
         self.assertIn("the OpenRouter key", prompt["hookSpecificOutput"]["additionalContext"])
         self.assertNotIn(self.ask_id, prompt["hookSpecificOutput"]["additionalContext"])
         self.assertEqual(self.run_hook("prompt", {"session_id": SID}), {})  # delivered once
-        self.set_policy(stop_lint="enforce")
-        blocked = self.run_hook("stop-lint", self.stop_payload(message))
-        self.assertEqual(blocked["decision"], "block")
-        self.assertIn("the OpenRouter key", blocked["reason"])
-        again = self.run_hook("stop-lint", dict(self.stop_payload(message), stop_hook_active=True))
-        self.assertNotIn("decision", again)  # never loops
+        self.assertEqual(self.run_hook("stop-lint", self.stop_payload(message)), {})  # the same sentence: flagged once
+        self.set_policy(stop_lint="enforce")  # 2026-11-24: an old "enforce" reads as warn and never blocks
+        fresh = message.replace("OpenRouter key", "Anthropic key")
+        self.assertNotIn("decision", self.run_hook("stop-lint", self.stop_payload(fresh)))
         fine = "What I need from you:\n- " + f"approve the plan [ask:{self.ask_id}]\n- pick one [src: {self.user(HUMAN, QUOTE)}]\n"
         self.assertEqual(self.run_hook("stop-lint", self.stop_payload(fine)), {})
         self.assertEqual(self.run_hook("stop-lint", self.stop_payload("Nothing needs you.")), {})
@@ -201,12 +209,13 @@ class Hooks(base.Env):
         self.assertEqual(self.run_hook("stop-lint", self.stop_payload(message)), {})
 
     def test_stop_lint_reads_the_transcript_tail_and_fails_open(self):
-        record = {"type": "assistant", "uuid": "u", "message": {"content": [{"type": "text", "text": "Decisions needed:\n- the region\n"}]}}
+        record = {"type": "assistant", "uuid": "u", "message": {"content": [{"type": "text", "text": "What I need from you:\n- the region\n"}]}}
         path = self.home / ".claude" / "projects" / "-proj" / "t.jsonl"
         path.write_text(json.dumps({"type": "user", "toolUseResult": {}}) + "\n" + json.dumps(record, separators=(",", ":")) + "\n" + "{garbage\n")
         self.set_policy(stop_lint="enforce")
         out = self.run_hook("stop-lint", {"session_id": SID, "transcript_path": str(path)})
-        self.assertEqual(out["decision"], "block")
+        self.assertIn("the region", out["systemMessage"])  # the tail was read and linted; never a block
+        self.assertNotIn("decision", out)
         user_after = json.dumps({"type": "user", "message": {"content": "thanks"}}, separators=(",", ":"))
         path.write_text(path.read_text().replace("{garbage\n", "") + user_after + "\n")
         self.assertEqual(self.run_hook("stop-lint", {"session_id": SID, "transcript_path": str(path)}), {})  # stale message
@@ -310,10 +319,10 @@ class DeviceAndHugeInputs(base.Env):
         with open(big, "wb") as handle:
             handle.truncate(5 * 1024 ** 3)
             handle.seek(-200, os.SEEK_END)
-            handle.write(b'\n{"type":"assistant","message":{"content":[{"type":"text","text":"Decisions needed:\\n- the region\\n"}]}}\n')
+            handle.write(b'\n{"type":"assistant","message":{"content":[{"type":"text","text":"What I need from you:\\n- the region\\n"}]}}\n')
         code, out, err, seconds, peak = self.hook(big)
         self.assertEqual(code, 0, err[:200])
-        self.assertEqual(json.loads(out)["decision"], "block")  # the tail was read and linted
+        self.assertIn("the region", json.loads(out)["systemMessage"])  # the tail was read and linted
         self.assertLess(seconds, 1.5)
         self.assertLess(peak, 100 * 1024 * 1024, f"peak RSS {peak >> 20} MiB")
 

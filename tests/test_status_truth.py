@@ -153,40 +153,15 @@ class Lint(Base):
         flagged = [line for line in RECALL["clean"] if st.classify(line, doc)["contradictions"]]
         self.assertEqual(flagged, [])
 
-    def test_stop_blocks_once_per_turn(self):
+    def test_stop_never_blocks_or_nags(self):
+        """Harness redesign 2026-11-24: the Stop side is silent; it used to block once per turn on a contradicting
+        or ledger-skipping status answer (this test asserted that block)."""
         self.seed()
-        out = self.stop("whats left", WRONG)
-        self.assertEqual(out.get("decision"), "block")
-        self.assertIn("self-update", out["reason"])
-        again = self.stop("whats left", WRONG, stop_hook_active=True)
-        self.assertNotEqual(again.get("decision"), "block")  # never twice in one turn
-
-    def test_every_flag_is_logged_with_ids_and_rules_only(self):  # rev 3 (main's ruling M4)
-        self.seed()
-        with mock.patch.object(st, "_policy_mode", return_value="warn"):
-            out = self.stop("whats left", WRONG)
-        self.assertIn("status-truth warning", out.get("systemMessage", ""))
-        log = (self.home / ".agent-harness" / "state" / "status-truth" / "flags.jsonl").read_text().splitlines()
-        row = json.loads(log[-1])
-        self.assertEqual((row["mode"], row["prompt_id"], row["answer_id"]), ("warn", "u-prompt-1", "a1"))
-        self.assertIn({"rule": "no-work", "goal": "self-update", "state": "LIVE_TESTED"}, row["rules"])
-        self.assertNotIn("no work", json.dumps(row))  # no message text
-        self.assertNotIn("stretch", json.dumps(row))
-
-    def test_block_is_not_skipped_when_another_hook_blocked_first(self):
-        self.seed()
-        out = self.stop("whats left", WRONG, stop_hook_active=True)
-        self.assertEqual(out.get("decision"), "block")  # own per-turn counter, not the shared flag
-
-    def test_status_answer_without_ah_goals_is_flagged_unless_consulted(self):
-        self.seed()
-        out = self.stop("whats left", RIGHT)
-        self.assertIn("`ah goals` was not run", out.get("reason", ""))
-        self.assertEqual(self.stop("whats left", RIGHT, tool_cmds=["python3 ~/.claude/hooks/ah.py goals"]), {})
-        # red-team L2: quoting or grepping for the goals text is not running `ah goals`
-        quoted = self.stop("whats left", RIGHT, tool_cmds=["grep 'ah goals' notes.md",
-                                                          "echo Goals from the mission ledger"])
-        self.assertIn("was not run", quoted.get("systemMessage", ""))  # same turn: already blocked once, so a warning
+        for kwargs in ({}, {"stop_hook_active": True}):
+            self.assertEqual(self.stop("whats left", WRONG, **kwargs), {})
+            self.assertEqual(self.stop("whats left", RIGHT, **kwargs), {})
+        with mock.patch.object(st, "_policy_mode", return_value="enforce"):
+            self.assertEqual(self.stop("whats left", WRONG), {})
 
     def test_done_about_a_file_edit_is_not_flagged(self):
         self.seed()
@@ -202,9 +177,7 @@ class Lint(Base):
 
     def test_missing_ledger_says_unknown_and_never_blocks(self):
         st._remember_mission(SESSION)  # the hooks saw an ok ledger before it went missing
-        out = self.stop("whats left", WRONG)
-        self.assertNotEqual(out.get("decision"), "block")
-        self.assertIn("GOALS UNAVAILABLE", out.get("systemMessage", ""))
+        self.assertEqual(self.stop("whats left", WRONG), {})
 
     def test_turn_id_comes_from_the_user_prompt_and_a_new_turn_resets_the_counter(self):
         import stop_blocks  # noqa: PLC0415
@@ -247,16 +220,10 @@ class Lint(Base):
         recs = [{"type": "user", "uuid": "u-old", "origin": {"kind": "human"},
                  "message": {"role": "user", "content": "fix the readme"}},
                 self.QUEUED, self.NOTE_USER, self.answer(RIGHT)]
-        out = self.stop_raw(recs)
-        self.assertIn("`ah goals` was not run", out.get("reason", ""))  # asked: the queued prompt is the question
+        self.assertEqual(self.stop_raw(recs), {})
         with mock.patch.object(st, "_read_tail", side_effect=lambda p: Path(p).read_bytes()):
             turn = st.current_turn({"session_id": SESSION, "transcript_path": self.raw_transcript(recs)})
         self.assertEqual((turn["prompt"], turn["prompt_id"]), ("whats left", "src-whats-left"))
-
-    def test_queued_status_question_with_absent_ledger_says_unavailable(self):
-        st._remember_mission(SESSION)
-        out = self.stop_raw([self.QUEUED, self.NOTE_USER, self.answer(WRONG)])
-        self.assertIn("GOALS UNAVAILABLE", out.get("systemMessage", ""))
 
     def test_queued_task_notification_is_not_a_human_prompt(self):
         self.seed()
@@ -290,9 +257,7 @@ class Lint(Base):
         counter on the answer let each rewrite block again; now an unknown turn only warns, whatever the answer."""
         self.seed()
         for text, uuid in ((WRONG, "a1"), (WRONG + "\n\nStill: nobody is working on the leads.", "a2")):
-            out = self.stop_raw([self.answer(text, uuid)])
-            self.assertNotEqual(out.get("decision"), "block")
-            self.assertTrue(out.get("systemMessage", "").startswith("status-truth (turn unknown, not blocked): "))
+            self.assertEqual(self.stop_raw([self.answer(text, uuid)]), {})
 
     def test_calibrate_counts_the_skip_rule_with_the_contradictions(self):
         self.seed()

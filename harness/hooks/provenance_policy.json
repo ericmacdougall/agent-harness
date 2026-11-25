@@ -1,18 +1,16 @@
 {
   "schema": 1,
-  "spec": "enforce",
+  "spec": "warn",
   "plan_packet": "warn",
-  "ask_user_question": "enforce",
+  "ask_user_question": "warn",
   "stop_lint": "warn",
   "status_lint": "warn",
   "ask_presence": "enforce",
-  "quarantine_lint": "enforce",
-  "quarantine_minutes": 10,
   "ask_presence_minutes": 10,
   "ticket_lookup": "enforce",
   "wal": {
-    "requirement": "enforce",
-    "ask": "enforce",
+    "requirement": "warn",
+    "ask": "warn",
     "blocker": "warn",
     "scope": "warn",
     "decision": "warn"
