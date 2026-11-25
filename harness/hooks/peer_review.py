@@ -38,6 +38,9 @@ from usage_guard import GuardError, PoolUnavailable, UsageStore, capture_subject
 
 PACKET_LIMIT = 150_000
 PACKET_WARNING = 32 * 1024
+# goodqa#16811: merge_gate mints the review-auth stamp as this process launches and main() takes it first thing, so a
+# stamp older than this was left by a run that never started or ended early; it is never honoured.
+REVIEW_STAMP_TTL_SECONDS = 120
 # Verdict-bearing provider output (stderr, the last-message file and every stdout record, except the exempt Codex
 # command_execution output below) is bounded at 1 MB, as before goodqa#16170.
 PROVIDER_LIMIT = 1_000_000
@@ -69,9 +72,13 @@ def review_policy():
 
 
 def prose_quota_failure(message):
-    """Free-text usage limit: unlock the one independent fallback, but never an account-pool cooldown."""
+    """Free-text usage limit: unlock the one independent fallback, but never an account-pool cooldown.
+
+    The provider's own reset wording ("resets Nov 29 at 6pm (TZ)") is kept as display text only (`reset_hint`), so
+    the operator sees when to come back on the first failure; it is never parsed into a cooldown time."""
     if diagnostics.usage_limit_prose(message, review_policy()):
-        return {**provider_failure({'code': 'quota_exceeded'}, trusted=False), 'reset_at': None}
+        return {**provider_failure({'code': 'quota_exceeded'}, trusted=False), 'reset_at': None,
+                'reset_hint': diagnostics.usage_limit_reset_hint(message)}
     return None
 DOMAIN_SECTION_LIMIT = 9000  # generated reviewer checklist, kept outside the signed packet bytes
 
@@ -384,13 +391,29 @@ def normalize_provider(provider, code, stdout, stderr='', last_message='', reque
     work, so the refusal stands only when the transcript itself shows no work (goodqa#16725, PR 318 review F1).
     """
     outcome = classify_provider(provider, code, stdout, stderr, last_message, requested_stage)
-    if outcome.get('provider_refused') is True and not (
-            not work_signal(outcome.get('usage')) and refusal_before_work(provider, stdout, last_message)):
-        outcome = {**outcome, 'provider_refused': False}
+    if outcome.get('provider_refused') is True:
+        if not work_signal(outcome.get('usage')) and refusal_before_work(provider, stdout, last_message):
+            # goodqa#16811: a proven refusal before work reports all-zero counters (a weekly limit hit on the first
+            # call); they are not reported usage, so the attempt does not read as spent.
+            outcome = {**outcome, 'usage': None}
+        else:
+            outcome = {**outcome, 'provider_refused': False}
     return outcome
 
 
 WORK_SIGNAL_KEYS = ('usage', 'total_cost_usd', 'modelUsage', 'costUSD', 'duration_api_ms', 'server_tool_use')
+# Descriptive labels Claude puts beside its counters directly inside a record's `usage` block ("service_tier":
+# "standard", "speed": "standard", "inference_geo": ""). Only there, and only as a short string, is a label not work.
+WORK_LABEL_KEYS = frozenset({'service_tier', 'speed', 'inference_geo'})
+
+
+def without_usage_labels(usage):
+    """A `usage` block minus the short WORK_LABEL_KEYS labels directly inside it (goodqa#16811). Labels anywhere
+    else, longer ones and every counter are kept, so they still read as work."""
+    if not isinstance(usage, dict):
+        return usage
+    return {key: item for key, item in usage.items()
+            if not (key in WORK_LABEL_KEYS and isinstance(item, str) and len(item) <= 32)}
 
 
 def work_signal(value, depth=0):
@@ -433,7 +456,8 @@ def refusal_before_work(provider, stdout, last_message=''):
                    and record['item'].get('type') == 'error' and set(record['item']) <= {'id', 'type', 'message'})
         if kind not in allowed and not warning:
             return False
-        if any(work_signal(record.get(key)) for key in WORK_SIGNAL_KEYS):
+        if any(work_signal(without_usage_labels(record.get(key)) if key == 'usage' else record.get(key))
+               for key in WORK_SIGNAL_KEYS):
             return False
         turns = record.get('num_turns')
         if turns is not None and (type(turns) is not int or turns > 1):
@@ -1812,6 +1836,29 @@ def plan_resource_gate(content):
         return 0, ''  # older install without the resource gate
 
 
+def _burn_review_stamp(argv) -> None:
+    """goodqa#16811: a run that argparse refuses (an unknown option, a bad value, --help) still consumes main's
+    review-auth stamp, so the stamp cannot outlive the run it was minted for. merge_gate mints one only for a single
+    plain command naming each binding flag once, so reading `--flag value` and `--flag=value` here finds the pair it
+    minted. Best effort: nothing here can change how the run ends."""
+    argv = [str(word) for word in argv]
+    if '--no-main-stamp' in argv:
+        return
+    found = {}
+    for index, word in enumerate(argv):
+        for flag in ('--github-repo', '--pr'):
+            if word == flag and index + 1 < len(argv):
+                found.setdefault(flag, argv[index + 1])
+            elif word.startswith(flag + '='):
+                found.setdefault(flag, word[len(flag) + 1:])
+    try:
+        repo, number = found['--github-repo'], int(found['--pr'])
+        import caller_identity
+        caller_identity.take_stamp('review-auth', [repo, number], ttl=REVIEW_STAMP_TTL_SECONDS)
+    except Exception:
+        return
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("stage", choices=("plan", "code-inspection", "pr"))
@@ -1848,7 +1895,19 @@ def main() -> int:
     parser.add_argument('--no-main-stamp', action='store_true',
                         help='Never look for or consume a main-agent review-auth stamp: the run can bind to a PR '
                              'but can never mint a merge authorization (the ahc daemon always passes this)')
-    args = parser.parse_args()
+    try:
+        args = parser.parse_args()
+    except SystemExit:
+        _burn_review_stamp(sys.argv[1:])  # argparse refused the run (or printed help) before the take below
+        raise
+    # goodqa#16811: take main's review-auth stamp before anything else can end the run, so a run that exits early (a
+    # usage error, a HEAD mismatch, a dirty worktree) leaves no stamp for a later process to take; a stamp older than
+    # REVIEW_STAMP_TTL_SECONDS (the hook mints it as this very process launches) is never honoured.
+    args.main_stamp = None
+    if args.github_repo is not None and args.pr is not None and not args.no_main_stamp:
+        import caller_identity
+        args.main_stamp = caller_identity.take_stamp('review-auth', [args.github_repo, args.pr],
+                                                     ttl=REVIEW_STAMP_TTL_SECONDS)
     if args.reviewer == 'codex-only' and args.secondary != 'default':
         parser.error('--reviewer codex-only cannot be combined with --secondary kimi')
     if (args.github_repo is None) != (args.pr is None):
@@ -1917,7 +1976,6 @@ def main() -> int:
         evidence.close()
         parser.error('repo HEAD differs from --expected-head')
     binding = None
-    args.main_stamp = None
     if args.github_repo is not None:
         try:
             binding = verify_pr_binding(args.github_repo, args.pr, before[0])
@@ -1925,15 +1983,21 @@ def main() -> int:
             target.close()
             evidence.close()
             parser.error(str(error))
-        # #134 red-team B2: only a run the main agent's hook saw may mint a merge authorization
-        import caller_identity
-        # goodqa#16049: a caller that is never the authority (the ahc daemon) opts out, so a run on a host where
-        # main has stamps can neither take main's authority nor burn main's stamp
-        if not args.no_main_stamp:
-            args.main_stamp = caller_identity.take_stamp('review-auth', [args.github_repo, args.pr])
+        # #134 red-team B2: only a run the main agent's hook saw may mint a merge authorization; the stamp was taken
+        # right after argument parsing. goodqa#16049: a caller that is never the authority (the ahc daemon) opts out
+        # with --no-main-stamp, so a run on a host where main has stamps can neither take nor burn main's stamp.
         if args.main_stamp is None:
-            print('Note: no main-agent stamp for this --github-repo/--pr run (run it from the main agent); this '
-                  'review cannot authorize a merge.', file=sys.stderr)
+            # goodqa#16811: the hook that decides names its reason in the agent's context; this note lists every cause
+            # instead of implying the caller is not main.
+            print('Note: no main-agent stamp for this --github-repo/--pr run; this review cannot authorize a merge. '
+                  + ('--no-main-stamp was given. ' if args.no_main_stamp else
+                     "The merge-gate hook's own note gives the reason when it minted none: not the proven main agent, "
+                     'not the Bash tool, not one plain python3 .../peer_review.py command (an unquoted ; & | < > or #, '
+                     'a newline, a backslash, or a $ or backtick even inside double quotes), or a missing or repeated '
+                     '--github-repo/--pr. A stamp is also single use and is honoured only within %d s of the '
+                     'launch. ' % REVIEW_STAMP_TTL_SECONDS)
+                  + 'Fix the cause and rerun once with --repeat-reason in single quotes, with no apostrophe inside.',
+                  file=sys.stderr)
     if before[1]:
         target.close()
         evidence.close()

@@ -14,7 +14,11 @@ WHAT.
                 missing copy. --run COMMAND ... holds the lease for the command in the verified checkout. It
                 refuses to create a copy below the free-space floor (exit 3) and writes an alert.
   pretool       PreToolUse Bash hook. Below the floor it denies commands that create copies (git clone, git worktree
-                add, cp -r/-R/-a, rsync -r/-a, ditto) with a clear alert. It always denies writing scratch INTO
+                add, cp -r/-R/-a, rsync -r/-a, ditto) with a clear alert. Wrapper options do not hide a copy
+                (`timeout 120 git clone`). The quoted remote command of an `ssh host '...'` is not charged to
+                this machine (it copies on the far host) when shell_words verifies the whole line; see
+                copy_commands and the ssh section below.
+                It always denies writing scratch INTO
                 /dev/shm (RAM); reading, copying out of and removing from /dev/shm stay allowed. Silent otherwise.
                 Fails OPEN on any internal error.
   session-start SessionStart hook: at most every 6 h starts a detached report-only `reap`, and prints one line when the
@@ -42,8 +46,21 @@ WHAT.
                 deletes nothing. `copy_hygiene.py protected [--check <path>]` lists or explains (exit 1 = protected),
                 the one choke point other cleaners should call: exit 0 is the only go-ahead, and checking children one
                 by one does not cover emptying a directory (check the directory). Known gap: a command sent with
-                `ssh host '...'` is not checked by any hook (the remote host's hook only sees agent sessions running
-                there). `rsync --delete` into a service directory and `git clean` are not treated as deletes.
+                `ssh host '...'` is not checked by any hook on the far host (the remote host's hook only sees agent
+                sessions running there). `rsync --delete` into a service directory and `git clean` are not treated
+                as deletes.
+  ssh           What is and is not checked for ssh (goodqa#16811). The protected-delete and /dev/shm checks still
+                read an ssh's quoted payload as if it ran here (over-reading, never under-reading). The disk-floor
+                copy check first asks shell_words.scan whether bash and zsh read the whole line as known commands.
+                Only then does it skip a command whose program is ssh (after VAR=value and sudo/env/timeout/...
+                wrappers, also inside `bash -c '...'`) with no ProxyCommand/LocalCommand/KnownHostsCommand option
+                and no -F config. Still checked against this machine's floor: every other command on the line
+                (`ssh h '...' && git clone a b`, `ssh h cd x && git clone a b`), and the whole line, strictly,
+                whenever shell_words cannot verify it: `$(...)` or backticks outside single quotes (they run here), a
+                comment, a backslash, ANSI-C quoting, a heredoc (`ssh h bash -s <<'EOF'` is read as local text) or
+                unbalanced quotes. Not checked: whether the host is really another machine; `ssh localhost '...'`
+                or an alias of this machine copies onto this disk uncounted (the hook does no DNS or ssh-config
+                reading). The far host's own floor is not checked from here.
   scratch       `copy_hygiene.py scratch [--key <name>]` creates and prints a private (0700) disk-backed scratch
                 directory, ~/.agent-harness/scratch/<session>, the replacement for /dev/shm:
                 `export TMPDIR=$(python3 ~/.claude/hooks/copy_hygiene.py scratch)`. Refused below the disk floor; its
@@ -77,6 +94,10 @@ import subprocess
 import sys
 import tempfile
 import time
+
+if os.path.dirname(os.path.abspath(__file__)) not in sys.path:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import shell_words  # noqa: E402  (goodqa#16811: the one shell reader shared with merge_gate)
 
 
 GB = 1024 ** 3
@@ -760,10 +781,17 @@ def protecting_tail(rel: str, prot: dict) -> "tuple[str, str] | None":
 
 
 # ---------------------------------------------------------------- command analysis
+SIMPLE_SPLIT = re.compile(r"\|\||&&|[;|&\n]|\$\(|`|\(|\)")
+
+
 def simple_commands(cmd: str) -> list:
-    """argv lists of the simple commands in a shell line (quote-aware enough for policy; never raises)."""
+    """argv lists of the simple commands in a shell line (quote-aware enough for policy; never raises).
+
+    It splits inside quotes on purpose: the protected-delete and /dev/shm checks rely on reading every command a
+    quoted `bash -c '...'` or ssh payload might run. Only the disk-floor copy check reads lines through
+    copy_commands instead (goodqa#16811)."""
     out = []
-    for seg in re.split(r"\|\||&&|[;|&\n]|\$\(|`|\(|\)", cmd):
+    for seg in SIMPLE_SPLIT.split(cmd):
         seg = seg.strip()
         if not seg:
             continue
@@ -775,6 +803,96 @@ def simple_commands(cmd: str) -> list:
             words = words[1:]
         if words:
             out.append(words)
+    return out
+
+
+# ---------------------------------------------------------------- copy check: ssh remote payloads
+# ssh options that make the LOCAL machine run a command; an ssh carrying one keeps the strict reading. `-F` names a
+# config file that may hold one, and the hook reads no ssh config.
+SSH_LOCAL_COMMAND = re.compile(r"proxycommand|localcommand|knownhostscommand|^-F", re.I)
+
+
+def _remote_only_ssh(words: list) -> bool:
+    """True when `words` (one verified shell_words command, wrappers dropped) is an ssh whose arguments run only on
+    the far host: its program is `ssh` and it has no ProxyCommand/LocalCommand/KnownHostsCommand option and no -F
+    config. shell_words already refused any `$(`, backtick, heredoc or comment on the line, so nothing in it runs
+    here before ssh starts.
+
+    Not proven: that the host is another machine. `ssh localhost '...'` or an ssh alias of this machine copies onto
+    this disk and is not counted (documented gap; the hook does no DNS or ssh-config reading)."""
+    return bool(words) and os.path.basename(words[0]) == "ssh" and not any(SSH_LOCAL_COMMAND.search(w) for w in words)
+
+
+_BUILT_WORD = frozenset("*?[]{}")
+
+
+def _ssh_words_spelled_out(segment) -> bool:
+    """True when no word of this ssh command can turn into an option at run time (goodqa#16811): no unquoted
+    expansion or glob or brace character, and no word that starts with an expansion (`ssh "$OPTS" host`). Otherwise
+    `$OPTS` could hold `-oProxyCommand=...`, which runs here. An expansion inside a double-quoted payload after other
+    text (`ssh h "cd $T && ..."`) only changes the text the far host runs."""
+    for word in segment.words:
+        if any(char in _BUILT_WORD for _, char in word.unquoted):
+            return False
+        for offset, inside, _ in word.expansions:
+            if not inside or offset <= word.start + 1:
+                return False
+    return True
+
+
+def _legacy_copy_commands(cmd: str, depth: int) -> list:
+    """The strict reading: split on every separator even inside quotes (the simple_commands reading), drop
+    wrappers, read `sh -c` scripts the same way. Over-reads, never under-reads."""
+    out = []
+    for seg in SIMPLE_SPLIT.split(cmd):
+        seg = seg.strip()
+        if not seg:
+            continue
+        try:
+            words = shlex.split(seg, comments=True)
+        except ValueError:
+            words = seg.split()
+        words = _unwrap(words)
+        if not words:
+            continue
+        out.append(words)
+        if depth < 4 and len(words) >= 3 and os.path.basename(words[0]) in SHELLS and words[1] == "-c":
+            out.extend(copy_commands(words[2], depth + 1))
+    return out
+
+
+def copy_commands(cmd: str, depth: int = 0) -> list:
+    """argv lists the disk-floor copy check reads (goodqa#16811).
+
+    A line shell_words.scan verifies (bash and zsh read it as exactly those commands) is read command by command:
+    - an ssh command that runs only on the far host (_remote_only_ssh) is dropped, so a clone inside
+      `ssh host 'cd x && git clone ...'` is not charged to this machine's floor; every other command on the line,
+      including one after the ssh (`ssh h '...' && git clone a b`), is still read;
+    - any other ssh (a ProxyCommand, LocalCommand, KnownHostsCommand or -F, or a word the shell builds at run time,
+      _ssh_words_spelled_out) gets the strict reading of _legacy_copy_commands, which is exactly how the check read
+      every ssh before goodqa#16811;
+    - wrapper words and their options are dropped (`timeout 120 git clone`, `nice -n 5 cp -r`, `sudo -u u ...`);
+    - the script of `sh|bash|zsh|dash|ksh -c SCRIPT` is read the same way, up to 4 levels deep, so
+      `bash -c 'ssh h "git clone a b"'` is a remote copy too.
+    Every line shell_words cannot verify (a comment, a backslash, `$(` or a backtick outside single quotes, ANSI-C
+    quoting, a heredoc, unbalanced quotes, ...) gets the strict reading of _legacy_copy_commands instead."""
+    scan = shell_words.scan(cmd)
+    if not scan.verified:
+        return _legacy_copy_commands(cmd, depth)
+    out = []
+    for segment in scan.segments:
+        words = _unwrap(segment.argv)
+        if not words:
+            continue
+        if os.path.basename(words[0]) == "ssh":
+            if _remote_only_ssh(words) and _ssh_words_spelled_out(segment):
+                continue
+            out.extend(_legacy_copy_commands(cmd[segment.start:segment.end], depth))
+            continue
+        out.append(words)
+        if (depth < 4 and len(words) >= 3 and os.path.basename(words[0]) in SHELLS
+                and re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", words[1])):
+            out.extend(copy_commands(words[2], depth + 1))
     return out
 
 
@@ -1540,7 +1658,7 @@ def pretool(event: dict, cfg: "dict | None" = None) -> "tuple[int, str]":
                            "t2-dev's 56 GB). Use disk-backed scratch instead: `export TMPDIR=$(python3 "
                            "~/.claude/hooks/copy_hygiene.py scratch --key " + safe_key(str(event.get("session_id") or "session")) +
                            ")` (private, under ~/.agent-harness/scratch/). Reading, copying out of and removing files in /dev/shm stay allowed.\n")
-        copying = [w for w in simple_commands(cmd) if is_copy_command(w)]
+        copying = [w for w in copy_commands(cmd) if is_copy_command(w)]
         if not copying:
             return 0, ""
         cfg = normalize(cfg) if cfg is not None else load_config()
