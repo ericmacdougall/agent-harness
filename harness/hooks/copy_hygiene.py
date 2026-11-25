@@ -1201,14 +1201,84 @@ _PUSH, _POP = "\0push", "\0pop"
 _DEFAULT = "\0default:"     # marks a ${X:-default} value so its own variables are expanded too
 
 
-def _expand_braces(s: str) -> "list[str]":
-    m = re.search(r"\{([^{}]*,[^{}]*)\}", s)
-    if not m:
-        return [s]
-    out = []
-    for alt in m.group(1).split(","):
-        out.extend(_expand_braces(s[:m.start()] + alt + s[m.end():]))
-    return out[:256]
+BRACE_CAP = 256     # alternatives one word may expand to before the delete check refuses it as unanalysable
+_BRACE_GROUP = re.compile(r"\{([^{}]*,[^{}]*)\}")
+
+
+class BraceOverflow(ValueError):
+    """A word expands to more than BRACE_CAP alternatives. The delete check cannot list every target, so the hook
+    refuses the command (goodqa#17182) instead of judging a truncated list that could miss a protected path."""
+
+
+def _expand_braces(s: str, cap: int = BRACE_CAP) -> "list[str]":
+    """Every brace alternative of s, innermost comma group first. Generation stops as soon as more than `cap`
+    alternatives exist and raises BraceOverflow: the old recursion built all 2^k results of k groups before it
+    truncated (17 real commands over the 5 s hook budget, and a timed-out PreToolUse hook lets the command run)."""
+    done, todo = [], [s]
+    while todo:
+        w = todo.pop()
+        m = _BRACE_GROUP.search(w)
+        if not m:
+            done.append(w)
+            if len(done) > cap:
+                raise BraceOverflow(s)
+            continue
+        alts = [w[:m.start()] + alt + w[m.end():] for alt in m.group(1).split(",")]
+        todo.extend(reversed(alts))      # depth first, left to right: the old result order
+        if len(done) + len(todo) > cap:  # every pending word yields at least one result, so the total is past cap
+            raise BraceOverflow(s)
+    return done
+
+
+# Quoted or backslash-escaped `{` `,` `}` are masked while a segment is split into words, so that brace expansion,
+# which no shell applies to quoted text, skips them; _cmd_lines unmasks every word before anything else reads it.
+_MASK = {"{": "", ",": "", "}": ""}
+_UNMASK = str.maketrans({v: k for k, v in _MASK.items()})
+# The command names delete_targets_line takes targets or bindings from. Only their words are brace-expanded, so code
+# in a heredoc body or a quoted ssh/node script is never expanded (goodqa#17182 replay: 48 commands refused by the cap).
+_BRACE_NAMES = DELETE_VERBS | {"mv", "gio", "find", "xargs", "git", "cd", "pushd", "for"}
+
+
+def _unmask(s: str) -> str:
+    return s.translate(_UNMASK)
+
+
+def _mask_quoted_braces(seg: str) -> str:
+    """seg with the braces and commas inside quotes, or after a backslash outside single quotes, masked. An unclosed
+    quote leaves seg as it is: expanding too much is the safe direction."""
+    out, q, i, n = [], "", 0, len(seg)
+    while i < n:
+        c = seg[i]
+        if c == "\\" and q != "'" and i + 1 < n:
+            out.append(c + _MASK.get(seg[i + 1], seg[i + 1]))
+            i += 2
+            continue
+        if q:
+            if c == q:
+                q = ""
+            out.append(_MASK.get(c, c))
+        else:
+            if c in "'\"":
+                q = c
+            out.append(c)
+        i += 1
+    return seg if q else "".join(out)
+
+
+def _expand_command_braces(words: list) -> list:
+    """Brace-expand a simple command's words when its name is one delete_targets_line reads, including a name that is
+    itself a brace word (`{rm,-rf,/p}`, `/bin/r{m,m}`); other commands' words, such as code after `f(` in a heredoc
+    body, are left as they are. A name word past the cap raises BraceOverflow when it could spell one of those names
+    (every alternative is built from the word's own characters, so one lacking a letter of each name cannot)."""
+    try:
+        names = _expand_braces(words[0]) if _BRACE_GROUP.search(words[0]) else [words[0]]
+    except BraceOverflow:
+        if any(set(n) <= set(words[0]) for n in _BRACE_NAMES):
+            raise
+        return words
+    if not any(os.path.basename(n) in _BRACE_NAMES for n in names):
+        return words
+    return [x for w in words for x in _expand_braces(w)]
 
 
 def _var_value(m, env: dict) -> "list[str] | None":
@@ -1294,6 +1364,7 @@ def _cmd_lines(cmd: str) -> "list[tuple[list, str]]":
     bracketed by _PUSH/_POP so a `cd` inside them does not leak out."""
     out = []
     sep = ";"
+    cmd = _unmask(cmd)          # a mask character typed in the command is read as the brace it stands for
     for seg, nsep, bodies in _split_line(cmd):
         cur_sep, sep = sep, nsep
         seg = seg.strip()
@@ -1302,21 +1373,21 @@ def _cmd_lines(cmd: str) -> "list[tuple[list, str]]":
                 out.append(([_PUSH], ";"))
                 out.extend(_cmd_lines(body))
                 out.append(([_POP], ";"))
-            seg = _strip_comment(seg)
+            seg = _mask_quoted_braces(_strip_comment(seg))
             try:
                 words = shlex.split(seg)                # not comments=True: it cuts `${f##*/}` mid-word
             except ValueError:
                 words = [w.strip("'\"") for w in seg.split()]
             words = _unwrap(words)
-            if words and os.path.basename(words[0]) in SHELLS:
+            if words and os.path.basename(_unmask(words[0])) in SHELLS:
                 j = next((i for i, w in enumerate(words[1:], 1) if re.match(r"^-[a-zA-Z]*c[a-zA-Z]*$", w)), 0)
                 if j and j + 1 < len(words):
                     out.append(([_PUSH], cur_sep))
-                    out.extend(_cmd_lines(words[j + 1]))
+                    out.extend(_cmd_lines(_unmask(words[j + 1])))    # the inner shell expands its own braces
                     out.append(([_POP], ";"))
                     words = []
             if words:
-                out.append((words, cur_sep))
+                out.append(([_unmask(w) for w in _expand_command_braces(words)], cur_sep))
         if nsep == "(":
             out.append(([_PUSH], nsep))
         elif nsep == ")":
@@ -1684,8 +1755,7 @@ def delete_targets_line(cmd: str, cwd: str) -> "list[tuple[str, bool, str]]":
                 pending_old = []
             if sep != "|":
                 find_ctx = None
-            words = [x for w in words for x in _expand_braces(w)]
-            name = os.path.basename(words[0])
+            name = os.path.basename(words[0])             # _cmd_lines already brace-expanded what this reads
             # find output bound to a loop variable: `for d in $(find R); do rm -rf "$d"` / `for d in $old`
             if name == "for" and len(words) >= 3 and words[2] == "in":
                 inherited = _inherit_finds(words[3:], subst_finds, var_finds)
@@ -1857,6 +1927,12 @@ def pretool(event: dict, cfg: "dict | None" = None) -> "tuple[int, str]":
                 alert("test-override-active", {"var": "HARNESS_COPY_HYGIENE_UNIT_DIRS"})
             try:
                 hit = protected_delete(cmd, cwd, cfg)
+            except BraceOverflow:   # fail CLOSED: a partial target list could miss a protected path (goodqa#17182)
+                alert("protected-check-unanalysable", {"reason": "brace-overflow", "cap": BRACE_CAP})
+                return 2, (f"UNANALYSABLE DELETE: a word in this command expands to more than {BRACE_CAP} brace "
+                           "alternatives, too many to check every target against the protected service paths. Split "
+                           "the command into smaller ones (fewer `{a,b}` groups per word), or list the paths "
+                           "explicitly.\n")
             except Exception as e:  # noqa: BLE001 -- documented choice: fail OPEN (a broken check must not block
                 hit = None          # every rm in every session) but leave an alert for the owner
                 alert("protected-check-error", {"error": f"{type(e).__name__}: {str(e)[:160]}"})
