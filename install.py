@@ -456,6 +456,15 @@ def merged_settings(current: dict, claude: Path, durable_tmp: bool = True, prove
     return settings
 
 
+def git_hook_command(script: Path) -> str:
+    """Through the launcher next to the script, so `harness off` silences the backstop too; the launcher skips a
+    missing script by itself, and a host without the launcher (never installed) skips the hook. commit_policy.py's
+    git_hook_command writes the same text."""
+    import shlex
+    launcher = shlex.quote(str(Path(script).parent / LAUNCHER))
+    return f'f={launcher}; [ -f "$f" ] || exit 0; exec python3 "$f" {shlex.quote(Path(script).name)} git-hook'
+
+
 def git_hook_status(home: Path, key: str, script: Path, *, apply: bool, git: str = "git") -> str:
     """Register the commit-msg backstop as an additive config-based hook.
 
@@ -476,10 +485,7 @@ def git_hook_status(home: Path, key: str, script: Path, *, apply: bool, git: str
     version = (int(match.group(1)), int(match.group(2))) if match else (0, 0)
     if version < MIN_GIT_HOOKS:
         return f"commit-msg backstop inactive: git {out.strip()} lacks config-based hooks (needs 2.54+)"
-    # Through the launcher next to the script, so `harness off` silences the backstop too; the launcher skips a
-    # missing script by itself, and a host without the launcher (never installed) skips the hook.
-    launcher = script.parent / LAUNCHER
-    command = f'f={shlex.quote(str(launcher))}; [ -f "$f" ] || exit 0; exec python3 "$f" {shlex.quote(script.name)} git-hook'
+    command = git_hook_command(script)
     if not apply:
         return f"would register git hook.{key} (commit-msg)"
     def get(name):

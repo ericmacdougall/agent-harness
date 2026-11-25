@@ -2196,9 +2196,12 @@ GIT_HOOK_NAME = "agent-harness-commit-policy"
 
 
 def git_hook_command(script: Path) -> str:
-    """A missing script must never break commits, so the command checks first."""
-    quoted = shlex.quote(str(script))
-    return f'f={quoted}; [ -f "$f" ] || exit 0; exec python3 "$f" git-hook'
+    """The commit-msg command, through the launcher beside the script (ah_hook.py), so `harness off` silences the
+    backstop too; the same text install.git_hook_command writes. A missing launcher or script never breaks commits:
+    the command checks for the launcher, and the launcher skips a missing script."""
+    script = Path(script)
+    launcher = shlex.quote(str(script.parent / "ah_hook.py"))
+    return f'f={launcher}; [ -f "$f" ] || exit 0; exec python3 "$f" {shlex.quote(script.name)} git-hook'
 
 
 def git_version(executable="git"):
