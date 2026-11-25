@@ -411,6 +411,18 @@ class CallersThatNeedTheRow(Base):
                                         {"waivers": {"min_reason_chars": 10}})
         self.assertIn("recover", str(caught.exception))
 
+    def test_a_target_policy_override_is_refused_when_its_row_only_reached_a_side_file(self):
+        self.link_wal()
+        sys.path.insert(0, str(WAL_PY.parent))
+        try:
+            import deliver
+        finally:
+            sys.path.remove(str(WAL_PY.parent))
+        args = mock.Mock(wal=self.wal, task="t1")
+        with self.assertRaises(deliver.DeliveryError) as caught:
+            deliver.record_target_override_in_wal(args, [{"reason": "x"}])
+        self.assertEqual(caught.exception.facts["reason"], "TARGET_OVERRIDE_UNRECORDED")
+
 
 if __name__ == "__main__":
     unittest.main()
