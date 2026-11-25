@@ -44,7 +44,7 @@ DEADLINE_GRACE = 60
 # an infrastructure refusal cannot turn into an unbounded retry loop or lock a fingerprint forever.
 ZERO_LAUNCH_CAP = 6
 ZERO_LAUNCH_WINDOW = 3600
-ZERO_LAUNCH_REASONS = {'TRANSIENT_INFRA', 'LOW_DISK', 'QUOTA', 'AUTH'}
+ZERO_LAUNCH_REASONS = {'TRANSIENT_INFRA', 'LOW_DISK', 'QUOTA', 'AUTH', 'POOL_BUSY'}
 MAX_ATTEMPTS = 32
 PID_MAX = 2 ** 31 - 1
 AUTO_ACTOR = 'usage_guard.auto'
@@ -52,7 +52,8 @@ RECONCILIATION_KINDS = {'manual_reconciliation', 'automatic_reconciliation'}
 EXECUTIONS = {'NOT_STARTED', 'RUNNING', 'COMPLETED', 'INTERRUPTED', 'UNKNOWN'}
 RESULTS = {'CHECK_OK', 'CHECK_FAILED', 'NO_RESULT'}
 REASONS = {'NONE', 'CODE_FINDINGS', 'QUOTA', 'AUTH', 'TRANSIENT_INFRA', 'LOW_DISK',
-           'TIMEOUT', 'INVALID_OUTPUT', 'OUTPUT_TOO_LARGE', 'INPUT_CHANGED', 'BUDGET_EXHAUSTED', 'ADVISORY', 'UNKNOWN'}
+           'TIMEOUT', 'INVALID_OUTPUT', 'OUTPUT_TOO_LARGE', 'INPUT_CHANGED', 'BUDGET_EXHAUSTED', 'ADVISORY', 'UNKNOWN',
+           'POOL_BUSY'}
 STAGES = {'PLAN', 'CODE_INSPECTION', 'PR'}
 ENVIRONMENT_KEYS = {'CI', 'LANG', 'LC_ALL', 'TZ', 'PYTHONHASHSEED', 'NODE_ENV'}
 HEX = re.compile(r'[0-9a-f]{64}\Z')
@@ -1199,6 +1200,26 @@ class UsageStore:
         with self._lock():
             return self._auto_reconcile_locked(run_id)
 
+    def holder_status(self, run_id):
+        """Read-only facts about the run that holds a pool, for the lease-refusal message. Never writes or reconciles.
+
+        `busy` is True only when the holder has not finished, is not provably dead, and its recorded deadline parsed
+        and is still in the future: a live run that another gate must wait for, never one to reconcile."""
+        directory = self._run_directory(run_id)
+        with self._lock():
+            start = self._owned_start(run_id)
+            # The `inspect --reference` handle for this START, so a holder of unknown state can be looked at (RT2-4).
+            start_sha = hashlib.sha256(file_bytes(directory / 'start.json')).hexdigest()
+            finished = os.path.lexists(directory / 'completion.json')
+            liveness = owner_liveness(start, self._children(directory))
+        busy = (not finished and liveness['state'] != 'DEAD' and not liveness['past_deadline']
+                and 'deadline' in liveness)
+        return {'run_id': run_id, 'busy': busy, 'state': liveness['state'], 'why': liveness['why'],
+                'finished': finished, 'past_deadline': liveness['past_deadline'],
+                'started_at': start.get('started_at') if isinstance(start.get('started_at'), str) else None,
+                'deadline': liveness.get('deadline'), 'label': start.get('label'),
+                'start_reference': '%s:start:%s' % (run_id, start_sha)}
+
     def _children(self, directory):
         path = directory / 'children.json'
         if not os.path.lexists(path): return ()
@@ -1246,6 +1267,207 @@ class UsageStore:
                 raise GuardError('UNKNOWN', 'Reconcile the active owner before acknowledging availability')
             self._pool_event(directory, {**state, 'cooldown': False, 'reason': 'NONE', 'reset_at': None},
                              'AVAILABILITY_ACK', actor=actor, reason=reason, evidence=evidence)
+
+
+# ---------------------------------------------------------------- provider availability (goodqa#17108)
+# A provider that refused a review for a usage limit is skipped by later runs until its reset time, so an exhausted
+# Codex, Claude or Kimi account is not probed on every run. A record names one (provider, pool) pair, sits in
+# <usage root>/availability/ (never a WAL), is replaced atomically, and is advisory: a missing, corrupt, foreign or
+# unsafe record reads as "no record" and the provider is launched. ASSUMPTION (owner decision, goodqa#17108): a free-text
+# limit with no reliable time is re-probed after 30 minutes, and no skip lasts longer than 6 hours from now.
+AVAILABILITY_REPROBE_SECONDS = 30 * 60
+AVAILABILITY_MAX_SKIP_SECONDS = 6 * 3600
+# ASSUMPTION (owner decision, RT2-9): a record dated up to 5 minutes in the future is tolerated as clock skew.
+AVAILABILITY_CLOCK_SKEW_SECONDS = 300
+AVAILABILITY_MAX_RECORD = 4096
+AVAILABILITY_MAX_ENTRIES = 4096
+AVAILABILITY_KEYS = frozenset({'schema', 'kind', 'provider', 'pool', 'reason', 'recorded_at', 'until', 'basis', 'hint'})
+AVAILABILITY_BASES = frozenset({'provider_reset', 'reprobe_interval', 'capped'})
+_RESET_ISO = re.compile(r'(?:at\s+)?(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:Z|[+-]\d{2}:?\d{2}))'
+                        r'(?![\w:])', re.IGNORECASE)
+_RESET_UNIT = re.compile(r'(\d{1,4})\s*(days?|d|hours?|hrs?|h|minutes?|mins?|m)(?![a-z])', re.IGNORECASE)
+_RESET_RELATIVE = re.compile(r'in\s+((?:\d{1,4}\s*(?:days?|d|hours?|hrs?|h|minutes?|mins?|m)(?![a-z])'
+                             r'(?:\s*,\s*|\s+and\s+|\s+)?){1,4})', re.IGNORECASE)
+_UNIT_SECONDS = {'d': 86400, 'h': 3600, 'm': 60}
+
+
+def parse_reset_text(text, now):
+    """An absolute reset time (epoch seconds) from the provider's own wording after "resets", or None.
+
+    Only two shapes are reliable enough: an ISO-8601 time with Z or an explicit UTC offset ("2026-11-24T18:00:00Z"),
+    and a relative duration at the start ("in 2 hours 13 minutes", "in 4d 3h"). Wording such as "Nov 29 at 6pm
+    (America/Denver)" or "Monday 9am" needs a guessed year or zone, so it is not parsed and the re-probe interval
+    applies instead."""
+    if not isinstance(text, str) or not 0 < len(text) <= 200:
+        return None
+    text = text.strip()
+    match = _RESET_ISO.match(text)
+    if match:
+        try:
+            value = datetime.fromisoformat(match[1].replace('Z', '+00:00').replace('z', '+00:00').replace(' ', 'T'))
+        except ValueError:
+            return None
+        return value.timestamp() if value.tzinfo is not None else None
+    match = _RESET_RELATIVE.match(text)
+    if match:
+        seconds = sum(int(number) * _UNIT_SECONDS[unit[0].lower()] for number, unit in _RESET_UNIT.findall(match[1]))
+        return now + seconds if seconds > 0 else None
+    return None
+
+
+def availability_window(reset_at, reset_hint, now):
+    """(until, basis) for a usage-limit refusal seen at `now`: the provider's reliable reset time when it gives one
+    (a structured numeric reset_at, or parse_reset_text), clamped to the hard cap; otherwise the re-probe interval."""
+    candidate = None
+    if type(reset_at) in (int, float) and math.isfinite(reset_at) and reset_at > now:
+        candidate = float(reset_at)
+    if candidate is None:
+        candidate = parse_reset_text(reset_hint, now)
+    if candidate is None or not math.isfinite(candidate) or candidate <= now:
+        return now + AVAILABILITY_REPROBE_SECONDS, 'reprobe_interval'
+    if candidate > now + AVAILABILITY_MAX_SKIP_SECONDS:
+        return now + AVAILABILITY_MAX_SKIP_SECONDS, 'capped'
+    return candidate, 'provider_reset'
+
+
+def _clean_hint(value):
+    if not isinstance(value, str):
+        return None
+    text = ''.join(char for char in value if char.isprintable())[:120].strip()
+    return text or None
+
+
+class ProviderAvailability:
+    """Per-(provider, pool) usage-limit records under <usage root>/availability. Each record is one small JSON file,
+    mode 0600, named by the digest of [provider, pool], written by temp file + fsync + rename. `active` never raises
+    and never blocks longer than AVAILABILITY_MAX_SKIP_SECONDS from now."""
+
+    def __init__(self, root=None):
+        base = Path(root or os.environ.get('AGENT_HARNESS_USAGE_DIR', Path.home() / '.agent-harness' / 'usage'))
+        self.root = base.expanduser().absolute()
+        self.directory = self.root / 'availability'
+
+    @staticmethod
+    def _name(provider, pool):
+        safe_label(provider); safe_label(pool)
+        return digest([provider, pool]) + '.json'
+
+    def _safe_directory(self, *, create):
+        """The record directory, owned by this user and mode 0700, never a symlink; None when absent (reads)."""
+        if create and not os.path.lexists(self.directory):
+            # Created only inside an established usage store: an availability directory in an empty root would make
+            # the next UsageStore() refuse the root as uninitialized nonempty state.
+            if not os.path.lexists(self.root / 'store.json') or os.path.islink(self.root):
+                raise GuardError('UNKNOWN', 'Availability records need an established usage store')
+            try:
+                self.directory.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+        if not os.path.lexists(self.directory):
+            return None
+        info = os.stat(self.directory, follow_symlinks=False)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+            raise GuardError('UNKNOWN', 'Availability directory ownership or permissions are unsafe')
+        return self.directory
+
+    @staticmethod
+    def _valid(value, provider, pool, now):
+        if (not isinstance(value, dict) or set(value) != AVAILABILITY_KEYS or value['schema'] != SCHEMA
+                or type(value['schema']) is not int or value['kind'] != 'provider_availability'
+                or value['provider'] != provider or value['pool'] != pool or value['reason'] != 'QUOTA'
+                or value['basis'] not in AVAILABILITY_BASES
+                or not (value['hint'] is None or isinstance(value['hint'], str) and len(value['hint']) <= 120)):
+            return False
+        recorded, until = value['recorded_at'], value['until']
+        if any(type(item) not in (int, float) or not math.isfinite(item) for item in (recorded, until)):
+            return False
+        # A record from the future (clock moved back, or a forged time) or one longer than the cap is not trusted.
+        return (recorded <= now + AVAILABILITY_CLOCK_SKEW_SECONDS and recorded < until
+                and until - recorded <= AVAILABILITY_MAX_SKIP_SECONDS + 1)
+
+    def active(self, provider, pool, now=None):
+        """The live record for (provider, pool), with `until` never later than now + the cap; None when there is no
+        trustworthy unexpired record. Never raises: availability is advisory and fails open."""
+        now = time.time() if now is None else now
+        try:
+            directory = self._safe_directory(create=False)
+            if directory is None:
+                return None
+            path = directory / self._name(provider, pool)
+            if not os.path.lexists(path):
+                return None
+            value = json.loads(file_bytes(path, AVAILABILITY_MAX_RECORD),
+                               parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
+            if not self._valid(value, provider, pool, now) or now >= value['until']:
+                return None
+            return {**value, 'until': min(value['until'], now + AVAILABILITY_MAX_SKIP_SECONDS)}
+        except (GuardError, OSError, ValueError, TypeError, UnicodeError, RecursionError):
+            return None
+
+    def record(self, provider, pool, *, reset_at=None, reset_hint=None, now=None):
+        """Write (replace) the usage-limit record for (provider, pool); returns it. Raises GuardError or OSError."""
+        now = time.time() if now is None else now
+        until, basis = availability_window(reset_at, reset_hint, now)
+        value = {'schema': SCHEMA, 'kind': 'provider_availability', 'provider': provider, 'pool': pool,
+                 'reason': 'QUOTA', 'recorded_at': now, 'until': until, 'basis': basis, 'hint': _clean_hint(reset_hint)}
+        name = self._name(provider, pool)
+        body = encoded(value)
+        directory = self._safe_directory(create=True)
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        temporary = '.stage-' + secrets.token_hex(16)
+        try:
+            target = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+            with os.fdopen(target, 'wb') as output:
+                output.write(body); output.flush(); os.fsync(output.fileno())
+            os.replace(temporary, name, src_dir_fd=fd, dst_dir_fd=fd)
+            os.fsync(fd)
+        finally:
+            try: os.unlink(temporary, dir_fd=fd)
+            except FileNotFoundError: pass
+            os.close(fd)
+        return value
+
+    def clear(self, provider, pool):
+        """Remove the record for (provider, pool); True when one was removed. Raises GuardError or OSError."""
+        name = self._name(provider, pool)
+        directory = self._safe_directory(create=False)
+        if directory is None:
+            return False
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.unlink(name, dir_fd=fd)
+            os.fsync(fd)
+            return True
+        except FileNotFoundError:
+            return False
+        finally:
+            os.close(fd)
+
+    def listing(self, now=None):
+        """Every record file with its provider, pool, until and whether it is active (operator view)."""
+        now = time.time() if now is None else now
+        directory = self._safe_directory(create=False)
+        rows = []
+        if directory is None:
+            return rows
+        for number, entry in enumerate(sorted(os.listdir(directory))):
+            if number >= AVAILABILITY_MAX_ENTRIES:
+                break
+            if entry.startswith('.stage-'):
+                continue
+            try:
+                value = json.loads(file_bytes(directory / entry, AVAILABILITY_MAX_RECORD))
+                provider, pool = value['provider'], value['pool']
+                ok = entry == self._name(provider, pool) and self._valid(value, provider, pool, now)
+            except (GuardError, OSError, ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+                rows.append({'file': entry, 'valid': False})
+                continue
+            rows.append({'file': entry, 'valid': ok, 'provider': provider, 'pool': pool,
+                         'active': ok and now < value['until'],
+                         'until': datetime.fromtimestamp(min(value['until'], now + AVAILABILITY_MAX_SKIP_SECONDS),
+                                                         timezone.utc).isoformat() if ok else None,
+                         'basis': value.get('basis'), 'hint': value.get('hint')})
+        return rows
 
 
 TICKETED_CATEGORIES = {'correctness', 'reliability', 'performance', 'maintainability', 'testing', 'documentation', 'ux'}
@@ -1547,8 +1769,26 @@ def main():
     for part in (reconcile, ack):
         for flag in ('actor', 'reason', 'evidence'): part.add_argument('--' + flag)
     sub.add_parser('sweep', help='apply the automatic dead-owner rule to every run and report each one')
+    available = sub.add_parser('availability', help='list provider usage-limit records, or --clear one (goodqa#17108)')
+    available.add_argument('--clear', action='store_true', help='remove the record for --provider and --pool')
+    available.add_argument('--provider'); available.add_argument('--pool', default='default')
     args = parser.parse_args()
     run = None
+    if args.action == 'availability':
+        try:
+            records = ProviderAvailability(args.state_dir)
+            if args.clear:
+                if not args.provider:
+                    parser.error('availability --clear needs --provider (and --pool unless it is default)')
+                value = {'cleared': records.clear(args.provider, args.pool), 'provider': args.provider, 'pool': args.pool}
+            else:
+                value = {'records': records.listing()}
+        except (GuardError, OSError) as error:
+            print(json.dumps({'result': 'NO_RESULT', 'message': error.message if isinstance(error, GuardError)
+                              else 'Availability records could not be read'}, sort_keys=True))
+            return 2
+        print(json.dumps(value, sort_keys=True))
+        return 0
     try:
         store = UsageStore(args.state_dir)
         if args.action == 'inspect': value = store.inspect(args.reference)

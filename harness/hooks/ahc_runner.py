@@ -285,8 +285,10 @@ def classify_review_failure(stderr, rc=None):
     code = codes[-1] if codes else ""
     if not code or code in UNKNOWN_CODES:
         return "unknown-outcome", code or "NO_DIAGNOSTIC"
-    if code == "PROVIDER_USAGE_LIMIT":
+    if code in ("PROVIDER_USAGE_LIMIT", "PROVIDER_SKIPPED"):  # goodqa#17108: a recorded skip is a quota wait
         return "quota", code
+    if code == "POOL_BUSY":  # goodqa#17108: another live run holds the pool; nothing was launched
+        return "contention", code
     if code == "PROVIDER_AUTH":
         return "auth", code
     if code in ("PROVIDER_INVALID_OUTPUT", "FALLBACK_NO_RESULT"):

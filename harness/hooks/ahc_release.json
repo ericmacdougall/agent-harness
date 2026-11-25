@@ -12,7 +12,7 @@
   "ahc_observe.py": "5adbdeceb9e0a8c15dac6481701418ebe7cca7e36c498f8a698fadd7bb0e4af9",
   "ahc_packet.py": "0c6e8fd1440c79ec3050c2f8c7945112e9c227335696e7b2bb9be146e3d352a4",
   "ahc_review.py": "06a7a90d725f6b3e5fde02c157cc620cfcef3188c0a29ec99d61954290ab752c",
-  "ahc_runner.py": "4baecf2b0e82297a55b3ac111d03ee4e5b0b5d3523f85a2ebeeb7a0a3c976095",
+  "ahc_runner.py": "04f710d31acecabe35ac3f6ee638963919ee728d5532e38d6557e03f0c9aa44c",
   "ahc_scan.py": "30b001910cf78995fd0b94e6c9bf88a0abeb3bbc5de161d386ebaa585b9d829b",
   "ahc_shadow.py": "fec4eb5856f8be96919dff7adb96f79d53f9247a9f4155107da1d482d7deb8b7",
   "ahc_w21.py": "04101af2e72ca39ec1d714977d7676d472d17ca4033827734170b856dfdf6b46"
@@ -20,7 +20,7 @@
  "helpers": {
   "ah": "99aa4f3585380e530c0846998687267682037ecc7012d1663aceba70d28acc75",
   "ops_watch": "94d0d1ee5d0f990145e01c70df78ffeef914582073b51ab4a0e87ff0db5f5b6f",
-  "peer_review": "6731fc44d0f91963247432967637cf8764c65b520dc6250eef0d33759bc109e1"
+  "peer_review": "360a96c97a17e77afe90087f68a4424bc0974e35da2c143b24880a45bf1da0b3"
  },
  "note": "v5 entry-point and legacy-helper sha256 list; regenerate with scripts/ahc_release_hashes.py"
 }

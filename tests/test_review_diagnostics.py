@@ -60,7 +60,7 @@ class ContractTests(unittest.TestCase):
         'SNAPSHOT_SPARSE_INDEX', 'SNAPSHOT_HIDDEN_INDEX_FLAG', 'SNAPSHOT_SHALLOW', 'SNAPSHOT_GRAFTS_ALTERNATES',
         'SNAPSHOT_CASE_COLLISION', 'SNAPSHOT_GITLINK', 'SNAPSHOT_SOURCE_CHANGED', 'PYTHON_UNSUPPORTED',
         'ISOLATION_FAILED', 'REVIEW_NOT_STARTED', 'REVIEW_LAUNCH_UNCONFIRMED',
-        'WORKTREE_SCAN_LIMIT', 'WORKTREE_SPECIAL_ENTRY', 'REVIEW_REPEAT_REQUIRED'}
+        'WORKTREE_SCAN_LIMIT', 'WORKTREE_SPECIAL_ENTRY', 'REVIEW_REPEAT_REQUIRED', 'PROVIDER_SKIPPED', 'POOL_BUSY'}
 
     def test_code_set_is_pinned(self):
         self.assertEqual(set(rd.CONTRACT), self.EXPECTED_CODES)
@@ -1265,7 +1265,7 @@ class RedTeamRound1Tests(unittest.TestCase):
         diag = rd.provider_attempt('codex', resolution, None, '', '', outcome)
         self.assertNotIn(diag['code'], ('EXEC_NOT_FOUND', 'EXEC_UNTRUSTED'))
         source = (HOOKS / 'peer_review.py').read_text()
-        lease = source.index('store.acquire_pool(provider, pool, run_record.run_id)')
+        lease = source.index('acquire_lease(store, provider, pool, run_record.run_id,')  # goodqa#17108: the lease helper
         lookup = source.index('diagnostics.discover_executable(\n                    provider')
         self.assertLess(lookup, lease, 'the executable must be resolved before the pool lease can raise')
 
