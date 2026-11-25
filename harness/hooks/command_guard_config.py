@@ -224,9 +224,9 @@ class Names:
 def _base(word, ctx, raw):
     """The program a head word names, or None when it may be something else (a path, an alias, a function, a variable)."""
     import command_guard as cg
-    text = word.text
-    if word.dynamic or word.glob or len(word.alts) != 1 or not text:
-        return None
+    text = cg._unq(word.text)
+    if word.dynamic or word.glob and text not in ('[', '[[') or len(word.alts) != 1 or not text:
+        return None  # the test builtins read as globs; the alias and function checks below still apply to them
     if '/' in text and posixpath.dirname(text) not in SYSTEM_DIRS:
         return None
     name = posixpath.basename(text)

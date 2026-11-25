@@ -50,7 +50,7 @@ BLOCK = [
     'python3 -c "import os; os.system(\'echo x >> ~/.claude/CLAUDE.md\')"',
     "awk '{print > \"/tmp/o\"}' ~/.claude/CLAUDE.md", 'sed -n w/tmp/o ~/.claude/CLAUDE.md', 'uniq /tmp/a ~/.claude/CLAUDE.md',
     'python3 -m json.tool /tmp/a ~/.claude/settings.json', 'rg --pre sh x ~/.claude/CLAUDE.md',
-    './cat ~/.claude/CLAUDE.md', 'cat() { tee "$1"; }; cat ~/.claude/CLAUDE.md', 'echo x >> $CLAUDE_CONFIG_DIR/CLAUDE.md',
+    '[() { tee "$2"; }; [ -f ~/.claude/CLAUDE.md ]', './cat ~/.claude/CLAUDE.md', 'cat() { tee "$1"; }; cat ~/.claude/CLAUDE.md', 'echo x >> $CLAUDE_CONFIG_DIR/CLAUDE.md',
     'D=$(cd ~/.claude && pwd); echo x >> $D/CLAUDE.md', 'git checkout -- ~/.claude/CLAUDE.md',
     "cat >> ~/.claude/CLAUDE.md <<'E'\nwords\nE", "trap 'echo x >> ~/.claude/CLAUDE.md' EXIT",
 ]
@@ -58,7 +58,8 @@ ALLOW = [
     'cat ~/.claude/CLAUDE.md', 'grep -n Hard ~/.claude/CLAUDE.md', 'head -5 ~/.claude/CLAUDE.md', 'diff ~/.claude/CLAUDE.md /tmp/a',
     'git hash-object ~/.claude/CLAUDE.md', 'git diff --no-index ~/.claude/CLAUDE.md /tmp/a', "sed -n '1,20p' ~/.claude/CLAUDE.md",
     'jq .hooks ~/.claude/settings.json', 'wc -l < ~/.claude/CLAUDE.md', 'cp ~/.claude/CLAUDE.md /tmp/backup.md', 'ls -la ~/.claude',
-    'test -f ~/.claude/CLAUDE.md && echo yes', '[[ -f ~/.claude/CLAUDE.md ]] && echo yes', 'timeout 5 cat ~/.claude/CLAUDE.md',
+    'test -f ~/.claude/CLAUDE.md && echo yes', '[[ -f ~/.claude/CLAUDE.md ]] && echo yes',
+    '[ -f ~/.claude/CLAUDE.md ] && echo yes', 'timeout 5 cat ~/.claude/CLAUDE.md',
     'LC_ALL=C grep x ~/.claude/CLAUDE.md', 'bash -c "cat ~/.claude/CLAUDE.md"', "ssh host 'cat ~/.claude/CLAUDE.md'",
     'find ~/.claude -name CLAUDE.md -exec cat {} \\;', 'shasum -a 256 ~/.claude/CLAUDE.md', 'tail -n 3 ~/.codex/config.toml',
     'python3 -c "print(open(\'@HOME@/.claude/CLAUDE.md\').read())"', 'cat ~/.claude/CLAUDE.md > /tmp/copy.md',
@@ -71,7 +72,7 @@ ALLOW = [
     # other files of the same name
     'echo x >> CLAUDE.md', 'echo x >> ~/repo/CLAUDE.md', 'cp a ~/repo/.claude/settings.json', 'sed -i s/a/b/ src/CLAUDE.md',
     'echo x >> ~/.claude/projects/p/memory/CLAUDE.md', 'echo x > ~/.claude/settings/extra.json',
-    'T=$(mktemp -d); mkdir -p "$T/.claude"; echo x > "$T/.claude/CLAUDE.md"',
+    # `T=$(mktemp -d); echo x > "$T/.claude/CLAUDE.md"` is not here: the older log-delete rule refuses it with or without this one
 ]
 
 
