@@ -198,7 +198,7 @@ class Case(unittest.TestCase):
     def run_script(self, script=SCRIPT, **extra):
         extra.setdefault("LOG_BACKUP_RETRY_SLEEP", "0")
         extra.setdefault("LOG_BACKUP_BULK_EVERY_SECONDS", "0")  # tests run the bulk tier every time unless they test the gap
-        extra.setdefault("LOG_BACKUP_STAGE_KEEP", "1")  # inspect the stage after the run; production prunes after upload
+        extra.setdefault("LOG_BACKUP_STAGE_KEEP", "1")  # inspect the stage after the run; production also keeps it (KEEP=0 prunes)
         extra.setdefault("LOG_BACKUP_STAGE_MIN_FREE_GIB", "0")  # production default is 20; tests must not depend on host free space
         done = subprocess.run(["/bin/bash", str(script)], env=self.env(**extra), cwd=str(self.tmp),
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
@@ -2067,7 +2067,7 @@ class BulkFilters(BulkResume):
 
 class StageSpace(Case):
     """Staging must not duplicate live trees on disk. Clonefile/reflink when the volume supports it;
-    never hardlinks (an append would change the snapshot); prune after upload unless KEEP=1;
+    never hardlinks (an append would change the snapshot); keep the stage by default and prune only when KEEP=0;
     skip a full-copy snapshot when free space is below the configured floor."""
 
     def test_a_live_snapshot_is_isolated_from_later_appends_and_is_not_a_hardlink(self):
@@ -2104,7 +2104,7 @@ class StageSpace(Case):
                             (staged.stat().st_dev, staged.stat().st_ino))
         self.assertEqual(staged.read_bytes(), blob)
 
-    def test_stage_is_pruned_after_upload_by_default(self):
+    def test_stage_is_pruned_after_upload_when_keep_is_0(self):
         done = self.run_script(LOG_BACKUP_STAGE_KEEP="0")
         self.assertEqual(done.returncode, 0, done.stderr)
         stage = self.home / ".agent-harness/backup-stage"
@@ -2113,6 +2113,54 @@ class StageSpace(Case):
         self.assertTrue(any("reclaimed staged" in line for line in (self.logs / "log-backup.log").read_text().splitlines()))
         # the upload still happened from the snapshot
         self.assertTrue([c for c in self.copies() if ".agent-harness/backup-stage" in c[-2]])
+
+    def test_stage_is_kept_by_default(self):
+        env = self.env(LOG_BACKUP_RETRY_SLEEP="0", LOG_BACKUP_BULK_EVERY_SECONDS="0",
+                       LOG_BACKUP_STAGE_MIN_FREE_GIB="0")
+        done = subprocess.run(["/bin/bash", str(SCRIPT)], env=env, cwd=str(self.tmp),
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        self.assertEqual(self.canary.read_text(), "alive")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        staged = self.home / ".agent-harness/backup-stage/.claude/projects/p1/a.jsonl"
+        self.assertTrue(staged.is_file(), "default KEEP must leave the snapshot in place")
+        log = (self.logs / "log-backup.log").read_text()
+        self.assertNotIn("reclaimed staged", log)
+
+    def test_planted_stage_symlink_does_not_delete_or_overwrite_live_claude(self):
+        live_root = self.home / ".claude"
+        live = live_root / "projects/p1/a.jsonl"
+        before = live.read_bytes()
+        ino = live.stat().st_ino
+        marker = live_root / "CANARY-DO-NOT-DELETE"
+        marker.write_text("live-canary")
+        stage = self.home / ".agent-harness/backup-stage"
+        stage.mkdir(parents=True, exist_ok=True)
+        planted = stage / ".claude"
+        planted.symlink_to(live_root)
+        done = self.run_script(LOG_BACKUP_STAGE_KEEP="0")
+        self.assertTrue(live_root.is_dir())
+        self.assertFalse(live_root.is_symlink())
+        self.assertTrue(live.is_file())
+        self.assertEqual(live.read_bytes(), before)
+        self.assertEqual(live.stat().st_ino, ino)
+        self.assertEqual(marker.read_text(), "live-canary")
+        self.assertTrue(planted.is_symlink())
+        log = (self.logs / "log-backup.log").read_text() if (self.logs / "log-backup.log").exists() else ""
+        self.assertIn("refusing", log)
+        # a write-through would have replaced the live inode; a follow-and-delete would drop the canary
+        self.assertNotEqual(done.returncode, 0)
+
+    def test_clone_engine_stages_cafe_filename_with_lang_c(self):
+        if not self._clone_works():
+            self.skipTest("clonefile/reflink is not available on this volume")
+        body = b"cafe-body\n"
+        self.put(".claude/projects/p1/caf\u00e9.jsonl", body)
+        done = self.run_script(LOG_BACKUP_STAGE_ENGINE="clone", LANG="C", LC_ALL="C")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        staged = self.home / ".agent-harness/backup-stage/.claude/projects/p1/caf\u00e9.jsonl"
+        self.assertTrue(staged.is_file(), "clone listing must resolve cafe.jsonl under LANG=C")
+        self.assertEqual(staged.read_bytes(), body)
+        self.assertTrue([c for c in self.copies() if ".agent-harness/backup-stage" in " ".join(c)])
 
     def test_a_full_copy_is_skipped_when_free_space_is_below_the_threshold(self):
         done = self.run_script(LOG_BACKUP_STAGE_ENGINE="rsync", LOG_BACKUP_STAGE_MIN_FREE_GIB="999")

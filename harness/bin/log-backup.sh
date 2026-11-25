@@ -20,9 +20,10 @@
 #                           change the snapshot mid-upload and Dropbox would reject the hash.
 #   LOG_BACKUP_STAGE_MIN_FREE_GIB  skip a full-copy snapshot when free space on the stage volume is below
 #                           this many GiB (default 20). Clonefile/reflink snapshots still run. 0 disables.
-#   LOG_BACKUP_STAGE_KEEP   exactly 1 leaves staged files in place after upload (tests, debug). The default
-#                           removes each staged source after its upload returns, so the stage does not hold
-#                           a second copy of ~/.claude and ~/.codex.
+#   LOG_BACKUP_STAGE_KEEP   exactly 0 removes each staged source after its upload returns. The default
+#                           leaves the stage in place: clonefile snapshots share extents with the source
+#                           (so they do not take a second allocation), and a full-copy fallback stays
+#                           incremental. A first clone pass replaces leftover full copies with clones.
 #   LOG_BACKUP_TPSLIMIT     rclone --tpslimit per host (default 1; the account's write budget is shared by all hosts) and
 #   LOG_BACKUP_TRANSFERS    --transfers (default 2), both whole numbers 1-99
 #   LOG_BACKUP_BULK_EVERY_SECONDS  minimum gap between bulk-tier attempts (default 3600); transcripts run every time
@@ -369,6 +370,8 @@ awk '/^[ \t]*(#|$)/ {next} {out=""; for (i = 1; i <= length($0); i++) {c = subst
 rm -rf "$STAGE/.rsync-tmp"
 STAGE_CLONE=0
 STAGE_CLONE_KIND=
+RSYNC_8=
+rsync -h 2>&1 | grep -q -- "--8-bit-output" && RSYNC_8=--8-bit-output
 stage_free_kib() { # POSIX df: available 1K-blocks on the stage volume
   df -kP "$STAGE" 2>/dev/null | awk 'NR==2 {print $4}'
 }
@@ -378,21 +381,61 @@ stage_same_inode() { # 0 when $1 and $2 are the same inode (a hardlink, unsafe f
   b=$(stat -f %d:%i "$2" 2>/dev/null || stat -c %d:%i "$2" 2>/dev/null) || return 1
   [ -n "$a" ] && [ "$a" = "$b" ]
 }
+stage_dev() { stat -f %d "$1" 2>/dev/null || stat -c %d "$1" 2>/dev/null; }
+stage_same_volume() { # 0 when $1 and $2 are on the same device (cp -c otherwise falls back to a full copy)
+  local a b
+  a=$(stage_dev "$1") || return 1
+  b=$(stage_dev "$2") || return 1
+  [ -n "$a" ] && [ "$a" = "$b" ]
+}
+stage_path_plain() { # 0 when $1 is STAGE or a path under it and no component from STAGE down is a symlink
+  local p="$1" cur rel part
+  [ -n "$p" ] && [ -n "$STAGE" ] || return 1
+  [ ! -L "$STAGE" ] || return 1
+  [ "$p" = "$STAGE" ] && return 0
+  case "$p" in "$STAGE"/*) ;; *) return 1 ;; esac
+  cur="$STAGE"
+  rel="${p#"$STAGE"/}"
+  while [ -n "$rel" ]; do
+    part="${rel%%/*}"
+    if [ "$part" = "$rel" ]; then rel=; else rel="${rel#*/}"; fi
+    [ -n "$part" ] || continue
+    cur="$cur/$part"
+    [ -L "$cur" ] && return 1
+    [ -e "$cur" ] || return 0
+  done
+  return 0
+}
+stage_physical_under_stage() { # 0 when the physical directory of $1 sits under the physical stage
+  local phys_stage phys_dir target="$1"
+  phys_stage=$(cd -P "$STAGE" 2>/dev/null && pwd -P) || return 1
+  if [ -d "$target" ] && [ ! -L "$target" ]; then
+    phys_dir=$(cd -P "$target" 2>/dev/null && pwd -P) || return 1
+  else
+    phys_dir=$(cd -P "$(dirname "$target")" 2>/dev/null && pwd -P) || return 1
+  fi
+  case "$phys_dir" in "$phys_stage"|"$phys_stage"/*) return 0 ;; esac
+  return 1
+}
+stage_dest_safe() { # 0 when writes or removals of $1 cannot escape the stage through a symlink
+  stage_path_plain "$1" && stage_physical_under_stage "$1"
+}
 stage_path_unused() { # 0 when no rclone/rsync command line is using $1 (do not kill those processes)
-  local p="$1" proc pids
-  # Only look at rclone/rsync pids: a full `ps -Ao args` on this host can be huge and slow.
+  local p="$1" proc pids extra
+  # Only look at rclone/rsync (and LOG_BACKUP_RCLONE's basename) pids. -ww: macOS truncates args without a tty.
   # A false match leaves the path in place rather than deleting under a reader.
-  for proc in rclone rsync; do
+  extra=$(basename "${RCLONE:-rclone}")
+  for proc in rclone rsync "$extra"; do
+    [ -n "$proc" ] || continue
     pids=$(pgrep -x "$proc" 2>/dev/null) || continue
     [ -n "$pids" ] || continue
-    if ps -p $(printf '%s' "$pids" | tr '
-' , | sed 's/,$//') -o args= 2>/dev/null | grep -F -- "$p" >/dev/null; then
+    if ps -ww -p $(printf '%s' "$pids" | tr '\n' , | sed 's/,$//') -o args= 2>/dev/null | grep -F -- "$p" >/dev/null; then
       return 1
     fi
   done
   return 0
 }
-stage_remove_path() { # only a path strictly inside the stage; never HOME, ~/.claude, ~/.codex or ~/.agent-harness/work
+stage_remove_path() { # only a path strictly inside the stage; never follow a symlink to ~/.claude, ~/.codex or work
   local p="$1"
   [ -n "$p" ] && [ -n "$STAGE" ] || return 1
   [ "$p" != "$STAGE" ] || return 1
@@ -402,7 +445,14 @@ stage_remove_path() { # only a path strictly inside the stage; never HOME, ~/.cl
     [ "$p" = "$guarded" ] && { say "refusing to remove a guarded path"; return 1; }
   done
   if [ -L "$p" ]; then rm -f -- "$p"; return 0; fi
-  rm -rf -- "$p"
+  stage_dest_safe "$p" || { say "refusing to remove a staged path that is not a plain directory under the stage"; return 1; }
+  # find -P does not descend through directory symlinks; do not use rm -rf (it can follow a mid-path link).
+  find -P "$p" \( -type f -o -type l \) -delete 2>/dev/null
+  find -P "$p" -depth -type d -exec rmdir {} + 2>/dev/null
+  if [ -e "$p" ] || [ -L "$p" ]; then
+    say "could not fully remove staged $p"; return 1
+  fi
+  return 0
 }
 stage_allow_full_copy() { # 0 when a full copy of $1 may be written into the stage
   local need free min
@@ -433,6 +483,8 @@ stage_probe_clone() { # set STAGE_CLONE when cp -c or cp --reflink=always makes 
   rm -rf "$d"
 }
 stage_try_clone() { # stage_try_clone SRC DEST: 0 when DEST is a clone of SRC, not a hardlink
+  # macOS cp -c falls back to a full copy across volumes; refuse that here so the free-space floor applies.
+  stage_same_volume "$1" "$STAGE" || return 1
   case "$STAGE_CLONE_KIND" in
     "cp -c") cp -c -p "$1" "$2" 2>/dev/null || return 1 ;;
     "cp --reflink=always") cp --reflink=always -p "$1" "$2" 2>/dev/null || return 1 ;;
@@ -442,9 +494,28 @@ stage_try_clone() { # stage_try_clone SRC DEST: 0 when DEST is a clone of SRC, n
   if stage_same_inode "$1" "$2"; then rm -f "$2"; return 1; fi
   return 0
 }
+stage_unchanged() { # 0 when DEST already matches SRC in size and mtime and is not a hardlink
+  local src="$1" dest="$2" ss ds sm dm
+  [ -f "$dest" ] && [ ! -L "$dest" ] || return 1
+  stage_same_inode "$src" "$dest" && return 1
+  ss=$(stat -f %z "$src" 2>/dev/null || stat -c %s "$src" 2>/dev/null) || return 1
+  ds=$(stat -f %z "$dest" 2>/dev/null || stat -c %s "$dest" 2>/dev/null) || return 1
+  sm=$(stat -f %m "$src" 2>/dev/null || stat -c %Y "$src" 2>/dev/null) || return 1
+  dm=$(stat -f %m "$dest" 2>/dev/null || stat -c %Y "$dest" 2>/dev/null) || return 1
+  [ "$ss" = "$ds" ] && [ "$sm" = "$dm" ]
+}
+stage_converted() { grep -Fxq "$1" "$LOGDIR/log-backup.stage-cloned" 2>/dev/null; }
+stage_note_converted() {
+  local f="$LOGDIR/log-backup.stage-cloned" tmp="$LOGDIR/log-backup.stage-cloned.tmp.$$"
+  stage_converted "$1" && return 0
+  { cat "$f" 2>/dev/null; printf '%s\n' "$1"; } > "$tmp" && mv "$tmp" "$f"
+  rm -f "$tmp"
+}
 stage_place_file() { # stage_place_file SRC DEST: clone when possible, else a full copy if free space allows
-  local src="$1" dest="$2" tmp rc=0
+  local src="$1" dest="$2" tmp
+  stage_dest_safe "$(dirname "$dest")" || { say "refusing to write a staged path that is not plain under the stage"; return 1; }
   mkdir -p "$(dirname "$dest")" "$STAGE/.rsync-tmp" || return 1
+  stage_dest_safe "$(dirname "$dest")" || { say "refusing to write a staged path that is not plain under the stage"; return 1; }
   tmp="$STAGE/.rsync-tmp/f.$$.$RANDOM"
   rm -f "$tmp"
   if [ "$STAGE_CLONE" = 1 ] && stage_try_clone "$src" "$tmp"; then
@@ -458,13 +529,22 @@ stage_place_file() { # stage_place_file SRC DEST: clone when possible, else a fu
     cp -p "$src" "$tmp" || { rm -f "$tmp"; return 1; }
     if stage_same_inode "$src" "$tmp"; then rm -f "$tmp"; return 1; fi
   fi
+  # Replace the dest only if it is a regular file already under the stage, or does not exist.
+  if [ -e "$dest" ] || [ -L "$dest" ]; then
+    stage_dest_safe "$dest" || { rm -f "$tmp"; say "refusing to replace a staged path that is not plain under the stage"; return 1; }
+    [ -L "$dest" ] && { rm -f "$tmp"; say "refusing to replace a symlink in the stage"; return 1; }
+    [ -d "$dest" ] && { rm -f "$tmp"; say "refusing to replace a directory with a staged file"; return 1; }
+  fi
   mv -f "$tmp" "$dest"
 }
-stage_drop_after_upload() { # remove the staged copy of $1 once rclone has returned (it is not using the path)
+stage_drop_after_upload() { # remove the staged copy of $1 only when KEEP is exactly 0
   local snap="$1"
-  [ "${LOG_BACKUP_STAGE_KEEP:-0}" = 1 ] && return 0
+  [ "${LOG_BACKUP_STAGE_KEEP:-}" = 0 ] || return 0
   stage_path_unused "$snap" || { say "leaving staged $snap: a copy process still names it"; return 0; }
   stage_remove_path "$snap" && say "reclaimed staged $snap after upload"
+}
+stage_unescape_rel() { # print rsync --out-format %n with \#ooo (and a following literal) decoded
+  python3 -c 'import sys,re; s=sys.argv[1]; s=re.sub(r"\\#([0-7]{3})", lambda m: chr(int(m.group(1),8)), s); sys.stdout.write(s)' "$1"
 }
 # Choose the snapshot engine on this volume. A clone probe writes a few MB under .rsync-tmp and deletes it.
 case "$STAGE_ENGINE" in
@@ -849,7 +929,11 @@ for src in "${LIVE[@]}"; do
   RESERVE=$(( later * (MIN_SLICE + DEADLINE_GRACE + KILL_GRACE + 3) ))
   if [ -L "$HOME/$src" ]; then say "refusing symlinked source root: $src"; ok=1; continue; fi
   snap="$STAGE/$src"
+  stage_dest_safe "$(dirname "$snap")" || { say "refusing to use a staged $src that is not a plain path under the stage"; ok=1; continue; }
   mkdir -p "$(dirname "$snap")" || { say "cannot stage $src"; ok=1; continue; }
+  if [ -e "$snap" ] || [ -L "$snap" ]; then
+    stage_dest_safe "$snap" || { say "refusing to use a staged $src that is not a plain path under the stage"; ok=1; continue; }
+  fi
   if [ -d "$HOME/$src" ]; then
     # rsync -a keeps symlinks as links; rclone never follows them. Exit 24 = a file vanished mid-copy (not an error).
     # --temp-dir sits outside every uploaded tree: a crash mid-copy leaves its partial files there, never beside data
@@ -878,55 +962,81 @@ for src in "${LIVE[@]}"; do
       fi
     else
       # Clonefile/reflink snapshot: list with the same rsync excludes, then place each file as a COW clone.
-      # An existing full-copy tree is replaced when no copy process is using it, so allocated space is reclaimed.
+      # The tree is kept and updated in place (unchanged files are skipped after the first conversion pass)
+      # so a 15-minute run is not spent re-cloning tens of thousands of files.
       empty="$STAGE/.rsync-tmp/empty.$$"
       list="$STAGE/.rsync-tmp/list.$$"
       mkdir -p "$empty" || { say "cannot create the stage list directory"; ok=1; continue; }
-      rsync -a -n --out-format='%n' --temp-dir="$STAGE/.rsync-tmp" --exclude='.[gG][oO][oO][dD][qQ][aA]-[tT][rR][aA][sS][hH]/' --include='*/' --exclude-from="$RSYNC_EXCLUDES" -- "$HOME/$src/" "$empty/" > "$list" </dev/null; rc=$?
+      rsync -a -n $RSYNC_8 --out-format='%n' --temp-dir="$STAGE/.rsync-tmp" --exclude='.[gG][oO][oO][dD][qQ][aA]-[tT][rR][aA][sS][hH]/' --include='*/' --exclude-from="$RSYNC_EXCLUDES" -- "$HOME/$src/" "$empty/" > "$list" </dev/null; rc=$?
       rm -rf "$empty"
+      list_ok=1
       if [ $rc -eq 23 ]; then
-        say "snapshot partial (rsync exit 23): $src"; ok=1
+        say "snapshot partial (rsync exit 23): $src"; ok=1; list_ok=0
       elif [ $rc -ne 0 ] && [ $rc -ne 24 ]; then
         say "snapshot failed (rsync exit $rc): $src"; ok=1; continue
       fi
-      if [ -d "$snap" ] && stage_path_unused "$snap"; then
-        stage_remove_path "$snap" || { say "cannot reclaim a previous staged $src"; ok=1; continue; }
-      fi
       mkdir -p "$snap" || { say "cannot stage $src"; ok=1; continue; }
+      stage_dest_safe "$snap" || { say "refusing to use a staged $src that is not a plain path under the stage"; ok=1; continue; }
+      snap_done=1
+      src_ok=1
       while IFS= read -r rel || [ -n "$rel" ]; do
         [ -n "$rel" ] || continue
         case "$rel" in .|./) continue ;; esac
+        if [ "$(time_left)" -lt $(( MIN_SLICE + DEADLINE_GRACE + KILL_GRACE )) ]; then
+          say "snapshot stopped at the run deadline: $src"; ok=1; snap_done=0; break
+        fi
         srcp="$HOME/$src/$rel"
         destp="$snap/$rel"
-        case "$destp" in "$snap"|"$snap"/*) ;; *) continue ;; esac
+        if [ ! -e "$srcp" ] && [ ! -L "$srcp" ]; then
+          decoded=$(stage_unescape_rel "$rel")
+          if [ -n "$decoded" ] && [ "$decoded" != "$rel" ]; then
+            rel="$decoded"
+            srcp="$HOME/$src/$rel"
+            destp="$snap/$rel"
+          fi
+        fi
+        case "$destp" in "$snap"|"$snap"/*) ;; *) ok=1; src_ok=0; continue ;; esac
         if [ "${rel%/}" != "$rel" ]; then
-          mkdir -p "${destp%/}" || { say "snapshot partial (mkdir): $src/$rel"; ok=1; }
+          stage_dest_safe "${destp%/}" || { say "snapshot partial (unsafe dest): $src/$rel"; ok=1; src_ok=0; continue; }
+          mkdir -p "${destp%/}" || { say "snapshot partial (mkdir): $src/$rel"; ok=1; src_ok=0; }
           continue
         fi
         if [ -d "$srcp" ] && [ ! -L "$srcp" ]; then
-          mkdir -p "$destp" || { say "snapshot partial (mkdir): $src/$rel"; ok=1; }
+          stage_dest_safe "$destp" || { say "snapshot partial (unsafe dest): $src/$rel"; ok=1; src_ok=0; continue; }
+          mkdir -p "$destp" || { say "snapshot partial (mkdir): $src/$rel"; ok=1; src_ok=0; }
           continue
         fi
         if [ ! -e "$srcp" ] && [ ! -L "$srcp" ]; then
-          continue   # vanished mid-list, same as rsync exit 24 for one file
+          # A listed name that still cannot be resolved may be rsync-escaped; do not call the run fresh.
+          say "snapshot partial (unresolved name): $src"; ok=1; src_ok=0
+          continue
         fi
-        mkdir -p "$(dirname "$destp")" || { say "snapshot partial (mkdir): $src/$rel"; ok=1; continue; }
+        stage_dest_safe "$(dirname "$destp")" || { say "snapshot partial (unsafe dest): $src/$rel"; ok=1; src_ok=0; continue; }
+        mkdir -p "$(dirname "$destp")" || { say "snapshot partial (mkdir): $src/$rel"; ok=1; src_ok=0; continue; }
         if [ -L "$srcp" ]; then
           tmp="$STAGE/.rsync-tmp/l.$$.$RANDOM"
-          rm -f "$tmp" "$destp"
+          rm -f "$tmp"
           if cp -P "$srcp" "$tmp" && mv -f "$tmp" "$destp"; then
             :
           else
             rm -f "$tmp"
-            say "snapshot partial (symlink): $src/$rel"; ok=1
+            say "snapshot partial (symlink): $src/$rel"; ok=1; src_ok=0
           fi
         elif [ -f "$srcp" ]; then
+          if stage_converted "$src" && stage_unchanged "$srcp" "$destp"; then
+            continue
+          fi
           if ! stage_place_file "$srcp" "$destp"; then
-            say "snapshot partial (file): $src/$rel"; ok=1
+            say "snapshot partial (file): $src/$rel"; ok=1; src_ok=0
           fi
         fi
       done < "$list"
       rm -f "$list"
+      # Mark a finished conversion so later runs can skip unchanged files. Do not mark a partial
+      # pass: leftover full copies with the same size and mtime would then never be replaced.
+      if [ "$snap_done" = 1 ] && [ "$src_ok" = 1 ] && [ "$list_ok" = 1 ]; then
+        stage_note_converted "$src"
+      fi
     fi
   else
     if ! stage_place_file "$HOME/$src" "$snap"; then
