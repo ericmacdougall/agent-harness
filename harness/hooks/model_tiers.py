@@ -230,6 +230,61 @@ def reviewer_for(policy, author_rung, author_harness='unknown', available=None):
     return {**spec, 'author_unknown': author_unknown, 'cross_harness': cross, 'why': why + '; ' + note}
 
 
+# goodqa#17129 (Eric, answer:1eaed05e-9884-44ca-a537-09a25d215e7c/1c875d08-df35-421b-90e6-8f0667464a40): while the
+# cross-harness primary (Codex) is down, a same-harness Claude PASS at a strictly higher rung may authorize a merge.
+# Reasons a primary counts as down: its own terminal QUOTA or AUTH refusal, or a CLI/model that is unavailable.
+PRIMARY_OUTAGE_REASONS = {'QUOTA', 'AUTH', 'TRANSIENT_INFRA'}
+_RUNG = re.compile(r'R([0-9]{1,2})')
+
+
+def _rung_number(value):
+    match = _RUNG.fullmatch(value) if isinstance(value, str) else None
+    return int(match.group(1)) if match else None
+
+
+def review_independence(review, routing, run_id, *, allow_same_harness=True):
+    """THE decision on whether a PR PASS is independent enough to authorize a merge: None when it is, else a one-line
+    reason (shown as "PASS not merge-eligible: <reason>"). Callers: peer_review.review_merge_eligible, before FINAL
+    exists, and merge_gate.pr_pass_evidence, from the sha-bound FINAL. Pure: it reads only the mappings it is given.
+
+    A different harness from the author is always independent. The same harness is independent only when ALL hold:
+    Claude authored and Claude reviewed; the reviewer rung is strictly above a known author rung; this run's own
+    record shows the cross-harness primary (Codex) was unavailable and the Claude step ran as its fallback; and that
+    record names this run. The record is written only from the provider attempt loop, never from a flag or the
+    packet, and rides inside FINAL, which the usage store binds by sha256."""
+    author, reviewer = review.get('author_harness'), review.get('reviewer_harness')
+    if author not in ('claude', 'openai'):
+        return 'author harness unknown'
+    if reviewer not in ('claude', 'openai'):
+        return 'reviewer harness unknown'
+    if author != reviewer:
+        return None
+    if not allow_same_harness:
+        return 'same harness as author'
+    none = 'same harness as author and no recorded fallback'
+    if author != 'claude':
+        return 'same harness as author (only Claude-authored work may use a Claude fallback review)'
+    record = review.get('primary_unavailable')
+    if not isinstance(record, dict):
+        return none
+    if (set(record) != {'run_id', 'provider', 'reason', 'basis'} or record.get('provider') != 'codex'
+            or record.get('reason') not in PRIMARY_OUTAGE_REASONS or record.get('basis') not in ('structured', 'prose')):
+        return 'same harness as author and the recorded fallback is not a Codex outage'
+    if not isinstance(run_id, str) or not run_id or record.get('run_id') != run_id:
+        return 'same harness as author and the recorded fallback belongs to a different run'
+    routing = routing if isinstance(routing, dict) else {}
+    order = routing.get('attempt_order')
+    if not (isinstance(order, list) and order[:1] == ['codex'] and routing.get('actual_reviewer') == 'claude'):
+        return 'same harness as author and the run did not fall back from Codex to Claude'
+    author_rung, reviewer_rung = _rung_number(review.get('author_rung')), _rung_number(review.get('reviewer_rung'))
+    if author_rung is None:
+        return ('same harness as author and the author rung is unknown (give --task or --author-rung, or commit with a '
+                'Co-Authored-By: Claude Sonnet trailer)')
+    if reviewer_rung is None or reviewer_rung <= author_rung:
+        return 'same harness as author and the reviewer rung is not above the author rung'
+    return None
+
+
 def next_rung_above(policy, rung):
     order = rung_order(policy)
     position = order.index(rung)

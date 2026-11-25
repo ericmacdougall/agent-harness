@@ -1456,7 +1456,8 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                 # The pool refused its lease before any call: nothing ran, so the one authorised independent fallback
                 # cannot lose or duplicate work. The reserved pool itself is left exactly as it is.
                 holder = error.holder if isinstance(error.holder, str) and RUN_ID.fullmatch(error.holder) else None
-                outcome.update(lease_refused=True, holder=holder, fallback_allowed=provider == primary)
+                outcome.update(lease_refused=True, holder=holder, fallback_allowed=provider == primary,
+                               lease_kind=getattr(error, 'kind', 'active'))
                 if holder:
                     base = 'python3 ~/.claude/hooks/usage_guard.py reconcile --run ' + holder
                     local_detail = diagnostics.sanitize(
@@ -1487,6 +1488,15 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
             return source, stage_report(stage, outcome['report']), failure
         if len(order) == 1 or provider != primary or not outcome['fallback_allowed']:
             raise ReviewFailure(outcome, source)
+        if (provider == 'codex' and outcome['reason'] in tiers.PRIMARY_OUTAGE_REASONS
+                and (not outcome.get('lease_refused') or outcome.get('lease_kind') == 'cooldown')):
+            # goodqa#17129: the only writer of the outage record. It comes from this run's own provider outcome, never
+            # from an argument or the packet; a reserved pool is not an outage. `basis` says whether the provider
+            # sent a structured refusal (cooldown placed, or the harness's own unavailable marker) or only prose.
+            options['primary_unavailable'] = {
+                'run_id': getattr(run_record, 'run_id', None), 'provider': 'codex', 'reason': outcome['reason'],
+                'basis': 'structured' if (outcome['reason'] == 'TRANSIENT_INFRA' or outcome['account_cooldown']
+                                          or outcome.get('lease_kind') == 'cooldown') else 'prose'}
         if outcome.get('lease_refused'):
             failure = ('Primary reviewer pool is reserved%s (no provider was launched); used authorized independent '
                        'fallback.' % (' by run ' + outcome['holder'] if outcome.get('holder') else ''))
@@ -1601,6 +1611,27 @@ def commit_author_harness(repo, base):
     return found.pop() if len(found) == 1 else 'unknown'
 
 
+MODEL_TRAILER = re.compile(r'\bclaude[ -](sonnet|opus|haiku|fable)\b', re.I)
+
+
+def commit_author_rung(repo, base):
+    """'R0' when every commit in base..HEAD carries a Co-Authored-By trailer naming a Claude Sonnet model, else None.
+    Only Sonnet maps to one rung whatever its effort; Opus spans R1 to R4 by effort and the trailer does not say which,
+    so it proves no rung. Like the author harness, this is the author's own trailer: evidence, not proof."""
+    try:
+        text = git(repo, 'log', '--max-count=500', '--format=%B%x00', (base + '..HEAD') if base else 'HEAD')
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    commits = [body for body in text.split('\0') if body.strip()]
+    if not commits:
+        return None
+    for body in commits:
+        names = {m.lower() for t in AUTHOR_TRAILER.findall(body) for m in MODEL_TRAILER.findall(t)}
+        if names != {'sonnet'}:
+            return None
+    return 'R0'
+
+
 def pr_base(repo, base):
     if base:
         return base
@@ -1612,14 +1643,28 @@ def pr_base(repo, base):
     return None
 
 
-def review_merge_eligible(args, binding, report, selection):
-    """Only a pure PR PASS with a known different-harness reviewer may auto-authorize."""
-    return bool(args.stage == 'pr' and binding and getattr(args, 'main_stamp', None)
-                and args.author_harness in {'claude', 'openai'}
-                and selection.get('harness') in {'claude', 'openai'}
-                and selection['harness'] != args.author_harness
-                and re.match(r'^VERDICT: PASS(?:\s|$)', report.strip())
-                and finding_ids(report) == ['UNSPECIFIED'] and 'TICKETED:' not in report)
+def merge_eligibility(args, binding, report, selection, review=None, routing=None, run_id=None):
+    """None when this review may authorize a merge, else the one-line reason (goodqa#17129). The independence part is
+    model_tiers.review_independence, the same function merge_gate.pr_pass_evidence applies to the settled FINAL.
+    `review` is the metadata being written into FINAL; without it the review is built from args and selection, which
+    carry no fallback record, so a same-harness reviewer is refused."""
+    if args.stage != 'pr':
+        return 'not a PR review'
+    if not binding:
+        return 'no --github-repo/--pr binding'
+    if not getattr(args, 'main_stamp', None):
+        return 'no main-agent stamp'
+    if not (re.match(r'^VERDICT: PASS(?:\s|$)', report.strip()) and finding_ids(report) == ['UNSPECIFIED']
+            and 'TICKETED:' not in report):
+        return 'verdict is not a pure PASS'
+    review = review if review is not None else {'author_harness': args.author_harness,
+                                                'reviewer_harness': selection.get('harness')}
+    return tiers.review_independence(review, routing, run_id)
+
+
+def review_merge_eligible(args, binding, report, selection, review=None, routing=None, run_id=None):
+    """Only a pure PR PASS that review_independence accepts may auto-authorize."""
+    return merge_eligibility(args, binding, report, selection, review, routing, run_id) is None
 
 
 FOLLOW_UP_LINE = re.compile(r'^follow-up:[ \t]*(.+)$', re.I | re.M)
@@ -2106,6 +2151,7 @@ def main() -> int:
             print('Note: the reviewed commits do not prove the author harness (%s); this review cannot authorize '
                   'a merge.' % evidenced, file=sys.stderr)
         args.author_harness = evidenced
+        args.evidenced_rung = commit_author_rung(repo, pr_base(repo, args.base))
     stage_rules = (
         "Planning gate: judge the proposed design, acceptance criteria, edge cases, test strategy, "
         "and rollout/rollback plan. You may read repository context. Do not BLOCK solely for an "
@@ -2133,6 +2179,10 @@ def main() -> int:
             author_rung = ladder.Ledger(policy=policy).status(args.task)['rung']
         except (ladder.LedgerError, tiers.TierError):
             author_rung = None
+    if author_rung is None:
+        # goodqa#17129: neither a flag nor a ledger task named the rung (PR 33 of private-lessons-host ran this way),
+        # so use the only rung the commits prove: every commit co-authored by a Sonnet model is R0.
+        author_rung = getattr(args, 'evidenced_rung', None)
     # Availability uses the launch's own trust-checked discovery, so a CLI found only at a policy location counts
     # and a binary inside the reviewed repo does not.
     providers = ('codex',) if args.reviewer == 'codex-only' else diagnostics.PROVIDERS
@@ -2386,6 +2436,12 @@ def main() -> int:
                                    reviewer=source,
                                    reviewer_harness=options.get('reviewer_harness', 'unknown'),
                                    author_harness=args.author_harness)
+            if author_rung in policy['rungs']:
+                review_metadata['author_rung'] = author_rung
+            if selection.get('rung') in policy['rungs']:
+                review_metadata['reviewer_rung'] = selection['rung']
+            if options.get('primary_unavailable') and options.get('reviewer_harness') == 'claude':
+                review_metadata['primary_unavailable'] = options['primary_unavailable']
             if binding:
                 review_metadata.update(binding)
             if base and base != before[0]:
@@ -2419,7 +2475,9 @@ def main() -> int:
               'Usage receipt: ' + json.dumps(reference, sort_keys=True), flush=True)
         announced = True
         actual_selection = dict(selection, harness=options.get('reviewer_harness', 'unknown'))
-        authorize_review = review_merge_eligible(args, binding, report, actual_selection)
+        not_eligible = merge_eligibility(args, binding, report, actual_selection, review_metadata,
+                                         routing_evidence(options), run_record.run_id)
+        authorize_review = not_eligible is None
     except (OSError, subprocess.TimeoutExpired, GuardError) as error:
         if run_record is not None and not finalized:
             try:
@@ -2442,6 +2500,15 @@ def main() -> int:
                     store.invalidate_review(reference, reason='Review publication did not complete')
                 except (OSError, GuardError):
                     print('Review settlement could not be invalidated; reconciliation is required.', file=sys.stderr)
+    if announced and not authorize_review and not_eligible and binding and re.match(r'^VERDICT: PASS\b', report.lstrip()):
+        # goodqa#17129: a PASS that cannot authorize says why, here and (as an advisory note) at merge_gate.
+        print('PASS not merge-eligible: ' + not_eligible, file=sys.stderr)
+        try:
+            import merge_gate
+            merge_gate.note_review_refusal(merge_gate.default_state_dir(), binding['repo'], binding['pr'], before[0],
+                                           not_eligible)
+        except (OSError, ValueError, ImportError):
+            pass
     if announced and authorize_review:
         import merge_gate
         try:
