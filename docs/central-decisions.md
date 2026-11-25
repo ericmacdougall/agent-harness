@@ -84,6 +84,10 @@ A retraction typed in a different session does not revoke automatically; use `ah
 
 ## Consumers
 
+Local approvals live in one store, `~/.agent-harness/approvals.jsonl` ([approvals.md](approvals.md)). A central
+decision is the signed cross-host copy of one top-rung permission; it is not a second local store. `tier_gate.py`
+reads the ledger permission, then a `top-rung` approval in that store, then a central decision.
+
 - `tier_gate.py` treats a verified central decision as the task's recorded permission. It applies only where the local permission is read for launches: the Agent spawn (family fable) and the Bash launch and climbed-rung checks (fable or astra by model). Reviewers are excluded, because `peer_review.py` honours only local permissions. The rung ceiling is unchanged, and nothing is written into the escalation state. All ledger reads of one hook run share one 6 s budget inside the hook's 10 s timeout, and the hook blocks on failure.
 - The T2Scan Claude adapter (`cli/adapters/claude-assessment.py`) uses the central path only when the approval task has no local escalation record. Both paths pass one check, `enforce_assent`:
   - the caller's freshness cap (for example the launcher's `top_assent_max_age_seconds`);

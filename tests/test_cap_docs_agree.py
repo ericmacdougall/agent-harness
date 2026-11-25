@@ -1,5 +1,5 @@
 """GoodQA #15565: install.py renders CLAUDE.md from HARNESS.md, so a stale number there silently reverted the user's owner cap.
-HARNESS.md, codex/AGENTS.md and model_tiers.json must all state the same owner cap."""
+HARNESS.md and codex/AGENTS.md must state the one owner cap, resource_limits.json max_live_owners."""
 
 import json
 import re
@@ -11,10 +11,10 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class CapDocsAgree(unittest.TestCase):
     def cap(self):
-        return json.loads((ROOT / "harness" / "hooks" / "model_tiers.json").read_text())["caps"]["session_owner_agents"]
+        return json.loads((ROOT / "harness" / "hooks" / "resource_limits.json").read_text())["max_live_owners"]
 
-    def test_the_users_cap_is_eight(self):
-        self.assertEqual(self.cap(), 8)  # user, 2026-11-09: raised from 4 to 8
+    def test_the_users_cap_is_sixteen(self):
+        self.assertEqual(self.cap(), 16)  # the user: "up to 16 live owners per session"
 
     def test_harness_md_states_the_policy_cap(self):
         text = (ROOT / "HARNESS.md").read_text()
@@ -27,10 +27,6 @@ class CapDocsAgree(unittest.TestCase):
         found = re.search(r"owner cap \((\d+) live owners", text)
         self.assertTrue(found, "codex/AGENTS.md must state the owner cap")
         self.assertEqual(int(found.group(1)), self.cap())
-
-    def test_live_agent_cap_covers_the_owners_plus_helpers(self):
-        caps = json.loads((ROOT / "harness" / "hooks" / "model_tiers.json").read_text())["caps"]
-        self.assertGreaterEqual(caps["session_live_agents"], 2 * caps["session_owner_agents"])
 
 
 if __name__ == "__main__":

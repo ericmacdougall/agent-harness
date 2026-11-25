@@ -334,14 +334,30 @@ SAFE_REMOTE_PATH = re.compile(r"[A-Za-z0-9._/~+@%=,-]{1,1024}")
 COMPRESSED = re.compile(r"\.(?:t?gz|bz2|tbz2?|xz|txz|zst|lz4|lzma|z)$", re.I)
 
 
-def copy_threshold_bytes() -> int:
-    value = 1.0
+_LIMITS_CACHE = {}
+
+
+def _limit(key, default):
+    """Cached per process: one hook run reads the limits files once, however many copy segments a line holds."""
+    if key not in _LIMITS_CACHE:
+        _LIMITS_CACHE[key] = _read_limit(key, default)
+    return _LIMITS_CACHE[key]
+
+
+def _read_limit(key, default):
+    """resource_budget.limit: the repo default, loosened freely or tightened only by the owner or a supervisor
+    (`ah limits set`); heavy_job_guard.json numbers count as an unsigned local value. The hook process's own
+    environment (HARNESS_*, the owner's launch environment) still applies after it."""
     try:
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "heavy_job_guard.json")
-        if os.path.exists(path):
-            value = float(load_json_file(path).get("copy_gib", value))
-    except Exception:
-        pass
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import resource_budget  # noqa: PLC0415
+        return resource_budget.limit(key)
+    except Exception:  # noqa: BLE001 - a partial install keeps the code default
+        return default
+
+
+def copy_threshold_bytes() -> int:
+    value = float(_limit("copy_gib", 1.0))
     env = os.environ.get("HARNESS_COPY_GIB", "")
     if re.fullmatch(r"[0-9]{1,4}(?:\.[0-9]{1,3})?", env):
         value = float(env)
@@ -2112,18 +2128,10 @@ def live_heavy_jobs() -> int:
 
 
 def max_heavy_jobs() -> int:
-    value = 2
     env = os.environ.get("HARNESS_MAX_HEAVY_MAC", "")
     if re.fullmatch(r"[0-9]{1,6}", env) and int(env) > 0:
         return int(env)
-    try:
-        import json
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resource_limits.json")
-        if os.path.exists(path):
-            value = int(load_json_file(path).get("max_heavy_mac", value))
-    except Exception:  # incl. safe_input.InputRejected (FIFO, device, oversize): keep defaults
-        pass
-    return value
+    return int(_limit("max_heavy_mac", 2))
 
 
 def log_event(record: dict) -> None:
@@ -2185,15 +2193,8 @@ def hatch_limit() -> int:
     env = os.environ.get("HARNESS_HATCH_PER_HOUR", "")
     if re.fullmatch(r"[0-9]{1,4}", env) and int(env) > 0:
         return int(env)
-    try:
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "heavy_job_guard.json")
-        if os.path.exists(path):
-            value = int(load_json_file(path).get("hatch_per_hour", 1))
-            if value > 0:
-                return value
-    except Exception:
-        pass
-    return 1
+    value = int(_limit("hatch_per_hour", 1))
+    return value if value > 0 else 1
 
 
 def owner_of(payload: dict) -> str:

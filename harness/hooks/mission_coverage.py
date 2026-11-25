@@ -1596,7 +1596,12 @@ def policy():
 
 
 def owner_cap():
-    cap = (policy().get("caps") or {}).get("session_owner_agents")
+    """The one owner cap (resource_budget.owner_cap, resource_limits.json max_live_owners); None when unreadable."""
+    try:
+        import resource_budget  # noqa: PLC0415
+        cap = resource_budget.owner_cap()["max"]
+    except Exception:  # noqa: BLE001 - a partial install: no cap advice
+        return None
     return int(cap) if isinstance(cap, int) and cap > 0 else None
 
 

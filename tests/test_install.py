@@ -174,7 +174,7 @@ class InstallerTests(unittest.TestCase):
         for group in (heavy, gate):  # fail-open: a guard bug must never block every Bash or Agent call
             self.assertNotIn("onFailure", group["hooks"][0])
         limits = json.loads((self.claude / "hooks" / "resource_limits.json").read_text())
-        self.assertEqual((limits["warn_agents"], limits["max_agents"]), (12, 20))
+        self.assertEqual((limits["max_live_owners"], limits["enforce"]), (16, False))  # the one owner cap
         before = (self.claude / "settings.json").read_bytes()
         hook_bytes = {n: (self.claude / "hooks" / n).read_bytes() for n in ("heavy_job_guard.py", "agent_gate.py")}
         install(self.home, apply=True)  # second run changes nothing

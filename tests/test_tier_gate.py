@@ -402,6 +402,64 @@ class BashAdvisory(GateFixture):
 
 
 class ModesAndCap(GateFixture):
+    def _to_r5(self, task):
+        self.policy = {**self.policy, 'ladder_limits': {'max_review_launches': 100, 'max_rung_climbs': 10, 'max_total_review_usd': 1000}}
+        self.ledger = esc.Ledger(self.root, self.policy)
+        for _ in range(4): self.escalate(task)
+        self.assertEqual(self.ledger.status(task)['rung'], 'R5')
+
+    def _approvals_home(self):
+        import ah_approvals  # noqa: PLC0415
+        home = Path(self.temp.name) / 'ahhome'; home.mkdir(exist_ok=True)
+        patcher = mock.patch.dict(os.environ, {'AH_HOME': str(home)}); patcher.start(); self.addCleanup(patcher.stop)
+        return ah_approvals, home
+
+    def test_a_supervisors_top_rung_approval_is_honoured_inside_its_project(self):
+        import ah_roles  # noqa: PLC0415
+        self._to_r5('k-sup')
+        ap, home = self._approvals_home()
+        project = Path(self.temp.name) / 'proj'; project.mkdir()
+        session = '11111111-2222-3333-4444-555555555555'
+        ah_roles.set_supervisor(session, [str(project)], home=home)
+        data = lambda cwd: {'tool_name': 'Agent', 'session_id': 's1', 'cwd': cwd,
+                            'tool_input': {'prompt': 'do it [task:k-sup]', 'description': 'owner', 'subagent_type': 'task-owner', 'model': 'fable'}}
+        self.assertEqual(gate.decide_spawn(data(str(project)), self.policy, self.ledger, session_id='s1')[0], 'deny')
+        ap.grant('top-rung', {'task': 'k-sup', 'project': str(project)}, 'supervisor:' + session, 'supervisor', home=home)
+        decision, reason, _, facts = gate.decide_spawn(data(str(project / 'sub')), self.policy, self.ledger, session_id='s1')
+        self.assertEqual(decision, 'allow', reason); self.assertIn('approval', facts)
+        other = Path(self.temp.name) / 'elsewhere'; other.mkdir()
+        self.assertEqual(gate.decide_spawn(data(str(other)), self.policy, self.ledger, session_id='s1')[0], 'deny')
+        # another task is never covered
+        self._to_r5('k-sup2')
+        data2 = data(str(project)); data2['tool_input'] = dict(data2['tool_input'], prompt='do it [task:k-sup2]')
+        self.assertEqual(gate.decide_spawn(data2, self.policy, self.ledger, session_id='s1')[0], 'deny')
+
+    def test_a_granted_reviewer_above_its_target_is_allowed_not_warned(self):
+        ap, home = self._approvals_home()
+        decision, reason, _, _ = self.spawn('review [task:k-rev-grant]', model='fable', effort='high', subagent_type='reviewer')
+        self.assertEqual(decision, 'deny'); self.assertIn('approve-top', reason)  # no grant: the user's stop
+        ap.grant('top-rung', {'task': 'k-rev-grant'}, 'user', 'reviewer at the top rung', home=home)
+        decision, reason, updated, _ = self.spawn('review [task:k-rev-grant]', model='fable', effort='high', subagent_type='reviewer')
+        self.assertEqual((decision, updated), ('allow', None), reason)
+
+    def test_click_testers_and_read_only_helpers_are_outside_the_ladder(self):
+        self.escalate('k-ct'); self.escalate('k-ct')  # R2 author: a sonnet click-tester used to be "below the rung"
+        for helper in ('click-tester', 'Explore', 'Plan'):
+            decision, reason, updated, facts = self.spawn('test it [task:k-ct]', model='sonnet', subagent_type=helper)
+            self.assertEqual((decision, updated), ('allow', None), (helper, reason))
+            self.assertTrue(facts.get('ladder_free'))
+        decision, reason, _, _ = self.spawn('test it [task:k-ct]', model='fable', subagent_type='click-tester')
+        self.assertEqual(decision, 'deny'); self.assertIn('approve-top', reason)  # the top rung still needs the user
+        # fixer writes code and red-team follows the reviewer rung: both stay on the ladder
+        self.assertEqual(self.spawn('fix it [task:k-ct]', model='sonnet', subagent_type='fixer')[0], 'deny')
+        self.assertEqual(self.spawn('review [task:k-ct]', model='sonnet', subagent_type='red-team')[0], 'deny')
+
+    def test_click_tester_spawn_in_warn_mode_says_nothing(self):
+        self.escalate('k-ct2'); self.escalate('k-ct2')
+        data = {'tool_name': 'Agent', 'tool_input': {'prompt': 'test [task:k-ct2]', 'model': 'sonnet',
+                                                     'subagent_type': 'click-tester'}, 'session_id': 's'}
+        self.assertIsNone(self.run_hook(data, 'warn'))
+
     def run_hook(self, data, mode):
         policy = dict(self.policy); policy['mode'] = mode
         path = Path(self.temp.name) / 'tiers.json'; path.write_text(json.dumps(policy))
@@ -445,15 +503,17 @@ class ModesAndCap(GateFixture):
         out = json.loads(spawn.stdout)['hookSpecificOutput']
         self.assertIn('ladder state unusable', out.get('additionalContext', '') + out.get('permissionDecisionReason', ''))
 
-    def test_live_agent_cap_counts_starts_and_stops(self):
-        cap = int(self.policy['caps']['session_live_agents'])
-        for n in range(cap):
-            gate.live_update('s2', 'agent-%d' % n, start=True, agent_type='fixer')  # helpers: the owner cap stays out of this test
-        self.assertEqual(gate.live_count('s2'), cap)
-        data = {'tool_name': 'Agent', 'tool_input': {'prompt': 'x [task:k11]', 'model': 'sonnet'}, 'session_id': 's2'}
-        self.assertEqual(self.run_hook(data, 'enforce')['permissionDecision'], 'deny')
+    def test_live_map_counts_starts_and_stops_but_the_spawn_hook_never_caps_all_agents(self):
+        # One cap (agent_gate.py, max_live_owners): tier_gate keeps the live map for live_owner_ids, and no longer
+        # denies or warns on a count of every agent (helpers included).
+        for n in range(30):
+            gate.live_update('s2', 'agent-%d' % n, start=True, agent_type='fixer')
+        self.assertEqual(gate.live_count('s2'), 30)
         gate.live_update('s2', 'agent-0', start=False)
+        self.assertEqual(gate.live_count('s2'), 29)
+        data = {'tool_name': 'Agent', 'tool_input': {'prompt': 'x [task:k11]', 'model': 'sonnet'}, 'session_id': 's2'}
         self.assertIsNone(self.run_hook(data, 'enforce'))  # matching rung, nothing to say
+        self.assertIsNone(self.run_hook(data, 'warn'))
 
 
 if __name__ == '__main__':

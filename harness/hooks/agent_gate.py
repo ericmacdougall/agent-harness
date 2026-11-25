@@ -1,29 +1,31 @@
 #!/usr/bin/env python3
-"""PreToolUse(Agent|Task) concurrency gate: cap live subagents per session.
+"""PreToolUse(Agent|Task|Workflow): the one owner cap per session.
 
-Counts live agents from the session WAL (plus slot reservations for spawns whose start record has not landed yet,
-taken under flock so a burst of parallel spawns cannot all see zero live): an agent is live when it has a `subagent`
-record, no `subagent_stop`, and its WAL showed activity inside LIVE_WINDOW_S (the stop
-hook does not fire for every agent, so recent activity is the liveness signal).
-Thresholds live in resource_limits.json beside this file: warn at {"warn_agents": 12} concurrent agents
-(advisory context, the spawn proceeds) and deny at {"max_agents": 20}. HARNESS_MAX_AGENTS overrides the deny limit.
-The denial tells the caller to queue the work or move it to dev2 (where heavy jobs
-belong). Fails OPEN on any error; register WITHOUT onFailure=block. Only acts on macOS
-(HARNESS_HEAVY_GUARD_FORCE=1 overrides for tests). Stdlib only, Python 3.9 compatible.
+The number is resource_budget.owner_cap() (resource_limits.json `max_live_owners`, default 16; `ah limits show`).
+Only owners count: a spawn of a helper type (reviewers, click-testers, fixers, Explore, Plan, ... from
+model_tiers.json caps.helper_types) is never counted and never warned about. Live owners come from the session WAL:
+a `subagent` record of an owner type, no `subagent_stop`, and WAL activity inside LIVE_WINDOW_S; owner spawns whose
+start record has not landed yet hold a slot reservation (taken under flock, so a burst of parallel spawns cannot all
+see zero live).
+
+At the cap: a short advisory naming the count, and the spawn proceeds. With `"enforce": true` the spawn is denied.
+Fails OPEN on any error; register WITHOUT onFailure=block. Only acts on macOS (HARNESS_HEAVY_GUARD_FORCE=1 overrides
+for tests). Stdlib only, Python 3.9 compatible.
 """
 from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 import uuid
 from datetime import datetime, timezone
 
-DEFAULT_MAX_AGENTS = 20  # deny; the replay of a real session showed 8 would block legitimate parallel owners
-DEFAULT_WARN_AGENTS = 12
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 LIVE_WINDOW_S = 600
-RESERVE_TTL_S = 120  # a spawn is reserved here until its `subagent` start record appears (burst safety)
+RESERVE_TTL_S = 120  # an owner spawn is reserved here until its `subagent` start record appears (burst safety)
+HELPER_TYPES_DEFAULT = ("red-team", "click-tester", "reviewer", "fixer", "Explore", "Plan", "claude-code-guide",
+                        "statusline-setup")
 
 
 def load_json_file(path):
@@ -47,30 +49,44 @@ def jsonl_records(path):
         return
 
 
-def limits():
-    """(warn, deny) thresholds from resource_limits.json; the file wins over code defaults."""
-    warn_at, deny_at = DEFAULT_WARN_AGENTS, DEFAULT_MAX_AGENTS
+def cap():
+    """(max live owners, enforce) from resource_budget.owner_cap(), the one owner cap."""
     try:
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resource_limits.json")
-        if os.path.exists(path):
-            data = load_json_file(path)
-            deny_at = int(data.get("max_agents", deny_at))
-            warn_at = int(data.get("warn_agents", warn_at))
-    except Exception:  # incl. safe_input.InputRejected (FIFO, device, oversize): keep defaults
+        import resource_budget
+        found = resource_budget.owner_cap()
+        return int(found["max"]), bool(found["enforce"])
+    except Exception:  # noqa: BLE001 - a partial install: the shipped default, advisory only
+        return 16, False
+
+
+def helper_types():
+    try:
+        data = load_json_file(os.path.join(os.path.dirname(os.path.abspath(__file__)), "model_tiers.json"))
+        found = (data.get("caps") or {}).get("helper_types")
+        if isinstance(found, list) and all(isinstance(t, str) for t in found):
+            return tuple(found)
+    except Exception:  # noqa: BLE001
         pass
-    env = os.environ.get("HARNESS_MAX_AGENTS", "")
-    if re.fullmatch(r"[0-9]{1,6}", env) and int(env) > 0:  # ASCII digits only: "²" must not raise
-        deny_at = int(env)
-    return min(warn_at, deny_at), deny_at
+    return HELPER_TYPES_DEFAULT
+
+
+def is_helper(agent_type, helpers=None) -> bool:
+    """A known helper type. The WAL stores types through wal.safe_id, which writes "Explore" as "z-explore-<hash>"."""
+    value = str(agent_type or "")
+    for helper in helpers or helper_types():
+        if value == helper or value.startswith("z-" + helper.lower() + "-"):
+            return True
+    return False
 
 
 def _ts(text):
     return datetime.fromisoformat(text).timestamp()
 
 
-def live_agents(wal_dir: str, now: float, window: float = LIVE_WINDOW_S):
-    """Ids of agents started, not stopped, and active within `window` seconds before `now`."""
+def live_owners(wal_dir: str, now: float, window: float = LIVE_WINDOW_S, helpers=None):
+    """Ids of owner-type agents started, not stopped, and active within `window` seconds before `now`."""
     started, stopped, last = {}, set(), {}
+    helpers = helpers or helper_types()
     for name in os.listdir(wal_dir):
         path = os.path.join(wal_dir, name)
         if name == "main.jsonl" or (name.startswith("agent-") and name.endswith(".jsonl")):
@@ -84,7 +100,7 @@ def live_agents(wal_dir: str, now: float, window: float = LIVE_WINDOW_S):
                 agent = record.get("agent_id")
                 if not agent:
                     continue
-                if record.get("event") == "subagent":
+                if record.get("event") == "subagent" and not is_helper(record.get("agent_type"), helpers):
                     started.setdefault(agent, at)
                 elif record.get("event") == "subagent_stop":
                     stopped.add(agent)
@@ -92,13 +108,17 @@ def live_agents(wal_dir: str, now: float, window: float = LIVE_WINDOW_S):
     return sorted(a for a, t in started.items() if a not in stopped and now - last.get(a, t) <= window)
 
 
-def recent_starts(wal_dir: str, now: float, window: float):
+live_agents = live_owners  # old name, kept for callers and tests
+
+
+def recent_owner_starts(wal_dir: str, now: float, window: float, helpers=None):
     count = 0
-    path = os.path.join(wal_dir, "main.jsonl")
+    helpers = helpers or helper_types()
     try:
-        for record in jsonl_records(path):
+        for record in jsonl_records(os.path.join(wal_dir, "main.jsonl")):
             try:
-                if record.get("event") == "subagent" and now - window <= _ts(record["at"]) <= now:
+                if record.get("event") == "subagent" and not is_helper(record.get("agent_type"), helpers) \
+                        and now - window <= _ts(record["at"]) <= now:
                     count += 1
             except (ValueError, KeyError, TypeError, AttributeError):
                 continue
@@ -107,10 +127,9 @@ def recent_starts(wal_dir: str, now: float, window: float):
     return count
 
 
-def reserve(session_id: str, now: float, state_root: str, wal_dir: str, live: int, ceiling: int):
-    """Atomically count + reserve a slot (flock), so a burst of parallel spawns cannot all see 'zero live'.
-    Reservations not yet matched by a start record count as live; the same applies to agent types that never
-    write start records (general-purpose, Explore, Plan) for RESERVE_TTL_S after spawn."""
+def reserve(session_id: str, now: float, state_root: str, wal_dir: str, live: int, ceiling: int, take: bool = True):
+    """Count live owners plus unmatched reservations under flock, and reserve a slot for this spawn when `take` and
+    there is room. Returns the count before this spawn."""
     import fcntl
     slot_dir = os.path.join(state_root, "agent-slots", os.path.basename(session_id))
     os.makedirs(slot_dir, mode=0o700, exist_ok=True)
@@ -131,47 +150,47 @@ def reserve(session_id: str, now: float, state_root: str, wal_dir: str, live: in
                         pass
                 else:
                     slots.append(path)
-        unmatched = max(0, len(slots) - recent_starts(wal_dir, now, RESERVE_TTL_S))
+        unmatched = max(0, len(slots) - recent_owner_starts(wal_dir, now, RESERVE_TTL_S))
         total = live + unmatched
-        if total >= ceiling:
-            return total
-        fd = os.open(os.path.join(slot_dir, f"slot-{int(now * 1000)}-{os.getpid()}-{uuid.uuid4().hex[:8]}"), os.O_CREAT | os.O_WRONLY, 0o600)
-        os.close(fd)
+        if take and total < ceiling:
+            fd = os.open(os.path.join(slot_dir, f"slot-{int(now * 1000)}-{os.getpid()}-{uuid.uuid4().hex[:8]}"),
+                         os.O_CREAT | os.O_WRONLY, 0o600)
+            os.close(fd)
         return total
 
 
-def decide(session_id: str, now: float = None, wal_root: str = None, max_agents: int = None, state_root: str = None,
-           warn_agents: int = None):
+def decide(session_id: str, now: float = None, wal_root: str = None, max_owners: int = None, state_root: str = None,
+           subagent_type: str = "", enforce: bool = None):
+    """{"action": allow|warn|deny, "live": n, "max": cap, "message"?}. warn is the advisory at the cap; deny only
+    with enforce. A helper spawn is always a silent allow."""
+    if is_helper(subagent_type):
+        return {"action": "allow", "live": None, "helper": True}
     now = now if now is not None else datetime.now(timezone.utc).timestamp()
     root = wal_root or os.path.join(os.path.expanduser("~"), ".claude", "wals")
     wal_dir = os.path.join(root, os.path.basename(session_id))
-    warn_at, ceiling = limits()
-    ceiling = max_agents or ceiling
-    warn_at = warn_agents if warn_agents is not None else min(warn_at, ceiling)
-    live_ids = live_agents(wal_dir, now) if os.path.isdir(wal_dir) else []
+    ceiling, enforcing = cap()
+    ceiling = max_owners or ceiling
+    enforcing = enforcing if enforce is None else enforce
+    live = len(live_owners(wal_dir, now)) if os.path.isdir(wal_dir) else 0
     state = state_root or os.path.join(os.path.expanduser("~"), ".agent-harness", "state")
     try:
-        total = reserve(session_id, now, state, wal_dir, len(live_ids), ceiling)
+        total = reserve(session_id, now, state, wal_dir, live, ceiling)
     except OSError:
-        total = len(live_ids)  # cannot reserve: fall back to the plain count (still fails open on errors)
-    live = list(range(total))
-    if total >= ceiling:
+        total = live  # cannot reserve: the plain count (still fails open on errors)
+    if total < ceiling:
+        return {"action": "allow", "live": total, "max": ceiling}
+    if enforcing:
         return {"action": "deny", "live": total, "max": ceiling,
-                "message": (f"Agent gate: {total} agents are already live in this session (limit {ceiling}). Queue this work "
-                            "until one finishes, resume an existing owner with SendMessage instead of spawning, or move heavy "
-                            "work to dev2. The Mac is the fragile host: unbounded fan-out reset it on 2026-11-04.")}
-    if total >= warn_at:
-        return {"action": "warn", "live": total, "max": ceiling,
-                "message": (f"Agent gate (warning): {total} agents are live in this session (deny at {ceiling}). Prefer resuming an "
-                            "existing owner with SendMessage, queue independent work, and run heavy jobs on dev2.")}
-    return {"action": "allow", "live": total}
+                "message": (f"Owner cap: {total} live owners in this session (cap {ceiling}, enforced). Route this work to "
+                            "the owner that holds its stream (SendMessage), or queue it on a ticket.")}
+    return {"action": "warn", "live": total, "max": ceiling,
+            "message": f"Owner cap: {total} live owners in this session (cap {ceiling}); this spawn proceeds."}
 
 
 def main() -> int:
     if sys.platform != "darwin" and os.environ.get("HARNESS_HEAVY_GUARD_FORCE") != "1":
         return 0
     try:
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import safe_input
         try:
             payload = safe_input.safe_json_loads(safe_input.read_stdin_bounded(8 * 1024 * 1024), max_depth=100,
@@ -183,7 +202,8 @@ def main() -> int:
         session = payload.get("session_id")
         if not isinstance(session, str) or not session:
             return 0
-        result = decide(session)
+        tool_input = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
+        result = decide(session, subagent_type=str(tool_input.get("subagent_type") or ""))
         if result["action"] == "deny":
             sys.stderr.write(result["message"] + "\n")
             return 2

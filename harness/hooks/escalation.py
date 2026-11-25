@@ -1427,8 +1427,9 @@ def verify_top_source(source, allow_env_root=False, max_age_seconds=TOP_ASSENT_M
 def approve_fix(task, wal=None):
     """The exact command that records a top-rung permission in one step (scenario B24)."""
     hooks = Path(__file__).resolve().parent
-    return ('python3 %s approve-top --task %s --user-msg <id from `python3 %s user-msg --recent 3`> --wal %s'
-            % (hooks / 'ah.py', task or '<task>', hooks / 'ah.py', wal or '<main WAL>'))
+    return ('python3 %s approve-top --task %s --user-msg <id from `python3 %s user-msg --recent 3`> --wal %s '
+            '(a supervisor session: python3 %s approve top-rung --task %s --project <dir>)'
+            % (hooks / 'ah.py', task or '<task>', hooks / 'ah.py', wal or '<main WAL>', hooks / 'ah.py', task or '<task>'))
 
 
 def session_key(session):

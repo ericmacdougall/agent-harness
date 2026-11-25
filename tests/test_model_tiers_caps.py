@@ -1,38 +1,33 @@
-"""The repo model_tiers.json owner caps match the user's decision and the installed copy (GoodQA #15585).
-
-The user raised the owner cap from 4 to 8 ("up owner slots to 8", main WAL decision wd89d1d837e0); main
-changed the installed ~/.claude/hooks/model_tiers.json, and the repo copy must carry the same values so the
-next install does not silently lower the cap again.
-"""
+"""One owner cap (the user: "fix the agent caps/threshold crap"): resource_limits.json max_live_owners is the only
+number. model_tiers.json no longer carries session_owner_agents or session_live_agents; load_policy copies the one cap
+into caps.session_owner_agents for older readers (successor.py)."""
 import json
 import os
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
+import sys
 
-REPO = Path(__file__).resolve().parents[1] / "harness" / "hooks" / "model_tiers.json"
-INSTALLED = Path(os.environ.get("HARNESS_INSTALLED_TIERS", str(Path.home() / ".claude" / "hooks" / "model_tiers.json")))
-CAP_KEYS = ("session_owner_agents", "session_live_agents")
+HOOKS = Path(__file__).resolve().parents[1] / "harness" / "hooks"
+sys.path.insert(0, str(HOOKS))
+import model_tiers  # noqa: E402
+import resource_budget  # noqa: E402
 
 
-def caps(path: Path) -> dict:
-    return json.loads(path.read_text(encoding="utf-8"))["caps"]
+class OneCap(unittest.TestCase):
+    def test_tier_table_has_no_cap_numbers_of_its_own(self):
+        caps = json.loads((HOOKS / "model_tiers.json").read_text(encoding="utf-8"))["caps"]
+        self.assertNotIn("session_owner_agents", caps)
+        self.assertNotIn("session_live_agents", caps)
 
-
-class ModelTiersCapsTest(unittest.TestCase):
-    def test_repo_caps_are_the_user_decision(self):
-        repo = caps(REPO)
-        self.assertEqual(repo["session_owner_agents"], 8)
-        self.assertEqual(repo["session_live_agents"], 16)
-        self.assertGreater(repo["session_live_agents"], repo["session_owner_agents"],
-                           "helpers must still fit beside a full owner set")
-
-    def test_repo_and_installed_caps_agree(self):
-        if not INSTALLED.is_file():
-            self.skipTest(f"no installed harness at {INSTALLED} (CI host)")
-        repo, installed = caps(REPO), caps(INSTALLED)
-        for key in CAP_KEYS:
-            self.assertEqual(repo[key], installed[key],
-                             f"{key}: repo {repo[key]} != installed {installed[key]}; reinstall or commit the change")
+    def test_policy_carries_the_one_cap_and_follows_a_local_change(self):
+        home = tempfile.mkdtemp()
+        with mock.patch.dict(os.environ, {"AH_HOME": home}):
+            self.assertEqual(model_tiers.load_policy()["caps"]["session_owner_agents"], 16)
+            resource_budget.set_limit("max_live_owners", 10, "user", "the owner tightened it")
+            self.assertEqual(model_tiers.load_policy()["caps"]["session_owner_agents"], 10)
+            self.assertEqual(resource_budget.owner_cap(), {"max": 10, "enforce": False})
 
 
 if __name__ == "__main__":

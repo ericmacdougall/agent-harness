@@ -3252,7 +3252,15 @@ def approve_top_cmd(home: Path, args) -> dict:
         status = ledger.approve_top(task, ask_id, str(wal))
     except escalation.LedgerError as e:
         raise AhError(e.code, f"approve-top: {e.message}", 2)
+    approval = None
+    try:  # the same grant in the one approvals store, so `ah approvals` shows it (the ledger stays the record)
+        import ah_approvals  # noqa: PLC0415
+        approval = ah_approvals.grant("top-rung", {"task": task}, "user", "ah approve-top: the user's own words",
+                                      source=source)["id"]
+    except Exception:  # noqa: BLE001 - the ledger permission above is already written and is what the gate reads
+        pass
     return {"ok": True, "task": task, "session": session, "ask": ask_id, "source": source, "ladder": status,
+            "approval": approval,
             "next": f"spawn with [task:{task}] in the Agent description; the permission covers this task only"}
 
 
@@ -4088,6 +4096,12 @@ def main(argv=None) -> int:
     if given[:1] == ["decision"]:  # goodqa#16651: signed central top-rung decisions (central_decisions.py)
         import central_decisions  # noqa: PLC0415
         return central_decisions.main(given[1:])
+    if given[:1] in (["approve"], ["approvals"], ["supervisor"]):  # the one approvals store (docs/approvals.md)
+        import ah_approvals  # noqa: PLC0415
+        return ah_approvals.main(given)
+    if given[:1] == ["limits"]:  # thresholds: repo defaults plus owner/supervisor-tightened local values
+        import resource_budget  # noqa: PLC0415
+        return resource_budget.limits_cli(given[1:])
     if given[:1] == ["guard-selftest"]:  # goodqa#15876: a fixed live test of a guard rule; it takes no command, path or directory
         try:
             import guard_selftest  # noqa: PLC0415

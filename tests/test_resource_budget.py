@@ -84,16 +84,17 @@ class Budget(unittest.TestCase):
         self.assertEqual((cap["host"], cap["cores"], cap["load1"]), ("dev2", 192, 4.0))
         self.assertAlmostEqual(cap["mem_available_gb"], 130.86, places=2)
 
-    def test_agent_gate_config_fifo_keeps_defaults(self):
+    def test_limits_config_fifo_keeps_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
             hooks = Path(tmp, "hooks")
             hooks.mkdir()
-            for name in ("agent_gate.py", "safe_input.py"):
+            for name in ("agent_gate.py", "resource_budget.py", "safe_input.py"):
                 (hooks / name).write_text((HOOKS / name).read_text())
             os.mkfifo(hooks / "resource_limits.json")
-            out = subprocess.run([sys.executable, "-c", "import agent_gate;print(agent_gate.limits())"], cwd=str(hooks),
-                                 capture_output=True, text=True, timeout=15, env=dict(os.environ, PYTHONPATH=str(hooks)))
-            self.assertEqual(out.stdout.strip(), "(12, 20)")
+            out = subprocess.run([sys.executable, "-c", "import agent_gate;print(agent_gate.cap())"], cwd=str(hooks),
+                                 capture_output=True, text=True, timeout=15,
+                                 env=dict(os.environ, PYTHONPATH=str(hooks), AH_HOME=tmp))
+            self.assertEqual(out.stdout.strip(), "(16, False)")
 
     def test_cli_exit_codes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -177,34 +178,53 @@ class BudgetParsing(unittest.TestCase):
 
 
 class AgentGate(unittest.TestCase):
-    def wal(self, live, stopped=0, stale=0, now=None):
+    """The one owner cap (resource_limits.json max_live_owners): owners count, helpers never do; at the cap a short
+    advisory unless enforce is set."""
+
+    def wal(self, live, stopped=0, stale=0, now=None, helpers=0):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         now = now or datetime.now(timezone.utc)
         root = Path(tmp.name, "sess")
         root.mkdir()
         main = []
-        for i in range(live + stopped + stale):
-            started = now - timedelta(minutes=30 if i >= live + stopped else 2)
-            main.append({"at": started.isoformat(), "event": "subagent", "agent_id": f"a{i}"})
-            last = started + (timedelta(seconds=10) if i >= live + stopped else timedelta(minutes=1))
+        for i in range(live + stopped + stale + helpers):
+            started = now - timedelta(minutes=30 if live + stopped <= i < live + stopped + stale else 2)
+            kind = "red-team" if i >= live + stopped + stale else "task-owner"
+            main.append({"at": started.isoformat(), "event": "subagent", "agent_id": f"a{i}", "agent_type": kind})
+            stale_row = live + stopped <= i < live + stopped + stale
+            last = started + (timedelta(seconds=10) if stale_row else timedelta(minutes=1))
             Path(root, f"agent-a{i}.jsonl").write_text(json.dumps({"at": last.isoformat(), "event": "pretool", "agent_id": f"a{i}"}) + "\n")
             if live <= i < live + stopped:
                 main.append({"at": last.isoformat(), "event": "subagent_stop", "agent_id": f"a{i}"})
         Path(root, "main.jsonl").write_text("\n".join(json.dumps(r) for r in main) + "\n")
         return tmp.name, now.timestamp()
 
-    def test_ninth_concurrent_agent_is_denied(self):
+    def test_at_the_cap_is_an_advisory_naming_the_count_and_enforce_denies(self):
         root, now = self.wal(live=8)
-        result = agent_gate.decide("sess", now, root, 8, state_root=root + "/st")
-        self.assertEqual((result["action"], result["live"]), ("deny", 8))
-        self.assertIn("dev2", result["message"])
+        result = agent_gate.decide("sess", now, root, 8, state_root=root + "/st", enforce=False)
+        self.assertEqual((result["action"], result["live"]), ("warn", 8))
+        self.assertIn("8 live owners", result["message"])
+        self.assertIn("proceeds", result["message"])
+        root, now = self.wal(live=8)
+        denied = agent_gate.decide("sess", now, root, 8, state_root=root + "/st", enforce=True)
+        self.assertEqual((denied["action"], denied["live"]), ("deny", 8))
         root7, now7 = self.wal(live=7)
-        self.assertEqual(agent_gate.decide("sess", now7, root7, 8, state_root=root7 + "/st")["action"], "allow")  # 8th spawn is fine
+        self.assertEqual(agent_gate.decide("sess", now7, root7, 8, state_root=root7 + "/st")["action"], "allow")
 
-    def test_redteam_f7_burst_of_parallel_spawns_is_limited(self):
+    def test_helpers_are_never_counted_or_warned_about(self):
+        root, now = self.wal(live=7, helpers=12)  # 19 live agents, 7 of them owners
+        self.assertEqual(agent_gate.decide("sess", now, root, 8, state_root=root + "/st")["action"], "allow")
+        root, now = self.wal(live=8)
+        for helper in ("red-team", "click-tester", "reviewer", "fixer", "Explore", "Plan"):
+            self.assertEqual(agent_gate.decide("sess", now, root, 8, state_root=root + "/st", enforce=True,
+                                               subagent_type=helper)["action"], "allow", helper)
+        self.assertTrue(agent_gate.is_helper("z-explore-0123456789abcdef0123"))  # wal.safe_id spelling of Explore
+
+    def test_redteam_f7_burst_of_parallel_owner_spawns_is_limited_when_enforced(self):
         root, now = self.wal(live=0)
-        results = [agent_gate.decide("sess", now, root, 8, state_root=root + "/st")["action"] for _ in range(12)]
+        results = [agent_gate.decide("sess", now, root, 8, state_root=root + "/st", enforce=True)["action"]
+                   for _ in range(12)]
         self.assertEqual(results.count("allow"), 8)  # slots are reserved even before start records exist
         self.assertEqual(results[8:], ["deny"] * 4)
 
@@ -213,50 +233,42 @@ class AgentGate(unittest.TestCase):
         result = agent_gate.decide("sess", now, root, 8, state_root=root + "/st")
         self.assertEqual((result["action"], result["live"]), ("allow", 3))
 
-    def test_thresholds_come_from_resource_limits_json_warn_12_deny_20(self):
-        warn_at, deny_at = agent_gate.limits()
-        self.assertEqual((warn_at, deny_at), (12, 20))
+    def test_one_cap_from_resource_limits_json_default_16_no_env_override(self):
         shipped = json.loads((HOOKS / "resource_limits.json").read_text())
-        self.assertEqual((shipped["warn_agents"], shipped["max_agents"]), (12, 20))
-        for live, expected in ((11, "allow"), (12, "warn"), (19, "warn"), (20, "deny")):
+        self.assertEqual((shipped["max_live_owners"], shipped["enforce"]), (16, False))
+        self.assertNotIn("max_agents", shipped)
+        self.assertNotIn("warn_agents", shipped)
+        with unittest.mock.patch.dict(os.environ, {"HARNESS_MAX_AGENTS": "3", "AH_HOME": tempfile.mkdtemp()}):
+            self.assertEqual(agent_gate.cap(), (16, False))  # the env override is gone
+        for live, expected in ((15, "allow"), (16, "warn"), (20, "warn")):
             root, now = self.wal(live=live)
-            result = agent_gate.decide("sess", now, root, state_root=root + "/st")
-            self.assertEqual(result["action"], expected, live)
-        # changing the file (not the code) moves the thresholds
-        home = tempfile.mkdtemp()
-        shutil_dir = Path(home, "hooks")
-        shutil_dir.mkdir()
-        for name in ("agent_gate.py", "heavy_job_guard.py", "safe_input.py"):
-            Path(shutil_dir, name).write_text((HOOKS / name).read_text())
-        Path(shutil_dir, "resource_limits.json").write_text(json.dumps({"warn_agents": 3, "max_agents": 5}))
-        out = subprocess.run([sys.executable, "-c", "import agent_gate;print(agent_gate.limits())"], cwd=str(shutil_dir),
-                             capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=str(shutil_dir)))
-        self.assertEqual(out.stdout.strip(), "(3, 5)")
+            with unittest.mock.patch.dict(os.environ, {"AH_HOME": root}):
+                self.assertEqual(agent_gate.decide("sess", now, root, state_root=root + "/st")["action"], expected, live)
 
-    def test_l3_non_ascii_digit_in_env_keeps_the_default_limit(self):
-        for value in ("\u00b2", "\u0662\u0660", "1e3", "-4"):
-            with unittest.mock.patch.dict(os.environ, {"HARNESS_MAX_AGENTS": value}):
-                self.assertEqual(agent_gate.limits(), (12, 20), value)
-        with unittest.mock.patch.dict(os.environ, {"HARNESS_MAX_AGENTS": "30"}):
-            self.assertEqual(agent_gate.limits()[1], 30)
-
-    def test_hook_process_denies_and_fails_open(self):
+    def test_hook_process_advises_denies_only_when_enforced_and_fails_open(self):
         home = tempfile.mkdtemp()
         wal_dir = Path(home, ".claude", "wals", "sess")
         wal_dir.mkdir(parents=True)
         now = datetime.now(timezone.utc)
-        lines = []
-        for i in range(9):
-            lines.append(json.dumps({"at": now.isoformat(), "event": "subagent", "agent_id": f"a{i}"}))
+        lines = [json.dumps({"at": now.isoformat(), "event": "subagent", "agent_id": f"a{i}", "agent_type": "task-owner"})
+                 for i in range(17)]
         wal_dir.joinpath("main.jsonl").write_text("\n".join(lines) + "\n")
-        env = dict(os.environ, HOME=home, HARNESS_HEAVY_GUARD_FORCE="1")
+        env = dict(os.environ, HOME=home, AH_HOME=home, HARNESS_HEAVY_GUARD_FORCE="1")
 
         def run(stdin):
             return subprocess.run([sys.executable, str(HOOKS / "agent_gate.py")], input=stdin, capture_output=True, text=True, env=env)
-        env["HARNESS_MAX_AGENTS"] = "8"  # 9 live agents in the fixture; the shipped default is 20
-        denied = run(json.dumps({"tool_name": "Agent", "session_id": "sess", "tool_input": {}}))
+        spawn = json.dumps({"tool_name": "Agent", "session_id": "sess", "tool_input": {"subagent_type": "task-owner"}})
+        advised = run(spawn)
+        self.assertEqual(advised.returncode, 0)
+        self.assertIn("17 live owners", json.loads(advised.stdout)["hookSpecificOutput"]["additionalContext"])
+        helper = run(json.dumps({"tool_name": "Agent", "session_id": "sess", "tool_input": {"subagent_type": "red-team"}}))
+        self.assertEqual((helper.returncode, helper.stdout.strip()), (0, ""))
+        Path(home, ".agent-harness").mkdir(exist_ok=True)
+        Path(home, ".agent-harness", "limits.local.json").write_text(json.dumps(
+            {"values": {"enforce": {"value": True, "set_by": "user", "reason": "test"}}}))
+        denied = run(spawn)
         self.assertEqual(denied.returncode, 2)
-        self.assertIn("limit 8", denied.stderr)
+        self.assertIn("cap 16, enforced", denied.stderr)
         for raw in ("", "garbage", "[" * 100000, json.dumps({"tool_name": "Agent", "session_id": "../../etc"}),
                     json.dumps({"tool_name": "Bash", "session_id": "sess"})):
             self.assertEqual(run(raw).returncode, 0, raw[:20])
