@@ -566,6 +566,19 @@ class OneSharedRule(unittest.TestCase):
                 built = re.findall(r'"outside_window"\s*:', text)
                 self.assertEqual(len(built), 1 if name == "provenance.py" else 0, "outside_window is built in one place")
 
+    def test_asks_and_requirements_read_through_the_shared_window(self):  # main's ruling on PR 257 v3 F6
+        home = Home(self)
+        for name, read in (("requirements", ah.requirements_view(home.home, SID)["read"]),
+                           ("asks", prov.ask_items(SID, home.home / ".claude")["read"])):
+            with self.subTest(producer=name):
+                self.assertEqual(read.get("window", {}).get("rule"), prov.LOST_WINDOW_RULE, read)
+                self.assertIn("outside_window", read)
+        for name in ("ah.py", "provenance.py"):
+            text = (HOOKS / name).read_text()
+            with self.subTest(file=name):
+                self.assertNotRegex(text, r"skipped\s*\+=\s*(prov\.)?lost_lines_without\(",
+                                    "a producer adds integrity-pass lines to skipped itself, bypassing the shared window")
+
     def test_an_outside_count_without_the_rule_is_partial(self):
         good = {"schema": col.READ_SCHEMA, "state": "ok", "sources_read": 1, "unread": [], "unread_total": 0,
                 "skipped": 0, "limited": False}

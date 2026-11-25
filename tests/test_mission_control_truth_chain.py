@@ -514,7 +514,7 @@ class DerivedFeeds(unittest.TestCase):
 
     DATA_SNAPSHOTS = {"owners": "owners", "asks": "asks", "initiatives": "initiatives", "chat": "chat"}
     META_SNAPSHOTS = {"health", "reads", "ledger"}
-    STATE_META = {"version", "started", "host", "health", "limits", "reads", "requirement_actions", "events", "ledger"}
+    STATE_META = {"version", "stream", "started", "host", "health", "limits", "reads", "requirement_actions", "events", "ledger"}
     # a row one collector writes about something other than its own rows
     ROW_ROLES = {("owners", "main-session"): "what the owners read knows of main's session: it feeds the session-scoped datasets"}
 

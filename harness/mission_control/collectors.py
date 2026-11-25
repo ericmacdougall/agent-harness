@@ -904,6 +904,7 @@ class Initiatives(Collector):
         self.items: list[dict] = []
         self.stale = False
         self.error = ""
+        self.read_failed = False  # the last read of this signature raised (refused, unreadable): read it again
         self.partial = False  # the file holds more initiatives than the MAX_ROWS kept
 
     MAX_ROWS = 100
@@ -918,17 +919,25 @@ class Initiatives(Collector):
         try:
             info = os.stat(self.path, follow_symlinks=False)
         except OSError:
+            # goodqa#16117 (PR 257 v1 F2): a metadata failure is retried like a read failure. The parent directory can
+            # come back with the file's inode, size and mtime unchanged, and the cached signature must not then repeat
+            # this error for ever. The signature is kept, so a file that did change meanwhile still counts as an update.
+            self.read_failed = True
             return self._fail("initiatives file missing")
         sig = (info.st_ino, info.st_size, info.st_mtime_ns)
         previous = self.sig
-        if sig == self.sig:
+        if sig == self.sig and not self.read_failed:
             if self.error:
-                raise ValueError(self.error)
+                raise ValueError(self.error)  # the same bad bytes (not JSON, too large): no change, no new read
             return f"{len(self.items)} initiatives"
-        self.sig = sig
+        # goodqa#16117 F3: an unchanged file is read again while its last read raised. A refused or unreadable read
+        # often recovers with no change to inode, size or mtime (permissions restored, a reader that was busy), so the
+        # signature never caches a read that did not happen.
+        self.sig, self.read_failed = sig, False
         try:
             raw = self.reader.read(self.path, 1024 * 1024 + 1)
         except (OSError, Refused) as exc:
+            self.read_failed = True
             # the signature is already taken: without this the next tick would see no change and report ok (v7 audit)
             return self._fail(f"initiatives file could not be read ({type(exc).__name__}); showing the last good copy")
         if len(raw) > 1024 * 1024:
@@ -943,7 +952,7 @@ class Initiatives(Collector):
         self.items = [clean_initiative(r, n) for n, r in enumerate(rows[:self.MAX_ROWS])]
         self.stale, self.error, self.partial = False, "", len(rows) > self.MAX_ROWS
         self.publish(info.st_mtime)
-        if previous is not None:
+        if previous is not None and previous != sig:   # a recovered read of an unchanged file is not an update
             self.hub.publish(ev.make("initiative", "initiatives", f"{len(self.items)} initiatives updated",
                                      eid=f"initiatives:{info.st_mtime_ns}"))
         return f"{len(self.items)} initiatives"
@@ -1375,6 +1384,7 @@ class Asks(Collector):
         super().__init__(hub, health)
         self.runner, self.session_fn = runner, session_fn
         self.root, self.owners_fn = root, owners_fn  # with a root, every ledger read is also a sweep (needs_sweep)
+        self.disclosed = ""  # outside_window(): lost lines before the read's window, said on the health row
         self.items: list[dict] = []
         self.resolved: list[dict] = []
         self.stale: list[dict] = []
@@ -1425,7 +1435,9 @@ class Asks(Collector):
             self.health.off(self.name, "no main session known yet")
             return "off"
         self.refresh(session, now)
-        return f"{len(self.items)} open, {len(self.stale)} stale, {len(self.flagged)} flagged"
+        # main's ruling on PR 257 v3 F6: lost lines the shared rule places before the 24 h window are disclosed here
+        return "; ".join(filter(None, [f"{len(self.items)} open, {len(self.stale)} stale, {len(self.flagged)} flagged",
+                                       self.disclosed]))
 
     def follow(self) -> None:
         """From the server's session watch: the Health row turns unknown the moment main's session moves, even while a
@@ -1458,6 +1470,7 @@ class Asks(Collector):
         code, out = self.runner.run("provenance-asks", session, timeout=60, limit=4 * 1024 * 1024 + 1)
         # exit 2 with a ledger on stdout means "some asks are untraceable"; anything else is a failed read
         data, notes = producer_read("provenance asks", code, out, cap=4 * 1024 * 1024, ok_codes=(0, 2))
+        self.disclosed = outside_window(data)
         if not isinstance(data.get("items"), list) or not isinstance(data.get("blocked"), list) \
                 or not isinstance(data.get("resolved"), list):
             raise ReadFailed("provenance asks returned no asks list")

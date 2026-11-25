@@ -7,6 +7,7 @@ import calendar
 import collections
 import json
 import re
+import secrets
 import socket
 import threading
 import time
@@ -136,12 +137,29 @@ class Client:
             return items
 
 
+_EVENT_ID = re.compile(r"([0-9a-f]{16})\.([0-9]{1,15})")
+
+
+def resume_after(last_event_id, generation: str) -> int:
+    """The revision a reconnecting stream resumes after: the Last-Event-ID's revision when it names this process's
+    generation, else 0 (nothing replayed). A revision from another process, or a bare number from an older server, is
+    meaningless here."""
+    found = _EVENT_ID.fullmatch(last_event_id or "") if isinstance(last_event_id, str) else None
+    return int(found.group(2)) if found and found.group(1) == generation else 0
+
+
 class Hub:
-    """Ring of recent events plus SSE fan-out. publish() never blocks on a client."""
+    """Ring of recent events plus SSE fan-out. publish() never blocks on a client.
+
+    goodqa#16117 (PR 257 review v1 F1): every frame is stamped `id: <generation>.<revision>`, and /api/state carries the
+    same pair from position(). The generation is random per process, so a restarted server never matches the old one;
+    the revision is `seq`, which grows by one for every frame under the lock. The page replays an update it held during
+    a state load only when it has the snapshot's generation and a higher revision."""
 
     def __init__(self, ring: int = 500, max_clients: int = 8, max_rate: float = 20.0):
         self.lock = threading.Lock()
         self.ring = collections.deque(maxlen=ring)
+        self.generation = secrets.token_hex(8)
         self.seq = 0
         self.clients: list[Client] = []
         self.max_clients = max_clients
@@ -149,11 +167,30 @@ class Hub:
         self.window = [time.monotonic(), 0]
         self.suppressed = self.suppressed_quiet = 0
         self.snapshots: dict[str, object] = {}
+        self.bodies: dict[str, str] = {}  # each snapshot exactly as it was framed: what /api/state serves (published())
         self.before = None  # called before any data snapshot is pushed (Truth pushes the dataset reads first)
 
     def frame(self, seq: int, name: str, data) -> bytes:
-        body = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-        return f"id: {seq}\nevent: {name}\ndata: {body}\n\n".encode("utf-8")
+        return self._frame_body(seq, name, json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+
+    def _frame_body(self, seq: int, name: str, body: str) -> bytes:
+        return f"id: {self.generation}.{seq}\nevent: {name}\ndata: {body}\n\n".encode("utf-8")
+
+    def published(self, names, events: int = 200) -> tuple:
+        """(bodies, stamp, events), all taken under the lock in one step (PR 257 review v4 F7): for each name in names
+        that was ever published, the JSON body of its last frame; the stamp {generation, revision} of that instant; and
+        the newest events. Every frame at or below the revision is in what is returned, and every frame above it was
+        framed later, so a page that installs these and applies only frames above the revision never goes back."""
+        with self.lock:
+            bodies = {name: self.bodies[name] for name in names if name in self.bodies}
+            stamp = {"generation": self.generation, "revision": self.seq}
+            recent = [e for _s, e in self.ring][-events:]
+        return bodies, stamp, recent
+
+    def position(self) -> dict:
+        """The stamp of a snapshot taken from now on: every frame at or below this revision was broadcast before it."""
+        with self.lock:
+            return {"generation": self.generation, "revision": self.seq}
 
     def _broadcast(self, frame: bytes) -> None:
         for client in list(self.clients):
@@ -195,7 +232,9 @@ class Hub:
         with self.lock:
             self.snapshots[name] = data
             self.seq += 1
-            self._broadcast(self.frame(self.seq, name, data))
+            body = json.dumps(data, ensure_ascii=False, separators=(",", ":"))  # serialized under the lock, as framed
+            self.bodies[name] = body
+            self._broadcast(self._frame_body(self.seq, name, body))
 
     def recent(self, after: int = 0, limit: int = 500) -> list[dict]:
         with self.lock:

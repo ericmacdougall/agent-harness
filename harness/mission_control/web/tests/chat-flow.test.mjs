@@ -7,13 +7,15 @@ import './dom-shim.mjs';
 
 globalThis.window = { matchMedia: () => ({ matches: false, addEventListener() {} }), addEventListener() {} };
 globalThis.localStorage = { getItem: () => null, setItem() {}, removeItem() {} };
+// Stamped as the server stamps them (goodqa#16117, PR 257 v3 F5: an unstamped message is never applied).
+const GENERATION = '0123456789abcdef'; let revision = 0;
 const sources = []; const posts = []; const gets = [];
-class FakeES { static CLOSED = 2; constructor(u) { this.url = u; this.readyState = 1; this.l = {}; sources.push(this); } addEventListener(t, f) { this.l[t] = f; } close() { this.readyState = 2; } emit(t, d) { this.l[t]?.(d === undefined ? {} : { data: JSON.stringify(d) }); } }
+class FakeES { static CLOSED = 2; constructor(u) { this.url = u; this.readyState = 1; this.l = {}; sources.push(this); } addEventListener(t, f) { this.l[t] = f; } close() { this.readyState = 2; } emit(t, d) { this.l[t]?.(d === undefined ? {} : { data: JSON.stringify(d), lastEventId: `${GENERATION}.${++revision}` }); } }
 globalThis.EventSource = FakeES;
 let postPlan = [];   // per POST: 'ok' | 'drop' (lost response) | 409
 const SESSION = 'baab765b-d85c-46b4-b7b9-588eb912c770';
 const targets = [{ session: SESSION, waiting: true }];
-const base = { version: '1', host: 'h', csrf: 'tok', initiatives: { items: [] }, owners: [], health: [], events: [], asks: { items: [] }, ledger: {},
+const base = { version: '1', host: 'h', csrf: 'tok', stream: { generation: GENERATION, revision: 0 }, initiatives: { items: [] }, owners: [], health: [], events: [], asks: { items: [] }, ledger: {},
   chat: { messages: [], replies: [], targets, main_session: SESSION, codex: { available: false, reason: 'off' } } };
 globalThis.fetch = async (url, init = {}) => {
   if (init.method === 'POST') {
