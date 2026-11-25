@@ -657,7 +657,10 @@ The agent may approve a delete itself, but only after a backup that the approval
 
 ```bash
 python3 ~/.claude/hooks/command_guard.py approve-delete --path <literal path> --remote dropbox:<mirror dir> --wal <WAL path>
+python3 ~/.claude/hooks/command_guard.py approve-delete --path <literal path> --remote b2-archive:<bucket>/<mirror dir> --wal <WAL path>
 ```
+
+A verified copy on the b2 remote named exactly `b2-archive` approves a delete the same way. The name is pinned, not the type: `b2-archive2` and every other b2 remote refuse, and no policy file can widen the list.
 
 For a clean, published linked worktree retired through `ah worktree-remove`, register a backup approval on the executing host for each otherwise-blocking ignored file. A collapsed ignored subtree qualifies only when every regular file has its own valid approval. The delegated verifier rejects mounted subtrees, special files, links, nested repositories, open backed files and any unfamiliar or changed path. Preview leaves approvals available. During removal, it verifies content, then rebuilds Git status, index flags and the complete ignored coverage under the approval lock after activity checks. Bounded directory identities and membership include the root and ignored-path ancestors, so a new sibling during activity checking or lock waiting refuses without spending any grant. The same full grant set is consumed once before non-forced Git removal. Observed quiescence remains required; this does not make an uncontrolled external writer atomic with Git removal. A removal that fails or is unconfirmed after consumption requires fresh backup verification and approval. Raw `git worktree remove` keeps its own guard.
 
@@ -667,7 +670,7 @@ For a clean, published linked worktree retired through `ah worktree-remove`, reg
 - a whole root, or a whole `projects`, `wals`, `sessions` or other top-level log directory, or one of their parents;
 - more than 20,000 files;
 - anything changed in the last 10 minutes;
-- a remote that is not a named remote of type `dropbox` (checked with `rclone listremotes --long`);
+- a remote that is not a named remote of type `dropbox`, or the b2 remote named exactly `b2-archive` (checked with `rclone listremotes --long`; `b2-archive2` or any other b2 remote is refused, and a policy file cannot add a type or a name);
 - a remote copy that is missing a file, differs in size or hash, or offers sizes only.
 
 A tree of many small files cannot be mirrored file by file in reasonable time at the account write rate (the pp407 trees ran at about 22 KiB/s). Back it up as one archive instead (goodqa#15068): run `tar -cf - <dir>` from the directory's parent so every member starts with `<dir>/`, optionally compress with `zstd` or gzip, stream it with `rclone rcat`, and upload a `.sha256` file (`<64-hex>  <archive name>`) and a `tar -tvf` listing beside it. Then:
@@ -675,6 +678,9 @@ A tree of many small files cannot be mirrored file by file in reasonable time at
 ```bash
 python3 ~/.claude/hooks/command_guard.py approve-delete --path <literal dir> --archive dropbox:<dir>.tar.zst \
   --archive-sha256 dropbox:<dir>.tar.zst.sha256 --archive-listing dropbox:<dir>.tar.listing.txt --wal <WAL path>
+# the same with the b2 remote named exactly b2-archive, all three remotes on it
+python3 ~/.claude/hooks/command_guard.py approve-delete --path <literal dir> --archive b2-archive:<bucket>/<dir>.tar.zst \
+  --archive-sha256 b2-archive:<bucket>/<dir>.tar.zst.sha256 --archive-listing b2-archive:<bucket>/<dir>.tar.listing.txt --wal <WAL path>
 ```
 
 The guard streams the archive with `rclone cat`, never to disk. The proof is the member comparison: every regular file in the archive (path, size and content sha256) must equal the local tree, with nothing missing and nothing extra. The `.sha256` file and the listing are written by the same uploader, so they are consistency checks that catch a broken upload run, not extra safeguards: the archive's sha256 must equal the `.sha256` file (which must not hold the digest of empty input), and the listing's (path, size) set must equal the archive's.
@@ -688,7 +694,7 @@ It refuses on any of these:
 - more than 4 members per local file plus 1000, decompressed data larger than twice the tree plus 256 MiB, or a read longer than the timeout;
 - a local file that changed between hashing and the end of verification;
 - `--no-backup` given with the archive flags;
-- any of the three remotes not being a named `dropbox` remote.
+- any of the three remotes not being a named `dropbox` remote or the b2 remote named exactly `b2-archive` (for example `--archive b2-archive:<dir>.tar.zst`); one wrong-name b2 remote among the three refuses the whole approval.
 
 macOS bsdtar stores extended attributes as AppleDouble `._name` companions that its own `tar -tvf` does not list. Such a member is ignored when it is not a local file, starts with the AppleDouble magic `00 05 16 07`, and its sibling is in the archive.
 

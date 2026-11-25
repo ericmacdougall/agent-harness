@@ -767,6 +767,8 @@ ANSWER_TRUST = "AskUserQuestion tool result bound to an AskUserQuestion tool_use
 MC_TRUST = ("Mission Control dashboard approval, HMAC-signed by the local server after an authenticated session click "
             "(accidental-damage threat model: a process running as this user could forge it)")
 QUEUE_TRUST = "transcript queue-operation record without an origin marker (accidental-damage threat model)"
+ATTACHMENT_TRUST = ("transcript queued_command attachment whose origin marker says human; reminder and pasted blocks removed "
+                    "(accidental-damage threat model: a process running as this user could forge it)")
 
 
 def queue_user_text(record):
@@ -780,6 +782,32 @@ def queue_user_text(record):
     if not isinstance(content, str) or not content.strip() or QUEUE_WRAPPER.match(content):
         return None
     return content
+
+
+def queued_attachment_text(record):
+    """(raw, text) of a human message picked up mid-turn, else None. Claude Code records it as an `attachment`
+    of type queued_command whose prompt is the typed text, often behind injected system-reminder blocks. Only
+    origin.kind == human counts; peer, agent, unmarked and cross-session records never do. `raw` is the prompt as
+    recorded (it keys the queue: id hash); `text` is what the user typed, with reminders and pasted blocks removed."""
+    if not isinstance(record, dict) or record.get("type") != "attachment" or record.get("isSidechain"):
+        return None
+    att = record.get("attachment")
+    if not isinstance(att, dict) or att.get("type") != "queued_command":
+        return None
+    origin = att.get("origin")
+    if not isinstance(origin, dict) or origin.get("kind") != "human":
+        return None
+    prompt = att.get("prompt")
+    if isinstance(prompt, str):
+        raw = prompt
+    elif isinstance(prompt, list) and all(isinstance(b, dict) and b.get("type") in ("text", "image") for b in prompt):
+        raw = "\n".join(b["text"] for b in prompt if b.get("type") == "text" and isinstance(b.get("text"), str))
+    else:
+        return None
+    text, _ = user_authorship({"type": "user", "origin": origin, "message": {"content": prompt}})
+    if text is None or not text.replace(SENTINEL, "").strip():
+        return None  # injected or pasted only: nothing the user typed
+    return raw, text
 
 
 def askuser_use_ids(record) -> set:
@@ -978,6 +1006,7 @@ def queue_turn(session: str, ident, home=None) -> dict:
     path = find_transcript(session, home)
     if not _has_human_turn(path):
         raise Problem("message-not-found", "that transcript has no human-origin turn (a helper session): queue records are not user text")
+    fallback = None
     for line in _lines_containing(path, stamp.encode()):
         if line is None:
             continue
@@ -985,11 +1014,19 @@ def queue_turn(session: str, ident, home=None) -> dict:
             record = loads_line(line)
         except ValueError:
             continue
+        attached = queued_attachment_text(record)
+        if attached is not None and record.get("timestamp") == stamp and hashlib.sha256(attached[0].encode()).hexdigest()[:12] == sha:
+            # An enqueue record with the same timestamp and digest wins whatever the file order (ah keeps that row).
+            fallback = fallback or {"text": attached[1], "timestamp": stamp, "uuid": f"{stamp}#{sha}", "session": session,
+                                    "trust": ATTACHMENT_TRUST}
+            continue
         text = queue_user_text(record)
         if text is not None and record.get("timestamp") == stamp and hashlib.sha256(text.encode()).hexdigest()[:12] == sha:
             # B6 (step-1 red-team): like a human turn, pasted and injected blocks are not the user's words. The id
             # still hashes the raw content, so `ah user-msg` ids stay stable.
             return {"text": strip_blocks(text), "timestamp": stamp, "uuid": f"{stamp}#{sha}", "session": session}
+    if fallback:
+        return fallback
     raise Problem("message-not-found", f"no queued user message {stamp}#{sha} in session {clip(session, 40)}")
 
 
@@ -1233,7 +1270,7 @@ def _resolve(source, ctx, depth, seen, result):
                 "timestamp": turn["timestamp"], "status": "verified"}
         if variant != "user":
             node["variant"] = variant
-            node["trust"] = ANSWER_TRUST if variant == "answer" else QUEUE_TRUST
+            node["trust"] = ANSWER_TRUST if variant == "answer" else turn.get("trust", QUEUE_TRUST)
         if ctx.get("want_text"):
             node["text"] = turn["text"]
         node["excerpt"] = parsed["excerpt"]

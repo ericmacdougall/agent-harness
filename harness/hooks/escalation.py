@@ -1190,9 +1190,7 @@ class Ledger:
         ask pair citing an unrelated human turn used to pass). There is no session-wide grant (review F1; main:
         grants are per task only), so `session` is accepted for compatibility and ignored."""
         proof = verify_ask_pair(Path(wal), ask_id, task, allow_env_root=self._non_default_root())
-        caps = self.policy.get('caps', {})
-        assent = verify_top_source(proof['source'], allow_env_root=self._non_default_root(),
-                                   max_age_seconds=int(caps.get('top_assent_max_age_seconds', TOP_ASSENT_MAX_AGE)))
+        assent = self.check_top_source(proof['source'])
         permission = {'ask_id': ask_id, 'wal': str(wal), 'at': now(), 'source': proof['source'], 'task': task,
                       'assent': assent['sentence'][:300], 'assent_at': assent['timestamp']}
         fd = self._lock(task)
@@ -1204,6 +1202,13 @@ class Ledger:
         finally:
             os.close(fd)
         return status
+
+    def check_top_source(self, source):
+        """The one place a top-rung source is judged (its words, its excerpt and the policy age cap). approve_top
+        uses it, and `ah approve-top` calls it BEFORE writing any WAL row so a refusal writes nothing (goodqa#17164)."""
+        caps = self.policy.get('caps', {})
+        return verify_top_source(source, allow_env_root=self._non_default_root(),
+                                 max_age_seconds=int(caps.get('top_assent_max_age_seconds', TOP_ASSENT_MAX_AGE)))
 
     def status(self, task):
         return ladder_status(self.load(task), self.policy)
