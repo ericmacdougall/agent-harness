@@ -799,7 +799,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         if t is None or agent_id in seen:
             return False
         td = disp.get(agent_id)
-        if td and td.get("kind") in GUARDED_KINDS and not t["state"].startswith(("live", "working", "waiting")):
+        if td and td.get("kind") in GUARDED_KINDS + (FINISHED,) and not t["state"].startswith(("live", "working", "waiting")):
             return False  # checked first: the row loop below relabels such a target (superseded, unverified-legacy)
         if t["state"] not in ("DROPPED", "done", "handoff", "returned") or agent_id in live_parents:
             return True
@@ -817,9 +817,9 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     for r in rows:
         d = disp.get(r["agent_id"])
         last_wal = parse_ts(r["last_activity"]) or 0.0
-        alive = liveness.disposition_live(d, now, last_activity=last_wal,
-                                          replacement_live=bool(d and d.get("kind") == "reassigned"
-                                                                and covered(d.get("ref"), (r["agent_id"],))))
+        alive = bool(d and d.get("kind") == FINISHED) or liveness.disposition_live(
+            d, now, last_activity=last_wal,
+            replacement_live=bool(d and d.get("kind") == "reassigned" and covered(d.get("ref"), (r["agent_id"],))))
         r["disposition"] = dict(d, live=alive) if d else None
         r["decision_required"] = bool(r["owner"] and r["state"] == "DROPPED" and not alive)
         r["attention"] = []
@@ -848,7 +848,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         if not r["owner"]:
             continue
         d = r.get("disposition") or {}
-        if d.get("kind") in liveness.ENDING_DISPOSITIONS:
+        if d.get("kind") in liveness.ENDING_DISPOSITIONS or d.get("kind") == FINISHED:
             continue  # a terminal disposition stays terminal, whatever the owner's last note says
         ref = str(d.get("ref") or "") if d.get("kind") == "waiting" and d.get("live") else \
             (r["state"][len("waiting-on-"):] if r["state"].startswith("waiting-on-") else "")
@@ -1533,8 +1533,8 @@ def precheck(op: str, args: dict) -> None:
             raise AhError("bad_request", f"{op}: detail must be a JSON object")
     elif op == "task.dispose":
         need("agent", "session", "kind", "at")
-        if args["kind"] not in liveness.DISPOSITIONS:
-            raise AhError("bad_request", f"task.dispose: kind must be one of {', '.join(liveness.DISPOSITIONS)}")
+        if args["kind"] not in DISPOSE_KINDS:
+            raise AhError("bad_request", f"task.dispose: kind must be one of {', '.join(DISPOSE_KINDS)}")
         if not OWNER_ID_RE.match(args["agent"]):
             raise AhError("bad_request", "task.dispose: agent must be an agent id or a task WAL name")
         if parse_ts(args["at"]) is None:
@@ -2029,7 +2029,7 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
             _closing_checks(args, ledger, time.time())
         rec = {"at": now, "event": "disposition", "id": wid, "agent": args["agent"], "kind": args["kind"],
                "note": f"owner {args['agent']} {args['kind']}: {args.get('reason') or args.get('ref') or ''}"[:300]}
-        for k in ("until", "ref", "reason", "deployed", "live_test", "gate_epoch", "owner_last"):
+        for k in ("until", "ref", "reason", "deployed", "live_test", "gate_epoch", "owner_last", "finished_by"):
             if args.get(k):
                 rec[k] = args[k]
         _wal_append(home, main_wal, rec)
@@ -2348,6 +2348,37 @@ NOT_LIVE_WORDS_RE = re.compile(r"\b(?:not|never|isn't|wasn't|aren't|weren't)\s+(
                                r"(?:live|prod|production)\b|\b(?:staging|pre-?prod(?:uction)?|locally|local[- ]only|dry[- ]run)\b",
                                re.I)
 GUARDED_KINDS = ("closed", "superseded", "wontdo", "legacy")
+# `finished` (2026-11-24): a task whose process has ended or which reported its outcome (a reviewer, a fixer) is
+# disposed of without deploy evidence or a ticket; liveness.py does not know the kind yet, so ah.py treats it as a
+# permanent, live disposition itself (see owners()).
+FINISHED = "finished"
+DISPOSE_KINDS = tuple(liveness.DISPOSITIONS) + (() if FINISHED in liveness.DISPOSITIONS else (FINISHED,))
+FINISHED_STATES = ("done", "handoff", "returned", "finishing", "DROPPED")
+
+
+def _finished_check(home: Path, args: dict) -> str:
+    """Who may record `finished` and when: the task must have ended (its process stopped) or reported finished;
+    the caller is the session that registered it, a supervisor or a top-rung caller. Returns who it was."""
+    session, agent = args["session"], args["agent"]
+    rows = owners(home, session)["owners"]
+    row = next((r for r in rows if r.get("agent_id") == agent), None)
+    if row is None:
+        raise AhError("unknown_agent", f"task.dispose finished: {agent} is not an agent or task WAL of session {session}", 3)
+    if row.get("state") not in FINISHED_STATES and not row.get("result_at"):
+        raise AhError("not_finished", f"task.dispose finished: {agent} is {row.get('state')}: its process is still "
+                                      "running and it has not reported finished; wait for it, or use waiting/reassigned", 3)
+    caller = env_session()
+    if not caller or caller == session:  # the registering session's own call (ah's session is the caller's)
+        return "session"
+    import ah_kill  # noqa: PLC0415 - cli_payload: the CLI's idea of the caller for ah_roles
+    import ah_roles  # noqa: PLC0415
+    payload = ah_kill.cli_payload(home, caller, os.environ.get("AH_AGENT_ID", ""))
+    if ah_roles.is_top_rung(payload):
+        return "top-rung"
+    if ah_roles.is_supervisor(payload, home):
+        return "supervisor"
+    raise AhError("forbidden", f"task.dispose finished: {agent} belongs to session {session}; only that session, a "
+                               "supervisor or a top-rung caller disposes of it", 3)
 GUARD_FIELDS = ("deploy_specific", "live_specific", "gate_epoch", "owner_last", "ref_checked", "deploy_at")
 WAL_SCAN_MAX = 64 * 1024 * 1024  # bytes of a session's WALs searched for one evidence id
 
@@ -2757,6 +2788,8 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
         if guarded and args.get("kind") in liveness.CLOSING:
             _close_burst(home, args, actor(session), time.time())  # first: a burst is refused whatever its arguments
         precheck(op, args)
+        if op == "task.dispose" and args.get("kind") == FINISHED:
+            args = dict(args, finished_by=_finished_check(home, args))
     except AhError as e:
         if guarded:
             _audit_reject(home, op, key, session, e.code, tag)
@@ -3720,7 +3753,8 @@ def build_parser():
                     help="WAL id of the deploy, release or install record (done means deployed live and tested)")
     dp = ks.add_parser("dispose", help="record the decision for a DROPPED owner: resumed, reassigned, waiting or closed")
     dp.add_argument("--agent", required=True)
-    dp.add_argument("--kind", required=True, choices=list(liveness.DISPOSITIONS))
+    dp.add_argument("--kind", required=True, choices=list(DISPOSE_KINDS),
+                    help="finished: the task ended or reported finished (a reviewer, a fixer); no evidence needed")
     dp.add_argument("--ref", help="waiting: ask id or ticket; reassigned: replacement agent id")
     dp.add_argument("--until", help="waiting: ISO time when the wait expires")
     dp.add_argument("--ack-handoff", dest="ack_handoff", action="store_true",
