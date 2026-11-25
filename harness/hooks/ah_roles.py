@@ -10,6 +10,7 @@ Every guard and gate asks here instead of keeping its own idea of roles.
   supervised_roots(payload) the project directories that supervisor covers.
   may_delete(payload, path) (allowed, reason): the delete rule the user set on 2026-11-24.
   may_handle_secrets(payload) Fable and Astra may; nobody else.
+  caller_transcript(payload) the calling agent's own transcript (for the checkouts it made).
 
 Rules (the user, 2026-11-24):
   * Fable and Astra may delete files and folders anywhere, and may handle secrets.
@@ -223,6 +224,12 @@ def may_delete(payload, path, extra_own_roots=(), home=None) -> tuple[bool, str]
 
 def may_handle_secrets(payload) -> bool:
     return is_top_rung(payload)
+
+
+def caller_transcript(payload) -> Path | None:
+    """The calling agent's own transcript file (the sub-agent's when the payload names one), or None. Guards read it to
+    find the checkouts and worktrees the caller made (its `extra_own_roots`)."""
+    return _transcript(payload) if isinstance(payload, dict) else None
 
 
 def describe(payload, home=None) -> dict:

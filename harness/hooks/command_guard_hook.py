@@ -4,12 +4,13 @@
 Codex treats a crashing or timing-out hook as "allow", and Claude Code does so unless the hook entry carries
 `onFailure: block`. This launcher therefore never relies on the host: it runs the analyser in a child process with
 a watchdog, passes its answer through, and when the child crashes, cannot start, prints garbage or runs out of
-time, it decides from the raw text itself: a guarded shell tool whose input names a protected harness location,
-a secret source, or a code-execution step plus a destructive verb is blocked (exit 2); anything else is allowed
-with a note on stderr. It imports nothing outside the standard library and never imports command_guard.
+time, it decides from the raw text itself: a guarded shell tool whose input names a secret source or a credential
+location is blocked (exit 2); anything else, deletions included, is allowed with one line on stderr (the redesign
+of 2026-11-24: a guard that could not read a command never blocks it for the words it contains). It imports nothing
+outside the standard library and never imports command_guard.
 
-The probe here is deliberately duplicated from command_guard.py (PROTECTED_TEXT, SECRET_TEXT, EXEC_TEXT,
-DESTROY_TEXT, CRED_TEXT) so that a broken or missing analyser cannot also break the fallback.
+The probe here is deliberately duplicated from command_guard.py (SECRET_TEXT, CRED_TEXT) so that a broken or missing
+analyser cannot also break the fallback.
 """
 
 import json
@@ -25,15 +26,10 @@ GUARDED_TOOLS = {'bash', 'powershell', 'shell', 'local_shell', 'exec_command', '
                  'container.exec'}
 COMMAND_KEYS = ('command', 'cmd', 'script', 'chars', 'input')
 
-PROTECTED_TEXT = re.compile(r'(?i)\.(?:claude|codex|agent-harness)(?![\w-])|(?:^|[/\s\'"])wals?(?:/|$|[\s\'"])|'
-                            r'main\.jsonl|\.wal\.jsonl')
 SECRET_TEXT = re.compile(r'(?i)\brclone\b|\bauth\s+token\b|--show-token|\bprintenv\b|(?:^|[;&|(\s])(?:env|set|export'
                          r'|declare|typeset)(?:\s+-[px])?\s*(?:$|[;&|)])|credentials|\bid_(?:rsa|dsa|ecdsa|ed25519)\b'
                          r'|\.env\b|auth\.json|\.npmrc|\.netrc|\.pgpass|hosts\.yml|rclone\.conf|find-(?:generic|'
                          r'internet)-password|dump-keychain|/environ\b|(?:TOKEN|SECRET|PASSWORD|API_?KEY)\b')
-EXEC_TEXT = re.compile(r'(?i)\|\s*(?:sudo\s+)?(?:ba|z|k|da|)sh\b|\beval\b|\b(?:ba|z|)sh\s+-[a-z]*c\b|'
-                       r'\b(?:python[0-9.]*|node|perl|ruby)\s+-[a-z]*[ce]\b|base64\s+-[dD]|xxd\s+-r|\bsource\s+<\(')
-DESTROY_TEXT = re.compile(r'(?i)\b(?:rm|rmdir|unlink|shred|truncate|mv|rmtree|remove|unlinksync|rmsync|dd|find)\b')
 CRED_TEXT = re.compile(r'(?i)/goodqa(?![\w.-])|gq-browser|goodqa-hive|\.config/+[^\s/;&|<>()]*[*?\[{]'
                        r'|(?:^|[\s/=~:])\.(?:ssh|aws|gnupg|kube|docker)(?![\w-])|\.config/+(?:gh|gcloud|rclone)(?![\w-])'
                        r'|\.vault-token|\.git-credentials')
@@ -80,28 +76,20 @@ def payload_cwd(raw):
 
 
 def sensitive(text, cwd=None):
+    """A secret source or a credential location in the raw text (receipt r7: fail closed for those only). `cwd` is kept
+    for callers; where the command runs no longer matters here."""
     t = text[:4_000_000]
-    if PROTECTED_TEXT.search(t) or SECRET_TEXT.search(t) or (EXEC_TEXT.search(t) and DESTROY_TEXT.search(t)):
+    if SECRET_TEXT.search(t):
         return True
-    if CRED_TEXT.search(t) or CRED_TEXT.search(re.sub(r'[\'"\\]', '', t)):
-        return True  # a credential location (receipt r7: fail closed when the analyser crashes or times out)
-    if cwd and DESTROY_TEXT.search(t):
-        try:
-            real = os.path.realpath(cwd)
-        except (OSError, ValueError):
-            real = cwd
-        return any(PROTECTED_TEXT.search(place.replace('\\', '/') + '/') for place in (cwd, real))
-    return False
+    return bool(CRED_TEXT.search(t) or CRED_TEXT.search(re.sub(r'[\'"\\]', '', t)))
 
 
 def fallback(raw, why):
     guarded, text = guarded_text(raw)
     if guarded and sensitive(text, payload_cwd(raw)):
-        sys.stderr.write('command_guard BLOCKED [guard_failure]: the analyser %s and the command names a protected '
-                         'harness location, a credential location, a secret source or a code-execution step with a '
-                         'destructive verb. Safe '
-                         'alternative: split the command into simple steps; run `python3 %s doctor` to check the '
-                         'guard.\n' % (why, GUARD))
+        sys.stderr.write('command_guard BLOCKED [guard_failure]: the analyser %s and the command names a credential '
+                         'location or a secret source. Safe alternative: split the command into simple steps; run '
+                         '`python3 %s doctor` to check the guard.\n' % (why, GUARD))
         return 2
     if guarded:
         sys.stderr.write('command_guard: analyser %s; the command looked harmless and was allowed\n' % why)
@@ -127,11 +115,14 @@ def main():
         return 0
     raw = data.decode('utf-8', 'replace')
     if oversized:
-        guarded, _ = guarded_text(raw[:MAX_STDIN])
-        if guarded:
+        guarded, text = guarded_text(raw[:MAX_STDIN])
+        if guarded and sensitive(text):
             sys.stderr.write('command_guard BLOCKED [oversized-input]: the tool input is larger than the guard '
-                             'analyses. Safe alternative: put the commands in a script file and run it.\n')
+                             'analyses and names a secret source. Safe alternative: put the commands in a script file '
+                             'and run it.\n')
             return 2
+        if guarded:
+            sys.stderr.write('command_guard: the tool input is larger than the guard analyses; allowed\n')
         return 0
     if not guarded_text(raw)[0]:
         return 0  # Read, Write, Edit, MCP...: not a shell command, and Codex sends every tool here (no matcher)
@@ -160,6 +151,6 @@ if __name__ == '__main__':
         sys.exit(main())
     except SystemExit:
         raise
-    except BaseException:  # noqa: BLE001 - last resort: never let a launcher bug become a silent allow
-        sys.stderr.write('command_guard BLOCKED [guard_failure]: the launcher failed. Run the guard doctor.\n')
-        sys.exit(2)
+    except BaseException:  # noqa: BLE001 - last resort: a launcher bug allows, never silently
+        sys.stderr.write('command_guard: the launcher failed and the command was allowed; run the guard doctor.\n')
+        sys.exit(0)

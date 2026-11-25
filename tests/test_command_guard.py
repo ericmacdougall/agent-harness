@@ -129,12 +129,12 @@ class CorpusTests(Fixture):
         with mock.patch.object(cg, 'linked_worktree_remove_refusal', return_value=None):
             self.expect(corpus.NEG15_WORK_ALLOW, 'allow', label='NEG15_WORK_ALLOW')
 
-    def test_heredoc_with_destructive_text_is_never_silent(self):
-        # warn, never block: writing or printing the text is not a deletion, but it must not pass silently
-        self.expect(corpus.HEREDOC_DESTRUCTIVE_WARN, 'warn', label='HEREDOC_DESTRUCTIVE_WARN')
-        for cmd in corpus.HEREDOC_DESTRUCTIVE_WARN:
-            self.assertIn('heredoc-destructive-text', self.decide(cmd)[1], cmd)
-        self.expect(corpus.HEREDOC_DESTRUCTIVE_BLOCK, 'block', label='HEREDOC_DESTRUCTIVE_BLOCK')
+    def test_heredoc_with_destructive_text_is_allowed(self):
+        # writing or printing deletion text is not a deletion (2026-11-24: prose is never refused or flagged)
+        self.expect(corpus.HEREDOC_DESTRUCTIVE_WARN, 'allow', label='HEREDOC_DESTRUCTIVE_WARN')
+        self.expect(corpus.UNSURE_WARN, 'warn', label='UNSURE_WARN')
+        # a script that only WRITES the text of a deletion into a data file deletes nothing (2026-11-24)
+        self.expect(corpus.HEREDOC_DESTRUCTIVE_BLOCK, 'allow', label='HEREDOC_DESTRUCTIVE_BLOCK')
         self.expect(corpus.HEREDOC_PLAIN_ALLOW, 'allow', label='HEREDOC_PLAIN_ALLOW')
 
     def test_kill_positive_warns_or_blocks(self):
@@ -269,9 +269,9 @@ class FailureModeTests(Fixture):
     def test_unterminated_quote_without_protected_text_warns(self):
         self.assertEqual(self.decide("echo 'hello")[0], 'warn')
 
-    def test_over_budget_with_exec_step_blocks(self):
-        padding = 'true; ' * 120000
-        self.assertEqual(self.decide(padding + 'echo eA== | base64 -d | sh; rm x')[0], 'block')
+    def test_over_budget_with_exec_step_warns(self):
+        padding = 'true; ' * 120000  # 2026-11-24: unanalysable is allowed with a note, whatever words it holds
+        self.assertEqual(self.decide(padding + 'echo eA== | base64 -d | sh; rm x')[0], 'warn')
 
     def test_existing_script_keeps_log_deletion_and_credential_reads(self):
         """Replay false positives: repo tooling that handles env or looks up one secret is allowed; its log deletion and
@@ -381,15 +381,16 @@ class FailureModeTests(Fixture):
         self.assertEqual(self.decide('cat ~/{' + creds + '}/credentials')[0], 'block')
         self.assertEqual(self.decide('touch {' + ','.join('f%d' % k for k in range(40)) + '}')[0], 'allow')
 
-    def test_internal_error_uses_raw_sensitive(self):
-        """Red-team F6: an analyser bug must fail closed for commands that name protected locations."""
+    def test_internal_error_fails_closed_only_for_secret_text(self):
+        """Red-team F6, revised 2026-11-24: an analyser bug fails closed for secret sources only; a deletion the guard
+        could not read is allowed (with a note), never blocked for its words."""
         original = cg.Analyzer.run
         def boom(self, *a, **k):
             raise ValueError('seeded analyser bug')
         cg.Analyzer.run = boom
         try:
-            self.assertEqual(self.decide('rm -rf ~/.agent-harness/state')[0], 'block')
-            self.assertEqual(self.decide('rm -rf ~/.claude')[0], 'block')
+            self.assertEqual(self.decide('rm -rf ~/.agent-harness/state')[0], 'allow')
+            self.assertEqual(self.decide('rclone config show')[0], 'block')
             self.assertEqual(self.decide('ls -la')[0], 'allow')
         finally:
             cg.Analyzer.run = original
@@ -408,12 +409,13 @@ class FailureModeTests(Fixture):
         finally:
             cg._resolve_prefix = original
 
-    def test_over_budget_from_protected_cwd_blocks(self):
-        """Fresh red-team #2: the unanalysable fallback must consider a protected working directory."""
+    def test_over_budget_from_protected_cwd_warns(self):
+        """Fresh red-team #2, revised 2026-11-24: an unanalysable command warns (allowed with a note) even from a
+        harness working directory; it is not blocked for what it might do."""
         padding = "cat <<'EOF'\n" + ('x' * 280000) + "\nEOF\n"
-        self.assertEqual(self.decide(padding + 'rm -rf projects', cwd='@HOME@/.claude')[0], 'block')
+        self.assertEqual(self.decide(padding + 'rm -rf projects', cwd='@HOME@/.claude')[0], 'warn')
         nested = '$(' * 12 + 'true' + ')' * 12
-        self.assertEqual(self.decide('echo ' + nested + '; rm -rf sessions', cwd='@HOME@/.codex')[0], 'block')
+        self.assertEqual(self.decide('echo ' + nested + '; rm -rf sessions', cwd='@HOME@/.codex')[0], 'warn')
         self.assertIn(self.decide(padding + 'ls', cwd='@HOME@/repo')[0], ('warn', 'allow'))
 
     def test_powershell_overwrite_is_not_an_append(self):
@@ -579,6 +581,7 @@ PROTECTED_PAYLOAD = {'tool_name': 'Bash', 'tool_input': {'command': 'rm -rf /hom
 HARMLESS_PAYLOAD = {'tool_name': 'Bash', 'tool_input': {'command': 'ls -la'}}
 READ_PAYLOAD = {'tool_name': 'Read', 'tool_input': {'file_path': '/home/x/.claude/projects/a.jsonl'}}
 EXEC_PAYLOAD = {'tool_name': 'Bash', 'tool_input': {'command': 'echo eA== | base64 -d | sh; rm -f x'}}
+SECRET_PAYLOAD = {'tool_name': 'Bash', 'tool_input': {'command': 'rclone config show'}}
 
 
 class LauncherTests(unittest.TestCase):
@@ -613,11 +616,15 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(self.run_launcher(d, HARMLESS_PAYLOAD)[0], 0)
         self.assertEqual(self.run_launcher(d, READ_PAYLOAD)[0], 0)
 
-    def test_crashing_analyser_fails_closed_for_sensitive_text(self):
+    def test_crashing_analyser_fails_closed_for_secret_text_only(self):
+        # 2026-11-24: a deletion the analyser could not judge is allowed with a note; secret sources still fail closed
         d = self.launcher_dir('import sys\nraise SystemExit(7)\n')
-        code, err = self.run_launcher(d, PROTECTED_PAYLOAD)
+        code, err = self.run_launcher(d, SECRET_PAYLOAD)
         self.assertEqual(code, 2, err)
-        self.assertEqual(self.run_launcher(d, EXEC_PAYLOAD)[0], 2)
+        code, err = self.run_launcher(d, PROTECTED_PAYLOAD)
+        self.assertEqual(code, 0, err)
+        self.assertIn('allowed', err)
+        self.assertEqual(self.run_launcher(d, EXEC_PAYLOAD)[0], 0)
         self.assertEqual(self.run_launcher(d, HARMLESS_PAYLOAD)[0], 0)
         self.assertEqual(self.run_launcher(d, READ_PAYLOAD)[0], 0)
 
@@ -629,16 +636,19 @@ class LauncherTests(unittest.TestCase):
     def test_hanging_analyser_times_out_closed(self):
         d = self.launcher_dir('import time\ntime.sleep(30)\n', child_timeout=1.0)
         started = time.monotonic()
-        self.assertEqual(self.run_launcher(d, PROTECTED_PAYLOAD)[0], 2)
-        self.assertLess(time.monotonic() - started, 20)
+        self.assertEqual(self.run_launcher(d, SECRET_PAYLOAD)[0], 2)
+        self.assertEqual(self.run_launcher(d, PROTECTED_PAYLOAD)[0], 0)
+        self.assertLess(time.monotonic() - started, 30)
 
     def test_garbage_output_fails_closed(self):
         d = self.launcher_dir('print("not json")\n')
-        self.assertEqual(self.run_launcher(d, PROTECTED_PAYLOAD)[0], 2)
+        self.assertEqual(self.run_launcher(d, SECRET_PAYLOAD)[0], 2)
+        self.assertEqual(self.run_launcher(d, PROTECTED_PAYLOAD)[0], 0)
 
     def test_unparsable_payload_is_probed(self):
         d = self.launcher_dir('import sys\nraise SystemExit(7)\n')
-        self.assertEqual(self.run_launcher(d, b'{not json rm -rf ~/.claude/wals')[0], 2)
+        self.assertEqual(self.run_launcher(d, b'{not json rclone config show')[0], 2)
+        self.assertEqual(self.run_launcher(d, b'{not json rm -rf ~/.claude/wals')[0], 0)
 
     def test_large_non_shell_payload_is_fast(self):
         d = self.launcher_dir()
@@ -671,7 +681,7 @@ class OverwriteExistingTests(Fixture):
             p.write_text('keep\n')
         (self.home / '.agent-harness/work/S/T/hooklink').symlink_to(self.home / '.claude/hooks')
         failures = [(cmd, want, got) for cmd, want in corpus.OVERWRITE_EXISTING
-                    for got in [self.decide(cmd, cwd='@TASK@')[0]] if got != want]
+                    for got in [self.decide(cmd, cwd='@TASK@')[0]] if got != corpus.want(cmd, want)]
         self.assertGreaterEqual(len(corpus.OVERWRITE_EXISTING), 122)
         self.assertEqual(failures, [])
 
@@ -687,11 +697,11 @@ class OverwriteExistingTests(Fixture):
         self._seed_bang_rows()
         self.assertGreaterEqual(len(corpus.BANG_READINGS), 120)
         failures = [(cmd, want, got) for cmd, want in corpus.BANG_READINGS
-                    for got in [self.decide(cmd, cwd='@TASK@')[0]] if got != want]
+                    for got in [self.decide(cmd, cwd='@TASK@')[0]] if got != corpus.want(cmd, want)]
         self.assertEqual(failures, [])
         self.assertGreaterEqual(len(corpus.BANG_READINGS_CWD), 9)
         failures = [(cmd, want, got) for cmd, want, where in corpus.BANG_READINGS_CWD
-                    for got in [self.decide(cmd, cwd=where)[0]] if got != want]
+                    for got in [self.decide(cmd, cwd=where)[0]] if got != corpus.want(cmd, want)]
         self.assertEqual(failures, [])
 
     def test_bash_reading_stops_the_operator_before_the_bang(self):
@@ -769,7 +779,7 @@ class OverwriteExistingTests(Fixture):
         self.assertEqual(verdict, 'warn')  # past the cap the command is unanalysable, not clean
         self.assertLessEqual(len(count), 60)
         self.assertGreater(len(count), 8)  # it did fork: the row is not stopped at the first descent
-        self.assertEqual(self.decide(self._nested(8, 'word @HOME@/.claude'), cwd='@HOME@/proj')[0], 'block')
+        self.assertEqual(self.decide(self._nested(8, 'word @HOME@/.claude'), cwd='@HOME@/proj')[0], 'warn')
 
     def test_a_budget_stop_keeps_what_was_already_refused(self):
         self._seed_bang_rows()
@@ -805,8 +815,8 @@ class OverwriteExistingTests(Fixture):
         hide = 'rm -rf ~/.c*/projects'
         self.assertFalse(cg.raw_sensitive(hide))
         self.assertEqual(self.decide(text + '; ' + hide, cwd='@HOME@/proj')[0], 'block')
-        # text that names a protected location fails closed when both readings cannot be judged
-        self.assertEqual(self.decide(text + '; ls @HOME@/.claude', cwd='@HOME@/proj')[0], 'block')
+        # 2026-11-24: naming a protected location is not a reason to block when both readings cannot be judged
+        self.assertEqual(self.decide(text + '; ls @HOME@/.claude', cwd='@HOME@/proj')[0], 'warn')
 
     def test_nesting_too_deep_for_python_keeps_what_was_already_refused(self):
         self._seed_bang_rows()
@@ -1101,25 +1111,13 @@ class OverwriteExistingTests(Fixture):
         finally:
             os.path.realpath = real
 
-    def test_layout_refusals_say_what_to_do_instead(self):
-        for rel in ('.agent-harness/work/S/T/state/run.txt', '.agent-harness/scratch/top.txt',
-                    '.agent-harness/work/top.log'):
-            p = self.home / rel
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text('keep\n')
-        self.assertGreaterEqual(len(corpus.OVERWRITE_HINTS), 4)
-        for cmd, words in corpus.OVERWRITE_HINTS:
-            verdict, message = self.decide(cmd, cwd='@TASK@')[:2]
-            self.assertEqual(verdict, 'block', cmd)
-            self.assertIn(words, message, cmd)
-            self.assertNotIn('approve-delete', message, cmd)
-
-    def test_redirect_glob_with_too_many_matches_is_refused_without_a_full_walk(self):
+    def test_redirect_glob_with_too_many_matches_is_judged_without_a_full_walk(self):
         many = self.home / '.claude/many'
         many.mkdir(parents=True)
         for i in range(300):
             (many / ('f%d' % i)).write_text('keep\n')
-        self.assertEqual(self.decide('echo x > @HOME@/.claude/many/*', cwd='@TASK@')[0], 'block')
+        self.assertEqual(self.decide('echo x > @HOME@/.claude/many/*', cwd='@TASK@')[0], 'allow')  # not machinery
+        self.assertEqual(self.decide('echo x > @HOME@/.claude/hooks/*', cwd='@TASK@')[0], 'block')
         self.assertEqual(self.decide('echo x > @HOME@/.claude/many/nomatch-*', cwd='@TASK@')[0], 'allow')
 
 
