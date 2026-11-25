@@ -504,6 +504,12 @@ def cmd_pretool(payload: dict) -> dict:
     if caller_identity.is_main(payload):
         _stamp_ack(cmd, payload)  # B4: `ah task dispose --ack-handoff` needs this stamp
         return {}
+    try:
+        from command_guard_hook import payload_records_only  # noqa: PLC0415
+        if payload_records_only(payload, assignments=True):  # notes and ticket text are data (goodqa#17105)
+            return {}
+    except Exception:  # noqa: BLE001 - no helper, no exemption
+        pass
     if not acknowledges(cmd):  # anything not proven main: sub-agents, Codex payloads, a payload with no transcript
         return {}
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",

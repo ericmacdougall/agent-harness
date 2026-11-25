@@ -614,6 +614,18 @@ def _substitutions(token):
     return out
 
 
+SED_PRINT = re.compile(r"(?:\d+|\$)(?:,(?:\d+|\$))?p(?:;(?:\d+|\$)(?:,(?:\d+|\$))?p)*")
+
+
+def _plain_read(words):
+    """`sed -n 'N,Mp' FILE...` (line numbers only: sed can run and write with any other script) and `cut -c|-d|-f ...`."""
+    if words[0] == "sed" and len(words) > 2 and words[1] == "-n":
+        return bool(SED_PRINT.fullmatch(words[2])) and not any(t.startswith(("-", "$", "`")) for t in words[3:])
+    if words[0] == "cut" and len(words) > 1:
+        return all(re.match(r"^-[cdfs]", t) or not t.startswith("-") for t in words[1:])
+    return False
+
+
 def _waiver_attempt(command, _depth=0):
     """True when the command can run merge_gate's exception record. A subagent command that names merge_gate and an
     exception word is allowed only when every simple command in it is a known free-text form (print, search, git
@@ -642,7 +654,7 @@ def _waiver_attempt(command, _depth=0):
     if runs_code and (writes or any(os.path.basename(t) == "tee" for w in commands for t in w)):
         return True  # a file written next to a git or python run could be the hook or script that runs
     for words in commands:
-        if not _free_text(words):
+        if not _free_text(words) and (writes or not _plain_read(words)):
             return True
         for t in words:
             if any(_waiver_attempt(inner, _depth + 1) or not _plain_text(inner, _depth + 1) for inner in _substitutions(t)):
@@ -1960,6 +1972,12 @@ def decide(payload, runner, state_dir, now=None, notes=None):
     plain = re.sub(r"[\"'\\$]", "", command)  # w''aive, $M and escaped spellings
     if STATE_NAMES.search(command) or STATE_NAMES.search(plain):
         return 2, "merge-gate: the waiver, audit and approval files are written only by merge_gate.py itself."
+    try:
+        from command_guard_hook import payload_records_only  # noqa: PLC0415
+        if payload_records_only(payload, assignments=True):  # notes and ticket text are data (goodqa#17149)
+            return 0, ""
+    except Exception:  # noqa: BLE001 - no helper, no exemption
+        pass
     # A quoted `;` before the binding flags hides them from PEER_REVIEW_AUTH; the segment-wise mention still sees
     # them, and a line shell_words cannot verify is read as one text (goodqa#16811).
     bound_review = _launches_bound_review(command)

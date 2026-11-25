@@ -1647,7 +1647,7 @@ def make_analyzer_class(cg):
             elif name in cg.INTERPRETERS or INTERPRETER_NAME.fullmatch(name):
                 if not self.is_codex_note(words, cmd, depth, pl) and not self.is_ah_kill(name, args, cmd, depth) \
                         and not self.is_harness_cli(name, args, cmd, depth):
-                    self.check_interpreter(name, texts, cmd, args)
+                    self.check_interpreter(name, texts, cmd, args, pl)
             self.check_spawn(name, args, texts, depth, pl, idx)
             self.check_text_runners(name, args, texts, cmd, depth, pl, idx)
 
@@ -1892,7 +1892,7 @@ def make_analyzer_class(cg):
                 return False  # delta red-team D-F2: main may not use another session's spawns or asks
             return '--pid' in seen and '--reason' in seen
 
-        def check_interpreter(self, name, texts, cmd, args=None):
+        def check_interpreter(self, name, texts, cmd, args=None, pl=None):
             if args is not None and len(args) == len(texts) and all(a.text == t for a, t in zip(args, texts)):
                 skip = test_runner_exemptions(name, args, self.script_kill)
                 if skip:
@@ -1900,11 +1900,13 @@ def make_analyzer_class(cg):
                     texts, args = [texts[k] for k in keep], [args[k] for k in keep]
             texts = self.drop_script_arguments(texts, args)
             body = ' '.join(texts)
+            stdin_code = cg.python_stdin_program(cmd, pl, self.whole_command())
+            reads = stdin_code is not None and cg.python_only_reads(stdin_code)  # item 1 of goodqa#17149: nothing to scan
             for redir in getattr(cmd, 'redirs', []):
                 if redir.body:
-                    body += '\n' + redir.body
+                    body += '' if reads else '\n' + redir.body
                 elif redir.op == '<<<' and redir.target is not None:
-                    body += '\n' + redir.target.text
+                    body += '' if reads else '\n' + redir.target.text
             body = body.replace('kill_guard', '').replace('kill-guard', '')  # the guard's own name
             if name.startswith('python') and '-c' in texts and texts.index('-c') + 1 < len(texts):
                 code = texts[texts.index('-c') + 1]
@@ -1933,7 +1935,8 @@ def make_analyzer_class(cg):
             if not texts or texts[0].startswith('-'):
                 return texts
             name = os.path.basename(texts[0])
-            if name not in self.DATA_ARG_SCRIPTS:
+            settles = name == 'usage_guard.py' and texts[1:2] == ['reconcile']  # it records; `check` runs its words
+            if name not in self.DATA_ARG_SCRIPTS and not settles:
                 return texts
             # goodqa#15276 red-team H1: decide on the RAW word, as hook_script_ok does. A quoted or escaped '~' is a
             # literal ./~ directory, while .text has HOME expanded, so a text match let a planted copy through.
@@ -2313,6 +2316,12 @@ def hook_main():
     policy = load_policy()
     if policy['mode'] == 'off':
         return 0
+    try:
+        from command_guard_hook import payload_records_only  # noqa: PLC0415 - the shared helper (goodqa#17149)
+        if payload_records_only(json.loads(raw), assignments=True):
+            return 0  # only recording calls with literal words: what they say is data, and nothing signals
+    except Exception:  # noqa: BLE001 - no helper, no exemption
+        pass
     try:
         child = subprocess.run([sys.executable, '-I', os.path.abspath(__file__), 'analyze'], input=data,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,

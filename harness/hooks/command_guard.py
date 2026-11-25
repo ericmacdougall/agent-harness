@@ -3819,6 +3819,149 @@ def read_only_pattern_script(code):
     return True
 
 
+# goodqa#17084, goodqa#17149: Python that can only read files and print. A closed set of syntax, names, module members and
+# methods; anything else (a write, an import, a function value, an unlisted attribute) is not proven, and keeps every rule.
+_READ_NODES = frozenset(
+    'Module Expr Assign AugAssign Name Load Store Constant Call keyword Attribute Dict List Tuple Set Subscript Index Slice '
+    'BinOp UnaryOp BoolOp Compare IfExp JoinedStr FormattedValue Import ImportFrom alias Add Sub Mult Mod Div FloorDiv BitOr '
+    'And Or Not USub Eq NotEq Lt LtE Gt GtE In NotIn Is IsNot For If With withitem Try ExceptHandler Pass Continue Break '
+    'ListComp SetComp DictComp GeneratorExp comprehension'.split())
+_READ_CALLS = frozenset('print str len dict list sorted int repr tuple set range sum min max bool float enumerate zip any all '
+                        'abs round reversed open'.split())
+_READ_VALUES = frozenset('int str list dict set tuple float len Exception ValueError KeyError OSError TypeError IndexError '
+                         'FileNotFoundError UnicodeDecodeError'.split())  # harmless as a value (defaultdict(int), except X)
+_READ_MEMBERS = frozenset(
+    'json.dumps json.loads json.load json.JSONDecodeError re.sub re.match re.search re.findall re.finditer re.fullmatch '
+    're.split re.compile re.escape re.I re.IGNORECASE re.M re.MULTILINE re.S re.DOTALL os.path.exists os.path.join '
+    'os.path.basename os.path.dirname os.path.getsize os.path.getmtime os.path.expanduser os.path.isfile os.path.isdir '
+    'glob.glob glob.iglob collections.Counter collections.defaultdict datetime.datetime.now datetime.datetime.utcnow '
+    'datetime.datetime.fromisoformat datetime.datetime.strptime datetime.timedelta datetime.date.today '
+    'datetime.timezone.utc time.time time.strftime time.gmtime time.localtime textwrap.shorten textwrap.indent'.split())
+_READ_PREFIXES = frozenset('.'.join(m.split('.')[:i]) for m in _READ_MEMBERS for i in range(1, len(m.split('.')) + 1))
+# Methods of text, numbers, dates, containers, matches and read-mode files. The program can hold no path object, so
+# `replace` is text. None of these returns a module or a function.
+_READ_METHODS = frozenset(
+    'join get items keys values upper lower strip lstrip rstrip split rsplit splitlines replace startswith endswith append '
+    'extend isoformat strftime group groups groupdict start end span title count index find rfind ljust rjust center zfill '
+    'read readline readlines close search match fullmatch findall finditer sub most_common add update setdefault pop sort '
+    'copy isdigit casefold partition rpartition timestamp date total_seconds'.split())
+
+
+def python_only_reads(code):
+    """True when the Python program `code` can only read files, compute and print (see _READ_NODES)."""
+    import ast
+    import builtins
+    if not isinstance(code, str) or '\r' in code or '\f' in code \
+            or any(re.match(r'[ \t]*#.*coding[:=]', line) for line in code.split('\n')[:2]):
+        return False  # a coding line can make Python read other text than this
+    try:
+        nodes = list(ast.walk(ast.parse(code)))
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return False
+    if any(type(n).__name__ not in _READ_NODES for n in nodes):
+        return False
+    aliases = {}  # local name -> dotted path of the imported module or member
+    stored = {n.id for n in nodes if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+    stored |= {n.name for n in nodes if isinstance(n, ast.ExceptHandler) and n.name}
+    for node in nodes:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            base = '' if isinstance(node, ast.Import) else (node.module or '?') + '.'
+            for a in node.names:
+                local, path = a.asname or a.name, base + a.name
+                if getattr(node, 'level', 0) or path not in _READ_PREFIXES or not base and '.' in path \
+                        or local in aliases or hasattr(builtins, local):
+                    return False
+                aliases[local] = path
+    if any(n.startswith('_') or n in aliases or hasattr(builtins, n) for n in stored):
+        return False  # a rebound name could hide another object
+    heads = {id(n.value) for n in nodes if isinstance(n, ast.Attribute)}
+    called = {id(n.func) for n in nodes if isinstance(n, ast.Call)}
+
+    def dotted(node):
+        parts = []
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        return '.'.join([aliases[node.id]] + parts[::-1]) if isinstance(node, ast.Name) and node.id in aliases else None
+
+    for node in nodes:
+        if isinstance(node, (ast.Name, ast.Attribute)):
+            path = dotted(node)
+            if path is not None:
+                if not isinstance(node.ctx, ast.Load) or path not in (_READ_PREFIXES if id(node) in heads else _READ_MEMBERS):
+                    return False
+            elif isinstance(node, ast.Attribute):
+                if not isinstance(node.ctx, ast.Load) or node.attr not in _READ_METHODS:
+                    return False
+            elif node.id not in stored and node.id not in _READ_VALUES and not (node.id in _READ_CALLS and id(node) in called):
+                return False
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                if func.id not in _READ_CALLS and func.id not in aliases:
+                    return False
+                if func.id == 'open' and (not 1 <= len(node.args) <= 2 or not _literal_mode_is_read(node) or any(
+                        k.arg not in ('mode', 'encoding', 'errors', 'newline') for k in node.keywords)):
+                    return False
+            elif not isinstance(func, ast.Attribute):
+                return False
+    return True
+
+
+_PYTHON_HEAD = re.compile(r'(?:/(?:usr|usr/local|opt/homebrew)/bin/)?python3?(?:\.[0-9]{1,2})?')
+_BASH_HEAD = re.compile(r'(?:/bin/)?bash')
+_LITERAL_FILE = re.compile(r'(?:~/)?[A-Za-z0-9_@%./][A-Za-z0-9_@%+:,./-]*')
+# what could make a plain program name something else: a definition, or another search path, anywhere in the command
+_REDEFINES = re.compile(r'\b(?:alias|aliases|function|functions|hash|enable|eval|source|autoload|PATH|path|PYTHON\w*|BASH_ENV|ENV)\b|'
+                        r'\(\s*\)|(?:^|[\s;&|])\.\s')
+
+
+def literal_head(cmd, pattern, top, body=''):
+    """The raw words after the program, when the simple command `cmd` starts with a program spelled literally (no
+    assignment or wrapper before it) that nothing else in the whole command `top` (less `body`) could redefine."""
+    raws = [w.raw for w in getattr(cmd, 'words', None) or ()]
+    if not top or not raws or None in raws or not pattern.fullmatch(raws[0]):
+        return None
+    if body and top.count(body) != 1 or _REDEFINES.search(top.replace(body, ' ') if body else top):
+        return None  # the same text twice: a line outside the here-document could hide behind it
+    return raws[1:]
+
+
+# a group, branch, loop, substitution or exec around the program could send what it prints to something that runs it
+_CAPTURES = re.compile(r'[(){}`]|\b(?:exec|coproc|do|then|else|case)\b')
+_SHOWS = frozenset(('head', 'tail', 'wc', 'cut', 'grep', 'cat'))
+
+
+def python_stdin_program(cmd, pl, top):
+    """The exact program text of a `python3 [-I|-B|-u|-s|-E]* [- ARGS]` whose one standard input is a here-document the shell
+    does not expand, or a single-quoted here-string, and whose output is only shown (see _CAPTURES and _SHOWS): printed text
+    that a shell or a file takes up could be run. None in every other case."""
+    stages = list(getattr(pl, 'cmds', None) or ())
+    feeds = [r for r in getattr(cmd, 'redirs', ()) if r.op in ('<<', '<<<')]
+    others = [r for r in getattr(cmd, 'redirs', ()) if r not in feeds]
+    if len(feeds) != 1 or feeds[0].fd not in (None, '0') or not stages or stages[0] is not cmd:
+        return None
+    for r in others:
+        to = getattr(r.target, 'text', '')
+        if not (r.op == '>&' and r.fd == '2' and to == '1' or r.op in ('>', '&>') and to == '/dev/null'):
+            return None
+    for stage in stages[1:]:
+        raws = [w.raw for w in stage.words]
+        if stage.redirs or None in raws or not raws or raws[0] not in _SHOWS:
+            return None
+    feed, text = feeds[0], None
+    if feed.op == '<<' and (feed.quoted or not re.search(r'[$`\\]', feed.body)):
+        text = feed.body
+    elif feed.op == '<<<' and re.fullmatch(r"'[^']*'", getattr(feed.target, 'raw', None) or ''):
+        text = feed.target.raw[1:-1]
+    raws = literal_head(cmd, _PYTHON_HEAD, top, text) if text else None
+    if raws is None or _CAPTURES.search(top.replace(text, ' ')):
+        return None
+    while raws and raws[0] in ('-I', '-B', '-u', '-s', '-E'):
+        raws = raws[1:]
+    return text if not raws or raws[0] == '-' else None
+
+
 def blank_regex_patterns(code):
     """Python source with the pattern literal of each `re.<fn>(PATTERN, ...)` call emptied, except a literal that names a
     protected location (a WAL, log or transcript path is never blanked). A regex pattern cannot run anything, so a
@@ -4025,6 +4168,10 @@ class Analyzer:
         if ok:
             return value
         raise value
+
+    def whole_command(self):
+        """The tool call's whole command text (kill_guard keeps it as `raw`), or None."""
+        return getattr(self.ctx, 'raw_top', None) or getattr(self, 'raw', None)
 
     # ---- entry
     def run(self, text):
@@ -4544,7 +4691,7 @@ class Analyzer:
                 self.code(body, depth)
                 return
         if name in INTERPRETERS:
-            self.code(body, depth)
+            self.code(body, depth, python=python_stdin_program(pl.cmds[idx], pl, self.whole_command()) == body)
             return
         if name == 'ssh':
             self.script(body, depth + 1, tail_visible=True)
@@ -5301,6 +5448,11 @@ class Analyzer:
     def shell(self, name, args, depth, pl, idx):
         texts = [a.text for a in args]
         ps = name in PS_SHELLS
+        cmd = pl.cmds[idx]
+        if len(texts) == 2 and len(pl.cmds) == 1 and not cmd.redirs:
+            raws = literal_head(cmd, _BASH_HEAD, self.whole_command())
+            if raws and raws[0] == '-n' and len(raws) == 2 and _LITERAL_FILE.fullmatch(raws[1]):
+                return  # `bash -n FILE` parses the file and runs none of it
         for i, t in enumerate(texts):
             is_c = (not ps and (t == '-c' or (re.fullmatch(r'-[a-zA-Z]*c[a-zA-Z]*', t) is not None) or t.startswith('--command'))) \
                 or (ps and t.lower() in ('-c', '-command', '-encodedcommand', '-e', '-ec') or ps and t.lower() == '/c')
@@ -6734,11 +6886,15 @@ class Analyzer:
                                      'can destroy or replace a file',
                                      'edit the file with the editor tool, or keep the change out of the harness roots')
 
-    def code(self, code, depth):
+    def code(self, code, depth, python=False):
+        """Judge the text of an interpreter program. `python`: it is exactly the program Python reads."""
         ctx = self.ctx
+        reads = python and python_only_reads(code)  # it writes nothing, so a write verb in its text acts on no path
         # destroyer words inside a regex pattern are data: the log-delete text rule reads the code without them
         blanked = blank_regex_patterns(code) if read_only_pattern_script(code) else code
         for f in fallback_scan(code, ctx.c):
+            if f.rule == 'log-delete-text' and reads:
+                continue
             if f.category == LOG_DELETE and blanked != code and not any(
                     g.rule == f.rule and g.category == LOG_DELETE for g in fallback_scan(blanked, ctx.c)):
                 continue
@@ -7443,6 +7599,29 @@ class Analyzer:
                     return False
         return True
 
+    def _own_work_target(self, word):
+        """One literal path to a plain work file (see _plain_work_file) below this machine's ~/.agent-harness/work/<the calling
+        session's id>/, with no `..`, symlink or other case in it, and no second name of another file. The id comes from the
+        hook payload, never from the command (goodqa#17104). A redirect may already overwrite any session's plain work file."""
+        session, text = getattr(self.c, 'session', None), word.text
+        if not session or word.dynamic or word.subs or word.vars or word.glob or word.overflow or len(word.alts) != 1 \
+                or '..' in text.split('/') or is_dynamic_path(text) or any(ch in text for ch in GLOB_CHARS + '\x00'):
+            return False
+        if not text.startswith(('/', '~/')) and (self.ctx.cwd_unknown or self.ctx.cwd_protected_unknown or not self.ctx.cwd_known):
+            return False
+        path = norm_path(text, self.ctx)
+        if re.search(r'(?:^|[^a-z])(?:wals?|transcripts?|backups?)(?:[^a-z]|$)|owner-decision|/inbox/', path[len(self.ctx.home):].casefold()):
+            return False  # a log, backup or answer file by its name
+        home = next((h for h in self.c.homes if path.startswith(h + '/.agent-harness/work/' + session + '/')), None)  # exact case
+        try:
+            if home is None or os.path.realpath(path) != os.path.realpath(home) + path[len(home):]:
+                return False  # another session's dir, another host's, or a symlink anywhere below the home
+            if os.path.lexists(path) and os.lstat(path).st_nlink != 1:
+                return False
+        except (OSError, ValueError):
+            return False
+        return self._plain_work_file(path)
+
     def note_created(self, word, text=None):
         self.ctx.fs_cache.clear()  # created paths change what the next probes must see
         for alt in word.alts[:32]:
@@ -7511,7 +7690,9 @@ class Analyzer:
                 if self.state_dest(w):
                     continue
                 if not appending:
-                    self.refuse(name + ' (overwrites)', w, tiers=('log', 'root', 'unknown'), need_existing=True)
+                    own = name == 'tee' and not ctx.ps and self._own_work_target(w)
+                    self.refuse(name + ' (overwrites)', w, tiers=('log', 'unknown') if own else ('log', 'root', 'unknown'),
+                                need_existing=True)
         elif name == 'dd':
             for a in args:
                 if a.text.startswith('of='):
@@ -9872,6 +10053,9 @@ def hook_main(fmt='exit2', stdin_bytes=None, compiled=None, marker=True):
                 return emit('block', format_block(Finding(LOG_DELETE, 'install-files', refusal.replace('ah install-files: ', ''),
                                                           INSTALL_FILES_FORM)), fmt)
         approvals = Approvals(compiled=c) if marker else None
+        session = payload.get('session_id') if isinstance(payload, dict) else None
+        c.session = session if isinstance(session, str) and re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', session) \
+            else None
         verdict, message = decide(command, c, cwd=cwd, ps=ps, marker=approvals)
         if verdict != 'block' and approvals is not None and approvals.used and not approvals.consume():
             verdict, message = 'block', format_block(Finding(LOG_DELETE, 'approval-used', 'the delete approval was '
