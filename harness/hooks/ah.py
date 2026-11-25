@@ -4085,6 +4085,15 @@ def main(argv=None) -> int:
     if given[:1] == ["decision"]:  # goodqa#16651: signed central top-rung decisions (central_decisions.py)
         import central_decisions  # noqa: PLC0415
         return central_decisions.main(given[1:])
+    if given[:1] == ["clone-remove"]:  # goodqa#17119: remove ONE verified whole clone inside an agent work dir (ah_clone.py)
+        try:
+            import ah_clone  # noqa: PLC0415
+        except ImportError:
+            json.dump({"ok": False, "code": "missing", "message": "ah_clone.py is not installed beside ah.py; install the "
+                                                                    "merged hook files first"}, sys.stdout)
+            sys.stdout.write("\n")
+            return 4
+        return ah_clone.cli_main(given[1:])
     if given[:1] == ["guard-selftest"]:  # goodqa#15876: a fixed live test of a guard rule; it takes no command, path or directory
         try:
             import guard_selftest  # noqa: PLC0415

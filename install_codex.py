@@ -47,7 +47,7 @@ DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report
                     'copy_hygiene.py', 'lifecycle_cleanup.py',
                     'shell_words.py',  # the shell reader merge_gate and copy_hygiene share (goodqa#16811)
                     # Dropped-owner gate on Codex Stop and its reads (goodqa#14791 P18)
-                    'dropped_gate.py', 'ah.py', 'ah_worktree.py', 'ah_install.py', 'guard_selftest.py', 'liveness.py',
+                    'dropped_gate.py', 'ah.py', 'ah_worktree.py', 'ah_clone.py', 'ah_install.py', 'guard_selftest.py', 'liveness.py',
                     # ah export and ah status: status_report imports goals_view (goodqa#15788)
                     'ah_export.py', 'goals_view.py',
                     # goals_view imports mission_coverage at load; spec_flow and others import these lazily
