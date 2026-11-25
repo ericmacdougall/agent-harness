@@ -3676,6 +3676,11 @@ def build_parser():
     cc = ts.add_parser("comment")
     cc.add_argument("ticket", help="GoodQA <project>#N")
     cc.add_argument("--body", required=True)
+    te = ts.add_parser("edit", help="change a ticket's title or priority (GoodQA update_issue)")
+    te.add_argument("number", help="GoodQA <project>#N or N")
+    te.add_argument("--title")
+    te.add_argument("--priority")
+    te.add_argument("--project", default="goodqa")
     tc = ts.add_parser("create", help="file a GoodQA ticket (idempotent on --key)")
     tc.add_argument("--project", required=True)
     tc.add_argument("--title", required=True)
@@ -3907,6 +3912,12 @@ def run(args, home: Path) -> dict:
             import ah_ticket
             try:
                 return ah_ticket.create(args.project, args.title, args.body_file, args.type, args.priority, args.key, home)
+            except ah_ticket.TicketCreateError as e:
+                raise AhError(e.code, str(e), e.exit_code)
+        if args.sub == "edit":
+            import ah_ticket
+            try:
+                return ah_ticket.edit(args.number, args.title, args.priority, args.project)
             except ah_ticket.TicketCreateError as e:
                 raise AhError(e.code, str(e), e.exit_code)
         if args.sub == "get":
