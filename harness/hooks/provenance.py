@@ -1475,7 +1475,7 @@ def _resolve(source, ctx, depth, seen, result):
         node = {"kind": "wal", "ref": f"{path.parent.name}/{path.name}#{parsed['entry']}", "event": record.get("event"),
                 "at": record.get("at"), "note": clip(record.get("note", ""), 300), "status": "verified"}
         result["chain"].append(node)
-        upstream = record.get("source")
+        upstream = record.get("source_normalized") or record.get("source")  # wal_note stores both (2026-11-24)
         if not upstream:
             # B3.9: an unsourced (legacy or grandfathered) entry no longer refuses the whole citation; it resolves as an
             # assumption, labelled so, which cannot ground a user requirement, a permission or a completion claim.

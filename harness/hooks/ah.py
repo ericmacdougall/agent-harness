@@ -1936,16 +1936,22 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
     if op == "task.register":
         if _task(ledger, args["task"]):
             raise AhError("task_exists", f"task {args['task']!r} is already registered; ownership is not reassigned silently", 3)
-        import provenance
+        # 2026-11-24: a source that does not trace is a warning, never a refusal; the row is flagged unsourced
+        warning = None
         try:
-            res = provenance.resolve(args["source"])
-        except Exception as e:  # a resolver crash is a rejection, never a silent pass
-            raise AhError("provenance", f"source check failed ({type(e).__name__})", 3)
-        if not res["ok"]:
-            first = res["problems"][0] if res["problems"] else {"code": "rejected", "message": "rejected"}
-            raise AhError("provenance", f"source rejected ({first['code']}): {first['message']}"[:300], 3)
+            import provenance
+            res = provenance.resolve(args["source"], {"session": args.get("session") or ""})
+            if not res["ok"]:
+                first = res["problems"][0] if res["problems"] else {"code": "rejected", "message": "rejected"}
+                warning = f"source not traced ({first['code']}): {first['message']}"[:300]
+        except Exception as e:  # noqa: BLE001 - a resolver crash is reported, never a reason to drop the task
+            warning = f"source check failed ({type(e).__name__})"
         rec = {"at": now, "event": "scope", "id": wid, "source": args["source"][:2000],
                "note": f"task {args['task']} registered: owner {args['owner_agent']}, {args['ticket']}; {args['scope']}"[:3900]}
+        if warning:
+            rec["unsourced"] = True
+            out["unsourced"] = True
+            out["warnings"] = [warning]
         _wal_append(home, _wal_path(home, args["session"], "main"), rec)
         out["wal"] = wid
     elif op == "task.status":
@@ -2370,9 +2376,8 @@ def _finished_check(home: Path, args: dict) -> str:
     caller = env_session()
     if not caller or caller == session:  # the registering session's own call (ah's session is the caller's)
         return "session"
-    import ah_kill  # noqa: PLC0415 - cli_payload: the CLI's idea of the caller for ah_roles
     import ah_roles  # noqa: PLC0415
-    payload = ah_kill.cli_payload(home, caller, os.environ.get("AH_AGENT_ID", ""))
+    payload = ah_roles.cli_payload(home=home, session=caller, agent=os.environ.get("AH_AGENT_ID", ""))
     if ah_roles.is_top_rung(payload):
         return "top-rung"
     if ah_roles.is_supervisor(payload, home):
@@ -3313,7 +3318,7 @@ def note_cmd(home: Path, args) -> dict:
     text = args.note
     if args.id and not ASK_ID_RE.match(args.id):
         raise AhError("bad_request", "note: --id must be a WAL entry id (w + 11 hex)")
-    if args.id:  # re-cite an existing quarantined entry: its event kind is kept; its text unless --note overrides
+    if args.id:  # re-cite an existing unsourced entry: its event kind is kept; its text unless --note overrides
         import safe_input  # noqa: PLC0415
         for raw in (safe_input.read_tail(wal, 4 << 20).splitlines() if wal.is_file() else []):
             try:
@@ -3358,8 +3363,7 @@ def note_cmd(home: Path, args) -> dict:
             plan["refused"] = True
             plan["problem"] = str(refusal.get("problem") or "")[:300]
     elif isinstance(plan.get("written"), dict) and plan["written"].get("warnings"):
-        plan["ok"] = False  # written, but quarantined: the source did not resolve here (M2); say so instead of ok
-        plan["quarantined"] = True
+        plan["unsourced"] = True  # written; the source did not trace here, so the row is flagged unsourced (2026-11-24)
         plan["warnings"] = plan["written"]["warnings"]
     return plan
 
@@ -3818,7 +3822,7 @@ def build_parser():
     nt = sub.add_parser("note", help="write a WAL note through wal_note.py; --source auto picks the nearest sourced ancestor")
     nt.add_argument("--wal", required=True)
     nt.add_argument("--event", default="decision")
-    nt.add_argument("--note", help="the note text (omit with --id to re-cite an existing quarantined entry)")
+    nt.add_argument("--note", help="the note text (omit with --id to re-cite an existing unsourced entry)")
     nt.add_argument("--id", help="re-cite an existing unsourced entry of this WAL by id")
     nt.add_argument("--source", default="auto", help="a Source: string, or auto")
     nt.add_argument("--dry-run", action="store_true", help="print the Source that would be written; write nothing")

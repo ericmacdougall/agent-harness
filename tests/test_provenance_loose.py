@@ -110,6 +110,19 @@ class Unsourced(Loose):
         rc, out = self.note("--event", "decision", "--note", "no source at all")
         self.assertEqual(rc, 0, out)
 
+    def test_wal_note_stores_the_normalised_source_found_through_the_wal_session(self):
+        # no session in the environment: the quote is looked up in the WAL folder's session (its directory name)
+        env = {k: v for k, v in self.env.items() if k not in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID")}
+        given = f'user said "{QUOTE}"'
+        p = subprocess.run([sys.executable, str(HOOKS / "wal_note.py"), "--wal", str(self.main), "--event", "decision",
+                            "--note", "we go with it", "--source", given], capture_output=True, text=True, env=env,
+                           timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        row = self.rows()[-1]
+        self.assertEqual(row["source"], given)  # kept as given
+        self.assertTrue(row.get("source_normalized", "").startswith(f"user:{SID}/{HUMAN} "), row)
+        self.assertFalse(row.get("unsourced"), row)
+
     def test_formerly_quarantined_record_reads_as_unsourced(self):
         old = {"at": iso(time.time() - 3600), "event": "decision", "id": "wquar0000001", "note": "we go with python",
                "unsourced": True}

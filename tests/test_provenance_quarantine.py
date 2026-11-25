@@ -129,19 +129,6 @@ class Quarantine(Base):
         self.assertEqual(rc, 0, doc)
         self.assertTrue(self.rows()[-1].get("unsourced"))
 
-    def test_only_caller_error_codes_are_refused_transient_codes_still_quarantine(self):
-        """Review finding (2026-11-06): a resolver that times out or hits a malformed transcript is not the caller's
-        mistake; those rejections keep the warn-mode quarantine path instead of dropping the note."""
-        import wal_note
-        for code in ("bad-syntax", "ticket-missing", "transcript-missing", "inferred-nested", "excerpt-not-found"):
-            self.assertTrue(wal_note.caller_error(f"source rejected ({code}): x"), code)
-        for code in ("scan-timeout", "transcript-malformed", "wal-missing", "wal-malformed", "file-unreadable",
-                     "file-too-large", "internal", "rejected"):
-            self.assertFalse(wal_note.caller_error(f"source rejected ({code}): x"), code)
-        self.assertFalse(wal_note.caller_error("decision has no --source"))
-        self.assertFalse(wal_note.caller_error("provenance check failed (TypeError)"))
-        self.assertFalse(wal_note.caller_error(None))
-
     def test_inferred_free_text_input_names_the_input_not_the_source(self):
         """The rejection of `inferred: from <free text> -- why` must say which input is not a source; the old message
         said the Source must start with inferred: although it did (main WAL w8d5f765ea4c)."""
@@ -208,15 +195,17 @@ class NoteSourceAuto(base.Env):
         self.assertIn("allowlist", p.stderr)
 
     def test_note_with_an_unbackable_source_is_written_unsourced(self):
-        """M2: when the chosen source cannot be backed here, `ah note` must not say ok. Since 2026-11-24 the row is
-        written labelled unsourced (it was refused and dropped from 2026-11-06)."""
+        """M2: when the chosen source cannot be backed here, `ah note` says so. Since 2026-11-24 the row is written
+        labelled unsourced and the result is ok=True, unsourced=True (it was refused and dropped from 2026-11-06)."""
         now = time.time()
         with open(self.wal, "a") as fh:
             fh.write(json.dumps({"at": iso(now - 600), "event": "scope", "id": "wsrc00000002", "note": "unbackable ancestor",
                                  "source": 'user:12345678-1234-1234-1234-123456789abc/12345678-1234-1234-1234-123456789abd "gone"'}) + "\n")
         before = len(self.rows())
         rc, done = self.ah("note", "--wal", str(self.wal), "--source", "auto", "--note", "follow-up")
-        self.assertFalse(done["ok"])
+        self.assertTrue(done["ok"], done)
+        self.assertTrue(done.get("unsourced"), done)
+        self.assertFalse(done.get("quarantined"), done)
         self.assertFalse(done.get("refused"), done)
         self.assertEqual(len(self.rows()), before + 1)
         self.assertTrue(self.rows()[-1].get("unsourced"))

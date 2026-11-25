@@ -841,14 +841,18 @@ class WriteTests(GoodQABase):
         audit = [json.loads(l) for l in open(self.home / ".agent-harness" / "state" / "ah" / "store" / "audit.jsonl")]
         self.assertEqual(audit[-1]["result"], "rejected")
 
-    def test_register_rejects_unsourced(self):
+    def test_register_warns_on_an_unsourced_source(self):
+        # 2026-11-24: an untraced source registers the task, flagged unsourced, with a warning (never a refusal)
         wal = self.home / ".claude" / "wals" / SESSION
         wal.mkdir(parents=True)
-        with self.assertRaises(ah.AhError) as c:
-            ah.write(self.home, "task.register", {
-                "task": "t2", "owner_agent": "o", "session": SESSION, "ticket": "GoodQA goodqa#77",
-                "scope": "s", "source": "because I said so"}, SESSION, "reg-bad-0001")
-        self.assertEqual(c.exception.code, "provenance")
+        r = ah.write(self.home, "task.register", {
+            "task": "t2", "owner_agent": "o", "session": SESSION, "ticket": "GoodQA goodqa#77",
+            "scope": "s", "source": "because I said so"}, SESSION, "reg-bad-0001")
+        self.assertTrue(r.get("unsourced"), r)
+        self.assertTrue(r.get("warnings"), r)
+        row = json.loads((wal / "main.jsonl").read_text().splitlines()[-1])
+        self.assertTrue(row.get("unsourced"))
+        self.assertEqual(row["source"], "because I said so")
 
     def test_comment_spools_when_goodqa_down_then_drains_once(self):
         FakeGoodQA.state["down"] = True
