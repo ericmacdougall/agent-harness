@@ -1898,7 +1898,7 @@ def make_analyzer_class(cg):
                 if skip:
                     keep = [k for k in range(len(args)) if k not in skip]
                     texts, args = [texts[k] for k in keep], [args[k] for k in keep]
-            texts = self.drop_script_arguments(texts, args)
+            texts = self.drop_script_arguments(texts, args, cmd)
             body = ' '.join(texts)
             for redir in getattr(cmd, 'redirs', []):
                 if redir.body:
@@ -1924,7 +1924,19 @@ def make_analyzer_class(cg):
         # goodqa#15276: only the caller's own installed copies, never ./ah.py, /tmp/ah.py or another user's home
         DATA_ARG_DIRS = ('~/.claude/hooks/', '~/.codex/agent-harness/')
 
-        def drop_script_arguments(self, texts, args=None):
+        REDEFINES = re.compile(r'\b(?:aliases|alias|function|functions|hash|eval|source|enable|path|PATH|PYTHON\w*|BASH_ENV|ENV)\b'
+                               r'|\(\s*\)|(?:^|[;&|({!\n]|\b(?:then|do|else|time|command|builtin)\s)\s*\.\s')
+
+        def settles(self, texts, args, cmd):
+            """`python3 usage_guard.py reconcile ...` records; `check` runs its words. The interpreter and the sub-command
+            are compared as written: .text holds the last value the analyser saw, which the shell may never have set. A
+            command that may give `python3` another meaning has no exemption either."""
+            head = (getattr(cmd, 'words', None) or [None])[0]
+            return bool(getattr(head, 'raw', None) == 'python3' and not self.REDEFINES.search(self.raw or '')
+                        and args and len(args) == len(texts) and len(args) > 1
+                        and os.path.basename(args[0].raw or '') == 'usage_guard.py' and args[1].raw == 'reconcile')
+
+        def drop_script_arguments(self, texts, args=None, cmd=None):
             """`python3 wal_note.py --note 'will kill nothing'`: the arguments of a NAMED harness tool that records
             text are data, not code (goodqa#14817). Deliberately an allowlist: any other script (run_capped.py,
             watch-tests.py, a runner) may run its arguments as a command, and a flag before the script may carry
@@ -1933,7 +1945,7 @@ def make_analyzer_class(cg):
             if not texts or texts[0].startswith('-'):
                 return texts
             name = os.path.basename(texts[0])
-            if name not in self.DATA_ARG_SCRIPTS:
+            if name not in self.DATA_ARG_SCRIPTS and not self.settles(texts, args, cmd):
                 return texts
             # goodqa#15276 red-team H1: decide on the RAW word, as hook_script_ok does. A quoted or escaped '~' is a
             # literal ./~ directory, while .text has HOME expanded, so a text match let a planted copy through.
@@ -2313,6 +2325,12 @@ def hook_main():
     policy = load_policy()
     if policy['mode'] == 'off':
         return 0
+    try:
+        from command_guard_hook import payload_records_only  # noqa: PLC0415 - the shared helper (goodqa#17149)
+        if payload_records_only(json.loads(raw), assignments=True):
+            return 0  # only recording calls with literal words: what they say is data, and nothing signals
+    except Exception:  # noqa: BLE001 - no helper, no exemption
+        pass
     try:
         child = subprocess.run([sys.executable, '-I', os.path.abspath(__file__), 'analyze'], input=data,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,

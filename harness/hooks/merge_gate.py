@@ -1960,6 +1960,12 @@ def decide(payload, runner, state_dir, now=None, notes=None):
     plain = re.sub(r"[\"'\\$]", "", command)  # w''aive, $M and escaped spellings
     if STATE_NAMES.search(command) or STATE_NAMES.search(plain):
         return 2, "merge-gate: the waiver, audit and approval files are written only by merge_gate.py itself."
+    try:
+        from command_guard_hook import payload_records_only  # noqa: PLC0415
+        if payload_records_only(payload, assignments=True):  # notes and ticket text are data (goodqa#17149)
+            return 0, ""
+    except Exception:  # noqa: BLE001 - no helper, no exemption
+        pass
     # A quoted `;` before the binding flags hides them from PEER_REVIEW_AUTH; the segment-wise mention still sees
     # them, and a line shell_words cannot verify is read as one text (goodqa#16811).
     bound_review = _launches_bound_review(command)

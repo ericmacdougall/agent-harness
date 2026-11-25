@@ -292,6 +292,25 @@ class FailureModeTests(Fixture):
         written = "printf 'env\\n' > @HOME@/repo/tools/new.sh && bash @HOME@/repo/tools/new.sh"
         self.assertEqual(self.decide(written)[0], 'block')
 
+    def test_a_note_that_names_a_credential_place_is_data_and_a_read_beside_it_is_not(self):
+        """goodqa#17149: text handed to the guard functions only; no such path is opened, listed or read here."""
+        import command_guard_hook as launcher
+        hooks = self.home / '.claude/hooks'
+        for name in ('wal_note.py', 'ah.py'):
+            (hooks / name).write_text('# a stand-in, never run\n')
+        for path in (self.home, self.home / '.claude', hooks, hooks / 'wal_note.py', hooks / 'ah.py'):
+            path.chmod(0o700)
+        note = 'python3 ~/.claude/hooks/wal_note.py --wal ~/.claude/wals/s/agent-a.jsonl --event status --note '
+        comment = 'python3 ~/.claude/hooks/ah.py ticket comment goodqa#17149 '
+        for command in (note + "'the step that reads ~/.aws/credentials was refused'", note + '"~/.ssh/config and .netrc are only named"',
+                        comment + "--body 'no .npmrc, .pgpass or hosts.yml was read'"):
+            self.assertTrue(launcher.payload_records_only({'tool_name': 'Bash', 'tool_input': {'command': command}}), command)
+        for command in (note + "'a'; cat ~/.aws/credentials", note + '"$(cat ~/.aws/credentials)"', note + '"`cat ~/.netrc`"',
+                        note + "'a' < ~/.aws/credentials", note + "'a' --source 'file:~/.aws/credentials#1'",
+                        comment + '--body-file ~/.aws/credentials', "N=$(cat ~/.netrc); " + note + '"$N"', "cat ~/.netrc | " + note + "'a'"):
+            for assignments in (False, True):
+                self.assertFalse(launcher.records_only(command, assignments), command)
+
     def test_explain_survives_an_unterminated_key_header_in_a_finding(self):
         """Plan review of the F01 port: explain() redacted serialized JSON, so a finding whose text held a private-key
         header without its END line made json.loads raise. It now redacts each value."""
@@ -590,7 +609,7 @@ class LauncherTests(unittest.TestCase):
         d = Path(tmp.name)
         text = LAUNCHER_SRC.read_text()
         if child_timeout is not None:
-            text = text.replace('CHILD_TIMEOUT = 10.0', 'CHILD_TIMEOUT = %r' % child_timeout)
+            text = text.replace('CHILD_TIMEOUT = 18.0','CHILD_TIMEOUT = %r' % child_timeout)
         (d / 'command_guard_hook.py').write_text(text)
         if guard_source is None:
             for name in ('command_guard.py', 'redact.py', 'safe_input.py'):
