@@ -68,6 +68,30 @@ An existing checkout can be reused at the disk floor. An advance to a different 
 
 Reaping reports by default. If enabled explicitly, it holds the managed checkout lease and checks liveness, service protection and local state. It confirms the same directory, Git registration, commit, tree and index before asking Git to remove the linked checkout without force. Keep legacy and unmanaged copies and copies with tracked protected logs or WALs for separate disposition. Tools that operate outside the managed lease must be stopped before reaping.
 
+## Checkout inventory (read-only)
+
+`scripts/checkout_inventory.py` lists checkouts and work dirs as TSV so a person or main can see what exists before
+anything is removed. It removes nothing and has no remove mode; removals go through the sanctioned routes
+(`ah worktree-remove`, `ah task dispose`, the janitor).
+
+```sh
+python3 -I scripts/checkout_inventory.py repos ~/timbar ~/parentproof ~/.agent-harness/work/*/* > repos.tsv
+python3 -I scripts/checkout_inventory.py workdirs ~/.agent-harness/work > workdirs.tsv
+```
+
+- `repos` prints one row per worktree (main checkout first, then each linked worktree, deduplicated by git common
+  dir): branch, HEAD, whether the folder exists, locked, prunable, dirty count, unpushed count, merged into
+  origin/main (ancestry only: a squash merge shows `no`), upstream, last touched, size, and on the main row the origin
+  URL without userinfo, the last fetch time, the stash count and `local_unpushed` (commits on any local branch or tag
+  and on no remote-tracking ref: what removing the whole clone would lose; the row's own unpushed count covers HEAD
+  only). "Unpushed" and "merged" are as of the last fetch: the tool never fetches.
+- `workdirs` prints one row per child folder: size, newest write, and counts of `.git`, `node_modules`, venv, build
+  folders and log files.
+- The checkouts it reads are agent-writable, so git runs with fsmonitor, hooks and the untracked cache off, no
+  optional locks (`git status` never rewrites an index), and without the variables that redirect a repository.
+- Who runs it: main or the user. A worktree-isolated agent may not: its git commands are confined to its own
+  worktree, and this tool must not become the way around that.
+
 ## Installer scan (installer_scan.py)
 
 `installer_scan.py <dir-or-file> [--json]` statically scans third-party shell and Python installers (`*.sh`, `*.py`, `install*`, `setup*`, `Makefile`) before anyone runs them. It never executes or imports the target and reads each file with a 2 MB cap (larger files are listed as skipped). Findings carry a category and `file:line`: `mcp` (agent CLI `mcp add`, `[mcp_servers.`, `mcpServers`), `agent-rules` (CLAUDE.md, AGENTS.md, settings files, config.toml, permission grants), `launchd` (launchctl, LaunchAgents, systemctl, crontab, schtasks), `shell-rc` (rc files, `PATH=`), `network-exec` (`curl | sh`, wget, pip/npm -g/brew install), `credentials` (keychain, keyring, `~/.ssh`, `~/.aws`, `~/.kimi-code`) and `privileged` (sudo, setuid, writes under `/usr/local`, `/etc`, `/Library`). Exit 0 means at least one file was scanned with no findings and nothing was left unscanned. Exit 1 means findings, a skipped file (oversize or unreadable), an executable-looking file the scan does not parse (`.js`, `.mjs`, `package.json`, `.plist`, `.ps1`, `.rb`, an executable or `#!` file, listed as skipped), no file scanned, or the 5,000-file limit reached. Exit 2 means bad usage. The rule is scan, then read. A clean scan is not a safety proof: it is regex matching on source text, so obfuscated or generated commands are missed. Review the installer anyway; the scan only makes the known side effects (for example the GoodQA MCP registration in the secure-login installer) visible first.
