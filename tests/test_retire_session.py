@@ -824,10 +824,12 @@ class PlanReview(Base):
                 ah.write(self.home, "task.retire_revoke", {"session": SESSION, "decision": out["id"], "at": iso(self.clock),
                                                             "source": SOURCE}, "")
         self.assertEqual(cm.exception.code, "provenance")
+        fields = {"session": SESSION, "decision": out["id"], "at": iso(self.clock), "source": SOURCE}
+        self.put_stamp("revoke", fields)  # main's valid stamp: only the self-session rule can refuse now
         with self.assertRaises(ah.AhError) as cm:
-            ah.write(self.home, "task.retire_revoke", {"session": SESSION, "decision": out["id"], "at": iso(self.clock),
-                                                        "source": SOURCE}, SESSION)
+            ah.write(self.home, "task.retire_revoke", dict(fields), SESSION)
         self.assertEqual(cm.exception.code, "forbidden")
+        self.assertIn("itself", str(cm.exception))
 
     def test_an_unreadable_replacement_transcript_is_retire_unreadable(self):
         (self.home / ".claude" / "projects" / "-proj" / f"{OTHER}.jsonl").write_text("{}\n")
