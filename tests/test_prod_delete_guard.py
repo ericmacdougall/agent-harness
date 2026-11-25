@@ -1,4 +1,4 @@
-"""goodqa#14908: prod_delete_guard, ported from Hawkeye's hawkeye-prod-delete-guard.py.
+"""goodqa#14908: prod_delete_guard.
 
 The detection cases are Hawkeye's own (tests/test-prod-delete-guard.py: H-1, H-1b, H-1c, the H-2
 accepted limitations and the BLOCKER 1-3 regression pins). Grants replace hawk_ask with a
@@ -166,9 +166,9 @@ class Detection(Case):
         self.assertEqual(self.verdict(d1), "deny")
         d1["tool_input"] = {"sql": "SELECT * FROM devices"}
         self.assertEqual(self.verdict(d1), "allow")
-        run = {"tool_name": "mcp__hawkeye__run",
+        run = {"tool_name": "mcp__mydb__run",
                "tool_input": {"command": "ls", "payload": ["wrangler d1 execute db --remote --command='DROP TABLE x'"]}}
-        self.assertEqual(self.verdict(run), "deny")
+        self.assertEqual(self.verdict(run), "allow")  # not a database tool unless local.json db_tool_patterns names it
         sql = {"tool_name": "mcp__pg__execute_sql", "tool_input": {"statement": "psql -h prod-1 -c 'TRUNCATE t'"}}
         self.assertEqual(self.verdict(sql), "deny")
         sql["tool_input"] = {"sql": "DROP TABLE t"}  # no named target and not production by construction
@@ -184,12 +184,49 @@ class Detection(Case):
                 self.assertEqual(self.verdict(ev), "allow")
 
     def test_matcher_covers_every_judged_tool_shape(self):
-        for name in ("Bash", "mcp__hawkeye__run", "mcp__cloudflare__d1_database_query", "mcp__pg__execute_sql",
+        for name in ("Bash", "mcp__cloudflare__d1_database_query", "mcp__pg__execute_sql",
                      "mcp__x__run_sql", "mcp__x__query", "mcp__x__sql", "mcp__cloudflare__hyperdrive_configs_list"):
             with self.subTest(name=name):
                 self.assertTrue(re.fullmatch(pdg.MATCHER, name))
         for name in ("Write", "Edit", "Read", "Agent"):
             self.assertFalse(re.fullmatch(pdg.MATCHER, name), name)
+
+
+class LocalDbTools(unittest.TestCase):
+    """~/.agent-harness/local.json `db_tool_patterns` adds a tool to the judged set and to the installed matcher."""
+
+    def setUp(self):
+        import ah_local
+        self.ah_local = ah_local
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "local.json"
+        path.write_text(json.dumps({"db_tool_patterns": [
+            {"tool": "mcp__mydb__run", "fields": ["payload", "command"]}, {"tool": "bad[regex"}, "junk"]}))
+        old = os.environ.get("AH_LOCAL_CONFIG")
+        os.environ["AH_LOCAL_CONFIG"] = str(path)
+        ah_local.reset()
+
+        def restore():
+            if old is None:
+                os.environ.pop("AH_LOCAL_CONFIG", None)
+            else:
+                os.environ["AH_LOCAL_CONFIG"] = old
+            ah_local.reset()
+        self.addCleanup(restore)
+
+    def test_a_configured_tool_is_judged_and_matched(self):
+        run = {"tool_name": "mcp__mydb__run",
+               "tool_input": {"command": "ls", "payload": ["wrangler d1 execute db --remote --command='DROP TABLE x'"]}}
+        self.assertIn("DROP TABLE", pdg.command_text_for_event(run))
+        self.assertTrue(re.fullmatch(pdg.matcher(), "mcp__mydb__run"))
+        self.assertFalse(re.fullmatch(pdg.matcher(), "mcp__other__run"))
+        self.assertEqual(pdg.matcher(), pdg.MATCHER + "|mcp__mydb__run")  # invalid entries are skipped
+
+    def test_the_installer_registers_the_configured_matcher(self):
+        sys.path.insert(0, str(ROOT))
+        import install
+        self.assertEqual(install.prod_delete_matcher(), pdg.matcher())
 
 
 class Grants(Case):

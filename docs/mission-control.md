@@ -79,7 +79,7 @@ Requirements of earlier sessions (only main's current session is read), the owne
 
 The default port is 47615. To use another one, pass `--port P` to `serve`, `url`, `open`, `status` and `install-launchd`.
 
-A disposable instance for testing does not touch your real chat data or launchd. In it, Codex is never run and t2-dev is never contacted:
+A disposable instance for testing does not touch your real chat data or launchd. In it, Codex is never run and the worker host is never contacted:
 
 ```sh
 MC_HOME=$(mktemp -d) python3 harness/mission_control/server.py serve --port 47699 --no-remote --no-codex
@@ -99,7 +99,7 @@ Every source has a fixed interval. A failing source is never retried faster, and
 | Owners | `python3 ~/.claude/hooks/ah.py owners` | Every 60 s |
 | GitHub | Your pushes and releases, from `gh api` events | One request every 60 s |
 | GoodQA tickets | Checkpoint comments on tickets that initiatives reference | One ticket read every 10 s, round robin, at most 12 tickets |
-| t2-dev | One fixed WAL probe over ssh | At most one ssh connection every 60 s |
+| remote | One fixed WAL probe over ssh to local.json `heavy_job_host` (off when unset) | At most one ssh connection every 60 s |
 | Event drops | `~/.agent-harness/mission-control/sources/*.jsonl`, written by external sources such as Fabric | Every 5 s |
 | Ledger | `ah goals`, `ah requirements`, `ah status` (see Ledger source) | 60 s attached, 300 s idle |
 
@@ -120,7 +120,7 @@ The server stays under 100 MB RSS.
 The two expensive sources are subprocesses: `provenance.py asks` (about 5 CPU seconds a run on a busy session) and `ah owners` (about 6). Neither is a blind poll any more.
 
 - The asks ledger is read when a WAL line registers or resolves an ask (debounced by 5 s), when you click Approve or Deny, and at every sweep (5 minutes). It is not read every minute.
-- `ah owners`, GitHub, the GoodQA ticket reader and the t2-dev probe run at their normal interval while a page is attached, and at their idle interval (5 minutes; tickets 2 minutes) while none is. Attaching a page refreshes them at once.
+- `ah owners`, GitHub, the GoodQA ticket reader and the remote probe run at their normal interval while a page is attached, and at their idle interval (5 minutes; tickets 2 minutes) while none is. Attaching a page refreshes them at once.
 - Scripts, styles and the three.js bundle are served gzipped with an ETag and `Cache-Control: no-cache, private`, so an unchanged file costs a 304. The page shell and every API response stay `no-store`.
 
 ### The read envelope and the gate
@@ -342,7 +342,7 @@ The demo feed also writes two tool-call records each pulse (seen with "Show tool
 ## Not yet
 
 - **Remote access over Tailscale.** It would need a second listener on the tailnet address, with the same launch-code and cookie model plus an allowlist of tailnet identities. It is off until it has its own review.
-- **Fabric events.** Fabric will write events through the event-drop directory, or through the t2-dev probe once `fabric control export` ships. The format is fixed in [mission-control-events.md](mission-control-events.md).
+- **Fabric events.** Fabric will write events through the event-drop directory, or through the remote probe once `fabric control export` ships. The format is fixed in [mission-control-events.md](mission-control-events.md).
 
 ### Named OpenAI owners
 

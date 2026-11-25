@@ -24,7 +24,7 @@ AGENTS = ("task-owner.md", "click-tester.md", "fixer.md", "red-team.md")
 HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", "usage_guard.py", "wal.py", "wal_note.py", "peer_review.py", "rescue.py", "publish_feature.py", "integrate_local.py", "node_check_reporter.mjs", "deliver.py",
          "ticket_adapters.py", "commit_policy.py", "commit_policy.json", "workdir.py",
          "spec_flow.py", "spec_policy.json", "spec_template.md", "provenance.py", "provenance_policy.json", "provenance_hooks.py", "safe_input.py", "caller_identity.py", "review_map.py",
-         "native_context.py", "native_user_source.py", "native_admission.py", "native_main.py", "t2scan_consent.py",
+         "native_context.py", "native_user_source.py", "native_admission.py", "native_main.py", "ah_local.py",
          "review_diagnostics.py", "review_policy.json", "merge_gate.py",
          "shell_words.py",  # the shell reader merge_gate and copy_hygiene share (goodqa#16811)
          "heavy_job_guard.py", "dropbox_budget.conf", "run_capped.py", "run_probe.py", "resource_budget.py", "agent_gate.py", "ops_watch.py", "resource_limits.json",
@@ -38,7 +38,7 @@ HOOKS = ("process.py", "git_safety.py", "github_identity.py", "report_file.py", 
          "commit_policy.local.json.example", "spec_policy.local.json.example", "ledger_reminder.py", "log_backup.py", "bg_job.py", "task_recovery.py", "bg_lint.py",
          "successor.py",  # successor kit and `ah task succeed` (goodqa#15565)
          "dropped_gate.py", "ask_reminders.py",  # dropped-owner gate and ask reminders (goodqa#14791)
-         "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py",  # Hawkeye ports (goodqa#14908)
+         "prod_delete_guard.py", "wal_cadence.py", "worktree_hygiene.py",  # goodqa#14908
          "copy_hygiene.py", "lifecycle_cleanup.py",  # reusable copies and scoped completed-task cleanup
          "backup_watch.py", "kimi_review.py", "installer_scan.py",
          "trivy_gate.py",  # pinned Trivy scan for deliver prepare --scan (goodqa#15295)
@@ -111,7 +111,19 @@ def managed_scripts(claude: Path) -> set[str]:
 # SubagentStart/Stop WAL record, so no liveness check could see them stop (goodqa#14613, the Solve drop).
 SUBAGENT_MATCHER = ".*"
 # Must equal prod_delete_guard.MATCHER (tests/test_prod_delete_guard.py pins it): every tool path the guard judges.
-PROD_DELETE_MATCHER = r"Bash|mcp__hawkeye__run|.*d1_database_query|mcp__.*__(execute_sql|run_sql|query|sql)|mcp__.*__hyperdrive_.*"
+PROD_DELETE_MATCHER = r"Bash|.*d1_database_query|mcp__.*__(execute_sql|run_sql|query|sql)|mcp__.*__hyperdrive_.*"
+
+
+def prod_delete_matcher() -> str:
+    """PROD_DELETE_MATCHER plus the extra database tools of ~/.agent-harness/local.json (db_tool_patterns)."""
+    sys.path.insert(0, str(ROOT / "harness" / "hooks"))
+    try:
+        import prod_delete_guard  # noqa: PLC0415
+        return prod_delete_guard.matcher()
+    except Exception:  # noqa: BLE001
+        return PROD_DELETE_MATCHER
+    finally:
+        sys.path.remove(str(ROOT / "harness" / "hooks"))
 GOODQA_STATUS_TOOLS = (r"^mcp__.*[Gg][Oo][Oo][Dd][Qq][Aa].*__(close_issue_done|close_issue_wont_fix|update_issue|"
                        r"bulk_update_issues|archive_issue|reassign_issue|call_api)$")
 
@@ -216,7 +228,7 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
             "hooks": [policy, {"type": "command", "command": "python3",  # advisory bg_lint: warns, never blocks
                                "args": [str(claude / "hooks" / "bg_lint.py")], "timeout": 5}],
         }, {
-            # Route heavy Mac work (browsers, full suites, builds) to dev2; advisory for hostile probes.
+            # Route heavy Mac work (browsers, full suites, builds) to the worker host; advisory for hostile probes.
             "matcher": "Bash",
             "hooks": [heavy_guard],
         }, {
@@ -227,7 +239,7 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
             "hooks": [{"type": "command", "command": "python3",
                        "args": [str(claude / "hooks" / "copy_hygiene.py"), "pretool"], "timeout": 5}],
         }, {
-            "matcher": PROD_DELETE_MATCHER,
+            "matcher": prod_delete_matcher(),
             "hooks": [prod_delete],
         }, {
             "matcher": "Agent|Task|Workflow",
@@ -243,7 +255,7 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
     if command_guard:
         managed["PreToolUse"].insert(0, command_guard_group(claude))
         managed["PreToolUse"].insert(1, kill_guard_group(claude))
-    # Copy hygiene report (t2-dev disk full 2026-11-21): one line when idle test copies pile up, and a detached
+    # Copy hygiene report (a worker disk filled up 2026-11-21): one line when idle test copies pile up, and a detached
     # report-only reap at most every 6 h. Never deletes; fails open.
     managed["SessionStart"].append({"hooks": [{
         "type": "command", "command": "python3", "args": [str(claude / "hooks" / "copy_hygiene.py"), "session-start"],

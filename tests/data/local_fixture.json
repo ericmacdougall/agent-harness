@@ -1,0 +1,36 @@
+{
+  "hosts": {
+    "worker-1": {
+      "role": "worker",
+      "os": "linux"
+    },
+    "worker-2": {
+      "role": "worker",
+      "os": "linux"
+    },
+    "mini-1": {
+      "role": "build",
+      "os": "macos"
+    },
+    "win-1": {
+      "role": "desktop",
+      "os": "windows"
+    }
+  },
+  "heavy_job_host": "worker-1",
+  "remote_worktree_hosts": [
+    "worker-1"
+  ],
+  "trusted_git_hosts": [
+    "worker-1"
+  ],
+  "backup_remotes": {
+    "b2": [
+      "b2-archive"
+    ]
+  },
+  "protected_label_prefixes": [
+    "com.example."
+  ],
+  "canonical_repo_url": "https://example.invalid/agent-harness.git"
+}

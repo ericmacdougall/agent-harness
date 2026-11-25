@@ -48,6 +48,8 @@ class Base(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.home = Path(self.tmp.name)
         self.cfg = ow.load_config(self.home, host="testhost", overrides={})
+        self.cfg["units"] = dict(self.cfg["units"], reclaim=["runner-worktree-retire", "inventory-hygiene",
+                                                             "ship-sample-watch"])
         self.cfg["processes"] = dict(self.cfg["processes"], meminfo=str(self.home / "no-meminfo"))
         self.cfg["liveness"] = dict(self.cfg["liveness"], wal_root=str(self.home / ".claude" / "wals"), gq=None)
 

@@ -57,7 +57,7 @@ STATUS_WORD = re.compile(
 # done" is true for every state below it; "not live" is false once a live test passed or a deploy is recorded; "no
 # work / not started" is false once any counted evidence exists; "nobody is working" is false while a live owner holds
 # the goal). Positive claims ("done", "live", "shipped") must attach to the goal name (_attached), so a task that
-# merely mentions a goal ("ParentProof test servers: done") is not a goal claim (NEG-17).
+# merely mentions a goal ("Test servers: done") is not a goal claim (NEG-17).
 NOT_DONE = re.compile(
     r"(?i)\b(?:not (?:yet )?(?:done|met|complete[d]?|finished)|(?:isn'?t|is not|aren'?t|are not|wasn'?t) (?:yet )?"
     r"(?:done|finished|complete[d]?)|(?:can'?t|cannot|couldn'?t|could not) (?:yet )?(?:call|say|claim|mark)\b"
@@ -203,7 +203,7 @@ def _spans(line: str, goals: list) -> list:
 
 def _attached(clause: str, spans: list, gid: str, claim_start: int) -> bool:
     """The positive claim belongs to the goal: between the goal name and the claim there is only markup, glue words
-    and other goal names ("User tokens and ParentProof are done", "**Prod move:** done")."""
+    and other goal names ("User tokens and the mobile app are done", "**Prod move:** done")."""
     start, end = next((st, en) for g, st, en in spans if g == gid)
     if end > claim_start:  # the claim starts before or inside the name ("Shipped: prod move"): not attached
         return False

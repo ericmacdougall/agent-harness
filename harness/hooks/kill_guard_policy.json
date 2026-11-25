@@ -1,7 +1,7 @@
 {
   "_doc": "Policy for kill_guard.py (GoodQA #14506, redesign 2026-11-24). mode: enforce | warn | off. protected and staging_live are regexes searched in a process command line, launchd label, systemd unit, tmux session, pm2 app or container name; stopping a match needs the owner's approval (a harness maintainer may stop `protected` ones). Host and unit names belong here, never in the code.",
   "mode": "enforce",
-  "protected": ["\\bahd(?:\\.py)?\\b", "\\bahd_peek\\b", "log[_-]backup", "backup[_-]watch", "ops[_-]watch", "\\bnetwatch\\b", "\\bhookd\\b", "\\brclone\\b", "mission[_-]control", "harness-console", "com\\.ericmacdougall\\.", "com\\.agent-harness\\."],
+  "protected": ["\\bahd(?:\\.py)?\\b", "\\bahd_peek\\b", "log[_-]backup", "backup[_-]watch", "ops[_-]watch", "\\bnetwatch\\b", "\\bhookd\\b", "\\brclone\\b", "mission[_-]control", "harness-console", "com\\.agent-harness\\."],
   "staging_live": [],
   "child_timeout_seconds": 10,
   "ledger_max_lines": 2000

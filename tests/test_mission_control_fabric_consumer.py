@@ -2,6 +2,7 @@
 
 import json
 import os
+os.environ["AH_LOCAL_CONFIG"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "local_fixture.json")  # a worker host to probe
 import shlex
 import sys
 import tempfile

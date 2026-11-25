@@ -139,9 +139,10 @@ class Inuse(Repo):
     def test_the_known_helpers_are_skipped_whatever_their_start_time(self):
         scan = self.t2_dev().scan(created=50.0)  # every fixture process started AFTER this worktree was created
         skipped = {name for _pid, name in scan["skipped"]}
-        self.assertEqual({"(sd-pam)", "tailscaled", "gpg-agent", "docker"} - skipped, set())
-        # but the name must agree with the command line: a docker client without the pgpool label is a workload
-        self.assertIn((2033, "sg"), scan["skipped"])  # the pgpool serve wrapper is a known helper too
+        self.assertEqual({"(sd-pam)", "tailscaled", "gpg-agent"} - skipped, set())
+        # no project-specific helper is built in: a docker client or an sg wrapper started after is judged by time
+        self.assertIn((2033, "sg"), scan["unreadable"])
+        self.assertIn((2060, "docker"), scan["unreadable"])
         other_sg = self.t2_dev(**{"788": unreadable("sg", "/usr/bin/sg docker -c exec /usr/bin/python3 run.py", 100.0)}).scan(created=50.0)
         self.assertIn((788, "sg"), other_sg["unreadable"])  # any other wrapper has no such exemption
         other = self.t2_dev(**{"786": unreadable("docker", "docker run --rm busybox", 100.0)}).scan(created=50.0)

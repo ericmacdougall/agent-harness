@@ -449,12 +449,6 @@
   },
   "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
  },
- "tests/test_fabric_do_auth_script.py": {
-  "counts": {
-   "redact:named-credential:prefix": 2
-  },
-  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
- },
  "tests/test_gq_browser.py": {
   "counts": {
    "bearer:prefix": 6,
@@ -479,12 +473,6 @@
    "redact:pem": 1,
    "redact:slack": 1,
    "slack": 1
-  },
-  "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
- },
- "tests/test_guard_pinned_routes.py": {
-  "counts": {
-   "redact:named-credential:prefix": 4
   },
   "reason": "secret-shaped test fixtures for this file's redaction or scan tests (fake values, never real credentials)"
  },

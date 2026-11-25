@@ -10,6 +10,7 @@ new declarations (collectors.FEEDS, producer_read, Health.expire)."""
 import collections
 import json
 import os
+os.environ["AH_LOCAL_CONFIG"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "local_fixture.json")  # a worker host to probe
 import subprocess
 import sys
 import tempfile
@@ -712,14 +713,14 @@ class AgedOut(unittest.TestCase):
 
     def test_a_row_not_checked_within_its_max_age_turns_stale_then_recovers(self):
         self.health.ok("owners", "3 owners")
-        self.health.off("t2-dev", "remote probe disabled", truth="current")
+        self.health.off("remote", "remote probe disabled", truth="current")
         now = time.time()
-        self.assertEqual(self.health.expire({"owners": 100.0, "t2-dev": 100.0}, now + 50), [])
-        self.assertEqual(self.health.expire({"owners": 100.0, "t2-dev": 100.0}, now + 101), ["owners"])
+        self.assertEqual(self.health.expire({"owners": 100.0, "remote": 100.0}, now + 50), [])
+        self.assertEqual(self.health.expire({"owners": 100.0, "remote": 100.0}, now + 101), ["owners"])
         row = self.health.rows["owners"]
         self.assertEqual((row["status"], row["truth"]), ("error", "stale"))
         self.assertIn("reader may have stopped", row["detail"])
-        self.assertEqual(self.health.rows["t2-dev"]["truth"], "current", "a source that is off has no reader to stop")
+        self.assertEqual(self.health.rows["remote"]["truth"], "current", "a source that is off has no reader to stop")
         self.health.ok("owners", "3 owners")
         self.assertEqual(self.health.rows["owners"]["truth"], "current")
 

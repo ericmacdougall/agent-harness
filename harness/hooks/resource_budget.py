@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Resource-budget gate: every plan and spec declares what it will consume and where.
 
-    resource_budget.py check --host mac|dev2 --packet plan.md [--capacity-json cap.json]
-    resource_budget.py capacity --host mac|dev2
+    resource_budget.py check --host mac|<host> --packet plan.md [--capacity-json cap.json]
+    resource_budget.py capacity --host mac|<host>
+
+<host> is a host named in ~/.agent-harness/local.json `hosts` (ah_local); its `limits` override the remote defaults.
 
 A plan packet or spec needs a `## Resource budget` section:
 
     ## Resource budget
-    Host: dev2
+    Host: <a configured worker host, or mac>
     Fan-out: agents=2 jobs=1 processes=8 browser_pages=0 test_workers=4
     Peak memory: 6 GB (method: measured RSS of the previous run x1.5)
     CPU: 8 cores (method: nproc used by the test runner)
@@ -20,7 +22,7 @@ A plan packet or spec needs a `## Resource budget` section:
 
 `check` rejects (exit 2) a packet that omits the section or a field, whose numbers exceed the
 target host's live headroom, or that omits checkpointing for a job over 10 minutes or 4 GB.
-The same budget can pass for dev2 and fail for the Mac. Big jobs are welcome on dev2; the gate
+The same budget can pass for a worker host and fail for the Mac. Big jobs are welcome on a worker host; the gate
 only asks that the numbers exist and fit. Stdlib only, Python 3.9 compatible.
 """
 from __future__ import annotations
@@ -42,8 +44,28 @@ FANOUT_KEYS = ("agents", "jobs", "processes", "browser_pages", "test_workers")
 HOST_LIMITS = {
     # "agents" is not set here: headroom() fills it from owner_cap(), the one owner cap
     "mac": {"processes": 8, "browser_pages": 4, "test_workers": 4, "jobs": 2, "mem_fraction": 0.4},
-    "dev2": {"processes": 64, "browser_pages": 16, "test_workers": 32, "jobs": 16, "mem_fraction": 0.7},
 }
+# A configured worker host without its own `limits` in local.json gets these.
+REMOTE_DEFAULT_LIMITS = {"processes": 64, "browser_pages": 16, "test_workers": 32, "jobs": 16, "mem_fraction": 0.7}
+
+
+def host_limits() -> dict:
+    """HOST_LIMITS plus every non-Windows host of ~/.agent-harness/local.json, with its `limits` laid over the
+    remote defaults (numbers only)."""
+    out = {k: dict(v) for k, v in HOST_LIMITS.items()}
+    try:
+        import ah_local  # noqa: PLC0415
+        for name, info in ah_local.hosts().items():
+            if name in out or str(info.get("os", "")).lower() == "windows" or not re.fullmatch(r"[a-z0-9._-]{1,60}", name):
+                continue
+            limits = dict(REMOTE_DEFAULT_LIMITS)
+            given = info.get("limits") if isinstance(info.get("limits"), dict) else {}
+            limits.update({k: v for k, v in given.items() if k in limits and isinstance(v, (int, float))
+                           and not isinstance(v, bool)})
+            out[name] = limits
+    except Exception:  # noqa: BLE001 - a broken local file leaves the Mac only
+        pass
+    return out
 SECTION = re.compile(r"(?ms)^##[ \t]+Resource budget[ \t]*\n(.*?)(?=^##[ \t]|\Z)")
 FIELD = re.compile(r"(?m)^[ \t]*(?:[-*][ \t]+)?([A-Za-z][A-Za-z -]+?)[ \t]*:[ \t]*(.+?)[ \t]*$")
 PLACEHOLDER = re.compile(r"<[^<>\n]{2,60}>")
@@ -81,7 +103,7 @@ LIMITS = {  # key: (code default, type, which direction is looser)
     "max_live_owners": (16, int, "higher"),   # the one owner cap (agent_gate, tier_gate, mission_coverage, plans)
     "enforce": (False, bool, "lower"),        # true: the owner cap denies; false (default): a short advisory
     "max_heavy_mac": (2, int, "higher"),      # heavy jobs at once on the Mac (heavy_job_guard)
-    "copy_gib": (1.0, float, "higher"),       # copies at or above this many GiB go to dev2 (heavy_job_guard)
+    "copy_gib": (1.0, float, "higher"),       # copies at or above this many GiB go to the worker host (heavy_job_guard)
     "hatch_per_hour": (1, int, "higher"),     # HARNESS_LOCAL_OK uses per owner per hour (heavy_job_guard)
     "min_free_gb": (25.0, float, "lower"),    # disk floor (for copy_hygiene to adopt; see docs/approvals.md)
 }
@@ -334,8 +356,8 @@ def lint_budget(text: str):
         problems.append(f"Resource budget: `{key}` is declared more than once")
     host = fields.get("host", "").split()[0].lower() if fields.get("host") else ""
     parsed = {"host": host}
-    if host not in HOST_LIMITS and not VM_HOST.match(host):
-        problems.append("Resource budget: `Host:` must be mac, dev2 or vm:<name>")
+    if host not in host_limits() and not VM_HOST.match(host):
+        problems.append("Resource budget: `Host:` must be mac, a host named in ~/.agent-harness/local.json, or vm:<name>")
     parsed["capacity"] = None
     if VM_HOST.match(host):
         cap_text = fields.get("capacity", "")
@@ -412,7 +434,9 @@ def capacity(host: str):
                 "disk_free_gb": round(int(disk[3]) / 2 ** 20, 1),
                 "pressure_free_pct": int(pressure.group(1)) if pressure else None}
     script = ("free -m | awk '/Mem:/{print $7}'; nproc; cut -d' ' -f1 /proc/loadavg; df -k $HOME | awk 'END{print $4}'")
-    out = _run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "dev2", script], 30).split()
+    if host not in host_limits():
+        raise ValueError("unknown host")
+    out = _run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--", host, script], 30).split()
     return {"host": host, "mem_available_gb": round(int(out[0]) / 1024, 2), "cores": int(out[1]), "load1": float(out[2]),
             "disk_free_gb": round(int(out[3]) / 2 ** 20, 1), "pressure_free_pct": None}
 
@@ -423,7 +447,7 @@ def _which(name):
 
 
 def headroom(cap: dict):
-    limits = dict(HOST_LIMITS.get(cap["host"], HOST_LIMITS["dev2"]))
+    limits = dict(host_limits().get(cap["host"], REMOTE_DEFAULT_LIMITS))
     limits["agents"] = owner_cap()["max"]  # a plan's agent fan-out is held to the one owner cap, not a number of its own
     pressure = cap.get("pressure_free_pct")
     mem = cap["mem_available_gb"] * limits["mem_fraction"]
@@ -458,7 +482,7 @@ def check(text: str, host=None, cap=None):
     if parsed is None:
         return problems
     host = host or parsed["host"]
-    if host in HOST_LIMITS:
+    if host in host_limits():
         try:
             cap = cap or capacity(host)
         except (OSError, subprocess.SubprocessError, ValueError, IndexError, AttributeError) as error:
@@ -491,11 +515,11 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
     one = sub.add_parser("check")
-    one.add_argument("--host", choices=("mac", "dev2"))
+    one.add_argument("--host", help="mac or a host named in ~/.agent-harness/local.json")
     one.add_argument("--packet", required=True)
     one.add_argument("--capacity-json", help="use this capacity instead of reading the live host (tests)")
     cap_cmd = sub.add_parser("capacity")
-    cap_cmd.add_argument("--host", choices=("mac", "dev2"), required=True)
+    cap_cmd.add_argument("--host", required=True, help="mac or a host named in ~/.agent-harness/local.json")
     args = parser.parse_args(argv)
     if args.command == "capacity":
         print(json.dumps(dict(capacity(args.host), headroom={k: v for k, v in headroom(capacity(args.host)).items()

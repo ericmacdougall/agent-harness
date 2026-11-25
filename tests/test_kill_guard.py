@@ -156,7 +156,7 @@ class Roles(Base):
 
     def test_top_rung_may_stop_anything_but_the_protected_list(self):
         self.assertAllowed(['kill 300', 'kill 500', 'pkill -f vitest', 'kill 600'], top=True)
-        self.assertRefused(['kill 400', 'kill 410', 'launchctl bootout gui/501/com.ericmacdougall.ahd'],
+        self.assertRefused(['kill 400', 'kill 410', 'launchctl bootout gui/501/com.agent-harness.ahd'],
                            'protected', top=True)
         self.assertRefused(['kill 100', 'kill 1'], 'never', top=True)
 
@@ -165,8 +165,8 @@ class Roles(Base):
         self.assertIn('--approved-by', self.decide('kill 400')[2])
 
     def test_harness_maintainer_may_stop_harness_daemons_and_it_is_logged(self):
-        self.assertAllowed(['kill 400', 'launchctl kickstart -k gui/501/com.ericmacdougall.ahd',
-                            'launchctl bootout gui/501/com.ericmacdougall.ahd'], top=True, maintainer=True)
+        self.assertAllowed(['kill 400', 'launchctl kickstart -k gui/501/com.agent-harness.ahd',
+                            'launchctl bootout gui/501/com.agent-harness.ahd'], top=True, maintainer=True)
         self.assertRefused(['kill 410'], 'protected', top=True, maintainer=True)  # staging/live still asks
         audit = Path(self.home) / '.agent-harness/state/kill-guard/audit.jsonl'
         rows = [json.loads(line) for line in audit.read_text().splitlines()]

@@ -2868,8 +2868,7 @@ def load_config(paths):
             config = {}
     except (core.Unreadable, ValueError):
         config = {}
-    config.setdefault("repos", ["ericmacdougall/bugtracker", "ericmacdougall/Android-security",
-                                "ericmacdougall/agent-harness", "ericmacdougall/agent-fabric"])
+    config.setdefault("repos", [])  # owner/name of each repository it serves: config.json only
     config.setdefault("work_roots", [str(paths.home / ".agent-harness" / "work")])
     if str(paths.packets) not in config["work_roots"]:
         config["work_roots"] = list(config["work_roots"]) + [str(paths.packets)]  # staged stdin packets (adv-3 F2)
@@ -3004,7 +3003,7 @@ def build_parser():
     w.add_argument("--ticket")
     w.add_argument("--extension", type=int, default=0, help="extra B7 review rounds (pr-gate only)")
     sub.add_parser("status", help="item states, pending effects, the email route and the units")
-    for name, text in (("install", "write and start the systemd user units ahc-core and ahc-review (t2-dev)"),
+    for name, text in (("install", "write and start the systemd user units ahc-core and ahc-review (Linux)"),
                        ("uninstall", "stop and remove the units; keep the ledger, clones and inbox")):
         p = sub.add_parser(name, help=text)
         p.add_argument("--apply", action="store_true", help="make the changes (default: print what would change)")

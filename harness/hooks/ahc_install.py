@@ -152,7 +152,7 @@ def kept_paths(paths) -> list:
 
 def _refuse_platform(system: str, out) -> int | None:
     if system != "Linux":
-        out("ahc install: systemd user units only (this host is %s); nothing changed. The build host is t2-dev."
+        out("ahc install: systemd user units only (this host is %s); nothing changed. Run it on a Linux host."
             % system)
         return 2
     return None

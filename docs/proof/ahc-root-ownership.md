@@ -29,7 +29,7 @@ Run each from the repo root.
 
 ## PR 258 v3 BLOCK repair (heads 675be534 and 8d3b4ae2)
 
-Run on t2-dev (Python 3.12.3, git 2.43.0) by `~/wt/ahc-pr258v3.sh <head> <old head>`. The script makes a fresh
+Run on a Linux worker host (Python 3.12.3, git 2.43.0) by `~/wt/ahc-pr258v3.sh <head> <old head>`. The script makes a fresh
 blob-filtered clone under `~/wt`, refuses to start with less than 30 GiB free, and keeps logs in the run directory.
 
 - Focused suites at 8d3b4ae20f826fe96b0520891b6baec8ec4bd4ef: the nine above plus `tests.test_ahc_fs` and
@@ -72,7 +72,7 @@ v3 variants:
 
 ## PR 258 v4 BLOCK repair: F1, a streamed restore (heads 0dc0ca99 and 2049e625)
 
-Run on t2-dev (Python 3.12.3, git 2.43.0) by `~/wt/ahc-pr258v4.sh <head> <old head>`, in a fresh blob-filtered
+Run on a Linux worker host (Python 3.12.3, git 2.43.0) by `~/wt/ahc-pr258v4.sh <head> <old head>`, in a fresh blob-filtered
 clone. The script refuses to start under 30 GiB free.
 
 - Focused suites at 2049e6254c300cf57b7491e3097ee770f3799ca5, the eleven above plus

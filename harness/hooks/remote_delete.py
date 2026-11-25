@@ -5,7 +5,7 @@ The approval is checked HERE, on the host that holds the user's transcript: the 
 local agents and never trusts relayed records, so it is not asked to. Then this helper performs the delete itself
 over ssh, through `remote_delete_agent.py`, which re-checks the remote side.
 
-  remote_delete.py --host t2-dev --path /home/eric/wt/X --archive-dir dropbox:Backups/.../worktree-archives \
+  remote_delete.py --host <host> --path /home/<user>/wt/X --archive-dir <remote>:Backups/.../worktree-archives \
       --user-source answer:<session>/<uuid> --wal <that session's WAL>
 
 Checks here, all before anything runs remotely:
@@ -174,7 +174,7 @@ def remote_delete(host, path, archive_dir, user_source, wal, home=None, now=None
                 any(ch in path for ch in cg.GLOB_CHARS) or "$" in path or "`" in path or not name:
             raise Refused("give the literal absolute path (no globs, variables, '..' or trailing slash)")
         if not REMOTE_RE.match(str(archive_dir or "")) or ".." in str(archive_dir):
-            raise Refused("--archive-dir must be an rclone remote path such as dropbox:Backups/x")
+            raise Refused("--archive-dir must be an rclone remote path such as <remote>:Backups/x")
         if not canonical:
             raise Refused("--user-source must be exactly answer:<session>/<uuid>")
         try:

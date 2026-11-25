@@ -72,7 +72,7 @@ writes a `top-rung` approval here, so `ah approvals` shows it.
   It applies to writers and to reviewers, so a supervisor can grant a top-rung reviewer.
 - Sibling guards call `ah_approvals.allowed(kind="merge"|"delete"|"kill", ...)` through a guarded import; the signature
   is documented at the top of `ah_approvals.py` and is kept stable.
-- `central_decisions.py` stays what it is: a signed, cross-host publication of one top-rung permission for the T2Scan
+- `central_decisions.py` stays what it is: a signed, cross-host publication of one top-rung permission for a
   worker host. It is not a second local store, so it was left in place.
 
 ## Harness maintainer
@@ -101,11 +101,11 @@ the sentence). Then delete the sentence from CLAUDE.md.
 | Old section | Kind of sentence | Equivalent command |
 |---|---|---|
 | Supervisor standing authority | "session S supervises project P and may approve X there" | `ah supervisor set --session S --project P` (then the supervisor runs `ah approve <kind> --project P ...` itself) |
-| Disposable test leftovers on t2-dev | "agents may delete disposable test leftovers under DIR on host H" | `ah approve delete --host H --path 'DIR/*' --reason "disposable test leftovers"` |
+| Disposable test leftovers on a worker host | "agents may delete disposable test leftovers under DIR on host H" | `ah approve delete --host H --path 'DIR/*' --reason "disposable test leftovers"` |
 | Harness stream: what the supervisor may approve | "the supervisor may merge harness PRs after review" | `ah approve merge --project owner/agent-harness --reason "after the required review"` (or a supervisor of that checkout runs it) |
 | Harness stream: changes to guards | "the supervisor may change guard G" | `ah supervisor set --session S --project DIR --harness`, then `ah approve harness --what G` |
 | Every supervised project: what the supervisor may approve | "in every project it supervises the supervisor may approve merges / releases / kills" | one `ah supervisor set` with every `--project`; the supervisor then records `ah approve merge|release|kill --project P` per project as it decides |
-| ParentProof standing approvals | "in project P, X is approved" (merge, release, a deploy step) | `ah approve <merge|release|other> --project P --what "<the step>" --reason "<the sentence>"` |
+| Per-project standing approvals | "in project P, X is approved" (merge, release, a deploy step) | `ah approve <merge|release|other> --project P --what "<the step>" --reason "<the sentence>"` |
 | Key-file exceptions for named key folders | "agents may read/handle the key files in folder K for purpose X" | `ah approve secret --path 'K/*' --what X --reason "<the sentence>"` (owner only) |
 | A dated approval ("until Friday") | any of the above with an end | add `--expires 2026-12-01` (or `--expires 7d`) |
 | An approval of one exact commit | "merge PR N at sha S" | only when the owner wants the pin: add `--exact-head S`; by default a PR approval survives later commits |

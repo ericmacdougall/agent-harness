@@ -66,9 +66,9 @@ python3 ~/.claude/hooks/ahd.py --once            # one tick in the foreground, J
 python3 ~/.claude/hooks/ahd.py report            # one tick, then the dropped / silent / unowned / waiting-on-user lists
 python3 ~/.claude/hooks/ahd_peek.py list [--all] [--json]
 python3 ~/.claude/hooks/ahd_peek.py tail c:<agent-id> -n 30 [-f]
-python3 ~/.claude/hooks/ahd.py install [--apply]  # launchd com.ericmacdougall.ahd / systemd --user ahd.service
+python3 ~/.claude/hooks/ahd.py install [--apply]  # launchd <prefix>ahd / systemd --user ahd.service
 tail -f ~/.agent-harness/logs/ahd.log
-launchctl bootout gui/$(id -u)/com.ericmacdougall.ahd     # stop (macOS)
+launchctl bootout gui/$(id -u)/com.agent-harness.ahd     # stop (macOS)
 systemctl --user disable --now ahd.service                # stop (Linux)
 python3 -m unittest tests.test_ahd tests.test_ahd_peek
 ```

@@ -44,14 +44,29 @@ def scrubbed_env(extra: dict | None = None) -> dict:
     return env
 
 
+def _default_remote_host() -> str:
+    """The worker host Mission Control probes: ~/.agent-harness/local.json `heavy_job_host`; "" when none is set."""
+    try:
+        import sys  # noqa: PLC0415
+        hooks = str(Path(__file__).resolve().parents[1] / "hooks")
+        if hooks not in sys.path:
+            sys.path.insert(0, hooks)
+        import ah_local  # noqa: PLC0415
+        value = ah_local.get("heavy_job_host", "")
+        return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,60}", value) else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 class Runner:
     """Allowlisted, read-only subprocess runner with timeouts and output caps."""
 
     def __init__(self, *, python: str, ah: str, gh: str | None = None, ssh: str = "/usr/bin/ssh",
-                 codex: str | None = None, remote_host: str = "t2-dev", fabric_bin: str | None = None):
+                 codex: str | None = None, remote_host: str | None = None, fabric_bin: str | None = None):
         self.python, self.ah = python, ah
         self.gh = gh or shutil.which("gh") or "/opt/homebrew/bin/gh"
-        self.ssh, self.codex, self.remote_host, self.fabric_bin = ssh, codex, remote_host, fabric_bin
+        self.ssh, self.codex, self.fabric_bin = ssh, codex, fabric_bin
+        self.remote_host = remote_host if remote_host is not None else _default_remote_host()
 
     # Each shape returns the argv or raises Refused. Arguments are validated before they are placed.
     def argv(self, kind: str, *args) -> list[str]:
@@ -81,14 +96,14 @@ class Runner:
             return [self.gh, "api", "user", "--method", "GET"]
         if kind == "gh-events" and len(args) == 1 and LOGIN_RE.match(str(args[0])):
             return [self.gh, "api", "--method", "GET", f"/users/{args[0]}/events?per_page=30"]
-        if kind == "remote-wal-probe" and not args:
+        if kind == "remote-wal-probe" and not args and self.remote_host:
             # one fixed read command: the newest WAL lines modified in the last 2 minutes, at most 64 KiB
             script = ("find ~/.claude/wals -maxdepth 2 -name '*.jsonl' -mmin -2 -type f 2>/dev/null | head -50 | "
                       "while read f; do printf '%s\\t' \"$f\"; tail -n 3 \"$f\" | tr '\\n' '\\036'; echo; done | "
                       "head -c 65536")
             return [self.ssh, "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-a", "-x", "-T",
                     self.remote_host, script]
-        if (kind == "fabric-export" and len(args) == 1 and self.fabric_bin
+        if (kind == "fabric-export" and len(args) == 1 and self.fabric_bin and self.remote_host
                 and isinstance(args[0], str) and CURSOR_RE.fullmatch(args[0])):
             command = shlex.quote(str(self.fabric_bin)) + " control export"
             if args[0]:

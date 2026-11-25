@@ -538,7 +538,6 @@
    "event": "PreToolUse",
    "tools": [
     "Bash",
-    "mcp__hawkeye__run",
     "mcp__cloudflare__d1_database_query",
     "mcp__pg__execute_sql"
    ],

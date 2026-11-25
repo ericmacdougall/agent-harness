@@ -15,6 +15,7 @@ from pathlib import Path
 
 HOOKS = Path(__file__).resolve().parents[1] / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
+os.environ["AH_LOCAL_CONFIG"] = str(Path(__file__).resolve().parent / "data" / "local_fixture.json")  # hermetic hosts
 import ah_kill as ak  # noqa: E402
 import kill_guard as kg  # noqa: E402
 
@@ -417,10 +418,10 @@ class ReviewFixes(KillBase):
         self.addCleanup(lambda: os.environ.__setitem__("HOME", old))
         runner = lambda argv, **kw: subprocess.CompletedProcess(  # noqa: E731
             argv, 0, stdout='{"ok": true, "run": "k1", "results": []}')
-        ak.kill_remote("t2-dev", [5], "why", False, 5, "sess-1", "a", home=self.home, runner=runner, foreign=True,
+        ak.kill_remote("worker-1", [5], "why", False, 5, "sess-1", "a", home=self.home, runner=runner, foreign=True,
                        notify=lambda h, e: None)
         text = next((self.home / ".claude").rglob("main.jsonl")).read_text()
-        self.assertIn("t2-dev", text)
+        self.assertIn("worker-1", text)
         self.assertIn("result", text)
 
 
@@ -648,34 +649,34 @@ class ReviewRound3(KillBase):
         runner = lambda argv, **kw: calls.append(argv) or subprocess.CompletedProcess(  # noqa: E731
             argv, 0, stdout='{"ok": true, "run": "k1", "results": []}')
         with self.assertRaises(ak.KillError) as cm:
-            ak.kill_remote("dev2", [5], "r", False, 5, home=self.home, runner=runner)
+            ak.kill_remote("worker-2", [5], "r", False, 5, home=self.home, runner=runner)
         self.assertEqual(cm.exception.code, "foreign_required")
         self.assertEqual(calls, [])
         notices = []
-        ak.kill_remote("dev2", [5], "r", False, 5, home=self.home, runner=runner, foreign=True,
+        ak.kill_remote("worker-2", [5], "r", False, 5, home=self.home, runner=runner, foreign=True,
                        notify=lambda h, e: notices.append(e))
         self.assertEqual(len(notices), 1)
         self.assertEqual(notices[0]["severity"], "high")
         for pid in (6, 7):
-            ak.kill_remote("dev2", [pid], "r", False, 5, home=self.home, runner=runner, foreign=True,
+            ak.kill_remote("worker-2", [pid], "r", False, 5, home=self.home, runner=runner, foreign=True,
                            notify=lambda h, e: notices.append(e), session="sess-1")
         self.assertEqual(notices[-1]["key"], notices[-2]["key"], "remote stops by one session on one host share one alert")
-        self.assertEqual(notices[-1]["key"], "ah-kill:foreign:remote-dev2-sess-1")
+        self.assertEqual(notices[-1]["key"], "ah-kill:foreign:remote-worker-2-sess-1")
 
         def boom(h, e):
             raise OSError("ring")
         calls.clear()
         with self.assertRaises(ak.KillError) as cm:
-            ak.kill_remote("dev2", [5], "r", False, 5, home=self.home, runner=runner, foreign=True, notify=boom)
+            ak.kill_remote("worker-2", [5], "r", False, 5, home=self.home, runner=runner, foreign=True, notify=boom)
         self.assertEqual(cm.exception.code, "notice_failed")
         self.assertEqual(calls, [], "no notice, no remote stop")
 
     def test_remote_validates_reason_and_answer(self):
         runner = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, stdout="[1]")  # noqa: E731
         with self.assertRaises(ak.KillError):
-            ak.kill_remote("dev2", [5], "  ", False, 5, home=self.home, runner=runner, foreign=True)
+            ak.kill_remote("worker-2", [5], "  ", False, 5, home=self.home, runner=runner, foreign=True)
         with self.assertRaises(ak.KillError) as cm:
-            ak.kill_remote("dev2", [5], "r", False, 5, home=self.home, runner=runner, foreign=True,
+            ak.kill_remote("worker-2", [5], "r", False, 5, home=self.home, runner=runner, foreign=True,
                            notify=lambda h, e: None)
         self.assertEqual(cm.exception.code, "host_unreachable")
 
@@ -687,7 +688,7 @@ class Remote(KillBase):
         def runner(argv, **kw):
             seen["cmd"] = argv[-1]
             return subprocess.CompletedProcess(argv, 0, stdout='{"ok": true, "run": "k1", "results": []}')
-        ak.kill_remote("dev2", [5], "r", False, 5, home=self.home, runner=runner, foreign=True, notify=lambda h, e: None)
+        ak.kill_remote("worker-2", [5], "r", False, 5, home=self.home, runner=runner, foreign=True, notify=lambda h, e: None)
         self.assertIn("--foreign", seen["cmd"])
         self.assertIn("python3 -I ", seen["cmd"])
 
@@ -697,14 +698,14 @@ class Remote(KillBase):
         def runner(argv, **kw):
             seen["argv"] = argv
             return subprocess.CompletedProcess(argv, 0, stdout='{"ok": true, "run": "k1", "results": []}')
-        out = ak.kill_remote("dev2", [5, 6], "it's $(bad); rm", True, 7, "s", "a", home=self.home, runner=runner,
+        out = ak.kill_remote("worker-2", [5, 6], "it's $(bad); rm", True, 7, "s", "a", home=self.home, runner=runner,
                              foreign=True, notify=lambda h, e: None)
-        self.assertEqual(out["host"], "dev2")
+        self.assertEqual(out["host"], "worker-2")
         cmd = seen["argv"][-1]
         self.assertIn("--pid 5,6", cmd)
         self.assertIn("'it'\"'\"'s $(bad); rm'", cmd)
         self.assertIn("--tree", cmd)
-        self.assertEqual(seen["argv"][-3:-1], ["--", "dev2"])
+        self.assertEqual(seen["argv"][-3:-1], ["--", "worker-2"])
         with self.assertRaises(ak.KillError):
             ak.kill_remote("evil;host", [5], "r", False, 5, home=self.home, runner=runner, foreign=True)
         self.assertTrue(any(r["event"] == "remote" for r in self.audit()))
@@ -747,7 +748,7 @@ class FakeWindowsRemote:
 
 
 class WindowsHost(unittest.TestCase):
-    """goodqa#15275: ah kill --host ah-spectre stops one process with Stop-Process over ssh, with the same guards."""
+    """goodqa#15275: ah kill --host win-1 stops one process with Stop-Process over ssh, with the same guards."""
     PS = {"ppid": 900, "name": "powershell.exe", "created": "2026-11-07T21:14:03.1234567Z",
           "cmd": "powershell.exe -NoProfile -File C:\\pp\\pp-lab.ps1 receipt", "owner": "SPECTRE\\lab",
           "mine": True, "self": False, "orphan": True}
@@ -758,7 +759,7 @@ class WindowsHost(unittest.TestCase):
         self.notices = []
 
     def run_kill(self, remote, pids=(4242,), foreign=True, tree=False):
-        return ak.kill_remote("ah-spectre", list(pids), "orphaned after TaskStop", tree, 5, "sess-1", "a1",
+        return ak.kill_remote("win-1", list(pids), "orphaned after TaskStop", tree, 5, "sess-1", "a1",
                               home=self.home, runner=remote, foreign=foreign,
                               notify=lambda h, e: self.notices.append(e))
 
@@ -778,15 +779,15 @@ class WindowsHost(unittest.TestCase):
         self.assertTrue(out["ok"], out)
         self.assertEqual(remote.stopped, [4242])
         self.assertEqual(len(remote.calls), 2)
-        self.assertEqual(remote.calls[0][6], "ah-spectre")
+        self.assertEqual(remote.calls[0][6], "win-1")
         self.assertIn("'2026-11-07T21:14:03.1234567Z'", remote.script)
         ident = [r for r in self.audit() if r.get("event") == "identity"]
         self.assertEqual(len(ident), 1, self.audit())
         self.assertEqual((ident[0]["host"], ident[0]["pid"], ident[0]["created"]),
-                         ("ah-spectre", 4242, "2026-11-07T21:14:03.1234567Z"))
+                         ("win-1", 4242, "2026-11-07T21:14:03.1234567Z"))
         self.assertIn("pp-lab.ps1 receipt", ident[0]["cmd"])
         self.assertEqual(len(self.notices), 1)
-        self.assertIn("ah-spectre", self.notices[0]["message"])
+        self.assertIn("win-1", self.notices[0]["message"])
 
     def test_neg1_a_reused_pid_is_not_stopped(self):
         remote = FakeWindowsRemote({4242: self.PS}, reuse_after_read="2026-11-08T01:00:00.0000000Z")
@@ -859,7 +860,7 @@ class WindowsHost(unittest.TestCase):
                 self.assertEqual(remote.stopped, [])
 
     def test_login_user_is_the_owner_of_the_checking_shell_not_env(self):
-        # live finding on ah-spectre: $env:USERDOMAIN is WORKGROUP, GetOwner says the machine name
+        # live finding on win-1: $env:USERDOMAIN is WORKGROUP, GetOwner says the machine name
         for script in (ak._WIN_READ, ak._WIN_STOP):
             self.assertNotIn("$env:USERDOMAIN", script)
             self.assertIn('-Filter "ProcessId=$PID") -MethodName GetOwner', script)
@@ -915,7 +916,7 @@ class SessionScope(KillBase):
         self.spawned(1211, root=other)                                        # another session's worktree
         self.spawned(1212, root=self.sess() + "0/t")                          # work/sess-10: a prefix, not inside
         self.spawned(1213, root=self.sess("..", "sess-2", "t"))              # dot segments out of the session dir
-        self.spawned(1214, root="remote:dev2")                                # a remote ledger root
+        self.spawned(1214, root="remote:worker-2")                                # a remote ledger root
         for pid in (1210, 1211, 1212, 1213, 1214, 1215):                      # 1215: never recorded
             out = self.run_kill(self.probe_for(pid), [pid], session_scope=True)
             self.assertEqual(out["results"][0]["status"], "refused", pid)
@@ -1152,7 +1153,7 @@ class HookAllowsAhKill(unittest.TestCase):
             for cmd in ("python3 -I ~/.claude/hooks/ah.py kill --help",
                         "python3 ~/.claude/hooks/ah.py kill --pid 4242 --reason x --approved-by wa1b2c3d4e5f",
                         "ah kill --pid 4242 --reason stuck --session-scope",
-                        "python3 -I ~/.claude/hooks/ah.py kill --pid 4242 --reason orphaned --host ah-spectre --foreign"):
+                        "python3 -I ~/.claude/hooks/ah.py kill --pid 4242 --reason orphaned --host win-1 --foreign"):
                 with self.subTest(cmd=cmd):
                     self.assertEqual(kg.decide(cmd, cwd=tmp, home=tmp)[0], "allow")
 

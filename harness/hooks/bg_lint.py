@@ -13,7 +13,7 @@ Patterns flagged (see docs/rules/bg-launch.json and tests/data/bg_lint_*.json):
                  written that way can never fail.
   self-match-pgrep  a while/until loop polling `pgrep -f PATTERN` (or `ps | grep PATTERN` without `grep -v grep`)
                  whose pattern also occurs in the loop's own shell command line, so it never exits. Suggests the
-                 `[t]sc` bracket trick, a PID wait or an exit file (incident 2026-11-06: 12 h on dev2).
+                 `[t]sc` bracket trick, a PID wait or an exit file (incident 2026-11-06: 12 h on a worker host).
 
 Lint reads stdin once, bounded; any internal error is swallowed (an advisory must not break a tool call).
 Stdlib only; Python 3.9+.
@@ -153,7 +153,7 @@ def _self_matching(flags, pattern):
 
 def find_self_matching_wait(segments):
     """A while/until loop that polls `pgrep -f PATTERN` or `ps | grep PATTERN` with a pattern that occurs in the
-    loop's own command line (incident 2026-11-06: `while pgrep -f "tsc --noEmit"` ran 12 h on dev2 because it
+    loop's own command line (incident 2026-11-06: `while pgrep -f "tsc --noEmit"` ran 12 h on a worker host because it
     matched the ssh'd bash that ran the loop)."""
     texts = [t for _, t in segments]
     loop_head = next((i for i, t in enumerate(texts) if LOOP_START.match(t)), None)
@@ -262,7 +262,7 @@ def lint(command, _depth=0):
     if hit:
         out.append(("self-match-pgrep", "This wait loop polls `%s`, and that pattern also occurs in the command line "
                                         "of the shell running the loop, so the match never goes away and the loop "
-                                        "never exits (one ran 12 h on dev2; a loop typed into an already-running shell "
+                                        "never exits (one ran 12 h on a worker host; a loop typed into an already-running shell "
                                         "is the exception). Use the bracket trick (`%s`), wait on a PID (`kill -0 $PID` "
                                         "or `bg_job.py wait`), or poll for an exit file written by the job "
                                         "(`cmd; echo $? > done.txt`)." % hit))

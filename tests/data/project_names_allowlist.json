@@ -1,0 +1,14 @@
+{
+  "_doc": "Legitimate leftovers for tests/test_no_project_names.py: {path, term, reason}. A term is the lower-case name the test reports. Keep this list short; machine- and owner-specific values belong in ~/.agent-harness/local.json (docs/local-config.md).",
+  "allow": [
+    {"path": "harness/netwatch.json", "term": "ericmacdougall",
+     "reason": "netwatch is a separate published tool; this is the repository its pinned release is downloaded from"},
+    {"path": "netwatch_install.py", "term": "ericmacdougall", "reason": "as above (the installer's docstring names it)"},
+    {"path": "harness/mission_control/collectors.py", "term": "fabric",
+     "reason": "Mission Control's Fabric event consumer (read-only mirror); removal proposed separately"},
+    {"path": "harness/mission_control/fabric_state.py", "term": "fabric", "reason": "as above"},
+    {"path": "harness/mission_control/safeio.py", "term": "fabric", "reason": "as above"},
+    {"path": "harness/mission_control/server.py", "term": "fabric", "reason": "as above"},
+    {"path": "harness/mission_control/web/tests/adapt.test.mjs", "term": "fabric", "reason": "as above"}
+  ]
+}

@@ -73,7 +73,7 @@ BUDGET_SECONDS=${LOG_BACKUP_BUDGET_SECONDS:-780}   # one run must end inside the
 RUN_START=$(date +%s)
 SCRIPT_START=$RUN_START
 TPSLIMIT=${LOG_BACKUP_TPSLIMIT:-1}       # Dropbox write budget is shared by every host that backs up to the account:
-TRANSFERS=${LOG_BACKUP_TRANSFERS:-2}     # keep each host's share small (the Mac, dev2 and T2 together stay near 3/s)
+TRANSFERS=${LOG_BACKUP_TRANSFERS:-2}     # keep each host's share small (all hosts together stay near 3/s)
 BULK_EVERY=${LOG_BACKUP_BULK_EVERY_SECONDS:-3600}   # the bulk tier (work tree, archives) runs hourly, transcripts every time
 JITTER=${LOG_BACKUP_JITTER_SECONDS:-0}   # random start delay so hosts on the same schedule do not collide
 SLICE_RESERVE=${LOG_BACKUP_SLICE_RESERVE_SECONDS:-20}  # the least copy time each later tier-1 source is promised
@@ -603,7 +603,7 @@ rate_limit_note() { # rate_limit_note LOG-OFFSET: name a Dropbox write rate limi
     '$2 ~ /(^|\/)rclone$/ && !index($0, own) {for (i = 3; i <= NF; i++) if (index($i, remote) == 1) {n++; break}} END {print n+0}')
   say "Dropbox write rate limit (too_many_write_operations) during this copy; other rclone uploads running now: $others (see: ps -axo pid,command | grep rclone)"
   # Every caller is a copy that failed or was cut short (goodqa#15218): more copies in this run would only spend the
-  # account's write budget again (dev2 2026-11-05: one throttled copy ran for two days). The run stops copying here;
+  # account's write budget again (2026-11-05: one throttled copy ran for two days). The run stops copying here;
   # a rate limit that rclone retried to success is never reported through this function, so it stops nothing.
   [ "$throttled" = 1 ] || { throttled=1 throttle_src="$rel others=$others"; }
 }

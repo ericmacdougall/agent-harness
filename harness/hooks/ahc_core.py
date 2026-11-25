@@ -131,7 +131,7 @@ class ForeignRoot(Refused):
 
 
 # ahc's state root (goodqa#16049 slice 1, the spec owner's ruling after the Q7 read). It was
-# ~/.agent-harness/coordinator, which another live program (coordd, a different coordinator) also uses on t2-dev for
+# ~/.agent-harness/coordinator, which another live program (a different coordinator) also used on a worker host for
 # its own ledger.sqlite, clones/, runs/ and token. No ahc ledger was installed on any host, so the root moved with
 # no migration. ahc owns a root only by its marker, written with O_EXCL after an exclusive mkdir:
 #   - absent: ahc creates it and writes the marker;

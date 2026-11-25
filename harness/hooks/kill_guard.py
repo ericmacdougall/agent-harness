@@ -94,6 +94,13 @@ def load_policy(path=None):
         pass
     if policy['mode'] not in ('enforce', 'warn', 'off'):
         policy['mode'] = 'enforce'
+    try:  # the owner's own launchd label prefixes (~/.agent-harness/local.json)
+        import ah_local  # noqa: PLC0415
+        if isinstance(policy.get('protected'), list):
+            policy['protected'] = policy['protected'] + [re.escape(p) for p in ah_local.protected_label_prefixes()
+                                                         if re.escape(p) not in policy['protected']]
+    except Exception:  # noqa: BLE001 - a broken local file adds nothing
+        pass
     return policy
 
 

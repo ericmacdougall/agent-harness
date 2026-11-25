@@ -10,10 +10,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+os.environ["AH_LOCAL_CONFIG"] = str(Path(__file__).resolve().parent / "data" / "local_fixture.json")  # hermetic labels
 import install  # noqa: E402
 import log_backup_install as lbi  # noqa: E402
 
-PLIST = "Library/LaunchAgents/com.ericmacdougall.log-backup.plist"
+PLIST = "Library/LaunchAgents/com.agent-harness.log-backup.plist"
 UNITS = (".config/systemd/user/log-backup.service", ".config/systemd/user/log-backup.timer")
 SCRIPT = ".agent-harness/bin/log-backup.sh"
 
@@ -79,11 +80,11 @@ class Darwin(Case):
         self.assertEqual(len(baks), 1)
         self.assertEqual(next((self.home / ".agent-harness/bin").glob("log-backup.sh.bak-*")).read_text(), "old script\n")
         plist = (self.home / PLIST).read_text()
-        self.assertIn("<key>Label</key><string>com.ericmacdougall.log-backup</string>", plist)
+        self.assertIn("<key>Label</key><string>com.agent-harness.log-backup</string>", plist)
         self.assertIn(f"{self.home}/.agent-harness/bin/log-backup.sh", plist)
         self.assertNotIn("@HOME@", plist)
-        self.assertEqual(runner.calls, [["launchctl", "enable", "gui/501/com.ericmacdougall.log-backup"],
-                                        ["launchctl", "bootout", "gui/501/com.ericmacdougall.log-backup"],
+        self.assertEqual(runner.calls, [["launchctl", "enable", "gui/501/com.agent-harness.log-backup"],
+                                        ["launchctl", "bootout", "gui/501/com.agent-harness.log-backup"],
                                         ["launchctl", "bootstrap", "gui/501", str(self.home / PLIST)]])
 
     def test_second_apply_changes_nothing_and_reloads_nothing(self):
@@ -104,8 +105,8 @@ class Darwin(Case):
 
     LANE_OFF = "<key>LOG_BACKUP_BULK_LANE</key><string>0</string>"
     LANE_ON = "<key>LOG_BACKUP_BULK_LANE</key><string>1</string>"
-    RELOAD = [["launchctl", "enable", "gui/501/com.ericmacdougall.log-backup"],
-              ["launchctl", "bootout", "gui/501/com.ericmacdougall.log-backup"]]
+    RELOAD = [["launchctl", "enable", "gui/501/com.agent-harness.log-backup"],
+              ["launchctl", "bootout", "gui/501/com.agent-harness.log-backup"]]
 
     def lane_in_plist(self):
         import plistlib
@@ -173,7 +174,7 @@ class Darwin(Case):
         text = (odd / PLIST).read_text()
         self.assertIn("a&amp;b&lt;c", text)
         import plistlib
-        self.assertEqual(plistlib.loads(text.encode())["Label"], "com.ericmacdougall.log-backup")
+        self.assertEqual(plistlib.loads(text.encode())["Label"], "com.agent-harness.log-backup")
 
     def test_reload_deferred_while_a_backup_runs(self):
         self.lock_held_by(self.holder().pid)
@@ -684,8 +685,8 @@ class OptIn(Case):
         lbi.save_choice(self.home, False)
         runner = Runner()
         lbi.status(self.home, True, system="Darwin", run=runner, uid=501, activate=True)
-        self.assertEqual(runner.calls, [["launchctl", "disable", "gui/501/com.ericmacdougall.log-backup"],
-                                        ["launchctl", "bootout", "gui/501/com.ericmacdougall.log-backup"]])
+        self.assertEqual(runner.calls, [["launchctl", "disable", "gui/501/com.agent-harness.log-backup"],
+                                        ["launchctl", "bootout", "gui/501/com.agent-harness.log-backup"]])
 
     def test_opting_out_stops_a_bulk_lane_run(self):
         # PR #124 review F4: launchd abandons the lane with the job's process group, so bootout never reached it.
@@ -769,9 +770,10 @@ class UnitContents(unittest.TestCase):
 
     def test_launchd_template_interval_label_and_program(self):
         import plistlib
-        text = (ROOT / "harness/schedulers/com.ericmacdougall.log-backup.plist").read_text().replace("@HOME@", "/h")
-        data = plistlib.loads(text.encode())
-        self.assertEqual(data["Label"], "com.ericmacdougall.log-backup")
+        text = (ROOT / "harness/schedulers/log-backup.plist").read_text().replace("@HOME@", "/h")
+        self.assertEqual(plistlib.loads(text.encode())["Label"], "@LABEL@")  # filled in from local.json at install
+        data = plistlib.loads(text.replace("@LABEL@", lbi.LABEL).encode())
+        self.assertEqual(data["Label"], "com.agent-harness.log-backup")
         self.assertEqual(data["StartInterval"], 900)
         self.assertEqual(data["ProgramArguments"], ["/bin/bash", "/h/.agent-harness/bin/log-backup.sh"])
         self.assertEqual(data["EnvironmentVariables"]["LOG_BACKUP_JITTER_SECONDS"], "120")  # stagger hosts on one account

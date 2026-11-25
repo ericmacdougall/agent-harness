@@ -49,8 +49,24 @@ FLOOR_LABEL = "com.agent-harness.floor"
 FLOOR_UNIT = "agent-harness-floor"
 # What the installers register on a host (install.py --services/ahd, log_backup_install, backup_watch, ops_watch,
 # mission_control_install, ahc_install, and the floor watcher below). netwatch is a separate network monitor and stays.
-MAC_LABELS = ("com.ericmacdougall.ahd", "com.ericmacdougall.log-backup", "com.ericmacdougall.backup-watch",
-              "com.ericmacdougall.ops-watch", "com.agent-harness.mission-control", FLOOR_LABEL)
+
+
+def _label_prefix():
+    """~/.agent-harness/local.json `launchd_label_prefix` (read inline: no sibling imports here; ah_local.label_prefix
+    is the same rule)."""
+    try:
+        path = os.environ.get("AH_LOCAL_CONFIG") or os.path.join(os.path.expanduser("~"), ".agent-harness", "local.json")
+        with open(os.path.expanduser(path), "rb") as handle:
+            value = json.loads(handle.read(262144).decode("utf-8")).get("launchd_label_prefix")
+        if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.", value):
+            return value
+    except (OSError, ValueError, AttributeError):
+        pass
+    return "com.agent-harness."
+
+
+MAC_LABELS = tuple(_label_prefix() + n for n in ("ahd", "log-backup", "backup-watch", "ops-watch")) + (
+    "com.agent-harness.mission-control", FLOOR_LABEL)
 LINUX_UNITS = ("ahd.service", "log-backup.timer", "backup-watch.timer", "ops-watch.timer", "ahc-core.service",
                "ahc-review.service", FLOOR_UNIT + ".path")
 PENDING_SECONDS = 900  # an install that marked itself pending this recently is never "repaired" underneath

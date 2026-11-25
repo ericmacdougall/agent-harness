@@ -1,7 +1,7 @@
 """`ah install-files`: install MERGED hook files on a remote host through one audited command (goodqa#15742).
 
-The 2026-11-11 t2-dev install of command_guard.py was blocked as a remote `cp` and then done with `scp`, a second route
-around a guard. This command is the sanctioned route:
+An install of command_guard.py on a worker host was once blocked as a remote `cp` and then done with `scp`, a second
+route around a guard. This command is the sanctioned route:
 
   * the bytes come only from a commit proven to be an ancestor of the canonical harness repository's main, fetched into a
     FRESH repository this tool owns (never one the caller names); the commit, the trees on the path and the blob are
@@ -32,8 +32,26 @@ import time
 import uuid
 from pathlib import Path
 
-HOSTS = ("t2-dev", "ah-mac-mini")
-CANONICAL_URL = "https://github.com/ericmacdougall/agent-harness.git"
+
+
+def _local():
+    try:
+        import sys  # noqa: PLC0415
+        here = str(Path(__file__).resolve().parent)
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        import ah_local  # noqa: PLC0415
+        return ah_local
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# The non-Windows hosts of ~/.agent-harness/local.json, and its `canonical_repo_url` (the harness repository whose
+# main proves a commit merged). Both are empty by default: install-files then refuses with a pointer to the config.
+_LOCAL = _local()
+HOSTS = tuple(h for h in (_LOCAL.host_names() if _LOCAL else ())
+              if h not in (_LOCAL.host_names(os_name="windows") if _LOCAL else ()))
+CANONICAL_URL = (_LOCAL.get("canonical_repo_url", "") if _LOCAL else "") or ""
 ALLOW_FILE = False  # tests only: lets the fetch read a local bare repository standing in for the canonical URL
 REMOTE_PREFIX = ""  # tests only: a `HOME=... ` assignment so a real ssh-to-localhost run uses a disposable home
 MAX_FILES = 20
@@ -144,7 +162,7 @@ def selftest():
     deadline = time.time() + TOTAL_DEADLINE
     probes = {"allow": "ls -la",
               "deny_wal": "rm -rf ~/.claude/wals",
-              "deny_hooks_copy": 'ssh t2-dev "cp x ~/.claude/hooks/command_guard.py"'}
+              "deny_hooks_copy": 'ssh worker "cp x ~/.claude/hooks/command_guard.py"'}
     for key, cmd in probes.items():
         if deadline - time.time() <= 0.5:
             res["guard"][key] = {"exit": None, "verdict": "error:deadline", "rule": ""}
@@ -393,8 +411,10 @@ class Remote:
 
 # ----------------------------------------------------------------------------- input and source proof
 def check_inputs(host, ref, files, ticket, dry_run, resume, rollback, force_files, allow_older=False):
+    if not CANONICAL_URL:
+        refuse("set canonical_repo_url in ~/.agent-harness/local.json (docs/local-config.md)")
     if host not in HOSTS:
-        refuse("--host must be one of %s" % ", ".join(HOSTS))
+        refuse("--host must be one of %s (hosts in ~/.agent-harness/local.json)" % (", ".join(HOSTS) or "none configured"))
     if resume and rollback:
         refuse("--resume and --rollback cannot be combined")
     for label, run in (("--resume", resume), ("--rollback", rollback)):

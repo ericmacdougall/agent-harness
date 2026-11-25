@@ -1,9 +1,8 @@
-"""approve-delete accepts a verified copy on Eric's B2 remote, pinned by NAME (supervisor standing authority, rule 4:
-"verified copy on b2-archive or Dropbox"). A b2-type remote is accepted only when it is called b2-archive; the type
-alone never approves. The list is built in: no policy file can widen it. Remote lists come from `rclone listremotes
---long` (names and types), never from reading rclone.conf."""
+"""approve-delete accepts a verified copy on a backup remote named in ~/.agent-harness/local.json `backup_remotes`
+(here the fixture's {"b2": ["b2-archive"]}), pinned by NAME: a b2-type remote is accepted only when it is called
+b2-archive; the type alone never approves, and no policy file can widen it. Without a local config only dropbox
+remotes approve. Remote lists come from `rclone listremotes --long` (names and types), never from reading rclone.conf."""
 
-import ast
 import json
 import os
 import sys
@@ -13,8 +12,12 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+os.environ['AH_LOCAL_CONFIG'] = str(ROOT / 'tests' / 'data' / 'local_fixture.json')
 sys.path.insert(0, str(ROOT / 'harness/hooks'))
+import ah_local  # noqa: E402
 import command_guard as cg  # noqa: E402
+
+ah_local.reset()
 
 LISTING = ('dropbox: dropbox\nb2-archive: b2\nb2-archive2: b2\nb2-other: b2\nB2-Archive: b2\nbackup-sftp: sftp\n'
            'local-crypt: crypt\n')
@@ -96,58 +99,31 @@ class B2Archive(unittest.TestCase):
             check('b2-archive2:x', found)
 
 
-# ---------------------------------------------------------------------------------------------------------------
-# One rule, many descriptions (PR 356 review F1/F2). The accepted remotes are described in guidance strings, a refusal
-# message, a CLI help text, the README and docs/operations.md; these tests fail when one of them says "Dropbox" without
-# the b2-archive route, so the descriptions cannot drift apart again.
+class LocalConfig(unittest.TestCase):
+    def test_without_a_local_config_only_dropbox_approves(self):
+        try:
+            os.environ['AH_LOCAL_CONFIG'] = '/nonexistent/local.json'
+            ah_local.reset()
+            policy = cg.load_policy('/nonexistent')
+            self.assertEqual(policy['marker']['approve_remote_names'], {})
+            self.assertEqual(policy['marker']['no_backup_remote_hosts'], ['github.com'])
+            check('dropbox:backups/claude', policy=policy)
+            with self.assertRaises(ValueError):
+                check('b2-archive:bucket/x', policy=policy)
+        finally:
+            os.environ['AH_LOCAL_CONFIG'] = str(ROOT / 'tests' / 'data' / 'local_fixture.json')
+            ah_local.reset()
 
-TOPIC = ('approve', 'back up', 'backup', 'remote', 'verified copy')
-EXEMPT = (  # strings about Dropbox for another reason: hashing, the access check, a log-backup feature, identifiers
-    'content_hash', 'first of dropbox', 'rclone lsd dropbox', 'user-run-store', 'recreated by `git clone`',
-    'needs no Dropbox backup',
-)
+    def test_the_local_config_adds_named_remotes_and_git_hosts(self):
+        policy = cg.load_policy('/nonexistent')
+        self.assertEqual(policy['marker']['approve_remote_names'], {'b2': ['b2-archive']})
+        self.assertIn('worker-1', policy['marker']['no_backup_remote_hosts'])
 
-
-class OperatorStrings(unittest.TestCase):
-    def test_every_guard_string_that_names_the_accepted_remotes_names_b2_archive(self):
-        tree = ast.parse((ROOT / 'harness/hooks/command_guard.py').read_text())
-        drifted = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                text = node.value
-                folded = text.casefold()
-                if 'dropbox' in folded and folded != 'dropbox' and any(t in folded for t in TOPIC) \
-                        and 'b2-archive' not in folded and not any(e.casefold() in folded for e in EXEMPT):
-                    drifted.append((node.lineno, text[:90]))
-        self.assertEqual(drifted, [], 'a guard string describes the accepted remotes as Dropbox only')
-
-    def test_the_refusal_text_carries_the_route_and_an_example(self):
-        self.assertIn('b2-archive', cg.APPROVE_REMOTES)
+    def test_the_refusal_text_points_at_the_local_config(self):
+        self.assertIn('local.json', cg.APPROVE_REMOTES)
         with self.assertRaises(ValueError) as caught:
-            cg._check_remote('/Users/eric/x', cg.load_policy('/nonexistent'), Verifier({}))
-        self.assertIn('b2-archive:', str(caught.exception))
+            cg._check_remote('/Users/x/x', cg.load_policy('/nonexistent'), Verifier({}))
         self.assertIn('dropbox:backups/claude', str(caught.exception))
-
-    def test_readme_and_operations_doc_describe_both_remotes(self):
-        for rel in ('README.md', 'docs/operations.md'):
-            drifted = []
-            for number, line in enumerate((ROOT / rel).read_text().splitlines(), 1):
-                folded = line.casefold()
-                if line.startswith(('python3 ', '  --')):  # command examples; the b2-archive examples are required below
-                    continue
-                if 'ah-mac-mini' in folded:  # the separate remote_delete route, which keeps its own Dropbox archive check
-                    continue
-                if 'dropbox' in folded and 'b2-archive' not in folded and (
-                        'approve-delete' in folded or 'named remote' in folded or 'named `dropbox`' in folded
-                        or 'verified dropbox' in folded):
-                    drifted.append((number, line[:100]))
-            self.assertEqual(drifted, [], rel)
-        text = (ROOT / 'docs/operations.md').read_text()
-        self.assertIn('approve-delete --path <literal path> --remote b2-archive:', text)
-
-    def test_the_archive_example_in_the_doc_names_the_b2_remote_too(self):
-        text = (ROOT / 'docs/operations.md').read_text()
-        self.assertIn('--archive b2-archive:', text)
 
 
 class ArchivePath(unittest.TestCase):
