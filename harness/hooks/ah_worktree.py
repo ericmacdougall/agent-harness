@@ -25,7 +25,21 @@ import uuid
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-REMOTE_HOSTS = ("t2-dev",)
+
+
+def _remote_hosts():
+    """~/.agent-harness/local.json `remote_worktree_hosts` (plain host names); none by default."""
+    try:
+        if str(HERE) not in sys.path:
+            sys.path.insert(0, str(HERE))
+        import ah_local  # noqa: PLC0415
+        return tuple(h for h in ah_local.str_list("remote_worktree_hosts") if re.fullmatch(r"[A-Za-z0-9._-]{1,60}", h)
+                     and h != "local")
+    except Exception:  # noqa: BLE001
+        return ()
+
+
+REMOTE_HOSTS = _remote_hosts()
 HOSTS = ("local",) + REMOTE_HOSTS
 MAX_REASON = 500
 VERIFIER_VERSION = 3

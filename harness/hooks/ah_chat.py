@@ -13,7 +13,8 @@ Two credentials, never mixed. Reading private messages needs the DEDICATED token
 abilities read + chat.dm.read; minted by you in the GoodQA web app). a file_list of a non-DM surface and an explicit `probe --token user` use the user
 token in ~/.config/goodqa/user-token. A missing or unusable file is an error that names the file: there is no fallback from one
 token to the other. The token is read in-process by gq_browser and sent only as the Authorization header of one HTTPS request
-to https://goodqa.app/v1/mcp (the host is fixed; --base and browser-defaults.json cannot move it). It is never printed, logged, put on a command line, written to the audit log or
+to <base>/mcp, where <base> is gq_browser.DEFAULT_BASE (https://goodqa.app/v1 unless ~/.agent-harness/local.json sets
+ticket_base_url; --base and browser-defaults.json cannot move it). It is never printed, logged, put on a command line, written to the audit log or
 kept anywhere. Every third-party string that is printed (text, previews, names, file names, --no-text values, the probe's
 server strings) goes through ONE screen, _screen: the union of redact.py's shapes and gq_browser.SECRET_SHAPES (GoodQA user
 tokens and keys, DigitalOcean and the rest) is replaced and the row carries redacted: true. Redirects and environment

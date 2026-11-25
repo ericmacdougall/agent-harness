@@ -640,7 +640,7 @@ def cmd_scan(args):
     return 0
 
 
-STATE_MAX_BYTES = 64 * 1024 * 1024  # a dev2 scan is ~250 bytes per row; this allows ~250k rows
+STATE_MAX_BYTES = 64 * 1024 * 1024  # a worker-host scan is ~250 bytes per row; this allows ~250k rows
 
 
 def load_last():

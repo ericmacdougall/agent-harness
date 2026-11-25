@@ -1,7 +1,7 @@
 """P12 (goodqa#14817): large-copy classification, hatch rate limit, per-owner disk budget block.
 
 Sparse files keep these cheap: st_blocks is faked by patching path_size where a "big" tree is needed, and one test
-writes a real 1.1 GiB-apparent sparse file to prove the real walker agrees. Run on dev2/T2 with the other suites.
+writes a real 1.1 GiB-apparent sparse file to prove the real walker agrees. Run on worker-1/T2 with the other suites.
 """
 import io
 import json
@@ -15,6 +15,7 @@ from unittest import mock
 
 HOOKS = Path(__file__).resolve().parents[1] / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
+os.environ["AH_LOCAL_CONFIG"] = str(Path(__file__).resolve().parent / "data" / "local_fixture.json")  # hermetic hosts
 import heavy_job_guard as guard  # noqa: E402
 
 GIB = 1024 ** 3
@@ -44,12 +45,12 @@ class CopyClassification(unittest.TestCase):
                 with self.subTest(command=command):
                     result = decide(command)
                     self.assertEqual((result["action"], result["rule"]), ("deny", "copy"), result)
-                    self.assertIn("dev2", result["message"])
+                    self.assertIn("worker-1", result["message"])
 
     def test_small_and_offbox_copies_are_allowed(self):
         with mock.patch.object(guard, "path_size", fake_size({"/bigsrc": 3 * GIB})):
-            for command in ("cp -r /smallsrc /Users/eric/x", "rsync -a /bigsrc/ dev2:work/", "scp -r /bigsrc dev2:work/",
-                            "ssh dev2 'cp -r /bigsrc /x'", "tar czf - /bigsrc | ssh dev2 'tar xzf -'",
+            for command in ("cp -r /smallsrc /Users/eric/x", "rsync -a /bigsrc/ worker-1:work/", "scp -r /bigsrc worker-1:work/",
+                            "ssh worker-1 'cp -r /bigsrc /x'", "tar czf - /bigsrc | ssh worker-1 'tar xzf -'",
                             "rsync -an /bigsrc/ /Users/eric/z/", "rsync --dry-run -a /bigsrc/ /Users/eric/z/",
                             "git status", "ls -la", "cp a.txt b.txt"):
                 with self.subTest(command=command):
@@ -140,10 +141,10 @@ class ReviewFindings(unittest.TestCase):
                 with self.subTest(command=command):
                     decide(command)
         with mock.patch.object(guard, "remote_path_size", lambda spec: 4 * GIB):
-            self.assertEqual(decide("rsync -a dev2:repo /Users/eric/r")["rule"], "copy")
+            self.assertEqual(decide("rsync -a worker-1:repo /Users/eric/r")["rule"], "copy")
             self.assertEqual(decide("scp -r eric@t2:repo /Users/eric/r")["rule"], "copy")
         with mock.patch.object(guard, "remote_path_size", lambda spec: None):
-            self.assertEqual(decide("rsync -a dev2:repo /Users/eric/r")["rule"], "copy")  # unknown fleet size is heavy
+            self.assertEqual(decide("rsync -a worker-1:repo /Users/eric/r")["rule"], "copy")  # unknown fleet size is heavy
 
     def test_depth_must_be_a_real_small_depth_option(self):
         url = "https://gitlab.com/huge/mono.git"
@@ -171,7 +172,7 @@ class ReviewFindings(unittest.TestCase):
 
     def test_t2_dev_is_a_fleet_host_and_tar_to_stdout_writes_nothing(self):
         with mock.patch.object(guard, "remote_path_size", lambda spec: 4 * GIB):
-            self.assertEqual(decide("scp -r t2-dev:/bigsrc /Users/eric/z")["rule"], "copy")
+            self.assertEqual(decide("scp -r worker-1:/bigsrc /Users/eric/z")["rule"], "copy")
         with mock.patch.object(guard, "path_size", fake_size({"/arch": 5 * GIB})):
             self.assertEqual(decide("tar xzf /arch.tgz --to-stdout")["action"], "allow")
             self.assertEqual(decide("tar -xOf /arch.tar")["action"], "allow")
@@ -230,10 +231,7 @@ class HeavyCommandFamilies(unittest.TestCase):
             with self.subTest(command=command):
                 result = guard.decide(command, "/Users/eric/proj", MODES)
                 self.assertEqual((result["action"], result["rule"]), ("deny", rule), result)
-                host = "dev2" if "claude" in command else "t2-dev"  # claude is not logged in on t2-dev
-                self.assertIn(f"ssh {host} bash -lc", result["message"])
-                if host == "dev2":
-                    self.assertNotIn("ssh t2-dev ", result["message"])
+                self.assertIn("ssh worker-1 bash -lc", result["message"])  # local.json heavy_job_host
 
     def test_quick_forms_stay_allowed(self):
         for command in self.ALLOWED:
@@ -242,13 +240,13 @@ class HeavyCommandFamilies(unittest.TestCase):
 
     def test_the_route_line_is_runnable_on_the_host(self):
         message = guard.decide("pnpm install --frozen-lockfile", "/Users/eric/proj", MODES)["message"]
-        self.assertIn("rsync -a --exclude node_modules --exclude .git /Users/eric/proj/ t2-dev:~/proj/", message)
-        self.assertIn("ssh t2-dev bash -lc 'cd ~/proj && pnpm install --frozen-lockfile'", message)
+        self.assertIn("rsync -a --exclude node_modules --exclude .git /Users/eric/proj/ worker-1:~/proj/", message)
+        self.assertIn("ssh worker-1 bash -lc 'cd ~/proj && pnpm install --frozen-lockfile'", message)
         self.assertNotIn("cd /Users/eric", message)  # a Mac path does not exist on the host
         with mock.patch.object(guard, "ah_run_available", lambda: False):
             self.assertIn("replaces steps 1-2 once goodqa#14548", guard.decide("pnpm install", "/Users/eric/proj", MODES)["message"])
         with mock.patch.object(guard, "ah_run_available", lambda: True):
-            self.assertIn("ah.py run --host t2-dev -- pnpm install", guard.decide("pnpm install", "/Users/eric/proj", MODES)["message"])
+            self.assertIn("ah.py run --host worker-1 -- pnpm install", guard.decide("pnpm install", "/Users/eric/proj", MODES)["message"])
         piped = guard.decide("ls | xargs -P8 pnpm install", "/Users/eric/proj", MODES)["message"]
         self.assertIn("ls | xargs -P8 pnpm install", piped)  # the whole command, pipe included
         multi = guard.decide("pnpm install\npnpm build", "/Users/eric/proj", MODES)["message"]
@@ -281,17 +279,17 @@ class ReviewRound4(unittest.TestCase):
         uncapped = "HARNESS_LOCAL_OK='needs local sessions' claude -p a & claude -p b & wait"
         self.assertEqual(self.d(uncapped)["action"], "deny")
 
-    def test_m1_claude_routes_to_dev2_and_others_to_t2_dev(self):
+    def test_m1_claude_follows_the_route_host_unless_its_own_host_is_set(self):
         message = self.d('for f in a b; do claude -p "x $f" & done')["message"]
-        self.assertIn("ssh dev2 bash -lc", message)
-        self.assertNotIn("ssh t2-dev", message)
-        self.assertIn("not logged in", message)
-        self.assertIn("ssh t2-dev bash -lc", self.d("pnpm install")["message"])
-        with mock.patch.dict(os.environ, {"HARNESS_CLAUDE_ROUTE_HOST": "t2-dev"}):
-            self.assertIn("ssh t2-dev bash -lc", self.d("claude -p a & claude -p b &")["message"])
+        self.assertIn("ssh worker-1 bash -lc", message)
+        self.assertIn("ssh worker-1 bash -lc", self.d("pnpm install")["message"])
+        with mock.patch.dict(os.environ, {"HARNESS_CLAUDE_ROUTE_HOST": "claude-box"}):
+            message = self.d("claude -p a & claude -p b &")["message"]
+            self.assertIn("ssh claude-box bash -lc", message)
+            self.assertNotIn("ssh worker-1 ", message)
 
     def test_docker_remote_engines_and_more_container_forms(self):
-        for command in ("docker --context t2-dev run x", "docker -H ssh://t2-dev run x", "DOCKER_HOST=ssh://t2-dev docker run x"):
+        for command in ("docker --context worker-1 run x", "docker -H ssh://worker-1 run x", "DOCKER_HOST=ssh://worker-1 docker run x"):
             self.assertEqual(self.d(command)["action"], "allow", command)
         for command in ("docker compose --profile dev up", "docker compose --env-file e.cfg up", "docker container run x",
                         "docker image pull x", "colima start", "podman machine start"):
@@ -319,11 +317,17 @@ class ReviewRound4(unittest.TestCase):
 
 
 class ClaudeRouteAndAuth(unittest.TestCase):
-    def test_claude_fanout_routes_to_dev2_with_the_reason_not_to_t2_dev(self):
-        message = guard.decide('for f in a b c; do claude -p "x $f" & done', "/Users/eric/p", MODES)["message"]
-        self.assertIn("ssh dev2 bash -lc", message)
-        self.assertNotIn("ssh t2-dev", message)
-        self.assertIn("not logged in", message)
+    def test_without_a_configured_host_the_route_names_a_placeholder(self):
+        with mock.patch.dict(os.environ, {"AH_LOCAL_CONFIG": "/nonexistent/local.json"}):
+            import ah_local
+            ah_local.reset()
+            try:
+                message = guard.decide('for f in a b c; do claude -p "x $f" & done', "/Users/eric/p", MODES)["message"]
+            finally:
+                ah_local.reset()
+        self.assertIn("ssh <worker host> bash -lc", message)
+        self.assertNotIn("@HOST@", message)
+        self.assertNotIn("@WORKER@", message)
 
 
 class RunGates(unittest.TestCase):
@@ -361,7 +365,7 @@ class RunGates(unittest.TestCase):
         self.assertEqual([e["key"] for e in events], ["heavy:copy:agentA"])
         detail = events[0]["detail"]
         self.assertEqual(detail["agent"], "agentA")
-        self.assertEqual(detail["route"], "t2-dev")
+        self.assertEqual(detail["route"], "worker-1")
         self.assertNotIn("secret-dest", json.dumps(events))
         self.assertNotIn("/bigsrc", json.dumps(events))
 
@@ -505,9 +509,9 @@ class RunGates(unittest.TestCase):
         cwd, dest, sizes = self.scp_case()
         with mock.patch.object(guard, "path_size", sizes), \
                 mock.patch.object(guard, "remote_path_size", lambda spec: 40 * 1024):
-            code, err = self.call(f"scp -q ah-mac-mini:hwq/launch-1.png {dest}/", cwd=cwd)
+            code, err = self.call(f"scp -q mini-1:hwq/launch-1.png {dest}/", cwd=cwd)
             self.assertEqual(code, 0, err)
-            code, err = self.call(f"scp -q -r ah-mac-mini:hwq {dest}/d", cwd=cwd)
+            code, err = self.call(f"scp -q -r mini-1:hwq {dest}/d", cwd=cwd)
             self.assertEqual(code, 0, err)
 
     def test_a_heavy_copy_into_the_over_budget_dir_is_still_refused_with_its_reason(self):
@@ -515,7 +519,7 @@ class RunGates(unittest.TestCase):
         cwd, dest, sizes = self.scp_case()
         with mock.patch.object(guard, "path_size", sizes), \
                 mock.patch.object(guard, "remote_path_size", lambda spec: 3 * GIB):
-            for cmd in (f"scp -r ah-mac-mini:big {cwd}/big", f"cd {dest} && cd {cwd} && scp -r ah-mac-mini:big ./big"):
+            for cmd in (f"scp -r mini-1:big {cwd}/big", f"cd {dest} && cd {cwd} && scp -r mini-1:big ./big"):
                 code, err = self.call(cmd, cwd=dest)
                 self.assertEqual(code, 2, cmd)
                 self.assertIn("over its", err, cmd)
@@ -647,10 +651,10 @@ class RunGates(unittest.TestCase):
             code, err = self.call("cp -r /bigsrc /Users/eric/y", agent="agentR")
             self.assertEqual(code, 2)
             self.assertIn("ssh t2 ", err)
-            self.assertNotIn("ssh dev2 ", err)
+            self.assertNotIn("ssh worker-1 ", err)
             self.assertEqual(self.ring()[-1]["detail"]["route"], "t2")
         with mock.patch.dict(os.environ, {"HARNESS_ROUTE_HOST": "bad host;rm"}):
-            self.assertEqual(guard.route_host(), "t2-dev")
+            self.assertEqual(guard.route_host(), "worker-1")  # falls back to local.json heavy_job_host
 
     def test_codex_payload_shapes_are_guarded(self):
         for tool_input in ({"cmd": "cp -r /bigsrc /Users/eric/x"}, {"command": ["bash", "-lc", "cp -r /bigsrc /Users/eric/x"]},

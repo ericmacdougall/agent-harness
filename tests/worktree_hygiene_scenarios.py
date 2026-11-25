@@ -1,27 +1,22 @@
 #!/usr/bin/env python3
-"""harness/hooks/worktree_hygiene.py (vendored from Hawkeye, goodqa#14908), proven by running it.
+"""harness/hooks/worktree_hygiene.py (goodqa#14908), proven by running it.
 
-Hawkeye's scenario suite, adapted only where the harness differs: hook path, state and config locations,
-no ##HAWKEYE-RULES switch, and the commit suggestion. It runs with block_unpushed on (Hawkeye's
-semantics); tests/test_worktree_hygiene.py covers the harness default and wraps this script.
-
-AGENTS.md "## Worktree and branch hygiene (you cannot stop with a mess --
-enforced)", Eric 2026-09-25: a session may not end its turn while a worktree
-it created or worked in has uncommitted work or commits on no origin branch;
-merged-but-present worktrees and duplicates are named for cleanup.
+The scenario suite runs with block_unpushed on; tests/test_worktree_hygiene.py covers the harness default and wraps
+this script. Rule S18: a session may not end its turn while a worktree it created or worked in has uncommitted work or
+commits on no origin branch; merged-but-present worktrees and duplicates are named for cleanup.
 
 Every scenario builds REAL git repos (a bare "origin", a clone under a temp
 ~/repos, real `git worktree add` linked worktrees), writes a transcript in
 the JSONL shape Claude Code writes (assistant records carrying tool_use blocks,
-the same shape tests/test-hawkeye-supervisor.py uses), and runs the hook as a
+and runs the hook as a
 subprocess with the stdin JSON Claude Code sends a Stop / SubagentStop hook
 (session_id, transcript_path, cwd, hook_event_name, stop_hook_active, and on
 SubagentStop agent_id + agent_transcript_path). HOME is a temp dir throughout:
-the real ~/.hawkeye, ~/.claude and ~/repos are never read or written.
+the real ~/.claude and ~/repos are never read or written.
 
   python3 tests/test-worktree-hygiene-hook.py
 
-HAWKEYE_TEST_WORKTREE_HOOK=<path> runs a mutated copy (negative controls).
+WTH_HOOK=<path> runs a mutated copy (negative controls).
 Exit 0 pass / 1 fail.
 """
 from __future__ import annotations
@@ -55,7 +50,7 @@ def check(name: str, cond: bool, detail: object = "") -> None:
             print("        " + str(detail)[:1500].replace("\n", "\n        "))
 
 
-TMP = tempfile.mkdtemp(prefix="hawkeye-wt-hygiene-")
+TMP = tempfile.mkdtemp(prefix="wt-hygiene-")
 HOME = os.path.join(TMP, "home")
 REPOS = os.path.join(HOME, "repos")
 WTS = os.path.join(REPOS, ".tmp-worktrees")
@@ -63,10 +58,10 @@ PROJECTS = os.path.join(HOME, ".claude", "projects")
 os.makedirs(WTS)
 os.makedirs(PROJECTS)
 
-_SCRUB_PREFIX = ("HAWKEYE_WORKTREE_HYGIENE_", "HARNESS_WORKTREE_", "GITHEAD_")
+_SCRUB_PREFIX = ("HARNESS_WORKTREE_", "GITHEAD_")
 BASE_ENV = {k: v for k, v in os.environ.items()
             if not k.startswith(_SCRUB_PREFIX) and k not in (
-                "HAWKEYE_NO_WORKTREE_GATE", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")}
+                "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")}
 BASE_ENV.update({"HOME": HOME, "GIT_CONFIG_NOSYSTEM": "1", "LC_ALL": "C",
                  "HARNESS_WORKTREE_HYGIENE_BLOCK_UNPUSHED": "1",
                  "GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "t@t.test",
@@ -395,8 +390,8 @@ def scenarios() -> None:
     r = run_hook(t)
     check("a worktree of a repo OUTSIDE ~/repos is out of scope by default", r.returncode == 0 and not r.stderr,
           r.stderr)
-    r = run_hook(t, env={"HAWKEYE_WORKTREE_HYGIENE_REPOS_DIRS": other_parent})
-    check("...and in scope once HAWKEYE_WORKTREE_HYGIENE_REPOS_DIRS names its parent", blocked(r), r.stderr)
+    r = run_hook(t, env={"HARNESS_WORKTREE_HYGIENE_REPOS_DIRS": other_parent})
+    check("...and in scope once HARNESS_WORKTREE_HYGIENE_REPOS_DIRS names its parent", blocked(r), r.stderr)
     t2 = Transcript(repo)
     t2.bash("git -C %s worktree add -b feat/out2 %s/outside-wt2 origin/main" % (repo, TMP))
     must(git(repo, "worktree", "add", "-q", "-b", "feat/out2", os.path.join(TMP, "outside-wt2"), "origin/main"), "wt")
@@ -445,7 +440,7 @@ def scenarios() -> None:
     ro_home = os.path.join(TMP, "readonly-home")
     os.makedirs(ro_home)
     os.chmod(ro_home, 0o500)
-    r = run_hook(t, env={"HOME": ro_home, "HAWKEYE_WORKTREE_HYGIENE_REPOS_DIRS": REPOS})
+    r = run_hook(t, env={"HOME": ro_home, "HARNESS_WORKTREE_HYGIENE_REPOS_DIRS": REPOS})
     os.chmod(ro_home, 0o700)
     check("state dir unwritable (so 'asked once' cannot be recorded): allowed, never an unbounded block",
           r.returncode == 0 and "Traceback" not in r.stderr, (r.returncode, r.stderr))
@@ -453,8 +448,6 @@ def scenarios() -> None:
     # ---- 11. opt-outs ----
     print("\n[11] opt-outs")
     write(os.path.join(wt, "more.py"), "m = 1\n")
-    r = run_hook(t, env={"HAWKEYE_NO_WORKTREE_GATE": "1"})
-    check("HAWKEYE_NO_WORKTREE_GATE=1: allowed", r.returncode == 0 and not r.stderr, r.stderr)
     r = run_hook(t, env={"HARNESS_WORKTREE_GATE": "off"})
     check("HARNESS_WORKTREE_GATE=off: allowed", r.returncode == 0 and not r.stderr, r.stderr)
 
@@ -468,7 +461,7 @@ def scenarios() -> None:
             fh.write("1")
     past = time.time() - 20 * 86400
     os.utime(old_m, (past, past))
-    run_hook(t, env={"HAWKEYE_NO_WORKTREE_GATE": "0"})
+    run_hook(t)
     check("a 20-day-old marker is removed by a later stop", not os.path.exists(old_m))
     check("CONTROL: a fresh marker is kept", os.path.exists(new_m))
 
@@ -486,7 +479,7 @@ def scenarios() -> None:
     marker = fakebin
     hang_env = {"PATH": fakebin + os.pathsep + BASE_ENV.get("PATH", "")}
     write(os.path.join(wt, "hang.py"), "h = 1\n")
-    r = run_hook(t, env=dict(hang_env, HAWKEYE_WORKTREE_HYGIENE_BUDGET_S="2"))
+    r = run_hook(t, env=dict(hang_env, HARNESS_WORKTREE_HYGIENE_BUDGET_S="2"))
     check("git hangs, 2s budget: exit 0 (fail open) in well under 10s",
           r.returncode == 0 and r.elapsed < 10, (r.returncode, round(r.elapsed, 1), r.stderr))
     r = run_hook(t, env=hang_env)
@@ -521,7 +514,7 @@ def scenarios() -> None:
     must(git(repo, "worktree", "add", "-q", "-b", "feat/slow", wt, "origin/main"), "wt")
     write(os.path.join(wt, "app.py"), "x = 'slow'\n")
     r = run_hook(t, env={"PATH": slowbin + os.pathsep + BASE_ENV.get("PATH", ""),
-                         "HAWKEYE_WORKTREE_HYGIENE_BUDGET_S": str(BUDGET)})
+                         "HARNESS_WORKTREE_HYGIENE_BUDGET_S": str(BUDGET)})
     with open(slow_log, encoding="utf-8") as fh:
         log = fh.read().split()
     starts, ends = log.count("start"), log.count("end")

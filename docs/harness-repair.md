@@ -3,8 +3,8 @@
 Use the repair command to refresh existing Claude and Codex harness files on a workstation and its SSH worker. Both hosts need Python 3.11 or later and existing installations. Run it from an inspected checkout of Agent Harness.
 
 ```sh
-scripts/repair-harness.sh --ref REVIEWED_MERGED_COMMIT --host t2-dev --check
-scripts/repair-harness.sh --ref REVIEWED_MERGED_COMMIT --host t2-dev --apply
+scripts/repair-harness.sh --ref REVIEWED_MERGED_COMMIT --host <worker host> --check
+scripts/repair-harness.sh --ref REVIEWED_MERGED_COMMIT --host <worker host> --apply
 ```
 
 Replace `REVIEWED_MERGED_COMMIT` with the full commit SHA from the reviewed release. Preview is the default. Use `--python /absolute/path/to/python3` when interpreter discovery needs an explicit choice. The SSH target must already have a trusted host key and working account access.

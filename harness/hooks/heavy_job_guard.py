@@ -3,7 +3,7 @@
 
 2026-11-04: a hostile-input test (a hook child reading /dev/zero) grew to ~66 GB
 and macOS jetsam hard-reset the machine; earlier a local Playwright sweep also
-spawned ~84 Chrome renderers. The standing rule is "heavy jobs run on dev2";
+spawned ~84 Chrome renderers. The standing rule is "heavy jobs run on the worker host";
 this hook is the front door that enforces it, and run_capped.py is the runtime
 cap for the work that really must run on the Mac.
 
@@ -11,14 +11,14 @@ Contract
 - stdin: Claude Code PreToolUse payload. Deny = exit 2 + message on stderr.
 - Fails OPEN: malformed input, deep JSON, any internal error -> exit 0 and a
   logged warning. Register it WITHOUT onFailure=block.
-- Acts fully on macOS. On other hosts (dev2, t2-dev are Linux) only the dropbox-lane rule applies, and only to
+- Acts fully on macOS. On other hosts (Linux worker hosts) only the dropbox-lane rule applies, and only to
   commands that mention rclone (goodqa#15246); HARNESS_HEAVY_GUARD_FORCE=1 applies every rule for tests.
 - Escape hatch: prefix the command with HARNESS_LOCAL_OK=<reason>; the reason is
   logged to the session WAL. Browser, adversarial, media and fan-out work must
   ALSO run under run_capped.py; suites and builds only need the hatch.
 - Rules: browser, adversarial (hostile-input/fuzz scripts, /dev/zero, mkfifo,
   perl alarm wrappers, scratchpad rt/ scripts), full-suite, build, install, replay, container, copy, media, fan-out.
-  Big jobs are fine on dev2; nothing here caps them. On the Mac, run_capped.py's cap
+  Big jobs are fine on the worker host; nothing here caps them. On the Mac, run_capped.py's cap
   PAUSES a runaway and alerts (netwatch kills only as a last resort).
   Default enforce for browser, full-suite, build, install (pnpm/npm/yarn/bun), replay (replay/synthetic/stress/soak
   scripts, k6), container (docker/podman run/pull/up/start, colima), copy and fan-out (route to the fleet; GoodQA
@@ -26,7 +26,7 @@ Contract
   need the hatch AND run_capped.py. Not covered (disclosed): pip/uv/bundle installs, codex exec, claude -p inside nested
   shells; warn for media and
   fan-out; adversarial is advisory ONLY (never denied: breaking things with hostile input
-  is the red team's job; the advice is dev2 or run_capped.py group cleanup). Override with
+  is the red team's job; the advice is the worker host or run_capped.py group cleanup). Override with
   HARNESS_HEAVY_GUARD=off|warn|enforce or heavy_job_guard.json next to this
   file: {"modes": {"media": "enforce"}}.
 - Build tools (goodqa#14459): make/gmake (test|tests|check targets = full-suite; all|build|install|package|dist|release
@@ -42,12 +42,12 @@ Contract
 - big-clone (goodqa#14927, 2026-11-06): warn only, never denied, no hatch needed. `git clone`, `cp -R/-r/-a` or a
   local `rsync` of a repository whose pack files exceed 500 MB (measured at a local source, or at an existing clone
   of the same name under ~/.agent-harness/work or ~ for a URL) names `git worktree add`, `git archive HEAD | tar -x`,
-  `git clone --filter=blob:none` and dev2/t2-dev. Partial clones (--filter, --depth, --reference, --shared) and a
+  `git clone --filter=blob:none` and the worker host. Partial clones (--filter, --depth, --reference, --shared) and a
   remote rsync side are not flagged. Review and red-team clones of GoodQA (4.4 to 9.4 GB each) had filled ~30 GB.
 
 Threat model: a CARELESS agent, not a hostile one. Wrapper and shell syntax (env/sudo/su/watch/nohup chains, ANSI-C
 quotes, eval) is parsed conservatively, with an unparseable form scanned word by word and denied on any heavy
-command (a false denial names HARNESS_LOCAL_OK and dev2; a false allow is the bug). Deliberate obfuscation is
+command (a false denial names HARNESS_LOCAL_OK and the worker host; a false allow is the bug). Deliberate obfuscation is
 best-effort and out of scope: command substitution such as `$(which pytest)`, variable indirection (`p=pytest; $p`),
 scripts that launch heavy work internally, and aliases. The runtime backstops (run_capped.py, netwatch) cover those.
 
@@ -81,7 +81,7 @@ CAPPED_RULES = {"browser", "media", "fan-out"}  # memory hogs: hatch alone is no
 # goodqa#15246: every host's agent uploads share one Dropbox account's write budget, so this rule holds everywhere.
 # The other rules guard the Mac's own capacity and stay Mac-only (heavy work is meant to run on the Linux hosts).
 EVERY_HOST_RULES = {"dropbox-lane"}
-NEVER_BLOCK = {"adversarial"}  # red-team/fuzz work is legitimate: advise (dev2, group cleanup), never deny
+NEVER_BLOCK = {"adversarial"}  # red-team/fuzz work is legitimate: advise (worker host, group cleanup), never deny
 WARN_ONLY = {"big-clone"}  # disk advice (goodqa#14927): warn whatever the mode table says, never deny
 BIG_PACK_BYTES = 500 * 1024 * 1024  # a repository whose packs exceed this is a big copy on the Mac
 MAX_PACK_ENTRIES = 20000
@@ -305,7 +305,7 @@ def positional(args, value_flags=()):
 # 2026-11-05: work/pp407 grew ~9 GB/h on the Mac from cp, tar, rsync, git clone and worktree review trees (one release
 # clone was 6.7 GB) with the disk at 94%. A copy is classified by ESTIMATED size, never by command name alone:
 # a bounded walk of the local source, `ssh host du` for a remote source, the GitHub repo size for a clone. At or above
-# the threshold (default 1 GiB, HARNESS_COPY_GIB) it is routed to dev2/T2. A source that cannot be measured inside
+# the threshold (default 1 GiB, HARNESS_COPY_GIB) it is routed to the worker host. A source that cannot be measured inside
 # its time bound counts as heavy (unknown = heavy on an interactive host), except a shallow/filtered clone.
 
 GIB = 1024 ** 3
@@ -402,9 +402,15 @@ def path_size(path: str, cap: int = None, seconds: float = COPY_WALK_SECONDS):
 
 
 def measured_hosts():
-    """Hosts the guard may `ssh du` to size a remote source: the fleet (dev2/T2) plus heavy_job_guard.json
-    "measure_hosts". Any other host is not contacted and its source is not counted."""
-    hosts = {"dev2", "t2", "t2-dev", "ah-mac-mini"}  # the user's own unix hosts (fleet.md); Windows hosts have no du
+    """Hosts the guard may `ssh du` to size a remote source: the non-Windows hosts of ~/.agent-harness/local.json
+    plus heavy_job_guard.json "measure_hosts". Any other host is not contacted and its source is not counted."""
+    hosts = set()
+    try:
+        import ah_local  # noqa: PLC0415
+        hosts |= {name for name, info in ah_local.hosts().items()
+                  if str(info.get("os", "")).lower() != "windows"}  # Windows hosts have no du
+    except Exception:
+        pass
     try:
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "heavy_job_guard.json")
         if os.path.exists(path):
@@ -670,7 +676,7 @@ def classify_copy(low, args, ctx):
         if to_stdout and mode == "x":
             return None  # extracting to stdout writes nothing to disk
         if mode is None or archive in (None, "-") or REMOTE_SPEC.match(archive) and not archive.startswith(("/", ".", "~")):
-            return None  # a pipe or a listing: the other end decides (tar czf - . | ssh dev2 'tar x')
+            return None  # a pipe or a listing: the other end decides (tar czf - . | ssh host 'tar x')
         if mode == "x":
             ctx.write_dir = resolve(os.path.expanduser(directory or "."), ctx.cwd)
             size, _complete = path_size(resolve(os.path.expanduser(archive), ctx.cwd))
@@ -1026,7 +1032,7 @@ SHELL_KEYWORDS = {"do", "then", "else", "elif", "{", "}", "!", "if", "while", "u
 # Wrapper flag tables: (flags that take no value, flags that consume the next token). A flag in neither table
 # (unknown, bundled like -iu, or a value we cannot place) makes the parse UNCERTAIN, and the guard then scans every
 # remaining word for a heavy command instead of guessing which word is the command. A false denial of an odd wrapper
-# form is acceptable (the message names HARNESS_LOCAL_OK and dev2); a false allow is not.
+# form is acceptable (the message names HARNESS_LOCAL_OK and the worker host); a false allow is not.
 WRAPPER_FLAGS = {
     "env": ({"-i", "--ignore-environment", "-0", "--null", "-v", "--debug"}, {"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}),
     "sudo": ({"-n", "--non-interactive", "-S", "--stdin", "-i", "--login", "-s", "--shell", "-E", "--preserve-env", "-H",
@@ -1989,41 +1995,50 @@ def _decide(command: str, cwd: str = None, modes=None):
     return best
 
 
+def _plain_host(value) -> str:
+    value = str(value or "")
+    return value if re.fullmatch(r"[A-Za-z0-9._-]{1,60}", value) else ""
+
+
 def route_host() -> str:
-    """Where refused heavy work should go: HARNESS_ROUTE_HOST or heavy_job_guard.json "route_host" (default dev2;
-    set to t2 when dev2 is retired). Only a plain host name is accepted."""
-    value = os.environ.get("HARNESS_ROUTE_HOST", "")
-    if not re.fullmatch(r"[A-Za-z0-9._-]{1,60}", value):
-        value = ""
+    """Where refused heavy work should go: HARNESS_ROUTE_HOST, heavy_job_guard.json "route_host", or
+    ~/.agent-harness/local.json "heavy_job_host". Only a plain host name is accepted; "" when none is configured."""
+    value = _plain_host(os.environ.get("HARNESS_ROUTE_HOST", ""))
+    if not value:
         try:
             path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "heavy_job_guard.json")
             if os.path.exists(path):
-                candidate = str(load_json_file(path).get("route_host", ""))
-                value = candidate if re.fullmatch(r"[A-Za-z0-9._-]{1,60}", candidate) else ""
+                value = _plain_host(load_json_file(path).get("route_host", ""))
         except Exception:
             value = ""
-    return value or "t2-dev"
+    if not value:
+        try:
+            import ah_local  # noqa: PLC0415
+            value = _plain_host(ah_local.get("heavy_job_host", ""))
+        except Exception:
+            value = ""
+    return value
 
 
 def routed(text: str) -> str:
-    return text.replace("ssh dev2 ", f"ssh {route_host()} ")
+    """Fill the host placeholders of a message: the configured worker host, or a generic name when none is set."""
+    host = route_host()
+    text = text.replace("ssh @HOST@ ", f"ssh {host or '<worker host>'} ")
+    return text.replace("@WORKER@", host or "a worker host")
 
 
 def claude_route_host() -> str:
-    """Host for headless claude/codex work. Default dev2: the claude CLI on t2-dev is not logged in (known gap,
-    goodqa#14817), so `claude -p` must not be routed there. Override: HARNESS_CLAUDE_ROUTE_HOST or
-    heavy_job_guard.json "claude_route_host"; `doctor.py route-auth` flags a host whose claude is not authenticated."""
-    value = os.environ.get("HARNESS_CLAUDE_ROUTE_HOST", "")
-    if not re.fullmatch(r"[A-Za-z0-9._-]{1,60}", value):
-        value = ""
+    """Host for headless claude/codex work: HARNESS_CLAUDE_ROUTE_HOST or heavy_job_guard.json "claude_route_host",
+    else the route host. `doctor.py route-auth` flags a host whose claude is not authenticated."""
+    value = _plain_host(os.environ.get("HARNESS_CLAUDE_ROUTE_HOST", ""))
+    if not value:
         try:
             path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "heavy_job_guard.json")
             if os.path.exists(path):
-                candidate = str(load_json_file(path).get("claude_route_host", ""))
-                value = candidate if re.fullmatch(r"[A-Za-z0-9._-]{1,60}", candidate) else ""
+                value = _plain_host(load_json_file(path).get("claude_route_host", ""))
         except Exception:
             value = ""
-    return value or "dev2"
+    return value or route_host()
 
 
 def ah_run_available() -> bool:
@@ -2036,7 +2051,7 @@ def exact_route(command, cwd, rule=None):
     `ah run --host H` is printed only when ah_run.py is installed (goodqa#14548)."""
     import shlex
     claude_work = rule == "fan-out" and bool(re.search(r"\bclaude\b", command or ""))
-    host = claude_route_host() if claude_work else route_host()
+    host = (claude_route_host() if claude_work else route_host()) or "<worker host>"
     if not command or not command.strip():
         return ""
     folder = os.path.basename((cwd or "").rstrip("/"))
@@ -2055,8 +2070,6 @@ def exact_route(command, cwd, rule=None):
         lines.append(f"  or: python3 ~/.claude/hooks/ah.py run --host {host} -- {command}")
     else:
         lines.append("  (`ah.py run --host HOST -- CMD` replaces steps 1-2 once goodqa#14548 is installed)")
-    if claude_work:
-        lines.append(f"  Note: claude on t2-dev is not logged in (known gap), so headless claude goes to {host} until dev2 retires on 11-09.")
     return "\n".join(lines)
 
 
@@ -2067,7 +2080,8 @@ def deny_message(rule, detail, hatch, capped, segment=None, cwd=None):
 def _deny_message_text(rule, detail, hatch, capped, segment=None, cwd=None):
     base_msg = routed(_deny_message(rule, detail, hatch, capped))
     if rule == "fan-out" and re.search(r"\bclaude\b", (segment or "") + detail):
-        base_msg = base_msg.replace(f"ssh {route_host()} ", f"ssh {claude_route_host()} ")  # claude is not logged in on t2-dev
+        if claude_route_host() and claude_route_host() != route_host():
+            base_msg = base_msg.replace(f"ssh {route_host() or '<worker host>'} ", f"ssh {claude_route_host()} ")
     # A Dropbox upload of Mac files cannot move to another host; the lane message already gives the command.
     extra = exact_route(segment, cwd, rule) if rule not in NEVER_BLOCK and rule != "dropbox-lane" else ""
     return base_msg + ("\n" + extra if extra else "")
@@ -2079,10 +2093,10 @@ def _deny_message(rule, detail, hatch, capped):
         return (f"Heavy-job guard [{rule}] advisory (not blocked): {RULE_HELP[rule]} ({detail}). Instead: "
                 "`git worktree add <dir> <branch>` from an existing clone shares its objects; "
                 "`git archive HEAD | tar -x -C <dir>` gives a read-only review copy without history; "
-                "`git clone --filter=blob:none` (or --depth 1) when a clone is unavoidable; or do the work on dev2/t2-dev.")
+                "`git clone --filter=blob:none` (or --depth 1) when a clone is unavoidable; or do the work on @WORKER@.")
     if rule in NEVER_BLOCK:
         return (f"Heavy-job guard [{rule}] advisory (not blocked): {RULE_HELP[rule]} ({detail}). Hostile-input tests are "
-                f"legitimate. Prefer dev2 (ssh dev2 '<command>'), or on the Mac run under {cap} so stopping the test also "
+                f"legitimate. Prefer @WORKER@ (ssh @HOST@ '<command>'), or on the Mac run under {cap} so stopping the test also "
                 "stops its children and a runaway is paused instead of resetting the machine.")
     if rule == "dropbox-lane":
         return (f"Heavy-job guard [dropbox-lane]: {RULE_HELP['dropbox-lane']} ({detail}). Use the one throttled lane: "
@@ -2091,12 +2105,12 @@ def _deny_message(rule, detail, hatch, capped):
                 f"use {HATCH}=<reason> (one use per owner per hour, audited).")
     if rule == "copy":
         return (f"Heavy-job guard [copy]: {RULE_HELP['copy']} ({detail}). Large copies, clones and review trees belong on "
-                "dev2/T2, not the Mac: run it there (ssh dev2 '<command>', or the T2 host) and fetch only the result; "
+                "@WORKER@, not the Mac: run it there (ssh @HOST@ '<command>') and fetch only the result; "
                 "clone with --depth 1 or --filter=blob:none, or delete finished trees first. A single unanticipated "
                 f"local step may use {HATCH}=<reason> (one use per owner per hour, audited, refused above 85% disk).")
     head = (f"Heavy-job guard [{rule}]: {RULE_HELP.get(rule, 'heavy work')} ({detail}). "
-            "Large jobs belong on dev2/T2, not the Mac (2026-11-04: an uncapped local process hit ~66 GB and reset the machine).")
-    lines = [head, "Run it there: ssh dev2 '<command>' (sync the checkout first if needed), or"]
+            "Large jobs belong on @WORKER@, not the Mac (2026-11-04: an uncapped local process hit ~66 GB and reset the machine).")
+    lines = [head, "Run it there: ssh @HOST@ '<command>' (sync the checkout first if needed), or"]
     if valid_reason(hatch) and rule in CAPPED_RULES and not capped:
         lines.append(f"{HATCH} is set, but {rule} work on the Mac must ALSO run under the resource cap: {cap}")
     elif rule in CAPPED_RULES:
@@ -2436,7 +2450,7 @@ def run(raw: bytes, modes=None, lane_only=False) -> int:
             sys.stderr.write(routed(scrub_url(f"Heavy-job guard [{decision['rule']}]: owner work dir {budget['path_key']} is over its {gib(budget['budget_bytes'])} GiB "
                              f"disk budget ({gib(budget['used_bytes'])} GiB used), and this {decision['rule']} writes there "
                              f"({str(decision.get('detail', ''))[:300]}). Free space there (nothing is deleted for you) or "
-                             "run the heavy job on dev2/T2 (ssh dev2 '<command>').\n")))
+                             "run the heavy job on @WORKER@ (ssh @HOST@ '<command>').\n")))
             log_event({"event": "deny-over-budget", "rule": decision["rule"]})
             ring_event(f"heavy:{event_class(decision)}:{owner}", "high", f"{owner} refused a heavy {decision['rule']}: over disk budget",
                        dict(copy_event_detail(payload, decision), used_bytes=budget["used_bytes"],
@@ -2445,21 +2459,21 @@ def run(raw: bytes, modes=None, lane_only=False) -> int:
     if action == "allow" and decision.get("hatch_reason") and decision.get("rule") not in NEVER_BLOCK:
         if decision.get("rule") == "copy" and disk_used_pct() >= HATCH_DISK_REFUSE_PCT:
             sys.stderr.write(routed(f"Heavy-job guard [copy]: the disk is above {HATCH_DISK_REFUSE_PCT:.0f}% used, so {HATCH} does not "
-                             "apply to large copies. Run it on dev2/T2 (ssh dev2 '<command>') or free space first.\n"))
+                             "apply to large copies. Run it on @WORKER@ (ssh @HOST@ '<command>') or free space first.\n"))
             log_event({"event": "deny-hatch-disk", "rule": "copy"})
             ring_event(f"heavy:{event_class(decision)}:{owner}", "high", f"{owner} refused a hatch copy: disk above 85%",
                        copy_event_detail(payload, decision))
             return 2
         if not lane_only and live_heavy_jobs() >= max_heavy_jobs():  # refuse BEFORE spending this owner's hourly use
             sys.stderr.write(routed(f"Heavy-job guard: {live_heavy_jobs()} heavy jobs are already running on the Mac (limit "
-                             f"{max_heavy_jobs()}). Queue this one until a run finishes, or run it on dev2 (ssh dev2 '<command>').\n"))
+                             f"{max_heavy_jobs()}). Queue this one until a run finishes, or run it on @WORKER@ (ssh @HOST@ '<command>').\n"))
             log_event({"event": "deny-concurrency", "rule": decision["rule"]})
             return 2
         # The hourly count applies on every host: off the Mac it is the only brake on hatching around the shared
         # Dropbox write budget (PR #132 delta N1).
         allowed, uses = record_hatch_use(owner, hatch_limit())
         if not allowed:
-            where = ("More than that is heavy work on the Mac: run it on dev2/T2 (ssh dev2 '<command>') or raise the "
+            where = ("More than that is heavy work on the Mac: run it on @WORKER@ (ssh @HOST@ '<command>') or raise the "
                      "budget in the run kit." if not lane_only else
                      "Wait for the hour to pass, or use the one throttled lane without the hatch.")
             sys.stderr.write(routed(f"Heavy-job guard: {HATCH} was already used {uses} time(s) in the last hour by this owner "
@@ -2472,7 +2486,7 @@ def run(raw: bytes, modes=None, lane_only=False) -> int:
     if (action == "allow" and decision.get("hatch_reason") and decision.get("rule") not in NEVER_BLOCK
             and not lane_only and live_heavy_jobs() >= max_heavy_jobs()):
         sys.stderr.write(routed(f"Heavy-job guard: {live_heavy_jobs()} heavy jobs are already running on the Mac (limit "
-                         f"{max_heavy_jobs()}). Queue this one until a run finishes, or run it on dev2 (ssh dev2 '<command>').\n"))
+                         f"{max_heavy_jobs()}). Queue this one until a run finishes, or run it on @WORKER@ (ssh @HOST@ '<command>').\n"))
         log_event({"event": "deny-concurrency", "rule": decision["rule"]})
         return 2
     if action == "allow":

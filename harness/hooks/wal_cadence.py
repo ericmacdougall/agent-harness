@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Stop/SubagentStop hook: nudge a human-readable WAL entry when real work has piled up without one
-(rule W04, goodqa#14908; ported from Hawkeye's hawkeye-wal-cadence.py).
+(rule W04, goodqa#14908).
 
 Why: on 2026-09-12 a session interrupted mid-turn had landed 9 proven fixes across 2 files with zero
 journal entries. The commit-time WAL gate never fired, because nothing had been committed. The
@@ -16,14 +16,12 @@ is the user's). For a subagent it is only a worktree under its own work folder
 agent-<id>.jsonl) has no human entry (a wal_note.py row with a note) in the last WAL_STALE_S
 seconds, the hook prints one advisory line (never a block, 2026-11-24) naming the one command that records it.
 
-Bounded like Hawkeye's original:
+Bounded:
 - at most one nudge per agent per distinct diff fingerprint, and at most one per agent per 30 minutes;
 - never on a repeated stop (stop_hook_active);
 - HARNESS_WAL_CADENCE=off disables it;
 - every internal error fails open, because a broken nudge must never wedge a session.
 Register it without onFailure.
-
-Hawkeye's knowledge-net replication (kn ingest) is not ported; it belongs to Hawkeye's knowledge tool.
 """
 from __future__ import annotations
 

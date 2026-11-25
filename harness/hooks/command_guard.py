@@ -64,10 +64,6 @@ import unicodedata
 import urllib.parse
 from pathlib import Path
 
-# Reviewed first-party why implementation. No name-only exemption: a changed
-# implementation must be reviewed and explicitly pinned again.
-WHY_SET_SCRIPT_SHA256 = '92dcbb67993947506b9c139521a53e25d83cf9e8a2a127bf8e88237b2d170918'
-
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:  # python3 -I (3.11+) no longer puts the script's directory on sys.path
     sys.path.insert(0, str(HERE))
@@ -172,16 +168,17 @@ DEFAULT_POLICY = {
     'marker': {'default_ttl_seconds': 900, 'max_ttl_seconds': 86400, 'max_walk_entries': 200000,
                'max_walk_seconds': 2.0, 'max_hash_bytes': 21474836480, 'recent_change_seconds': 600,
                'approve_remote_types': ['dropbox'],
-               # a backend type that is approved only for remotes with these exact names (supervisor standing
-               # authority, rule 4: "verified copy on b2-archive or Dropbox"). b2-archive2 is a b2 remote that is
-               # NOT approved. Built in: a policy file never widens it (it is not in ADDITIVE_LISTS).
-               'approve_remote_names': {'b2': ['b2-archive']},
-               'no_backup_remote_hosts': ['github.com', 't2-dev']},
+               # a backend type that is approved only for remotes with these exact names, e.g. {'b2': ['my-b2']}.
+               # Comes from ~/.agent-harness/local.json `backup_remotes` (load_policy); a policy file never widens it
+               # (it is not in ADDITIVE_LISTS).
+               'approve_remote_names': {},
+               # git hosts whose remote counts as a copy (no backup needed); local.json `trusted_git_hosts` adds more
+               'no_backup_remote_hosts': ['github.com']},
 }
 
 # The one operator-facing description of which remotes approve a delete. Every guidance string and refusal message that
 # names the accepted remotes uses it; tests/test_approve_remote_b2.py fails when an operator-facing string drifts.
-APPROVE_REMOTES = 'Dropbox or the b2 remote named exactly b2-archive'
+APPROVE_REMOTES = 'a Dropbox remote or a backup remote named in ~/.agent-harness/local.json (backup_remotes)'
 SECRET_DUMP, LOG_DELETE, BROAD_KILL = 'secret_dump', 'log_delete', 'broad_kill'
 BULK_STAGING = 'bulk_staging'  # goodqa#15787: git add -A, git commit -a in a dirty original checkout; warn by default
 PARSE = 'parse'  # warn-only notes: input the guard could not fully parse
@@ -255,7 +252,24 @@ def load_policy(path=None):
             mode = 'enforce'  # never warn-only, whatever the file says
         clean[category] = mode
     policy['modes'] = clean
+    _apply_local(policy)
     return policy
+
+
+def _apply_local(policy):
+    """Owner-specific backup remotes and git hosts from ~/.agent-harness/local.json (ah_local); empty by default."""
+    try:
+        import ah_local  # noqa: PLC0415
+        remotes = ah_local.get('backup_remotes', {})
+        names = policy['marker'].setdefault('approve_remote_names', {})
+        for kind, listed in (remotes.items() if isinstance(remotes, dict) else ()):
+            if isinstance(kind, str) and isinstance(listed, list):
+                bucket = names.setdefault(kind.casefold(), [])
+                bucket += [n for n in listed if isinstance(n, str) and n and n not in bucket]
+        hosts = policy['marker'].setdefault('no_backup_remote_hosts', [])
+        hosts += [h for h in ah_local.str_list('trusted_git_hosts') if h not in hosts]
+    except Exception:  # noqa: BLE001 - a broken local file leaves the generic defaults
+        pass
 
 
 class Compiled:
@@ -2212,19 +2226,18 @@ def _worktree_created(path):
 
 
 # What may sit in a working directory and was started by a person or an agent: a shell, an interpreter, an editor, a
-# privilege wrapper or a build tool. An unreadable one of these always refuses (an interactive shell run through sg is the
-# real t2-dev finding of goodqa#15739).
+# privilege wrapper or a build tool. An unreadable one of these always refuses (goodqa#15739: an interactive shell run
+# through sg).
 UNREADABLE_ALWAYS_REFUSES = {'sh', 'bash', 'zsh', 'dash', 'ksh', 'ash', 'fish', 'csh', 'tcsh', 'busybox', 'mksh', 'pwsh',
                              'powershell', 'tmux', 'screen', 'vi', 'vim', 'nvim', 'nano', 'emacs', 'less', 'more', 'man',
                              'make', 'git', 'ssh', 'xargs', 'watch', 'python', 'python2', 'python3', 'node', 'nodejs',
                              'perl', 'ruby', 'php', 'deno', 'bun', 'lua', 'java', 'go', 'cargo', 'npm', 'pnpm', 'yarn',
                              'pip', 'uv'}
 # Known long-lived helpers that never work in a project directory: an unreadable one is skipped whatever its start time
-# (the user systemd manager and its sd-pam helper, the ssh and gpg agents, a tailscaled session helper, and the harness's own
-# pgpool test server started through `sg docker`). The name AND the command line must agree; both can be set by the process
+# (the user systemd manager and its sd-pam helper, the ssh and gpg agents, a tailscaled session helper). The name AND the command line must agree; both can be set by the process
 # itself, which is a stated limit (accident prevention, not an access control).
 UNREADABLE_KNOWN_HELPERS = (('(sd-pam)', ''), ('systemd', '--user'), ('ssh-agent', ''), ('gpg-agent', ''),
-                            ('tailscaled', ' be-child '), ('docker', '--label pgpool.tool='), ('sg', 'lanes/pgpool.py serve'))
+                            ('tailscaled', ' be-child '))
 # Every other unreadable process (a wrapper such as sg, an agent CLI, pytest, a compiler, a node app that renamed itself) is
 # judged by time: it cannot have been launched from the worktree before the worktree existed, so one that started BEFORE the
 # worktree was created is skipped, and one that started after it, or whose start time or the creation time is unknown, refuses.
@@ -2316,7 +2329,7 @@ def busy_scan(path, skip_names=(), created=None):
                             continue
                         # Judged from the worktree side (goodqa#15870): a setgid or sd-pam helper that cannot be read is
                         # skipped and reported unless something ties it to the worktree (see unreadable_verdict).
-                        # the scanner's own ancestors are the caller's session (on t2-dev an ssh login runs under an unreadable
+                        # the scanner's own ancestors are the caller's session (an ssh login can run under an unreadable
                         # `tailscaled be-child` whose command line carries the very command being run): never a reason to refuse
                         if int(entry) in ancestors or unreadable_verdict(entry, status['name'], path, created) is None:
                             result['skipped'].append((int(entry), status['name'] or '?'))
@@ -2376,7 +2389,7 @@ WORKTREE_POLICY = {'reproducible_clone': {'total_seconds': VERIFY_SECONDS, 'remo
 
 def delegated_policy(base=None):
     """The user policy (when given) with the delegated route's own rules laid over its reproducible_clone section: the
-    scaled budget and allow_hooks. The route always applies them, whatever the caller loaded (the real t2-dev proof showed
+    scaled budget and allow_hooks. The route always applies them, whatever the caller loaded (a live proof showed
     the command line passed the loaded user policy straight down, so the delegated rules were never in force); a policy
     can still switch the exemption off with enabled false when it is passed in by code (a policy FILE cannot: load_policy
     ignores the reproducible_clone section of a file)."""
@@ -2765,7 +2778,7 @@ def _clean_reason(reason):
     return re.sub(r'[^\x20-\x7e]', '?', str(reason))[:160]
 
 
-WORKTREE_ROUTE_HOSTS = ('t2-dev',)  # the remote hosts `ah worktree-remove` serves (ah_worktree.REMOTE_HOSTS)
+WORKTREE_ROUTE_HOSTS = ('<host>',)  # placeholder; the real hosts are local.json `remote_worktree_hosts` (ah_worktree)
 # goodqa#16943, #333 review rounds 1 to 3: the route advice and the prune step are constant text with placeholders. The
 # guard fills in no path, host or remote of its own, because any value it resolves can differ from what the kernel or git
 # resolves (symlinked parents with `..`, a stale working directory, another host's ~, a container's filesystem); the
@@ -2784,7 +2797,7 @@ WORKTREE_PRUNE_STEP = ('run `git fetch --prune <the remote that holds the delete
 
 def _worktree_instead(reason):
     """The advice for a refused `git worktree remove`: the verifier's reason, its next step, and the delegated route
-    (ah worktree-remove runs the full verifier, on this Mac or t2-dev), all in fixed text. None when no reason is known."""
+    (ah worktree-remove runs the full verifier, here or on a configured worker host), all in fixed text. None when no reason is known."""
     if not reason:
         return None
     step = _worktree_next_step(reason)
@@ -4995,7 +5008,7 @@ class Analyzer:
         help_only = '--help' in texts or texts == ['-h']
         if ('/' in name or '/' in words[0].text) and not help_only:
             # ./run.sh or /path/to/script: analyse the script text when it is a shell script
-            self.script_file(words[0], depth, require_shell=True, invocation=words, command=cmd)
+            self.script_file(words[0], depth, require_shell=True)
         if name in ('flock', 'unshare', 'parallel', 'tmux', 'screen', 'osascript', 'at', 'batch', 'script'):
             if self.launcher(name, args, depth, pl, idx):
                 return
@@ -5115,7 +5128,7 @@ class Analyzer:
                 self.dispatch(inner, cmd, pl, idx, depth + 1)
         return True
 
-    def script_file(self, word, depth, require_shell=False, invocation=None, command=None):
+    def script_file(self, word, depth, require_shell=False):
         """Analyse a shell script named on the command line (or written earlier in this command)."""
         ctx = self.ctx
         if word is None or word.dynamic or not word.text:
@@ -5129,100 +5142,9 @@ class Analyzer:
                 self._script_on_disk(path, depth, require_shell)
             self.script(ctx.written[key], depth + 1, tail_visible=True)
             return
-        self._script_on_disk(path, depth, require_shell, invocation, command)
+        self._script_on_disk(path, depth, require_shell)
 
-    def _why_set_text(self, path, data, invocation, command):
-        """Model only the pinned, direct, literal .git-scoped set operation.
-
-        The ordinary shell analyser cannot bind positional parameters or the
-        note_of function result. Keep analysing the script, but remove its
-        unreachable clear arm and bind that result to the validated literal
-        note path. Every unsupported case keeps ordinary conservative analysis.
-        """
-        ctx = self.ctx
-        if ctx.ps or not invocation or command is None or ctx.cwd_unknown or not ctx.cwd_known \
-                or path != posixpath.join(ctx.cwd, 'bin/why') \
-                or hashlib.sha256(data).hexdigest() != WHY_SET_SCRIPT_SHA256:
-            return None
-        if any(k in ctx.vars or k in ctx.var_hints for k in ('PATH', 'BASH_ENV', 'ENV')) \
-                or any(os.environ.get(k) for k in ('BASH_ENV', 'ENV')):
-            return None
-        if any(w.dynamic or w.vars or w.subs or w.glob or len(w.alts) != 1 for w in invocation):
-            return None
-        assigns, _ = self._skip_assigns([self.resolve(w) for w in strip_reserved(command.words)])
-        if len(assigns) != 1 or assigns[0].text != 'WHY_GIT_DIRS=.git' \
-                or assigns[0].dynamic or assigns[0].vars or assigns[0].subs:
-            return None
-        texts = [w.text for w in invocation[1:]]
-        if any(t in ('--clear', '--show', '-h', '--help', '--shared') for t in texts):
-            return None
-        lane, subject, i = None, False, 0
-        while i < len(texts):
-            t = texts[i]
-            if t in ('-l', '--lane', '-m', '-p', '--path'):
-                if i + 1 == len(texts):
-                    return None
-                value = texts[i + 1]
-                if t in ('-l', '--lane'):
-                    if not re.fullmatch(r'[A-Za-z0-9._-]{1,120}', value) or value in ('.', '..'):
-                        return None
-                    lane = value
-                elif t == '-m' and not re.fullmatch(r'[0-9]+', value):
-                    return None
-                i += 2
-            elif t.startswith('-'):
-                return None  # includes every --clear/--show/help occurrence
-            else:
-                subject = subject or bool(t)
-                i += 1
-        if not lane or not subject:
-            return None
-        gitdir = posixpath.join(ctx.cwd, '.git')
-        note = posixpath.join(gitdir, 'autocommit.why.d', lane)
-        # No symlinks (including nonexistent target's existing ancestors),
-        # untrusted owners, writable parents, or same-command path replacement.
-        for target in (path, gitdir, note, note + '.tmp'):
-            p = target
-            while True:
-                key = p.casefold()
-                if key in ctx.written or key in ctx.created or key in ctx.links or p in ctx.links:
-                    return None
-                try:
-                    s = os.lstat(p)
-                except FileNotFoundError:
-                    pass
-                except OSError:
-                    return None
-                else:
-                    if stat.S_ISLNK(s.st_mode) or s.st_uid not in (0, os.getuid()) \
-                            or s.st_mode & 0o022 and not (stat.S_ISDIR(s.st_mode) and s.st_mode & stat.S_ISVTX):
-                        return None
-                parent = posixpath.dirname(p)
-                if parent == p:
-                    break
-                p = parent
-        try:
-            if os.stat(gitdir).st_uid != os.getuid() or not os.path.isdir(gitdir):
-                return None
-            if os.path.lexists(note + '.tmp'):
-                return None  # never truncate an existing temporary file
-            if os.path.lexists(note):
-                s = os.lstat(note)
-                if not stat.S_ISREG(s.st_mode) or s.st_uid != os.getuid() or s.st_nlink != 1:
-                    return None
-            if _git_out(ctx.cwd, ['rev-parse', '--absolute-git-dir'], 1.0).strip() != gitdir:
-                return None
-        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
-            return None
-        text = data.decode('utf-8')
-        start = text.find('  clear)\n')
-        end = text.find('\nesac', start)
-        if start < 0 or end < 0 or text.count('f=$(note_of "$d")') != 1:
-            return None
-        text = text[:start] + '  clear) :;;' + text[end:]
-        return text.replace('f=$(note_of "$d")', 'f=' + _quote_for_rebuild(note)), note
-
-    def _script_on_disk(self, path, depth, require_shell, invocation=None, command=None):
+    def _script_on_disk(self, path, depth, require_shell):
         ctx = self.ctx
         ctx.files_read = getattr(ctx, 'files_read', 0) + 1
         if ctx.files_read > 8:
@@ -5234,8 +5156,7 @@ class Analyzer:
                 data = handle.read(262145)
         except (OSError, ValueError):
             return
-        modeled = self._why_set_text(path, data, invocation, command)
-        text = modeled[0] if modeled else data.decode('utf-8', 'replace')
+        text = data.decode('utf-8', 'replace')
         if require_shell:
             first = text.split('\n', 1)[0]
             if not (first.startswith('#!') and re.search(r'\b(?:ba|z|k|da|)sh\b', first)) \
@@ -5251,14 +5172,8 @@ class Analyzer:
         keep = {k: (v.copy() if isinstance(v, (set, dict, list)) else v) for k, v in vars(ctx).items()
                 if k not in ('findings', 'budget', 'c', 'marker', 'files_read', 'unterminated', 'readings_capped')}
         try:
-            if modeled:
-                # Only this pinned script's exact dedicated atomic publication.
-                # Destination checks and all surrounding command checks remain.
-                ctx.why_note_publish = (modeled[1] + '.tmp', modeled[1])
             self.script(text, depth + 1, tail_visible=True)
         finally:
-            if modeled:
-                del ctx.why_note_publish
             for k, v in keep.items():
                 setattr(ctx, k, v)
             ctx.findings[before:] = [f for f in ctx.findings[before:] if f.category == LOG_DELETE
@@ -7830,7 +7745,7 @@ class Analyzer:
 
     def _work_base(self, segs):
         """Segment count of the ~/.agent-harness/work or /scratch prefix of `segs`, for this machine's homes and for
-        /home/<user> on another host (`ssh dev2 'cmd > /home/someone/...'`), else None."""
+        /home/<user> on another host (`ssh host 'cmd > /home/someone/...'`), else None."""
         other = ['/'.join(segs[:2])] if len(segs) > 2 and segs[0] == 'home' else []
         for h in list(self.c.homes) + other:
             for top in ('work', 'scratch'):
@@ -7947,10 +7862,6 @@ class Analyzer:
             elif len(nd) >= 2:
                 dest, sources = nd[-1], nd[:-1]
             for w in sources:
-                if name == 'mv' and len(args) == 2 and len(sources) == 1 and dest is not None \
-                        and not w.dynamic and not dest.dynamic \
-                        and (norm_path(w.text, ctx), norm_path(dest.text, ctx)) == getattr(ctx, 'why_note_publish', None):
-                    continue  # freshly created, validated why note temp; not a general .git deletion allowance
                 self.refuse(name + ' (moves it away)', w)
             if dest is not None and not self.state_dest(dest):
                 self.overwrite_dest(name, dest)
@@ -8182,7 +8093,7 @@ class Analyzer:
 
     def remote_copy_dest(self, name, args, texts):
         """scp and rsync copying TO a remote path that names a protected harness location (hooks, WALs, state): the same refusal
-        as a local or ssh-wrapped cp (goodqa#15759; the 2026-11-11 t2-dev install of command_guard.py used scp after the cp was
+        as a local or ssh-wrapped cp (goodqa#15759: an install once used scp after the cp was
         refused). Option values never hide the destination; IPv6 hosts, scp:// and rsync:// urls and `host::module` are read; a
         recursive copy or an rsync --delete into a directory that CONTAINS protected files is refused too (it overwrites or
         removes them in one command). Downloads (a remote SOURCE, a local destination) are not touched. Stated limits: sftp batch
@@ -8683,7 +8594,7 @@ def format_block(f, more=0, warn=False):
 # local key. The hook lets a destructive command through only when every protected operand is the exact approved
 # path, the path's device, inode and stat manifest are unchanged, and the entry can be removed under an exclusive
 # lock (so two commands cannot share one approval). Everything is appended to log-delete-audit.jsonl and, for
-# approve-delete, to the WAL named with --wal. The agent itself may approve after a verified copy on Dropbox or b2-archive: the
+# approve-delete, to the WAL named with --wal. The agent itself may approve after a verified copy on an approved remote: the
 # safeguard is the verified copy, the single use and the audit trail, not a human prompt.
 
 ARCHIVE_KIND = 'archive'  # an approval backed by one verified remote tar archive (goodqa#15068)
@@ -9437,11 +9348,11 @@ def _approval_refusal(real, policy, home=None):
 
 
 def _check_remote(remote, policy, verifier):
-    """Only named remotes of an allowed backend type (default dropbox) or a pinned name (b2-archive); never local paths
-    or on-the-fly backends."""
+    """Only named remotes of an allowed backend type (default dropbox) or a name listed in local.json
+    `backup_remotes`; never local paths or on-the-fly backends."""
     if not isinstance(remote, str) or ':' not in remote or remote.startswith((':', '/', '.', '~')) or ',' in \
             remote.split(':', 1)[0] or '\\x00' in remote:
-        raise ValueError('remote must be a named rclone remote such as dropbox:backups/claude or b2-archive:bucket/claude '
+        raise ValueError('remote must be a named rclone remote such as dropbox:backups/claude '
                          '(' + APPROVE_REMOTES + '; not a local path, '
                          'an on-the-fly :backend: or a connection string)')
     name = remote.split(':', 1)[0]
@@ -9629,7 +9540,7 @@ DECLINE_WORDS = re.compile(r"\b(?:not|don'?t|keep|leave|cancel|nothing|never|lat
                            re.I)
 # an absolute path in question text: ends at whitespace, a quote or bracket, or sentence punctuation
 QUESTION_PATH_RE = re.compile(r'(?<![\w.~-])/[^\s"\'`,;:()<>\[\]{}?!*|]+')
-DEFAULT_REMOTE_HOSTS = ('github.com', 't2-dev')
+DEFAULT_REMOTE_HOSTS = ('github.com',)
 # Repository config must not run anything while the guard inspects a clone: no fsmonitor, hooks, ext transport,
 # custom ssh command, credential helper or pager, and no prompt.
 _SAFE_GIT = ['git', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'protocol.ext.allow=never',
@@ -10665,8 +10576,8 @@ def main(argv=None):
     rep.add_argument('paths', nargs='+')
     appr = sub.add_parser('approve-delete')
     appr.add_argument('--path', required=True)
-    appr.add_argument('--remote', help='named rclone remote mirroring --path (Dropbox or the b2 remote named exactly b2-archive), e.g. '
-                      'dropbox:backups/x or b2-archive:bucket/x')
+    appr.add_argument('--remote', help='named rclone remote mirroring --path (' + APPROVE_REMOTES + '), e.g. '
+                      'dropbox:backups/x')
     appr.add_argument('--archive', help='named rclone remote of ONE tar archive (.tar, .tar.gz or .tar.zst) of --path, '
                                         'whose members start with the directory name of --path (goodqa#15068)')
     appr.add_argument('--archive-sha256', dest='archive_sha256', help='remote .sha256 file of --archive')

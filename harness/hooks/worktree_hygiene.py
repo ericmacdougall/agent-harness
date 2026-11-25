@@ -1,29 +1,17 @@
 #!/usr/bin/env python3
 """Stop / SubagentStop hook: do not end a turn with work that exists only on this disk.
 
-Vendored from Hawkeye install/claude-hooks/hawkeye-worktree-hygiene.py (ericmacdougall/hawkeye 831ea85) for
-rule S18 (goodqa#14908), so T2 and the Mac keep the dev2 protection after dev2 is retired. Harness changes:
+Rule S18 (goodqa#14908): a session may not end while a worktree it created or worked in has work that exists only on
+this disk (uncommitted changes, or commits on no remote branch).
   - state in ~/.agent-harness/state/worktree-hygiene/, config in ~/.agent-harness/state/worktree-hygiene.json;
   - default repos dirs are ~/repos and ~/.agent-harness/work (where harness owner worktrees live);
-  - HARNESS_WORKTREE_GATE=off (or Hawkeye's HAWKEYE_NO_WORKTREE_GATE=1) opts out; there is no
-    ##HAWKEYE-RULES=FALSE switch;
+  - HARNESS_WORKTREE_GATE=off opts out;
   - committed-but-unpushed work is REPORTED, not blocked, unless block_unpushed is set (config key, or
     HARNESS_WORKTREE_HYGIENE_BLOCK_UNPUSHED=1). Harness owners commit locally and publish through
     deliver.py / publish_feature.py after review, so a stop block that says "git push" would route around
     the identity-checked publication path. Uncommitted work always blocks (once per state), and so do
     commits on a detached HEAD (on no branch, so git gc can drop them): the block asks for `switch -c`;
-  - the suggested commit uses the commit policy (commit -F after commit_policy.py check-message), not a
-    per-handle identity.
-Hawkeye's original text follows.
-
-WHY THIS EXISTS. Eric, 2026-09-25 (AGENTS.md "## Worktree and branch hygiene
-(you cannot stop with a mess -- enforced)"): "You may not end your turn or
-session while any worktree you created has work that exists only on this
-disk: every such worktree's commits must be on an origin branch (a pending
-feature branch is fine) and nothing may be left uncommitted." and "No mess of
-duplicates on disk: one worktree per branch; remove a worktree as soon as its
-branch is merged". The rule names "the harness stop hook" as its enforcement.
-This is that hook.
+  - the suggested commit uses the commit policy (commit -F after commit_policy.py check-message).
 
 WHAT IT DOES at the end of a turn:
   1. Reads the transcript named in the hook's stdin JSON (the subagent's own
@@ -34,17 +22,16 @@ WHAT IT DOES at the end of a turn:
      shell lexer: heredoc bodies and quoted text are data, and a directory it
      cannot know -- `-C "$X"`, `cd $(...)` -- is dropped, never pinned on the
      surrounding cwd; see bash_touches). Only LINKED
-     worktrees of repos under the repos dir(s) count (default ~/repos;
-     HAWKEYE_WORKTREE_HYGIENE_REPOS_DIRS or ~/.hawkeye/harness/
-     worktree-hygiene.json {"repos_dirs": [...]} override it).
+     worktrees of repos under the repos dir(s) count (see above;
+     HARNESS_WORKTREE_HYGIENE_REPOS_DIRS or the config's {"repos_dirs": [...]}
+     override it).
   2. Drops every worktree that another transcript worked in MORE RECENTLY than
      this one did -- a subagent this session delegated the tree to, or another
      session that took it over. Its owner answers for it, not us; telling this
      agent to commit it would be telling it to commit someone else's
      half-finished edit (2026-09-24, a read-only reviewer obeyed exactly that
      kind of instruction on another agent's live worktree).
-  3. BLOCKS (exit 2, stderr = the reason, the same contract the sibling Stop
-     hooks hawkeye-wal-cadence.py / hawkeye-adversarial-review.py use --
+  3. BLOCKS (exit 2, stderr = the reason, the Stop hook contract --
      https://code.claude.com/docs/en/hooks, fetched 2026-09-25: "A hook that
      blocks by exiting 2 routes the same way as `reason`") when a remaining
      worktree has uncommitted changes, or a HEAD that is contained in no
@@ -72,14 +59,13 @@ IT MUST NEVER TRAP A SESSION. Hard rules, each tested:
     never takes index.lock or rewrites the index, and core.fsmonitor off so no
     daemon is spawned. It never fetches, commits, prunes or removes anything --
     it prints the commands; the agent decides.
-  - opt-out: HAWKEYE_NO_WORKTREE_GATE=1, or `##HAWKEYE-RULES=FALSE` in the
-    project's CLAUDE.md/AGENTS.md (the whole managed harness's kill switch).
+  - opt-out: HARNESS_WORKTREE_GATE=off (or the harness off-switch, ~/.agent-harness/OFF).
 """
 from __future__ import annotations
 
 
 def _hidden_no_window():
-    return {}  # POSIX only (the Mac and T2); Hawkeye's Windows window-hiding is not needed here
+    return {}  # POSIX only; no Windows window-hiding is needed here
 
 
 import calendar
@@ -150,8 +136,8 @@ def budget_seconds() -> float:
 
 
 def _env(suffix: str) -> str:
-    """HARNESS_<suffix>, else Hawkeye's HAWKEYE_<suffix> (so dev2-era settings keep working)."""
-    return os.environ.get("HARNESS_" + suffix) or os.environ.get("HAWKEYE_" + suffix) or ""
+    """The HARNESS_<suffix> environment variable, or ""."""
+    return os.environ.get("HARNESS_" + suffix) or ""
 
 
 def _config() -> dict:
@@ -193,8 +179,6 @@ def repos_dirs() -> list:
 
 
 def opted_out(cwd: str) -> bool:
-    if os.environ.get("HAWKEYE_NO_WORKTREE_GATE") == "1":
-        return True
     return os.environ.get("HARNESS_WORKTREE_GATE", "").strip().lower() == "off"
 
 
@@ -937,7 +921,7 @@ def touches_in(path: str, budget: Budget, needles=None) -> list:
 
 
 def projects_root(transcript: str) -> str:
-    env = os.environ.get("HAWKEYE_WORKTREE_HYGIENE_TRANSCRIPTS_ROOT")
+    env = os.environ.get("HARNESS_WORKTREE_HYGIENE_TRANSCRIPTS_ROOT")
     if env:
         return env
     d = os.path.dirname(os.path.abspath(transcript))

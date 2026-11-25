@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 HOOKS = ROOT / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
 sys.path.insert(0, str(ROOT))
+os.environ["AH_LOCAL_CONFIG"] = str(ROOT / "tests" / "data" / "local_fixture.json")  # hermetic labels
 import ah_switch  # noqa: E402
 import install  # noqa: E402
 
@@ -237,7 +238,7 @@ class Services(TempHome):
     def test_off_stops_loaded_agents_and_on_restarts_only_those(self):
         agents = self.home / "Library" / "LaunchAgents"
         agents.mkdir(parents=True)
-        for label in ("com.ericmacdougall.ahd", ah_switch.FLOOR_LABEL, "com.ericmacdougall.ops-watch"):
+        for label in ("com.agent-harness.ahd", ah_switch.FLOOR_LABEL, "com.agent-harness.ops-watch"):
             (agents / f"{label}.plist").write_text("<plist/>")
         calls = []
 
@@ -247,11 +248,11 @@ class Services(TempHome):
                 return 0 if not argv[2].endswith("ops-watch") else 113  # ops-watch present but not loaded
             return 0
         result = ah_switch.switch_off(self.home, services=True, run=run, system="darwin")
-        self.assertEqual(sorted(result["services_stopped"]), sorted(["com.ericmacdougall.ahd", ah_switch.FLOOR_LABEL]))
+        self.assertEqual(sorted(result["services_stopped"]), sorted(["com.agent-harness.ahd", ah_switch.FLOOR_LABEL]))
         self.assertFalse([c for c in calls if c[1] == "bootout" and c[2].endswith("ops-watch")])
         calls.clear()
         on = ah_switch.switch_on(self.home, run=run, system="darwin")
-        self.assertEqual(sorted(on["services_started"]), sorted(["com.ericmacdougall.ahd", ah_switch.FLOOR_LABEL]))
+        self.assertEqual(sorted(on["services_started"]), sorted(["com.agent-harness.ahd", ah_switch.FLOOR_LABEL]))
         self.assertEqual(len([c for c in calls if c[1] == "bootstrap"]), 2)
         self.assertFalse((self.home / ".agent-harness" / "off-stash" / "services.json").exists())
 

@@ -978,7 +978,16 @@ def setup_logging(to_stderr: bool = False) -> None:
 
 # ---------------------------------------------------------------- service install
 
-LABEL = "com.ericmacdougall.ahd"
+def _job_label(name):
+    """launchd label of this job: ~/.agent-harness/local.json `launchd_label_prefix` (ah_local) + name."""
+    try:
+        import ah_local  # noqa: PLC0415
+        return ah_local.label(name)
+    except Exception:  # noqa: BLE001
+        return "com.agent-harness." + name
+
+
+LABEL = _job_label("ahd")
 
 
 def unit_files(script: Path) -> dict:

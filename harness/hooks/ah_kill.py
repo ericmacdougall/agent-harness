@@ -31,16 +31,33 @@ import time
 import uuid
 from pathlib import Path
 
-HOSTS = ("dev2", "t2-dev", "ah-mac-mini")
+
+def _local():
+    """harness/hooks/ah_local.py (the owner's ~/.agent-harness/local.json), or None."""
+    try:
+        import sys  # noqa: PLC0415
+        here = str(Path(__file__).resolve().parent)
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        import ah_local  # noqa: PLC0415
+        return ah_local
+    except Exception:  # noqa: BLE001
+        return None
+
+
+_LOCAL = _local()
+# ssh hosts `ah kill --host` serves: the hosts of ~/.agent-harness/local.json (none by default).
+HOSTS = tuple(h for h in (_LOCAL.host_names() if _LOCAL else ())
+              if h not in (_LOCAL.host_names(os_name="windows") if _LOCAL else ()))
 # Windows OpenSSH hosts (goodqa#15275): ah.py is not installed there, so ah kill reads and stops the process itself
 # over ssh with PowerShell. Windows OpenSSH does not end a session's processes when the client disconnects, so
 # orphaned remote PowerShell children need this audited path.
-WINDOWS_HOSTS = ("ah-spectre",)
+WINDOWS_HOSTS = _LOCAL.host_names(os_name="windows") if _LOCAL else ()
 # Delta red-team D-F4: a Windows stop is an allowlist, not a deny list. It may stop only an orphaned shell (its parent
 # is gone, or the parent pid now belongs to a newer process) that the ssh login user owns and that is not part of the
 # ssh session running the check. That is exactly the orphaned PowerShell children it exists for. "The login user" is
-# GetOwner of the checking shell itself: on the Spectre $env:USERDOMAIN is WORKGROUP while GetOwner says the machine
-# name (found live, goodqa#15275). Anything else
+# GetOwner of the checking shell itself: on a workgroup machine $env:USERDOMAIN is WORKGROUP while GetOwner says the
+# machine name (found live, goodqa#15275). Anything else
 # (claude, codex, node, adb, sshd-session, WSL, Defender, ...) is refused.
 WINDOWS_ALLOWED = {"powershell", "pwsh", "cmd"}
 WIN_SENTINEL = "AHK1 "  # D-F5: the answer is the last line with this prefix; profile or CLIXML noise is ignored

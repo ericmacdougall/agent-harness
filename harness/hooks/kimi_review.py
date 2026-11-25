@@ -231,14 +231,30 @@ SECRET_PATTERNS = (
 SPLIT_SAFE = tuple((re.compile(item[0].pattern.replace(r'\b', '')), item[1]) for item in SECRET_PATTERNS if item[1] in {
     'Anthropic key shape', 'sk- key shape', 'GitHub token shape', 'AWS access key shape', 'Slack token shape',
     'Google API key shape', 'Stripe secret key shape'})
+
+
+def _local_topics():
+    """~/.agent-harness/local.json `review_forbidden_topics`: [{"pattern": "<regex>", "label": "..."}], the owner's own
+    projects and material that must never reach an external reviewer."""
+    out = []
+    try:
+        import ah_local  # noqa: PLC0415
+        for entry in ah_local.get('review_forbidden_topics', []):
+            if isinstance(entry, dict) and isinstance(entry.get('pattern'), str) and entry['pattern']:
+                try:
+                    out.append((re.compile(entry['pattern'], re.I), str(entry.get('label') or 'forbidden topic')[:80]))
+                except re.error:
+                    continue
+    except Exception:  # noqa: BLE001 - a broken local file adds nothing
+        return ()
+    return tuple(out)
+
+
 TOPIC_PATTERNS = (
-    (re.compile(r'y[^\w\s]{0,2}a[^\w\s]{0,2}t[^\w\s]{0,2}e[^\w\s]{0,2}s', re.I), 'forbidden project: yates'),
-    (re.compile(r'apex[\W_]{0,3}app[\W_]{0,3}pos', re.I), 'forbidden project: apex_app_pos'),
     (re.compile(r'granola', re.I), 'Granola material'),
     (re.compile(r'(?:candidate|customer|user|research)?[\W_]{0,3}interview[\W_]{0,3}(?:transcript|recording|notes|log)|'
                 r'candidate[\W_]{1,3}interview', re.I), 'interview material'),
-    (re.compile(r'solve[\W_]{0,3}(?:session[\W_]{0,3})?(?:transcript|log|recording)', re.I), 'Solve transcript'),
-)
+) + _local_topics()
 TRANSCRIPT_SHAPES = (
     (re.compile(r'"(?:parentUuid|sessionId|isSidechain)"\s*:'), 'Claude transcript shaped JSON'),
     (re.compile(r'"event"\s*:\s*"[a-z_]{3,30}"[^\n]{0,400}"(?:note|tool_use_id|agent_id)"\s*:'), 'WAL shaped JSON'),

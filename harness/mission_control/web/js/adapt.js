@@ -89,7 +89,7 @@ export function owners(rows, items = []) {
 }
 
 const SOURCE_NAMES = { wals: 'Claude + Codex WALs', initiatives: 'Initiatives file', owners: 'Owners', github: 'GitHub', goodqa: 'GoodQA tickets',
-  't2-dev': 't2-dev', 'file-drop': 'Event drops', sources: 'Event drops', 'main-session': 'Main\'s session', 'native-projects': 'Native project registry', 'native-streams': 'Native streams', codex: 'Codex chat', chat: 'Chat store', 'codex-owners': 'OpenAI supervised owners', 'owner-policy': 'Owner/helper type policy', ledger: 'Goals, requirements and status', asks: 'Asks ledger' };
+  remote: 'Worker host', 'file-drop': 'Event drops', sources: 'Event drops', 'main-session': 'Main\'s session', 'native-projects': 'Native project registry', 'native-streams': 'Native streams', codex: 'Codex chat', chat: 'Chat store', 'codex-owners': 'OpenAI supervised owners', 'owner-policy': 'Owner/helper type policy', ledger: 'Goals, requirements and status', asks: 'Asks ledger' };
 // A Source health row. `truth` is the server's status truth for the source (collectors.read_truth); `state` is the CSS
 // class and `label` the word shown, both from status and truth together, so a source that reads but is partial or
 // stale is never shown as plain "ok".

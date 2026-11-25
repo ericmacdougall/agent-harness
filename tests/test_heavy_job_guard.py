@@ -1,6 +1,6 @@
 """Heavy-job guard, run_capped and run_probe.
 
-Run on dev2, not the Mac: the process tests allocate ~1.5 GB on purpose.
+Run on worker-1, not the Mac: the process tests allocate ~1.5 GB on purpose.
 """
 import json
 import os
@@ -16,6 +16,7 @@ from pathlib import Path
 
 HOOKS = Path(__file__).resolve().parents[1] / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
+os.environ["AH_LOCAL_CONFIG"] = str(Path(__file__).resolve().parent / "data" / "local_fixture.json")  # hermetic hosts
 import heavy_job_guard as guard  # noqa: E402
 
 MODES = dict(guard.DEFAULT_MODES)
@@ -41,7 +42,7 @@ NORMAL = [
     "python3 -m unittest tests.test_wal -v", "python3 -m pytest tests/test_wal.py -x -q",
     "pytest tests/test_wal.py::TestWal::test_append", "python3 tests/test_wal.py", "npm test -- src/foo.test.ts",
     "npx vitest run src/foo.test.ts", "go test ./pkg/foo -run TestBar", "echo 'next build' > note.txt",
-    "ssh dev2 'cd repo && pytest'", "ssh eric@192.0.2.7 'npm run build'", "rsync -a src/ dev2:src/",
+    "ssh worker-1 'cd repo && pytest'", "ssh eric@192.0.2.7 'npm run build'", "rsync -a src/ worker-1:src/",
     "sed -n 1,40p heavy.py", "python3 -m json.tool < x.json", "node --version", "npm --version",
     "docker ps", "docker logs web | tail", "cargo --version", "ffmpeg -version", "ffprobe -v error clip.mp4",
     "xargs -n1 echo < list.txt", "git ls-files -z | xargs -0 -P 6 grep -l foo", "ls | xargs -P2 echo", "playwright install chromium", "open -a 'Google Chrome' http://x",
@@ -57,7 +58,7 @@ def decide(command, cwd=None, modes=None):
 
 class BigClone(unittest.TestCase):
     """goodqa#14927 item 9: full copies of a large repository onto the Mac get a warning (never a denial) that names
-    worktrees, git archive, partial clones and dev2. Pack files are sparse here, so nothing large is written."""
+    worktrees, git archive, partial clones and worker-1. Pack files are sparse here, so nothing large is written."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -93,7 +94,7 @@ class BigClone(unittest.TestCase):
             with self.subTest(command):
                 result = self.judge(command)
                 self.assertEqual((result["action"], result["rule"]), ("warn", "big-clone"), result)
-                for phrase in ("git worktree add", "git archive HEAD | tar -x", "--filter=blob:none", "dev2"):
+                for phrase in ("git worktree add", "git archive HEAD | tar -x", "--filter=blob:none", "worker-1"):
                     self.assertIn(phrase, result["message"])
                 self.assertIn("0.6 GB", result["detail"])
 
@@ -106,7 +107,7 @@ class BigClone(unittest.TestCase):
     def test_small_partial_remote_and_non_recursive_copies_are_allowed(self):
         for command in (f"git clone {self.small} /tmp/t", f"cp -R {self.small} /tmp/t2", f"cp {self.big}/README.md /tmp/",
                         f"git clone --filter=blob:none {self.big} /tmp/t3", f"git clone --depth 1 {self.big} /tmp/t4",
-                        f"rsync -a {self.big}/ dev2:/srv/goodqa/", f"rsync -a dev2:/srv/goodqa/ {self.big}/",
+                        f"rsync -a {self.big}/ worker-1:/srv/goodqa/", f"rsync -a worker-1:/srv/goodqa/ {self.big}/",
                         f"git -C {self.big} status", f"ls {self.big}", f"git clone {self.root}/nonexistent /tmp/t5"):
             with self.subTest(command):
                 self.assertEqual(self.judge(command).get("action"), "allow", command)
@@ -132,11 +133,11 @@ class Classification(unittest.TestCase):
         result = decide(IO_COMMAND)
         self.assertEqual(result["action"], "warn", result)
         self.assertEqual(result["rule"], "adversarial")
-        self.assertIn("dev2", result["message"])
+        self.assertIn("worker-1", result["message"])
         self.assertIn("run_capped.py", result["message"])
 
     def test_ac1_io_probe_on_dev2_or_group_cleanup_is_plain_allow(self):
-        self.assertEqual(decide("ssh dev2 'cd repo/rt && perl -e \"alarm 150; exec @ARGV\" python3 io.py'"), {"action": "allow"})
+        self.assertEqual(decide("ssh worker-1 'cd repo/rt && perl -e \"alarm 150; exec @ARGV\" python3 io.py'"), {"action": "allow"})
         wrapped = IO_COMMAND.replace("perl -e 'alarm 150; exec @ARGV' python3 io.py", CAP + "python3 io.py")
         self.assertEqual(decide(wrapped), {"action": "allow"})
 
@@ -156,14 +157,14 @@ class Classification(unittest.TestCase):
                    "https://127.0.0.1:8791 --ignore-https-errors --out s.json > s.log 2>&1; tail -70 s.log | cut -c1-220")
         result = decide(command)
         self.assertEqual((result["action"], result["rule"]), ("deny", "browser"), result)
-        self.assertIn("ssh t2-dev", result["message"])
+        self.assertIn("ssh worker-1", result["message"])
         relaunch = ("pkill -f site_sweep.py; cd " + d + " && python3 - <<'E'\ns=open('site_sweep.py').read()\nE\n"
                     "(./venv/bin/python site_sweep.py https://x --public > o.log 2>&1 &) ; ./venv/bin/python site_sweep.py https://y")
         self.assertEqual(decide(relaunch)["action"], "deny")
 
     def test_ac2_ssh_prefix_allows(self):
         d = self.sweep_dir()
-        self.assertEqual(decide(f"ssh dev2 'cd {d} && ./venv/bin/python site_sweep.py https://x'"), {"action": "allow"})
+        self.assertEqual(decide(f"ssh worker-1 'cd {d} && ./venv/bin/python site_sweep.py https://x'"), {"action": "allow"})
         self.assertEqual(decide("ssh eric@192.0.2.7 pytest"), {"action": "allow"})
 
     def test_hatch_needs_reason_and_cap_for_browser(self):
@@ -217,15 +218,15 @@ class Classification(unittest.TestCase):
             result = decide(command)
             self.assertEqual(result["action"], "deny", command)
             self.assertIn("HARNESS_LOCAL_OK", result["message"], command)
-            self.assertIn("ssh t2-dev", result["message"], command)
-            self.assertIn("dev2", result["message"])
+            self.assertIn("ssh worker-1", result["message"], command)
+            self.assertIn("worker-1", result["message"])
 
     def test_guard_is_a_noop_off_the_mac_and_ssh_dev2_is_allowed_on_it(self):
         import io
         import safe_input
         payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "pytest"}, "session_id": "s"}).encode()
         ssh = json.dumps({"tool_name": "Bash", "session_id": "s",
-                          "tool_input": {"command": "ssh dev2 'cd repo && pytest && npm run build'"}}).encode()
+                          "tool_input": {"command": "ssh worker-1 'cd repo && pytest && npm run build'"}}).encode()
 
         def run_main(platform, data):
             with unittest.mock.patch.object(sys, "platform", platform), \
@@ -233,12 +234,12 @@ class Classification(unittest.TestCase):
                     unittest.mock.patch.object(safe_input, "read_stdin_bounded", return_value=data), \
                     unittest.mock.patch.object(guard, "log_event"), unittest.mock.patch.object(sys, "stderr", io.StringIO()):
                 return guard.main()
-        self.assertEqual(run_main("linux", payload), 0)   # dev2/Linux: no heavy-work rule applies (goodqa#15246)
+        self.assertEqual(run_main("linux", payload), 0)   # worker-1/Linux: no heavy-work rule applies (goodqa#15246)
         self.assertEqual(run_main("darwin", payload), 2)  # the same command on the Mac is denied
-        self.assertEqual(run_main("darwin", ssh), 0)      # ...but not when it is sent to dev2
+        self.assertEqual(run_main("darwin", ssh), 0)      # ...but not when it is sent to worker-1
 
     def test_off_the_mac_only_the_dropbox_lane_rule_is_enforced(self):
-        # goodqa#15246: t2-dev is the main lane; its agent uploads share the account's write budget, so the lane rule
+        # goodqa#15246: worker-1 is the main lane; its agent uploads share the account's write budget, so the lane rule
         # applies on every host while the other heavy-job rules stay Mac-only.
         import io
         import safe_input
@@ -290,9 +291,9 @@ class Classification(unittest.TestCase):
             calls = []
             self.assertEqual(run_main("linux", payload("git clone https://github.com/a/b && cp -R a b")), 0)
             self.assertEqual(calls, [])
-        with unittest.mock.patch("socket.gethostname", return_value="T2-Dev.lan"), \
+        with unittest.mock.patch("socket.gethostname", return_value="Worker-1.lan"), \
                 unittest.mock.patch.object(sys, "platform", "linux"):
-            self.assertEqual(guard.host_label(), "t2-dev")
+            self.assertEqual(guard.host_label(), "worker-1")
         with unittest.mock.patch.object(sys, "platform", "darwin"):
             self.assertEqual(guard.host_label(), "mac")
         self.assertEqual(run_main("linux", fast, HARNESS_HEAVY_GUARD="off"), 0)  # the off switch still turns it off
@@ -361,7 +362,7 @@ class Classification(unittest.TestCase):
                         "stdbuf -oL pytest", "caffeinate -dimsu pytest"):
             with self.subTest(command=command):
                 self.assertEqual(decide(command)["action"], "deny", command)
-        for command in ("sudo -u root ls", "time ls", "env FOO=1 ls", "git status", "ssh dev2 pytest", "command -v pytest",
+        for command in ("sudo -u root ls", "time ls", "env FOO=1 ls", "git status", "ssh worker-1 pytest", "command -v pytest",
                         "command -V pytest", "time grep -rn pytest .", "env FOO=1 grep pytest notes.txt", "sudo ls pytest",
                         "nice -n 5 tail -f pytest.log", "watch -n 5 ls", "su -c 'ls -la'", "doas ls", "env -i HOME=/tmp ls"):
             with self.subTest(allowed=command):
@@ -418,8 +419,8 @@ class BuildTools(unittest.TestCase):
         "mvn --version", "mvn -v", "mvn clean", "mvn help:effective-pom", "mvn dependency:tree", "./mvnw -v",
         "bazel version", "bazel info", "bazel query //...", "bazel clean", "xcodebuild -version", "xcodebuild -list",
         "xcodebuild -showBuildSettings", "xcodebuild -showsdks", "xcodebuild -scheme test -list",
-        "ssh dev2 'make test'", "ssh dev2 'cd repo && ./gradlew build'", "ssh eric@192.0.2.7 'mvn verify'",
-        "rsync -a Makefile dev2:repo/", "cd /nonexistent && ls Makefile", "which make gradle mvn",
+        "ssh worker-1 'make test'", "ssh worker-1 'cd repo && ./gradlew build'", "ssh eric@192.0.2.7 'mvn verify'",
+        "rsync -a Makefile worker-1:repo/", "cd /nonexistent && ls Makefile", "which make gradle mvn",
     ]
 
     def wrap(self, command):
@@ -442,7 +443,7 @@ class BuildTools(unittest.TestCase):
                 self.assertEqual(result["action"], "deny", command)
                 self.assertEqual(result["rule"], "full-suite", command)
                 self.assertIn("HARNESS_LOCAL_OK", result["message"])
-                self.assertIn("dev2", result["message"])
+                self.assertIn("worker-1", result["message"])
 
     def test_b1_build_targets_are_build(self):
         for command in self.DENY_BUILD:
@@ -557,7 +558,7 @@ class HookProcess(unittest.TestCase):
         done = self.run_hook(self.payload("pytest"))
         self.assertEqual(done.returncode, 2)
         self.assertIn("[full-suite]", done.stderr)
-        self.assertIn("ssh t2-dev", done.stderr)
+        self.assertIn("ssh worker-1", done.stderr)
 
     def test_normal_and_non_bash_pass(self):
         self.assertEqual(self.run_hook(self.payload("git status")).returncode, 0)
@@ -886,8 +887,8 @@ class DropboxBudget(unittest.TestCase):
     def test_the_shipped_file_is_valid_and_sets_the_ruled_shares(self):
         shares = guard.budget_shares(HOOKS / "dropbox_budget.conf")
         # Main's ruling after PR 129 review MAJOR-1: the total sits below the observed onset (about 7/s).
-        self.assertEqual(shares, {"account": 6, "log-backup.Mac-2": 2, "log-backup.t2-dev": 1, "agent-bulk": 2,
-                                  "reserve": 1})
+        # Per-host log-backup shares are machine-specific and not shipped: without one each host keeps its own rate.
+        self.assertEqual(shares, {"account": 6, "agent-bulk": 2, "reserve": 1})
         self.assertIn("ASSUMPTION", (HOOKS / "dropbox_budget.conf").read_text())
         self.assertEqual(guard.LANE_TPS, 2)   # the shipped share, below the built-in 4, so this proves the file is read
         import install

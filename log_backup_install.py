@@ -3,7 +3,8 @@
 Files written (each atomically, only when the bytes differ; a differing hand-installed file is first saved as
 NAME.bak-STAMP):
   ~/.agent-harness/bin/log-backup.sh, log-backup.excludes and log-backup.work-excludes
-  macOS: ~/Library/LaunchAgents/com.ericmacdougall.log-backup.plist (label unchanged, so no second job appears)
+  macOS: ~/Library/LaunchAgents/<prefix>log-backup.plist (prefix: local.json `launchd_label_prefix`, default
+  com.agent-harness.; keep an existing install's prefix there so no second job appears)
   Linux: ~/.config/systemd/user/log-backup.service and log-backup.timer
 
 The scheduler is (re)enabled when a unit file changed, a retry marker exists, or the recorded scheduler state is not
@@ -34,7 +35,22 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 ROOT = Path(__file__).resolve().parent
-LABEL = "com.ericmacdougall.log-backup"
+
+
+def _job_label(name):
+    """~/.agent-harness/local.json `launchd_label_prefix` (harness/hooks/ah_local.py) + name."""
+    import sys  # noqa: PLC0415
+    sys.path.insert(0, str(ROOT / "harness" / "hooks"))
+    try:
+        import ah_local  # noqa: PLC0415
+        return ah_local.label(name)
+    except Exception:  # noqa: BLE001
+        return "com.agent-harness." + name
+    finally:
+        sys.path.remove(str(ROOT / "harness" / "hooks"))
+
+
+LABEL = _job_label("log-backup")
 
 
 class InstallRefused(Exception):
@@ -155,7 +171,8 @@ def desired_files(home: Path, system: str) -> list[tuple[Path, bytes, int, bool]
            (bin_dir / "log-backup.work-excludes", (ROOT / "harness" / "bin" / "log-backup.work-excludes").read_bytes(), 0o644, False)]
     sched = ROOT / "harness" / "schedulers"
     if system == "Darwin":
-        plist = (sched / f"{LABEL}.plist").read_text().replace("@HOME@", escape(str(home)))
+        plist = (sched / "log-backup.plist").read_text().replace("@HOME@", escape(str(home))).replace(
+            "@LABEL@", escape(LABEL))
         dest = home / "Library" / "LaunchAgents" / f"{LABEL}.plist"
         if lane_kept_on(dest):
             plist = plist.replace(LANE_OFF, LANE_ON)

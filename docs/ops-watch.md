@@ -1,6 +1,6 @@
 # ops-watch
 
-`harness/hooks/ops_watch.py` is a small, read-only watcher (GoodQA goodqa#14591). It runs every 10 minutes on each host: launchd `com.ericmacdougall.ops-watch` on the Mac, and the systemd user units `ops-watch.timer` and `ops-watch.service` on Linux. It is a stopgap: the G10 resource observer (goodqa#14548) and netwatch I4 will take over its checks, and they will keep writing to the same alert file.
+`harness/hooks/ops_watch.py` is a small, read-only watcher (GoodQA goodqa#14591). It runs every 10 minutes on each host: launchd `<prefix>ops-watch` on the Mac, and the systemd user units `ops-watch.timer` and `ops-watch.service` on Linux. It is a stopgap: the G10 resource observer (goodqa#14548) and netwatch I4 will take over its checks, and they will keep writing to the same alert file.
 
 It never deletes, kills, reclaims or writes Codex trust. It writes only its own state, the alert ring and a heartbeat. The one process it ends is its own `du` child, when that child runs past its timeout.
 
@@ -60,7 +60,7 @@ Context (2026-11-24): at SessionStart, `wal.py` (Claude) and `codex/hooks/wal.py
 ## Delivery of transitions
 
 1. The ring, as described above.
-2. One GoodQA comment per run on goodqa#14592. `sinks.comment` may be a list that is tried in order, so t2-dev can relay through `ssh <mac> python3 ~/.claude/hooks/ops_watch.py relay-comment` until its own goodqa CLI is installed. That relay only ever posts to #14592.
+2. One GoodQA comment per run on goodqa#14592. `sinks.comment` may be a list that is tried in order, so a worker host can relay through `ssh <mac> python3 ~/.claude/hooks/ops_watch.py relay-comment` until its own goodqa CLI is installed. That relay only ever posts to #14592.
    - The Mac uses `gq.py comment_on_issue` with an idempotent `operationId`.
    - Linux uses the `goodqa ticket comment` CLI.
 3. The deadman alert script, for critical raises only. Each command in `sinks.deadman` is tried in order until one succeeds.
@@ -76,10 +76,10 @@ Per-host settings go in `~/.agent-harness/ops-watch.json`. Every key is optional
 ```json
 {"delivery": ["~/repos/bugtracker-delivery2"],
  "drift": {"repo": "~/repos/agent-harness"},
- "peers": ["dev2", "t2-dev"],
- "remote_units": [{"host": "t2-dev", "unit": "t2-blog-drip", "user": true, "max_age_h": 26}],
+ "peers": ["worker-1"],
+ "remote_units": [{"host": "worker-1", "unit": "nightly-job", "user": true, "max_age_h": 26}],
  "sinks": {"comment": {"mode": "gq"},
-           "deadman": [["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "t2-dev",
+           "deadman": [["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "worker-1",
                         "~/.agent-harness/bin/deadman-alert.sh '{SUBJECT}'"]]}}
 ```
 
@@ -90,7 +90,7 @@ python3 ~/.claude/hooks/ops_watch.py install --apply   # launchd or systemd --us
 python3 ~/.claude/hooks/ops_watch.py run               # one run now
 python3 ~/.claude/hooks/ops_watch.py status            # active alerts, peers, queued deliveries
 tail ~/.agent-harness/logs/ops-watch.err               # macOS; Linux: journalctl --user -u ops-watch
-launchctl bootout gui/$(id -u)/com.ericmacdougall.ops-watch   # stop (macOS)
+launchctl bootout gui/$(id -u)/com.agent-harness.ops-watch   # stop (macOS)
 systemctl --user disable --now ops-watch.timer                # stop (Linux)
 ```
 
@@ -107,19 +107,19 @@ Host and unit names must be plain words, and `max_age_h` must be a finite positi
 `proxmox_pools` (goodqa#15771) watches the capacity of a dir-type Proxmox storage pool whose thin guest disks can fill it. It is empty by default; enable it per host in `ops-watch.json`:
 
 ```json
-{"proxmox_pools": [{"host": "root@t2-proxmox", "storage": "local", "mount": "/var/lib/vz", "watch_vms": [102, 103]}]}
+{"proxmox_pools": [{"host": "root@proxmox-host", "storage": "local", "mount": "/var/lib/vz", "watch_vms": [102, 103]}]}
 ```
 
-A host reachable only through another one takes three optional keys, with no edit to `~/.ssh/config`: `ssh_config` (an absolute path, passed as `-F`), `jump` (a plain-word ssh host, passed as `-J`) and `known_hosts` (an absolute path to a pinned known_hosts file, passed as `UserKnownHostsFile`; host-key checking is strict either way). Prefer a dedicated `ssh_config` file that defines the host alias: the alias then names the alert (`disk:volume:t2-proxmox:...`, never an address), and the jump hop gets its own settings from that file (an `-J` hop does not inherit BatchMode, ConnectTimeout or the pinned known_hosts). The Mac reaches t2-proxmox this way, with both files kept in `~/.agent-harness/ops-watch/` (0600):
+A host reachable only through another one takes three optional keys, with no edit to `~/.ssh/config`: `ssh_config` (an absolute path, passed as `-F`), `jump` (a plain-word ssh host, passed as `-J`) and `known_hosts` (an absolute path to a pinned known_hosts file, passed as `UserKnownHostsFile`; host-key checking is strict either way). Prefer a dedicated `ssh_config` file that defines the host alias: the alias then names the alert (`disk:volume:proxmox-host:...`, never an address), and the jump hop gets its own settings from that file (an `-J` hop does not inherit BatchMode, ConnectTimeout or the pinned known_hosts). The Mac reaches proxmox-host this way, with both files kept in `~/.agent-harness/ops-watch/` (0600):
 
 ```json
-{"proxmox_pools": [{"host": "t2-proxmox", "ssh_config": "/Users/eric/.agent-harness/ops-watch/ssh_config.t2-proxmox",
+{"proxmox_pools": [{"host": "proxmox-host", "ssh_config": "/Users/eric/.agent-harness/ops-watch/ssh_config.proxmox-host",
   "storage": "local", "mount": "/var/lib/vz", "watch_vms": [102, 103]}]}
 ```
 
-`ssh_config.t2-proxmox` starts with `Include ~/.ssh/config_fleetops` at top level, so the jump host t2-dev resolves. An Include placed after a `Host` block belongs to that block and is never read for t2-dev; check with `ssh -G -F FILE t2-dev`. It then holds `Host t2-proxmox` (HostName, `User root`, `ProxyJump t2-dev`, `StrictHostKeyChecking yes`, `UserKnownHostsFile ~/.agent-harness/ops-watch/known_hosts.t2-proxmox`) and a final `Host *` with `BatchMode yes` and `ConnectTimeout 5`, so the jump hop never prompts either. Copy the known_hosts lines from the jump host's own trusted file (`ssh-keygen -F ADDRESS` there), never by trust on first use. Any exception while probing or parsing (undecodable bytes, a corrupt saved sample) is `disk:unknown`, which turns high after 30 minutes without a good read.
+`ssh_config.proxmox-host` starts with `Include ~/.ssh/config_fleetops` at top level, so the jump host resolves. An Include placed after a `Host` block belongs to that block and is never read for t2-dev; check with `ssh -G -F FILE t2-dev`. It then holds `Host proxmox-host` (HostName, `User root`, `ProxyJump t2-dev`, `StrictHostKeyChecking yes`, `UserKnownHostsFile ~/.agent-harness/ops-watch/known_hosts.proxmox-host`) and a final `Host *` with `BatchMode yes` and `ConnectTimeout 5`, so the jump hop never prompts either. Copy the known_hosts lines from the jump host's own trusted file (`ssh-keygen -F ADDRESS` there), never by trust on first use. Any exception while probing or parsing (undecodable bytes, a corrupt saved sample) is `disk:unknown`, which turns high after 30 minutes without a good read.
 
-Each run makes one read-only call: `ssh -n -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=yes -o ControlMaster=no -o ControlPath=none [-F CFG] [-J JUMP] [-o UserKnownHostsFile=KH -o StrictHostKeyChecking=yes] -- HOST SCRIPT` with 25 s in total. `pvesm status` headers with or without `(KiB)` after each size column (pve 8 prints them) both parse; any other unit, or `(KiB)` on only some columns, is UNKNOWN. The script is fixed text, each command under a remote `timeout` (3 to 8 s): `pvesm status --storage STORAGE`; `pvesm list STORAGE`, which gives the size of every volume on the storage (VM disks, detached `unusedN` disks and container volumes alike); `find MOUNT/images -mindepth 2 -maxdepth 2`, which lists the image file names only, because `pvesm list` skips a file it cannot size with nothing but a warning; and `du -sk` of each watched VM's image directory only, one call per directory. Every command is followed by its own exit status line (`##RC`), and data from a command whose status is missing or nonzero is never used: du can print a plausible subtotal and still fail. ssh runs with `-n`, `StrictHostKeyChecking=yes` and no ControlMaster, so the host key must already be in known_hosts (or in the pinned `known_hosts` file). The host may carry a login (`root@t2-proxmox`: the hypervisor admits root only); alerts show the host without it. Host, storage and mount are checked against plain-word patterns and VM ids must be integers, so a bad entry is refused as `disk:config:...` before ssh. Nothing changes on the hypervisor. Alerts (key suffix `HOST:MOUNT`):
+Each run makes one read-only call: `ssh -n -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=yes -o ControlMaster=no -o ControlPath=none [-F CFG] [-J JUMP] [-o UserKnownHostsFile=KH -o StrictHostKeyChecking=yes] -- HOST SCRIPT` with 25 s in total. `pvesm status` headers with or without `(KiB)` after each size column (pve 8 prints them) both parse; any other unit, or `(KiB)` on only some columns, is UNKNOWN. The script is fixed text, each command under a remote `timeout` (3 to 8 s): `pvesm status --storage STORAGE`; `pvesm list STORAGE`, which gives the size of every volume on the storage (VM disks, detached `unusedN` disks and container volumes alike); `find MOUNT/images -mindepth 2 -maxdepth 2`, which lists the image file names only, because `pvesm list` skips a file it cannot size with nothing but a warning; and `du -sk` of each watched VM's image directory only, one call per directory. Every command is followed by its own exit status line (`##RC`), and data from a command whose status is missing or nonzero is never used: du can print a plausible subtotal and still fail. ssh runs with `-n`, `StrictHostKeyChecking=yes` and no ControlMaster, so the host key must already be in known_hosts (or in the pinned `known_hosts` file). The host may carry a login (`root@proxmox-host`: the hypervisor admits root only); alerts show the host without it. Host, storage and mount are checked against plain-word patterns and VM ids must be integers, so a bad entry is refused as `disk:config:...` before ssh. Nothing changes on the hypervisor. Alerts (key suffix `HOST:MOUNT`):
 
 - `disk:volume:` warning at 85% used, high at 92%, critical at 97% or under 20 GiB free. The overcommit ratio is reported in this alert and not alerted on its own: it is a standing condition, decided by the disk options in goodqa#15771. The detail holds `overcommit_ratio` (the summed size of every guest volume on this storage, `images` and `rootdir` content from `pvesm list`, over pool total; ISO images, templates and backups do not count), `provisioned_gib`, and for each watched VM `allocated_gib` (its volumes on this storage), `actual_gib` (du of its image dir) and `growth_gib_day`.
 - `disk:growth:` more than 10 GiB/day, measured against the stored sample 6 to 48 h old that is closest to 24 h (samples every 30 min, kept 48 h, from good reads only). High when the pool would fill within 3 days at that rate, else warning.

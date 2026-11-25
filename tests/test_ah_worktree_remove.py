@@ -17,6 +17,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 HOOKS = ROOT / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
+os.environ["AH_LOCAL_CONFIG"] = str(Path(__file__).resolve().parent / "data" / "local_fixture.json")  # hermetic hosts
 import ah  # noqa: E402
 import ah_worktree  # noqa: E402
 import command_guard as cg  # noqa: E402
@@ -469,7 +470,7 @@ class Delegation(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name)
 
-    def remove(self, runner, host="t2-dev", path=None, reason="merged and published", authenticated=False):
+    def remove(self, runner, host="worker-1", path=None, reason="merged and published", authenticated=False):
         return ah_worktree.remove(host, path or self.PATH, reason, authenticated, "s1", "agent-x", self.home, runner)
 
     def audit_rows(self):
@@ -482,7 +483,7 @@ class Delegation(unittest.TestCase):
         self.assertTrue(result["ok"] and result["removed"])
         argv = run.calls[0][0]
         self.assertEqual(argv[:6], ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--"])
-        self.assertEqual(argv[6], "t2-dev")
+        self.assertEqual(argv[6], "worker-1")
         self.assertEqual(argv[7], "python3 -I .claude/hooks/command_guard.py free-worktree --path " + self.PATH)
         self.assertNotIn("--force", " ".join(argv))
         self.assertEqual([row["event"] for row in self.audit_rows()], ["start", "result"])
@@ -505,7 +506,7 @@ class Delegation(unittest.TestCase):
         self.assertEqual(argv[3:], ["free-worktree", "--path", self.PATH])
 
     def test_bad_requests_fail_before_any_process_or_audit_row(self):
-        for kwargs in ({"host": "dev2"}, {"host": "t2-dev; id"}, {"path": "relative/p"}, {"path": "/a/../b"},
+        for kwargs in ({"host": "worker-2"}, {"host": "worker-1; id"}, {"path": "relative/p"}, {"path": "/a/../b"},
                        {"path": "/a/b/"}, {"path": "/a/b c"}, {"path": "/a/$(x)"}, {"path": "/a/b;rm"}, {"path": "/"},
                        {"path": "/a//b"}, {"path": "/a/é"}):  # a reason is optional since 2026-11-24
             with self.subTest(kwargs=str(kwargs)[:40]):
@@ -517,7 +518,7 @@ class Delegation(unittest.TestCase):
 
     def test_there_is_no_force_second_path_or_caller_supplied_refs_flag(self):
         parser = ah.build_parser()
-        base = ["worktree-remove", "--host", "t2-dev", "--path", self.PATH, "--reason", "r"]
+        base = ["worktree-remove", "--host", "worker-1", "--path", self.PATH, "--reason", "r"]
         parser.parse_args(base)
         parser.parse_args(base + ["--remote-auth"])
         for extra in (["--force"], ["-f"], ["--forc"], ["--no-verify"], ["--heads-stdin"], ["--remote-heads-from", "local"],

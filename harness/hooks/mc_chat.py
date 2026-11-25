@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Mission Control chat store (GoodQA #15585): the file inbox/outbox shared by the dashboard server, the
-`mc_inbox.py` CLI that Claude main and Codex use, and read-only mirrors such as Fabric.
+`mc_inbox.py` CLI that Claude main and Codex use, and read-only mirrors.
 
 Layout under MC_HOME (default ~/.agent-harness/mission-control, directories 0700, files 0600, atomic renames):
 

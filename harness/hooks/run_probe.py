@@ -20,7 +20,7 @@ external-write, sandbox-escape, hang.
 
 Honest limits: the disk bound counts the probe's sandbox directory only (RLIMIT_FSIZE bounds each file
 anywhere); HOME/TMPDIR are environment variables, not filesystem confinement, so a probe can still write
-elsewhere (class external-write/sandbox-escape probes should declare that and run on dev2 or a throwaway
+elsewhere (class external-write/sandbox-escape probes should declare that and run on a worker host or a throwaway
 dir); bounds are polled, so memory and process counts overshoot by one poll interval. Daemonized
 (setsid) escapees are only accounted for on Linux, where the runner is a subreaper; the report says so.
 Every probe also gets a default RSS ceiling of 25% of physical memory when it declares none.
@@ -129,7 +129,7 @@ def parse(argv):
         missing.append(f"--max-rss-gb must not exceed physical memory ({phys_gb:.0f} GB)")
     if args.klass == "memory" and not run_capped.accurate_memory_measure():
         # goodqa#14948: never run a memory probe where the bound cannot be measured (macOS without phys_footprint)
-        missing.append("an accurate memory measure on this host (macOS phys_footprint unavailable): run the probe on dev2")
+        missing.append("an accurate memory measure on this host (macOS phys_footprint unavailable): run the probe on a Linux worker host")
     if not missing and not args.max_rss_gb:
         try:
             fraction = positive_finite(os.environ.get("HARNESS_PROBE_RSS_FRACTION", "0.25"), 1)  # test override
@@ -214,7 +214,7 @@ def main(argv=None):
             if not run_capped.live_memory_measure():
                 time.sleep(args.poll_s)
                 continue
-            # Between ps snapshots (slow on a busy host: `ps -ax` on dev2 with ~100 users takes long enough for a
+            # Between ps snapshots (slow on a busy host: `ps -ax` on a shared host with ~100 users takes long enough for a
             # fast slurp to finish unseen), re-read the known members' memory every MEM_POLL_S (phys_footprint on
             # macOS, /proc statm on Linux: one cheap read per process), faster while the tree is growing, so the
             # breach is caught near its bound instead of one ps interval later (goodqa#14948).

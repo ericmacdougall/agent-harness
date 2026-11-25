@@ -63,8 +63,8 @@ B64URL = re.compile(r'[A-Za-z0-9_-]+')
 KEY_ID = re.compile(r'[0-9a-f]{16}')
 REVOKE = re.compile(r'agent-harness-revoke (?:(all)|task ([A-Za-z0-9][A-Za-z0-9._-]{0,63})|session (%s)|decision ([0-9a-f]{32}))'
                     % UUID.pattern)
-# A superset of the T2Scan adapter's own withdrawal openers (no, stop, cancel, revoke, do not, don't), so the prompt
-# hook revokes at least whenever the adapter's local transcript scan would deny.
+# A superset of the usual withdrawal openers (no, stop, cancel, revoke, do not, don't), so the prompt hook revokes at
+# least whenever a consumer's local transcript scan would deny.
 BARE_WITHDRAWAL = re.compile(r"\s*(?:stop|cancel|revoke|withdraw|no|do\s+not|don'?t)\b", re.I)
 
 
@@ -72,8 +72,8 @@ def withdrawal_signal(text):
     """THE later-turn predicate (goodqa#16651, PR 14 class A). Every revocation trigger uses it: the publish-time
     later-turn scan, the prompt hook, the question-answer hook and the transcript sweep. True when the text names the
     top rung, retracts, or opens with a bare withdrawal, judged on the raw text and on the text with wrapper blocks
-    removed (the T2Scan adapter judges the stripped text). It is a superset of the adapter's later_withdrawal trigger,
-    which adds only a narrowing task-name filter; the cross-repo contract test pins that relation."""
+    removed (a consumer may judge the stripped text). An external consumer's own later-withdrawal trigger should be
+    this predicate narrowed (for example by task name), never wider."""
     if not isinstance(text, str) or not text.strip():
         return False
     import provenance as prov  # noqa: PLC0415
@@ -905,7 +905,7 @@ def on_hook_event(session, *, text=None, unreadable=False, sweep=True, claude_ho
       1. if this session has live published decisions: choose to revoke all of them when `text` (a prompt or an
          answer) meets withdrawal_signal, or when the answer could not be read (`unreadable`, fail safe); otherwise,
          with `sweep`, rescan the session transcript after each decision's cited turn with later_mentions (the same
-         record extraction as the adapter: typed turns, question answers, queued mid-turn messages); a transcript
+         record extraction as publish: typed turns, question answers, queued mid-turn messages); a transcript
          that cannot be read revokes too, as publish does;
       2. write each chosen revocation's local tombstone and queue row (no network yet), so a process killed later
          still leaves it queued;

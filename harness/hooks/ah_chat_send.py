@@ -31,7 +31,7 @@ caller_identity.is_main accepts, bound to that tool call and to the exact target
 file's bytes. A sub-agent, a replay, a script and a text file edited after the hook saw it all find no stamp. Without the
 installed hook nothing has a stamp, so send fails closed for everyone.
 
-What is sent: PREFIX + the file's text. PREFIX is the one constant "Claude (Eric's bot). ". The text file is an absolute path
+What is sent: PREFIX + the file's text. PREFIX is fixed per install: local.json `chat_prefix`, default "Claude (bot). ". The text file is an absolute path
 to a regular file (no symlink, one link) of at most MAX_CHARS characters of UTF-8 (the prefix not counted) with no control,
 format or separator character other than a line break (REFUSED_CATEGORIES). Text holding any secret shape or a piece of either
 GoodQA token is refused, never sent. No attachments, no channels, no group DMs, no bot personas.
@@ -72,7 +72,21 @@ import uuid
 import ah_chat as chat
 from ah_chat import ChatError
 
-PREFIX = "Claude (Eric's bot). "
+
+
+def _chat_prefix():
+    """~/.agent-harness/local.json `chat_prefix` (one line, at most 60 characters), else "Claude (bot). "."""
+    try:
+        import ah_local  # noqa: PLC0415
+        value = ah_local.get("chat_prefix", "")
+        if isinstance(value, str) and 0 < len(value) <= 60 and value.isprintable():
+            return value
+    except Exception:  # noqa: BLE001
+        pass
+    return "Claude (bot). "
+
+
+PREFIX = _chat_prefix()
 MAX_CHARS = 600
 MAX_FILE_BYTES = 4 * MAX_CHARS + 16
 RATE_LIMIT = 6
@@ -283,7 +297,7 @@ def _attempts(rows):
 
 def check_ledger(rows, peer, digest, now):
     """Refuse a duplicate or a send over a rate. peer and digest come from _identity; every attempt counts, whatever its
-    outcome. The ledger is one per home directory per host: the Mac and t2-dev do not see each other's sends."""
+    outcome. The ledger is one per home directory per host: two hosts do not see each other's sends."""
     attempts = list(_attempts(rows).values())
     mine = [a for a in attempts if a["peer"] == peer]
     same = [a for a in mine if a["sha"] == digest and now - a["at"] < SAME_TEXT_WINDOW]
@@ -528,7 +542,7 @@ def allow(home, with_=None, org=None, name=None, source=None, base=None, list_on
         raise ChatError("bad_request", "--org ID is required: an entry holds for one org", fixed=True)
     if not isinstance(name, str) or not NAME_RE.match(name):
         raise ChatError("bad_request", "--name is the one word the user's quoted words call this person (for example "
-                                       "Tisha)", fixed=True)
+                                       "Sam)", fixed=True)
     chat._refuse_credential_ids(with_, org)
     if not isinstance(source, str) or not source.strip():
         raise ChatError("bad_request", "--source is required: the user's own words that name this person", fixed=True)

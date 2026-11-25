@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """AC-12 live-gate run kit (goodqa#16049 slice 1 (b), spec r9). NOT run by this slice: it runs on the Linux host main
-names (t2-dev), before the coordinator runs live, and its result is recorded as a REALLY_TESTED entry there.
+names, before the coordinator runs live, and its result is recorded as a REALLY_TESTED entry there.
 
 One real R3-shaped unit is started with the R3 template's properties: DynamicUser (system scope), --collect,
 NoNewPrivileges, PrivateTmp, RemainAfterExit, RuntimeMaxSec (a probe bound of 300 s; the daemon uses 3600) and
@@ -42,7 +42,7 @@ sys.path.insert(0, str(HOOKS))
 
 PROBE_TEXT = "ahc-ac12 probe: public text, loaded through LoadCredential\n"
 CHECKLIST = """AC-12 live-gate checklist (post the filled copy on goodqa#16049; REALLY_TESTED names this host and commit)
-[ ] host named by main: ______ (t2-dev unless main names another)   commit: ______
+[ ] host named by main: ______ (a Linux worker host)   commit: ______
 [ ] L1 DynamicUser (system) or `systemd-run --user` (R-c, sandbox repo only): unit uid ____ != core uid ____
 [ ] L2 LoadCredential: probe credential sha256 matched inside the unit
 [ ] L3 InvocationID via `systemctl show`: ____ == the unit's $INVOCATION_ID

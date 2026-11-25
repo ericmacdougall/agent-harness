@@ -473,7 +473,8 @@ class App:
             self.health.off("codex-owners", "OpenAI supervised owners are not configured on this instance", truth="current")
         self.github = col.GitHub(self.hub, self.health, self.runner)
         self.tickets = col.Tickets(self.hub, self.health, self.runner, self.tracked_tickets)
-        self.remote = col.Remote(self.hub, self.health, self.runner, enabled=remote, fabric=bool(fabric_bin),
+        self.remote = col.Remote(self.hub, self.health, self.runner,
+                                 enabled=remote and bool(getattr(self.runner, "remote_host", True)), fabric=bool(fabric_bin),
                                  drop_dir=root / "sources")
         self.drop = col.FileDrop(self.hub, self.health, self.reader, root / "sources")
         self.asks = col.Asks(self.hub, self.health, self.runner, lambda: self.owners.session, root=root,

@@ -389,15 +389,25 @@ class KimiReviewTests(unittest.TestCase):
                 self.assertNotIn(fragment, result.stderr, label + ': refusal must not echo the match')
 
     def test_forbidden_topics_survive_unicode_tricks(self):
-        cases = {'yates': 'the yates-cloud deploy', 'cyrillic': 'the yаtes deploy', 'zero width': 'the ya​tes deploy',
-                 'fullwidth': 'the ｙａｔｅｓ deploy', 'dotted': 'the y.a.t.e.s deploy',
-                 'apex': 'see apex_app_pos tables', 'apex dots': 'see apex.app.pos tables', 'apex slash': 'apex/app_pos',
+        # the owner's own forbidden projects come from ~/.agent-harness/local.json (review_forbidden_topics)
+        local = self.home / '.agent-harness' / 'local.json'
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.write_text(json.dumps({'review_forbidden_topics': [
+            {'pattern': r'z[^\w\s]{0,2}e[^\w\s]{0,2}n[^\w\s]{0,2}i[^\w\s]{0,2}t[^\w\s]{0,2}h', 'label': 'forbidden project'},
+            {'pattern': r'acme[\W_]{0,3}app[\W_]{0,3}pos', 'label': 'forbidden project'},
+            {'pattern': r'orbit[\W_]{0,3}(?:session[\W_]{0,3})?(?:transcript|log|recording)', 'label': 'Orbit transcript'}]}))
+        cases = {'zenith': 'the zenith-cloud deploy', 'cyrillic': 'the zеnith deploy', 'zero width': 'the zen\u200bith deploy',
+                 'fullwidth': 'the ｚｅｎｉｔｈ deploy', 'dotted': 'the z.e.n.i.t.h deploy',
+                 'acme': 'see acme_app_pos tables', 'acme dots': 'see acme.app.pos tables', 'acme slash': 'acme/app_pos',
                  'granola': 'from the Granola export', 'interview': 'Interview transcript for Dana',
-                 'candidate interview': 'a candidate interview', 'solve': 'a Solve transcript excerpt',
-                 'solve log': 'the Solve session log'}
+                 'candidate interview': 'a candidate interview', 'orbit': 'an Orbit transcript excerpt',
+                 'orbit log': 'the Orbit session log'}
         for label, line in cases.items():
             self.packet.write_text('Evidence.\n%s\n' % line)
             self.assertRefused(self.run_kimi(), label)
+        local.unlink()  # without the local config only the built-in topics refuse
+        self.packet.write_text('Evidence.\nthe zenith-cloud deploy\n')
+        self.assertEqual(self.run_kimi().returncode, 0)
 
     def test_wal_and_transcript_shaped_json_is_refused_inside_any_file(self):
         shapes = {'wal': '{"at":"2026-11-08T00:00:00Z","event":"status","note":"did a thing","id":"w1"}',

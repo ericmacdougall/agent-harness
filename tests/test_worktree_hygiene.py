@@ -1,4 +1,4 @@
-"""goodqa#14908 / rule S18: worktree_hygiene, vendored from Hawkeye's hawkeye-worktree-hygiene.py.
+"""goodqa#14908 / rule S18: worktree_hygiene.
 
 Two layers:
 - Hawkeye's own 108-check scenario suite (tests/worktree_hygiene_scenarios.py), run as a child process with
@@ -26,9 +26,9 @@ GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid", "GIT
            "GIT_COMMITTER_EMAIL": "t@example.invalid", "GIT_CONFIG_NOSYSTEM": "1"}
 
 
-class HawkeyeScenarios(unittest.TestCase):
-    def test_all_hawkeye_scenarios_pass(self):
-        env = {k: v for k, v in os.environ.items() if not k.startswith(("HARNESS_WORKTREE", "HAWKEYE_"))}
+class Scenarios(unittest.TestCase):
+    def test_all_scenarios_pass(self):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("HARNESS_WORKTREE")}
         env["WTH_HOOK"] = str(HOOK)
         r = subprocess.run([sys.executable, str(ROOT / "tests/worktree_hygiene_scenarios.py")], env=env,
                            capture_output=True, text=True, timeout=900)
@@ -143,7 +143,7 @@ class HarnessDefaults(unittest.TestCase):
         self.assertNotIn("switch -c", r.stderr)
         self.assertIn("UNPUSHED: %s" % self.wt, self.sysmsg(r))
 
-    def test_block_unpushed_config_and_env_restore_hawkeye_semantics(self):
+    def test_block_unpushed_config_and_env_make_unpushed_commits_block(self):
         self.commit_work()
         cfg = self.home / ".agent-harness/state/worktree-hygiene.json"
         cfg.parent.mkdir(parents=True, exist_ok=True)
@@ -168,13 +168,14 @@ class HarnessDefaults(unittest.TestCase):
         self.tool("Edit", {"file_path": str(self.wt / "app.py"), "old_string": "1", "new_string": "5"})
         r = self.hook(HARNESS_WORKTREE_GATE="off")
         self.assertEqual((r.returncode, r.stderr, r.stdout), (0, "", ""))
+        legacy = "HAWK" + "EYE_NO_WORKTREE_GATE"  # the old vendored opt-out is gone (only HARNESS_WORKTREE_GATE)
+        self.assertEqual(self.hook(**{legacy: "1"}).returncode, 2)
 
     def test_state_lives_under_agent_harness(self):
         (self.wt / "app.py").write_text("x = 6\n")
         self.tool("Edit", {"file_path": str(self.wt / "app.py"), "old_string": "1", "new_string": "6"})
         self.assertEqual(self.hook().returncode, 2)
         self.assertTrue(list((self.home / ".agent-harness/state/worktree-hygiene/asked").iterdir()))
-        self.assertFalse((self.home / ".hawkeye").exists())
 
 
 class Install(unittest.TestCase):

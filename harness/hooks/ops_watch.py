@@ -77,8 +77,8 @@ def defaults(host: str) -> dict:
                  "extra_roots": ["/tmp", "~/.goodqa-trash", "~/vm-backups", "~/.local/share/docker",
                                  "/var/lib/docker", "~/Library/Caches", "~/Library/Logs", "~/Library/Developer"],
                  "exclude": list(DARWIN_PROTECTED) if darwin else []},
-        "units": {"enabled": linux, "reclaim": ["runner-worktree-retire", "inventory-hygiene", "ship-sample-watch",
-                                                "disk-maintain", "dev2-lane-prune", "runner-byproduct-cleanup"]},
+        # reclaim: the host's own cleanup timers to watch, named in ~/.agent-harness/ops-watch.json
+        "units": {"enabled": linux, "reclaim": []},
         "crashes": {"enabled": darwin, "dir": "~/Library/Logs/DiagnosticReports", "window_h": 6},
         "processes": {"netwatch": "~/.agent-harness/bin/netwatch", "orphan_warn": 5, "runaway_rss_mb": 4096,
                       "runaway_cpu": 80, "chrome_max": 150, "shell_max": 300,
@@ -693,7 +693,7 @@ def owner_budget_alerts(cfg: dict, state: dict, now: float) -> list:
                              f"owner {agent} is over its disk budget: {used / GIB:.1f} GiB of {budget / GIB:.0f} GiB in {key}",
                              {"agent": agent, "path_key": key, "used_bytes": used, "budget_bytes": budget,
                               "over_since": since, "rate_gib_h": d.get("rate_gib_h"),
-                              "next": "free space there or route the heavy work to dev2/T2; new heavy local copies are blocked"}))
+                              "next": "free space there or route the heavy work to a worker host; new heavy local copies are blocked"}))
     return out
 
 
@@ -1214,7 +1214,7 @@ def codex_hook_hash(label: str, matcher, handler: dict) -> str:
     handler.async defaulting to false. This mirrors codex-rs hook discovery as documented by the sidekick crate's
     codex_trust.rs and is verified against live trusted entries (tests: test_hash_matches_live_verified_algorithm).
     Codex parses the handler into its typed config first, so fields it does not hash (additionalContextLimit,
-    tool-private keys such as _hawkeye_managed) are dropped; verified against a dev2 entry carrying both."""
+    tool-private keys such as _<tool>_managed) are dropped; verified against a live entry carrying both."""
     h = {k: v for k, v in handler.items() if k in CODEX_HASHED_FIELDS}
     h.setdefault("async", False)
     ident = {"event_name": label, "hooks": [h]}
@@ -1481,7 +1481,7 @@ def parse_pool_status(text: str, storage: str):
     lines = [l.split() for l in (text or "").splitlines() if l.strip()]
     if not lines:
         return None
-    # pve 8 prints "Total (KiB)  Used (KiB) Available (KiB)"; older output has no unit. Either all three size columns say
+    # Proxmox VE 8 prints "Total (KiB)  Used (KiB) Available (KiB)"; older output has no unit. Either all three size columns say
     # (KiB) or none does; any other unit is refused rather than misread.
     head = lines[0]
     units = [t for t in head if t.startswith("(")]
@@ -2870,7 +2870,17 @@ def injection_text(home: Path | None = None, max_chars: int = 700, session: str 
 
 # ---------------------------------------------------------------- install
 
-LABEL = "com.ericmacdougall.ops-watch"
+def _job_label(name):
+    """launchd label of this job: ~/.agent-harness/local.json `launchd_label_prefix` (ah_local) + name."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import ah_local  # noqa: PLC0415
+        return ah_local.label(name)
+    except Exception:  # noqa: BLE001
+        return "com.agent-harness." + name
+
+
+LABEL = _job_label("ops-watch")
 
 
 def unit_files(home: Path, script: Path) -> dict:

@@ -5,6 +5,7 @@ Schema+FileDrop AC-13/NEG-13."""
 import http.client
 import json
 import os
+os.environ["AH_LOCAL_CONFIG"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "local_fixture.json")  # a worker host to probe
 import re
 import socket
 import stat
@@ -258,7 +259,7 @@ class Deploys(WalTail):
         path = self.wals / "sess1" / "agent-d.jsonl"
         path.write_text("")
         self.tailer.run(time.time())
-        self.append(path, {"event": "result", "note": "DEPLOYED 0e2084b on t2-dev via deploy-live.sh"})
+        self.append(path, {"event": "result", "note": "DEPLOYED 0e2084b on worker-1 via deploy-live.sh"})
         self.tailer.run(time.time())
         self.assertEqual(self.kinds(), ["wal", "deploy"])
 
@@ -847,7 +848,7 @@ class Budget(ServerHarness):
         self.assertGreaterEqual(intervals["owners"], 60)
         self.assertGreaterEqual(intervals["github"], 60)
         self.assertGreaterEqual(intervals["goodqa"], 10)
-        self.assertGreaterEqual(intervals["t2-dev"], 60)
+        self.assertGreaterEqual(intervals["remote"], 60)
 
     def test_hub_rate_limit_summarises_bursts(self):
         hub = ev.Hub(max_rate=20)

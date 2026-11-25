@@ -647,7 +647,7 @@ def validate(message: str, *, policy: dict, previous: str | None = None, is_merg
                 problems.append(f"revert: needs '{field}: ...' (why it is reverted and who authorized it)")
             elif field.lower() == "authorized-by" and tickets_required and not ticket_refs(content, policy):
                 problems.append("revert: Authorized-by must cite the ticket where the authorization is recorded, "
-                                "e.g. 'Authorized-by: Eric, GoodQA #14151'")
+                                "e.g. 'Authorized-by: <owner>, GoodQA #14151'")
     if misplaced:
         detail = ""
         if unrecognised:
@@ -1899,7 +1899,7 @@ def check_range(repo, base, head, policy, *, branch=None, pr=None, verify_ticket
 
 
 def check_github(slug, base, head, policy, *, verify_tickets=True, adapters=None, timeout=30):
-    """Check a branch range as GitHub sees it, wherever the commits were made (dev2, T2, Mac)."""
+    """Check a branch range as GitHub sees it, wherever the commits were made (any host)."""
     if policy.get("enforcement") == "off":
         return {"base": base, "head": head, "commits": [], "tickets": [], "waivers": [], "status": "PASS",
                 "enforcement": "off"}

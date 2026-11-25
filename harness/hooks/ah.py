@@ -591,7 +591,7 @@ def _summarize_cached(path: Path, index_dir: Path, cache: dict | None) -> dict:
         cache["dirty"] = True
         cache["misses"] += 1
         # R8 progress save, at most one per OWNERS_CACHE_SAVE_GAP_S: each save writes the whole cache, so a count-only
-        # trigger made a fresh 2,400-agent run write it 7 times (3.5 s of 8.6 s on t2-dev)
+        # trigger made a fresh 2,400-agent run write it 7 times (3.5 s of 8.6 s on a worker host)
         if cache["misses"] % OWNERS_CACHE_SAVE_EVERY == 0 \
                 and time.monotonic() - cache.get("saved_at", cache["started"]) >= OWNERS_CACHE_SAVE_GAP_S:
             _save_owners_cache(cache["path"], cache, prune=False)
@@ -3683,7 +3683,7 @@ def build_parser():
     ca = chs.add_parser("allow", help="add a person to the send allow-list on the user's own words (main agent only), or --list it")
     ca.add_argument("--with", dest="with_user", help="the person's user id (never a name)")
     ca.add_argument("--org", help="organization id (required): the entry holds for this org only")
-    ca.add_argument("--name", help="the one word the user's quoted words call this person, e.g. Tisha; the member name must contain it")
+    ca.add_argument("--name", help="the one word the user's quoted words call this person, e.g. Sam; the member name must contain it")
     ca.add_argument("--source", help="user:/uuid:, queue: or answer: source whose verbatim excerpt names the person")
     ca.add_argument("--list", dest="list_only", action="store_true", help="print the listed user ids; changes nothing")
     ca.add_argument("--base", help="API base; must be the pinned GoodQA base")
@@ -3857,7 +3857,7 @@ def build_parser():
     kp.add_argument("--reason", required=True, help="why (mandatory, logged)")
     kp.add_argument("--tree", action="store_true", help="signal children first")
     kp.add_argument("--grace", type=float, default=10.0, help="seconds between SIGTERM and SIGKILL (default 10)")
-    kp.add_argument("--host", help="run on dev2, t2-dev or ah-mac-mini over ssh; ah-spectre (Windows) takes one pid, "
+    kp.add_argument("--host", help="run on a host from ~/.agent-harness/local.json over ssh; a Windows host takes one pid, "
                     "no --tree, and stops it with Stop-Process")
     kp.add_argument("--foreign", action="store_true",
                     help="a process outside your worktree, process tree and supervised projects (audited, ops-watch "
@@ -3875,7 +3875,7 @@ def build_parser():
     kp.add_argument("--via", help=argparse.SUPPRESS)
     wp = sub.add_parser("worktree-remove", help="free ONE dead linked worktree here or on a remote host (audited; see "
                         "ah_worktree.py; --rescue saves commits and changes first)")
-    wp.add_argument("--host", required=True, help="local or t2-dev")
+    wp.add_argument("--host", required=True, help="local or a remote_worktree_hosts entry of ~/.agent-harness/local.json")
     wp.add_argument("--path", required=True, help="one literal absolute path")
     wp.add_argument("--reason", help="why (optional, logged)")
     wp.add_argument("--rescue", action="store_true", help="save commits to refs/rescue/<name> and changes to a patch, "
@@ -3888,7 +3888,7 @@ def build_parser():
     wp.add_argument("--agent", help="calling agent id for the audit row")
     ip = sub.add_parser("install-files", help="install MERGED listed hook files on a remote host (audited; see ah_install.py; "
                         "the bytes come only from a commit on the canonical main; main only)")
-    ip.add_argument("--host", required=True, help="t2-dev or ah-mac-mini")
+    ip.add_argument("--host", required=True, help="a host from ~/.agent-harness/local.json")
     ip.add_argument("--from-ref", dest="from_ref", help="a full 40-hex commit sha on the canonical main")
     ip.add_argument("--file", dest="files", action="append", help="a bare hook file name (repeatable)")
     ip.add_argument("--ticket", help="GoodQA project#N (required for a real run, a resume and a rollback)")
