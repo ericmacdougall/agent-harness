@@ -91,7 +91,9 @@ What it checks and does, in order. Any failed step stops the run, and nothing af
 1. **Not an agent.** It stops when an agent marker is set (`CLAUDECODE`, `CODEX_THREAD_ID`, `CODEX_TOOL_CALL_ID`,
    `CODEX_SANDBOX`, `AI_AGENT`, the same list as `commit_policy.py`), for `--preview` too. This is a mitigation, not a
    boundary: an agent can unset the variables. The command_guard rule that refuses every agent call of the script is
-   goodqa#17036.
+   goodqa#17036. It also stops when `AH_HOME` is set (not empty) and is not your home folder: `ah` keeps the remote
+   installer's audit under `AH_HOME`, and step 5 and the resume and rollback commands it prints read the one under
+   your home. Unset it and rerun.
 2. **Fresh source, main's own updater.** It fetches the canonical `main` into a new bare repository under
    `~/.agent-harness/update-cache/run-<12 hex>` (created exclusively, mode 0700, deleted when the run ends). Git runs
    hardened, the same way `ah install-files` runs it: no system or global config, no hooks, no fsmonitor, no replace
@@ -119,6 +121,10 @@ What it checks and does, in order. Any failed step stops the run, and nothing af
      bare names or `<folder>/<file>`, all literal tuples) whose copy under `~/.claude` is missing, differs from the
      commit's digest, or is a symlink. If `main` changed one of those files after the commit, the run stops: installing
      it would put an older version in place.
+   - Each of the four names must be bound exactly once in `install.py`, by one top-level `NAME = (...)`. Any other
+     binding of it anywhere (`+=`, an annotation, a second assignment, unpacking, `:=`, a loop, import or local of that
+     name, `del`, `global`) or a star import stops the run, because `install.py` could then install a list the updater
+     never compared. A rebinding through `globals()`, `setattr` or `exec` is not seen.
    - t2-dev: every `HOOKS` file that the remote installer's dry run does not report as `already_current` there.
 7. **Confirmation.** A real run with something to install asks, on `/dev/tty`, for the first 12 characters of the
    commit. No flag skips it, and without a terminal the run stops.
@@ -151,12 +157,20 @@ What it checks and does, in order. Any failed step stops the run, and nothing af
    state other than `WIRED` or `MISSING` (`SCRIPT_MISSING`: registering it would not fix it). A required hook the
    doctor reports `MISSING` (on the Mac, newly declared or already missing before this run, listed apart), or any name
    a host's install reports `unregistered`, gives exit 3.
+   - What each doctor proves. The Mac's doctor after the install also runs each manifest canary: it runs the
+     installed hook script on a sample payload under a scratch `HOME` and checks its allow or deny answer. A registered
+     hook that crashes, or answers wrongly, is `CANARY_FAIL` and stops the run. Six hooks have a canary today
+     (`commit_policy`, `copy_hygiene`, `owner_inbox`, `prod_delete_guard`, `wal_cadence`, `worktree_hygiene`). The
+     baseline before the install, and every host check, prove registration and file presence only: a host check is
+     read-only over ssh and cannot run a hook there. The closing line says this, for example: "on the Mac and on
+     t2-dev every required hook is registered with its script present (on the Mac each one with a doctor canary also
+     passed it; no other hook behaviour is tested)".
 
 `--preview` runs steps 1 to 6 and stops: it never installs and never writes under `~/.claude`. Each t2-dev dry run
 appends the remote installer's own audit row. `--no-remote` updates the Mac only.
 
 Exit codes: 0 every listed file matches the commit and every doctor reports every required hook wired, on the Mac
-and on each host (or a clean preview); 1 `STOP:` and the step that failed (files installed before that step stay
+(past its canary where it has one) and on each host (or a clean preview); 1 `STOP:` and the step that failed (files installed before that step stay
 installed, and the message says what was done); 2 usage (an unknown option, or a malformed `--commit` or
 `--ticket`), or not started with `-I -S`; 3 files in place, but some hooks need registering with `install.py --apply`
 (without `--hooks-only`) from a checkout of that commit, on each host named. There is no `--home` option: the home
@@ -168,8 +182,9 @@ so 6). Each dry run fetches the canonical `main` on its own and runs the host's 
 been measured (goodqa#17036).
 
 Proof status: the tests run the script against the repository's own tree (its HEAD as `main`, a temporary home, the
-repository's own `install.py` and doctor, ending with the doctor answering every required hook `WIRED` for the
-settings `install.py` writes), with `--no-remote`. The host path is tested with the real answers: `ah install-files`
+repository's own `install.py` and doctor, ending with the doctor answering every required hook `WIRED`, with its
+canaries run, for the settings `install.py` writes), with `--no-remote`. A crashing registered hook is tested with the
+real doctor and a real canary against a temporary home: the run stops with `CANARY_FAIL` and never prints "Done". The host path is tested with the real answers: `ah install-files`
 runs through `ah.main` with the argv the updater builds, the real remote script runs against a temporary host home
 through a stand-in for ssh, and the real doctor runs with `--ssh` against that home. No one has yet run a preview
 against the real home or against t2-dev: the script refuses agents, so the first real use by the user is that check.

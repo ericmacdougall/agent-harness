@@ -11,7 +11,8 @@
 Steps, each of which stops the run when it fails (nothing after a failed step runs):
   0. Refuse when an agent marker is set in the environment (CLAUDECODE, CODEX_THREAD_ID, CODEX_TOOL_CALL_ID,
      CODEX_SANDBOX, AI_AGENT), for a preview too: its remote dry runs are a main-only command. A mitigation, not a
-     boundary (an agent can unset them); the command_guard rule that refuses agent calls is goodqa#17036.
+     boundary (an agent can unset them); the command_guard rule that refuses agent calls is goodqa#17036. Refuse,
+     too, when AH_HOME is set and is not the home: ah keeps its audit there, and step 4 reads the one under the home.
   1. Fetch the canonical main into a FRESH bare repository (~/.agent-harness/update-cache/run-XXXXXXXXXXXX, created
      exclusively, deleted at the end) with hardened git: no system or global config, no hooks, no fsmonitor, no
      replace objects, https only, every fetched object fsck-checked. Grafts, shallow history and replace refs stop the run.
@@ -25,7 +26,8 @@ Steps, each of which stops the run when it fails (nothing after a failed step ru
      install-audit.jsonl (the remote installer's own rule) stops the run before anything is installed anywhere, for a
      preview too, with the resume and rollback commands. Checked again after the confirmation.
   5. Derive the file lists, never hand-kept: every name in install.py's AGENTS, HOOKS, TOOLS and SKILLS literal tuples
-     at the commit (bare names; SKILLS also <folder>/<file>) whose copy under ~/.claude is missing, a symlink, or
+     at the commit (bare names; SKILLS also <folder>/<file>; each name bound exactly once in install.py, by one
+     top-level plain assignment, else the run stops) whose copy under ~/.claude is missing, a symlink, or
      differs from the commit's digests; for each remote host, every HOOKS name that `ah install-files --dry-run` does
      not report as already current. A Mac file that main changed after the commit stops the run (it would be a
      downgrade); ah_install refuses the same for the host.
@@ -41,14 +43,17 @@ Steps, each of which stops the run when it fails (nothing after a failed step ru
   9. Registration, for the Mac and for every host whether or not anything was installed there: the doctor (for a host
      `doctor.py check --ssh H`, read-only) must answer, with an exit code that agrees with its rows; otherwise the run
      stops (registration not proven). A required hook that is unregistered (MISSING), or any name a host's install
-     reported `unregistered`, gives exit 3; any other required hook that is not WIRED (SCRIPT_MISSING, CANARY_FAIL)
-     stops the run.
+     reported `unregistered`, gives exit 3; any other required hook that is not WIRED stops the run: SCRIPT_MISSING,
+     or on the Mac CANARY_FAIL (the Mac's doctor after the install runs each manifest canary, the installed hook on a
+     sample payload under a scratch HOME; the baseline before it, and every host check, prove registration and file
+     presence only). The closing line says exactly that.
 
 Run time: a preview makes ceil(N/20) dry runs per host, N = the HOOKS count at the commit (about 110 today, so 6);
 a real run makes those, one install per batch of changed files, and the same dry runs again.
 
-Exit: 0 every listed file matches the commit and every doctor reports every required hook wired (or a clean
-preview); 1 stopped (files installed before the failed step stay installed, and the message says what was done);
+Exit: 0 every listed file matches the commit and every doctor reports every required hook wired: registered with its
+script present, and on the Mac past its canary where the manifest has one (or a clean preview); 1 stopped (files
+installed before the failed step stay installed, and the message says what was done);
 2 usage (a bad option or value), or not started with -I -S; 3 installed, with hooks that need registering.
 """
 import sys
@@ -342,6 +347,52 @@ def valid_name(folder, name):
     return len(parts) == 1 and bool(NAME_RE.fullmatch(name))
 
 
+MATCH_NAMES = tuple(getattr(ast, n) for n in ("MatchAs", "MatchStar") if hasattr(ast, n))   # Python 3.10+
+
+
+def bound_names(node):
+    """The names one AST node binds or deletes in some scope ("*" for a star import)."""
+    if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+        return [node.id]                 # =, +=, an annotation, :=, for/with/comprehension targets, unpacking, del
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return [node.name]
+    if isinstance(node, ast.arg):        # a parameter of a def or lambda
+        return [node.arg]
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return [a.asname or a.name.split(".")[0] for a in node.names]
+    if isinstance(node, (ast.Global, ast.Nonlocal)):
+        return list(node.names)
+    if isinstance(node, ast.ExceptHandler) or (MATCH_NAMES and isinstance(node, MATCH_NAMES)):
+        return [node.name] if node.name else []
+    if hasattr(ast, "MatchMapping") and isinstance(node, ast.MatchMapping):
+        return [node.rest] if node.rest else []
+    return []
+
+
+def single_bindings(tree):
+    """PR 336 gate F2: the updater reads each list from one top-level `NAME = <literal tuple>`, so that must be the only
+    binding of the name anywhere in install.py. Any other (+=, an annotation, a second assignment, unpacking, :=, a
+    loop or import, a local of that name, del, global, a star import) stops: install.py could install another list.
+    Not seen: a rebinding through globals(), setattr or exec; install.py is reviewed code on main."""
+    watched = {var for _folder, var in FOLDERS}
+    plain = {id(s.targets[0]) for s in tree.body
+             if isinstance(s, ast.Assign) and len(s.targets) == 1 and isinstance(s.targets[0], ast.Name)}
+    seen = {}
+    for node in ast.walk(tree):
+        for name in bound_names(node):
+            if name == "*":
+                raise Stop("install.py has a star import (line %s), which could rebind its file lists"
+                           % getattr(node, "lineno", "?"))
+            if name in watched:
+                seen.setdefault(name, []).append((getattr(node, "lineno", 0), id(node) in plain))
+    bad = ["%s (line %s)" % (name, ", ".join(str(line) for line, _plain in sorted(binds)))
+           for name, binds in sorted(seen.items()) if len(binds) != 1 or not binds[0][1]]
+    if bad:
+        raise Stop("install.py binds a file list other than by one top-level `NAME = (...)`, so the updater cannot tell "
+                   "which list install.py installs: %s" % "; ".join(bad))
+    return plain
+
+
 def installer_lists(export, digests=None):
     """{folder: [names]} from the exported install.py (literal tuples only; anything else stops). With `digests`, the
     bytes parsed must be the ones verified at export time."""
@@ -349,8 +400,10 @@ def installer_lists(export, digests=None):
     if digests is not None and hashlib.sha256(data).hexdigest() != digests.get("install.py"):
         raise Stop("the exported install.py changed after it was verified; nothing was installed")
     found = {}
-    for stmt in ast.parse(data.decode("utf-8")).body:
-        if not isinstance(stmt, ast.Assign):
+    tree = ast.parse(data.decode("utf-8"))
+    plain = single_bindings(tree)
+    for stmt in tree.body:
+        if not isinstance(stmt, ast.Assign) or id(stmt.targets[0]) not in plain:
             continue
         for target in stmt.targets:
             for folder, var in FOLDERS:
@@ -441,9 +494,28 @@ def ah_argv(home, host, commit, names, ticket, dry_run):
     return argv + (["--dry-run"] if dry_run else ["--ticket", ticket])
 
 
+def check_ah_home(environ, home):
+    """PR 336 gate F3: ah reads its audit under AH_HOME, or the home when AH_HOME is unset or empty (ah.py). The
+    updater reads the one under the home, and so do the resume and rollback commands it prints only if the caller's
+    AH_HOME agrees; one that is set and is not the home (the same folder, through a symlink too) stops first."""
+    value = environ.get("AH_HOME")
+    if not value:
+        return
+    try:
+        same = os.path.samefile(value, home)
+    except OSError:
+        same = False
+    if not same:
+        raise Stop("AH_HOME is set to %r, which is not your home %s. ah keeps the remote installer's audit under "
+                   "AH_HOME; this updater, and the resume and rollback commands it prints, read the one under your "
+                   "home, so an unfinished run could go unseen. Unset AH_HOME (or set it to your home) and rerun; "
+                   "nothing was changed." % (value, home))
+
+
 def ah_env(home):
     """ah keeps its audit under AH_HOME (else the home directory). The updater reads that audit for its open-run check,
-    so ah is told the updater's own home: both read one file, whatever AH_HOME the caller's shell has."""
+    so ah is told the updater's own home: both read one file. Defence in depth beside check_ah_home, which stops a
+    caller whose AH_HOME is another folder before anything runs."""
     return dict(os.environ, AH_HOME=str(home))
 
 
@@ -570,21 +642,25 @@ def resume_guidance(home, host, ticket, done):
     return "\n".join(lines)
 
 
-def doctor_argv(home, host=None):
+def doctor_argv(home, host=None, canaries=False):
+    """With `canaries` (the Mac only) the doctor also runs each manifest canary: the installed hook script on a sample
+    payload under a scratch HOME, so a registered hook that crashes or decides wrongly is CANARY_FAIL. A host check is
+    never canaried: it is read-only over ssh, and the doctor would run this Mac's copies."""
     claude = Path(home) / ".claude"
-    argv = [sys.executable, "-I", str(claude / "hooks" / "doctor.py"), "check", "--json", "--no-canary"]
+    argv = [sys.executable, "-I", str(claude / "hooks" / "doctor.py"), "check", "--json"]
     if host:   # read-only over ssh: the host's own settings.json and hooks folder, judged by this Mac's manifest
-        return argv + ["--ssh", host]
-    return argv + ["--settings", str(claude / "settings.json"), "--hooks-dir", str(claude / "hooks")]
+        return argv + ["--no-canary", "--ssh", host]
+    return argv + ([] if canaries else ["--no-canary"]) + ["--settings", str(claude / "settings.json"),
+                                                            "--hooks-dir", str(claude / "hooks")]
 
 
-def doctor_check(runner, home, host=None):
+def doctor_check(runner, home, host=None, canaries=False):
     """{check id: (state, required)} from the installed doctor, or None when it is missing, does not answer, or its
     exit code disagrees with its own rows (doctor.verdict: 0 exactly when every required row is WIRED)."""
     if not (Path(home) / ".claude" / "hooks" / "doctor.py").is_file():
         return None
     try:
-        r = runner(doctor_argv(home, host), capture_output=True, text=True, timeout=DOCTOR_TIMEOUT)
+        r = runner(doctor_argv(home, host, canaries), capture_output=True, text=True, timeout=DOCTOR_TIMEOUT)
         items = json.loads(r.stdout)
     except (subprocess.TimeoutExpired, OSError, TypeError, ValueError):
         return None
@@ -611,8 +687,11 @@ def registration(before, after, where="the Mac"):
     lost = sorted(i for i, (s, _r) in before.items() if s == WIRED and after.get(i, ("", False))[0] != WIRED)
     broken = sorted(i for i, (s, req) in after.items() if req and s not in (WIRED, UNREGISTERED))
     if broken:
-        raise Stop("on %s these required hooks are not working (%s); this is not fixed by registering them: %s"
-                   % (where, ", ".join(sorted({after[i][0] for i in broken})), " ".join(broken)))
+        raise Stop("on %s these required hooks are not working (%s); this is not fixed by registering them: %s.%s"
+                   % (where, ", ".join(sorted({after[i][0] for i in broken})), " ".join(broken),
+                      " Files already installed stay installed (install.py backed up the ones it replaced under %s); "
+                      "run `python3 -I ~/.claude/hooks/doctor.py check` to see why." % BACKUPS
+                      if where == "the Mac" else ""))
     unreg = [i for i, (s, req) in after.items() if req and s == UNREGISTERED]
     new = sorted(i for i in unreg if i not in before or before[i][0] in NOT_REGISTERED_BEFORE)
     old = sorted(i for i in unreg if i not in new)
@@ -643,6 +722,7 @@ def main(argv=None, runner=subprocess.run, reader=read_tty, environ=None, home=N
         if markers:
             raise Stop("an agent is running this (%s is set). The updater is user-run: its installs and its remote dry "
                        "runs are main-only commands. Ask the user to run it." % ", ".join(markers))
+        check_ah_home(environ, home)
         if not a.preview and hosts and not a.ticket:
             raise Stop("--ticket 'GoodQA project#N' is required for a real run")
         check_no_open_runs(home, hosts, a.ticket)
@@ -692,7 +772,8 @@ def main(argv=None, runner=subprocess.run, reader=read_tty, environ=None, home=N
             if still:
                 raise Stop("after install.py these Mac files are live but are NOT the commit's bytes: %s. The files "
                            "they replaced are under %s; restore them or rerun this command." % (" ".join(still), BACKUPS))
-        lost, new, old = registration(before, doctor_check(runner, home))
+        # the baseline above is registration only; the answer after the install also runs the canaries (gate F1)
+        lost, new, old = registration(before, doctor_check(runner, home, canaries=True))
         if lost:
             raise Stop("hooks wired before this install are not wired now: %s. The replaced files are under %s."
                        % (" ".join(lost), BACKUPS))
@@ -715,7 +796,10 @@ def main(argv=None, runner=subprocess.run, reader=read_tty, environ=None, home=N
             print("Commit %s: files in place, NOT fully active: register these hooks with install.py --apply (without "
                   "--hooks-only) from a checkout of that commit, on each host named." % commit)
             return EXIT_REGISTER
-        checked = "the doctor reports every required hook wired on the Mac" + "".join(" and on %s" % h for h in hosts)
+        # what the doctors proved, and no more: a host check is registration and file presence only
+        checked = ("on the Mac%s every required hook is registered with its script present (on the Mac each one with a "
+                   "doctor canary also passed it; no other hook behaviour is tested)"
+                   % "".join(" and on %s" % h for h in hosts))
         if mac or any(remote.values()):
             print("Done. Installed commit %s; %s." % (commit, checked))
         else:

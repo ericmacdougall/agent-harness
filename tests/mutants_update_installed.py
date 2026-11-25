@@ -1,4 +1,4 @@
-"""Mutation controls for tests/test_update_installed.py (goodqa#16947, PR 336 reviews R3 F1-F7, R4 F1-F6, R5 F1-F7): each mutant removes one
+"""Mutation controls for tests/test_update_installed.py (goodqa#16947, PR 336 reviews R3 F1-F7, R4 F1-F6, R5 F1-F7, gate F1-F3): each mutant removes one
 refusal, hardening step or derivation of scripts/update_installed.py, and the named test must FAIL against it. Run from
 the repository root:
 
@@ -189,8 +189,8 @@ MUTANTS = [
      '        gaps = [("Mac", new)]',
      T + "Registration.test_hooks_already_unregistered_before_the_run_still_give_exit_3"),
     ("the doctor is skipped when nothing is installed",
-     '        lost, new, old = registration(before, doctor_check(runner, home))',
-     '        lost, new, old = registration(before, doctor_check(runner, home)) '
+     '        lost, new, old = registration(before, doctor_check(runner, home, canaries=True))',
+     '        lost, new, old = registration(before, doctor_check(runner, home, canaries=True)) '
      'if (mac or any(remote.values())) else ([], [], [])',
      T + "Registration.test_nothing_to_install_still_runs_the_doctor"),
     # Kept from 7298d3ef
@@ -296,6 +296,45 @@ MUTANTS = [
      '        except OSError as e:   # e.g. two names that differ only in case on a case-insensitive file system',
      '        except ZeroDivisionError as e:',
      T + "Export.test_two_entries_that_land_on_one_path_stop_the_export_without_a_traceback"),
+    # PR 336 gate F1 (3cc0f3bb): a registered hook that crashes must not end in "Done"
+    ("the post-install Mac doctor runs without its canaries",
+     '        lost, new, old = registration(before, doctor_check(runner, home, canaries=True))',
+     '        lost, new, old = registration(before, doctor_check(runner, home))',
+     T + "RealDoctorCanaries.test_a_registered_hook_that_crashes_stops_and_never_prints_done"),
+    ("the Mac doctor argv always has --no-canary",
+     '    return argv + ([] if canaries else ["--no-canary"]) + ["--settings", str(claude / "settings.json"),',
+     '    return argv + ["--no-canary"] + ["--settings", str(claude / "settings.json"),',
+     T + "RealDoctorCanaries.test_a_registered_hook_that_crashes_stops_and_never_prints_done"),
+    ("the baseline doctor runs the canaries",
+     '        before = doctor_check(runner, home)\n',
+     '        before = doctor_check(runner, home, canaries=True)\n',
+     T + "RealDoctorCanaries.test_the_post_install_mac_doctor_runs_its_canaries_and_the_baseline_does_not"),
+    ("a host check is canaried",
+     '        return argv + ["--no-canary", "--ssh", host]',
+     '        return argv + ["--ssh", host]',
+     T + "RealDoctorCanaries.test_the_post_install_mac_doctor_runs_its_canaries_and_the_baseline_does_not"),
+    ("the closing line drops what was not tested",
+     '"doctor canary also passed it; no other hook behaviour is tested)"',
+     '"doctor canary also passed it)"',
+     T + "RealDoctorCanaries.test_the_post_install_mac_doctor_runs_its_canaries_and_the_baseline_does_not"),
+    # PR 336 gate F2: any other binding of a watched list stops
+    ("a second binding of a watched list is ignored",
+     '    if bad:\n        raise Stop("install.py binds a file list',
+     '    if False:\n        raise Stop("install.py binds a file list',
+     T + "FileList.test_any_other_binding_of_a_watched_name_stops"),
+    ("a star import is ignored",
+     '            if name == "*":',
+     '            if False:',
+     T + "FileList.test_any_other_binding_of_a_watched_name_stops"),
+    # PR 336 gate F3: a caller AH_HOME that is not the home stops
+    ("a caller AH_HOME that is not the home is accepted",
+     '        check_ah_home(environ, home)\n',
+     '',
+     T + "RealRun.test_a_caller_ah_home_that_is_not_the_home_stops_before_anything"),
+    ("an AH_HOME that is the home through a symlink stops",
+     '        same = os.path.samefile(value, home)',
+     '        same = value == str(home)',
+     T + "RealRun.test_a_caller_ah_home_that_is_not_the_home_stops_before_anything"),
 ]
 
 

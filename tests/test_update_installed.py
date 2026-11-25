@@ -24,7 +24,9 @@ import test_ah_install as TAI  # noqa: E402  (its Base runs the real remote inst
 
 GIT = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "init.defaultBranch=main",
        "-c", "commit.gpgsign=false"]
-CLEAN_ENV = {k: v for k, v in os.environ.items() if k not in U.AGENT_MARKERS}
+# Without the agent markers, and without an AH_HOME a runner's shell may set (the updater stops on one that is not the
+# test's home; RealRun tests that rule with their own environ).
+CLEAN_ENV = {k: v for k, v in os.environ.items() if k not in U.AGENT_MARKERS and k != "AH_HOME"}
 
 INSTALL_PY = ("import json, os, sys\n"
               "AGENTS = ('x.md',)\nHOOKS = %r\nTOOLS = ()\nSKILLS = %r\n"
@@ -365,6 +367,59 @@ class FileList(Fixture):
         self.assertEqual(U.local_changes(digests, self.home, lists),
                          ["agents/x.md", "hooks/a.py", "hooks/b.py", "hooks/c.py"])   # a symlink is never "current"
 
+    def lists_of(self, text):
+        d = tempfile.mkdtemp(dir=self.t)
+        Path(d, "install.py").write_text(text)
+        return U.installer_lists(d)
+
+    def test_any_other_binding_of_a_watched_name_stops(self):
+        """PR 336 gate F2 (3cc0f3bb): only the first top-level `HOOKS = (...)` was read, so a later `HOOKS += (...)` (or
+        any other rebinding) made install.py install a list the updater never compared. Each list must be bound exactly
+        once, by one top-level plain assignment; any other binding or deletion of that name, anywhere, stops."""
+        base = "HOOKS = ('a.py',)\n"
+        cases = [("augmented", base + "HOOKS += ('b.py',)\n", "HOOKS"),
+                 ("annotated", "HOOKS: tuple = ('a.py',)\n", "HOOKS"),
+                 ("annotation only", base + "HOOKS: tuple\n", "HOOKS"),
+                 ("repeated", base + "HOOKS = ('b.py',)\n", "HOOKS"),
+                 ("chained", "HOOKS = AGENTS = ('a.py',)\n", "HOOKS"),
+                 ("unpacked", "HOOKS, TOOLS = ('a.py',), ()\n", "HOOKS"),
+                 ("walrus", base + "if (HOOKS := ('b.py',)):\n    pass\n", "HOOKS"),
+                 ("loop target", base + "for HOOKS in [('b.py',)]:\n    pass\n", "HOOKS"),
+                 ("with target", base + "with open('x') as HOOKS:\n    pass\n", "HOOKS"),
+                 ("import alias", base + "from os import sep as HOOKS\n", "HOOKS"),
+                 ("import", base + "import HOOKS\n", "HOOKS"),
+                 ("def", base + "def HOOKS():\n    pass\n", "HOOKS"),
+                 ("class", base + "class HOOKS:\n    pass\n", "HOOKS"),
+                 ("global in a function", base + "def f():\n    global HOOKS\n    HOOKS = ('b.py',)\n", "HOOKS"),
+                 ("a local in a function", base + "def f():\n    HOOKS = ('b.py',)\n    return HOOKS\n", "HOOKS"),
+                 ("nested in an if", "if True:\n    HOOKS = ('a.py',)\n", "HOOKS"),
+                 ("deleted", base + "del HOOKS\n", "HOOKS"),
+                 ("except name", base + "try:\n    pass\nexcept OSError as HOOKS:\n    pass\n", "HOOKS"),
+                 ("comprehension target", base + "x = [HOOKS for HOOKS in ()]\n", "HOOKS"),
+                 ("another list", base + "SKILLS = ()\nSKILLS += ('s/x.md',)\n", "SKILLS"),
+                 ("tools repeated", base + "TOOLS = ()\nTOOLS = ('t.py',)\n", "TOOLS"),
+                 ("agents augmented", base + "AGENTS = ('x.md',)\nAGENTS += ('y.md',)\n", "AGENTS")]
+        if sys.version_info >= (3, 10):
+            cases.append(("match capture", base + "match 1:\n    case HOOKS:\n        pass\n", "HOOKS"))
+        for why, text, var in cases:
+            with self.subTest(why):
+                with self.assertRaises(U.Stop) as cm:
+                    self.lists_of(text)
+                self.assertIn("binds a file list other than by one top-level", str(cm.exception))
+                self.assertIn(" %s (line " % var, str(cm.exception))
+        with self.assertRaises(U.Stop) as cm:
+            self.lists_of(base + "from os.path import *\n")
+        self.assertIn("star import", str(cm.exception))
+        # reading a list, an attribute of the same name and an unrelated name are not bindings of it
+        for text in (base,
+                     base + "names = HOOKS\nfor n in HOOKS:\n    pass\n",
+                     base + "def f(x):\n    return HOOKS + x\n",
+                     base + "class C:\n    hooks = HOOKS\n",
+                     base + "import types\nns = types.SimpleNamespace()\nns.HOOKS = ()\n",
+                     base + "SKILLS = ('s/x.md',)\nHOOKS_EXTRA = ()\n"):
+            with self.subTest(text):
+                self.assertEqual(self.lists_of(text)["hooks"], ["a.py"])
+
     def test_the_lists_are_parsed_only_from_the_verified_install_py(self):
         repo, d, digests = self.export(self.main_sha)
         Path(d, "install.py").write_text(INSTALL_PY % (self.HOOKS + ("planted.py",), ()))
@@ -453,9 +508,32 @@ class RealRun(Fixture):
         self.assertEqual(len(self.typed), 1)
         self.assertEqual(self.cache_runs(), [])
 
+    def test_a_caller_ah_home_that_is_not_the_home_stops_before_anything(self):
+        """PR 336 gate F3 (3cc0f3bb): the updater told its own ah calls AH_HOME=home, but a caller whose shell has
+        another AH_HOME runs the resume and rollback commands it prints against another audit. ah reads AH_HOME, or
+        the home when it is unset or empty (ah.py), so an AH_HOME that is set and is not the home stops first."""
+        other = os.path.join(self.t, "other-home")
+        os.makedirs(other)
+        for value in (other, os.path.join(self.t, "does-not-exist"), "relative/ah-home"):
+            for args in (["--preview"], ["--ticket", "GoodQA goodqa#1"]):
+                with self.subTest(value=value, args=args):
+                    self.calls.clear()
+                    rc, out, err = self.run_main(*args, environ=dict(CLEAN_ENV, AH_HOME=value))
+                    self.assertEqual(rc, U.EXIT_STOP, out + err)
+                    self.assertIn("AH_HOME is set to %r" % value, err)
+                    self.assertEqual(self.calls, [])
+                    self.assertFalse(Path(self.home, ".agent-harness").exists(), "nothing was fetched")
+        link = os.path.join(self.t, "home-link")
+        os.symlink(self.home, link)
+        for value in (self.home, link, ""):
+            with self.subTest(value=value):
+                rc, out, err = self.run_main("--preview", environ=dict(CLEAN_ENV, AH_HOME=value))
+                self.assertEqual(rc, U.EXIT_OK, err)
+
     def test_every_ah_call_is_told_the_updaters_home(self):
-        """ah keeps its audit under AH_HOME; the open-run check reads the audit under the updater's home. With another
-        AH_HOME in the caller's shell they would read two different files, and an open run would go unseen."""
+        """ah keeps its audit under AH_HOME; the open-run check reads the audit under the updater's home. Defence in
+        depth beside the stop above: even when this process's own environment has another AH_HOME, every ah call it
+        makes is told the updater's home, so the two never read different files."""
         with mock.patch.dict(os.environ, {"AH_HOME": os.path.join(self.t, "elsewhere")}):
             rc, _, err = self.run_main("--ticket", "GoodQA goodqa#1")
         self.assertEqual(rc, U.EXIT_OK, err)
@@ -649,7 +727,8 @@ class Registration(Fixture):
         self.host_doctor = [{"id": "a", "state": "WIRED"}]
         rc, out, err = self.run_main("--ticket", "GoodQA goodqa#1")
         self.assertEqual(rc, U.EXIT_OK, err)
-        self.assertIn("the doctor reports every required hook wired on the Mac and on t2-dev", out)
+        self.assertIn("on the Mac and on t2-dev every required hook is registered with its script present (on the Mac "
+                      "each one with a doctor canary also passed it; no other hook behaviour is tested).", out)
 
     def test_a_required_hook_that_is_broken_stops_and_a_pending_one_is_not_a_gap(self):
         """R5 F5: SCRIPT_MISSING or CANARY_FAIL on a required hook is not a registration step; PENDING is not required."""
@@ -685,6 +764,64 @@ class Registration(Fixture):
         self.assertEqual(rc, U.EXIT_STOP)
         self.assertIn("not wired now: a", err)
         self.assertFalse([a for a, _ in self.calls if "install-files" in a and "--dry-run" not in a])
+
+
+class RealDoctorCanaries(Fixture):
+    """PR 336 gate F1 (3cc0f3bb): a hook that is registered but crashes ended in "Done", because the Mac doctor ran with
+    --no-canary. Here the REAL doctor.py (with its safe_input) runs under the temp home, against a one-row manifest whose
+    canary runs the installed a.py and a settings.json that registers a.py the way the doctor expects. Only `ah
+    install-files` and the `--ssh` doctor would be stand-ins, and these tests run --no-remote."""
+
+    def setUp(self):
+        super().setUp()
+        hooks = Path(self.home, ".claude", "hooks")
+        for name in ("doctor.py", "safe_input.py"):
+            shutil.copy(ROOT / "harness" / "hooks" / name, hooks / name)
+        row = {"id": "a:stop", "event": "Stop", "script": "a.py", "tools": [], "status": "installed",
+               "flavors": ["claude"], "canaries": [{"payload": {"hook_event_name": "Stop"}, "expect": "allow"}]}
+        (hooks / "hooks_manifest.json").write_text(json.dumps({"hooks": [row]}))
+        handler = {"type": "command", "command": "python3", "args": [str(hooks / "a.py")]}
+        Path(self.home, ".claude", "settings.json").write_text(json.dumps({"hooks": {"Stop": [{"hooks": [handler]}]}}))
+
+    def real_doctor(self, argv, **kw):
+        if any(str(x).endswith("doctor.py") for x in argv):
+            self.assertNotIn("--ssh", argv)
+            self.calls.append((argv, kw))
+            return subprocess.run(argv, **kw)
+        return self.runner(argv, **kw)
+
+    def mac_doctor_calls(self):
+        return [a for a, _ in self.calls if str(a[2]).endswith("doctor.py")]
+
+    def test_a_registered_hook_that_crashes_stops_and_never_prints_done(self):
+        self.main_sha = self.commit_main("a.py crashes", {"harness/hooks/a.py": "raise RuntimeError('planted crash')\n"})
+        rc, out, err = self.run_main("--no-remote", runner=self.real_doctor)
+        self.assertEqual(rc, U.EXIT_STOP, out + err)
+        self.assertIn("not working (CANARY_FAIL)", err)
+        self.assertIn(U.BACKUPS, err, "the stop says where the replaced files are")
+        self.assertNotIn("Done.", out)
+        self.assertIn("planted crash", Path(self.home, ".claude", "hooks", "a.py").read_text(), "it was installed")
+        # the same home again: nothing differs, and the post-install doctor still runs the canary
+        rc, out, err = self.run_main("--no-remote", runner=self.real_doctor)
+        self.assertEqual(rc, U.EXIT_STOP, out + err)
+        self.assertIn("not working (CANARY_FAIL)", err)
+        self.assertNotIn("Nothing to install", out)
+
+    def test_the_post_install_mac_doctor_runs_its_canaries_and_the_baseline_does_not(self):
+        """Positive control for the test above (the fixture's a.py prints and exits 0), and the argv of each call: the
+        baseline before the install is a registration baseline only (a CANARY_FAIL there would hide a hook that is
+        wired before and unregistered after), the call after the install runs the canaries."""
+        rc, out, err = self.run_main("--no-remote", runner=self.real_doctor)
+        self.assertEqual(rc, U.EXIT_OK, out + err)
+        self.assertIn("Done. Installed commit %s; on the Mac every required hook is registered with its script present "
+                      "(on the Mac each one with a doctor canary also passed it; no other hook behaviour is tested)."
+                      % self.main_sha, out)
+        calls = self.mac_doctor_calls()
+        self.assertEqual(len(calls), 2)
+        self.assertIn("--no-canary", calls[0])
+        self.assertNotIn("--no-canary", calls[1])
+        self.assertEqual(U.doctor_argv(self.home, "t2-dev")[-3:], ["--no-canary", "--ssh", "t2-dev"],
+                         "a host is never canaried (the doctor would run this Mac's copies)")
 
 
 class Contracts(unittest.TestCase):
@@ -1352,8 +1489,10 @@ class RealTree(unittest.TestCase):
         print("--- real-tree rerun (settings.json as install.py writes it) ---\n" + out.getvalue()[-800:]
               + err.getvalue()[-800:])
         self.assertEqual(rc, U.EXIT_OK, err.getvalue())
-        self.assertIn("Nothing to install: everything listed already matches %s; the doctor reports every required "
-                      "hook wired on the Mac." % self.head, out.getvalue())
+        # with the real manifest's canaries run by the real doctor against the installed hooks (PR 336 gate F1)
+        self.assertIn("Nothing to install: everything listed already matches %s; on the Mac every required hook is "
+                      "registered with its script present (on the Mac each one with a doctor canary also passed it; no "
+                      "other hook behaviour is tested)." % self.head, out.getvalue())
 
 
 if __name__ == "__main__":
