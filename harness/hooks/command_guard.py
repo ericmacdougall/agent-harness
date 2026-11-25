@@ -1658,6 +1658,8 @@ def reproducible_clone_refusal(path, policy=None, now=None, *, remote_ls=None, p
 
     def step(seconds):
         return min(left(), seconds * scale)
+    nested = {'inside': [], 'prunable': 0, 'tips': set()}
+    details = []
     try:
         if not path or '\x00' in path or not os.path.isabs(path):
             return 'not a literal absolute path'
@@ -1672,7 +1674,7 @@ def reproducible_clone_refusal(path, policy=None, now=None, *, remote_ls=None, p
         for forbidden, why in (('worktrees', 'it owns linked worktrees'), ('modules', 'it has submodules'),
                                (os.path.join('info', 'grafts'), 'it has grafts'), ('refs/replace', 'it has replace refs')):
             if forbidden == 'worktrees' and delegated:
-                why = _clone_registry_refusal(os.path.join(gitdir, 'worktrees'))
+                why, nested = _clone_worktrees(path, gitdir, step)
                 if why:
                     return why
                 continue
@@ -1694,9 +1696,23 @@ def reproducible_clone_refusal(path, policy=None, now=None, *, remote_ls=None, p
         for entry in _git_out(path, ['ls-files', '-v', '-z'], step(3.0)).split('\x00'):
             if entry and entry[0] != 'H':
                 return 'a tracked file is marked assume-unchanged, skip-worktree or otherwise hidden from git status'
+        worktree_states = []
+        for admin_rel, work_rel in nested['inside']:
+            why, state = _nested_worktree_refusal(path, admin_rel, work_rel, cfg, scale, step)
+            if why:
+                return why
+            worktree_states.append(state)
         ignored_ok, ignored_top_ok = set(cfg['ignored_ok']), set(cfg['ignored_top_ok'])
         status = _git_out(path, CLONE_STATUS_ARGS, step(3.0))
+        homes = [work_rel + '/' for _, work_rel in nested['inside']]
         for entry in filter(None, status.split('\x00')):
+            if homes and entry[:3] in ('!! ', '?? ') and entry.endswith('/') and any(
+                    h.startswith(entry[3:]) for h in homes):
+                stray, seen = _worktree_homes(path, entry[3:], homes)
+                if stray:
+                    return 'the clone holds files next to its nested worktrees (%s)' % _clean_reason(stray)[:60]
+                details.append(seen)
+                continue
             if entry.startswith('!! '):
                 name = entry[3:]
                 leaf = name.rstrip('/').rsplit('/', 1)[-1]
@@ -1765,7 +1781,7 @@ def reproducible_clone_refusal(path, policy=None, now=None, *, remote_ls=None, p
         for name, sha in refs.items():
             if name.startswith('refs/tags/') and any(v.get(name) == sha for v in live_all.values()):
                 verified.add(sha)
-        local = {sha for name, sha in refs.items() if not name.startswith('refs/remotes/')} | {head} | stale
+        local = {sha for name, sha in refs.items() if not name.startswith('refs/remotes/')} | {head} | stale | nested['tips']
         for pointer in ('ORIG_HEAD', 'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD'):
             pfile = os.path.join(gitdir, pointer)
             if os.path.isfile(pfile):
@@ -1794,6 +1810,8 @@ def reproducible_clone_refusal(path, policy=None, now=None, *, remote_ls=None, p
                 unpushed[:8], ' (counting %d remote-tracking ref(s) the remote no longer shows)' % len(stale) if stale else '')
         if facts is not None:
             local_names = sorted(n for n in refs if not n.startswith('refs/remotes/'))
+            facts.update(nested_worktrees={'inside': len(nested['inside']), 'prunable': nested['prunable']},
+                         _nested=list(nested['inside']), _details=list(details), _worktree_states=worktree_states)
             facts.update(head=head, remotes=shown, commits_checked=len(local), stale_tracking_refs=len(stale),
                          pull_proof_tips=len(pull_proof), local_refs=len(local_names), local_ref_names=[_clean_reason(n)[:80] for n in local_names[:50]],
                          _status=status, _refs=listing)
@@ -2785,21 +2803,200 @@ def _shown_url(url):
     return _clean_reason(re.sub(r'^([A-Za-z][A-Za-z0-9+.-]*://)[^/@]*@', r'\1', str(url)))
 
 
-def _clone_registry_refusal(registry):
-    """The clone route accepts a linked-worktree registry only when it is absent or an empty plain directory. A clone
-    with any linked worktree, present or prunable, is refused: its directory or its admin entry (HEAD, index, reflog)
-    would go with the clone."""
+CLONE_MAX_WORKTREES = 50
+CLONE_WT_IN_PROGRESS = ('MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'BISECT_LOG', 'rebase-merge', 'rebase-apply',
+                        'sequencer')
+CLONE_WT_NOT_HINTS = frozenset({'index', 'gitdir', 'commondir', 'locked', 'COMMIT_EDITMSG', 'config.worktree', 'HEAD'})
+_LOCK_HOLDER = re.compile(r'\(pid ([0-9]{1,9}) start ([^)]{10,40})\)')
+_SHA = re.compile(r'(?<![0-9a-f])[0-9a-f]{40}(?:[0-9a-f]{24})?(?![0-9a-f])')
+
+
+def _worktree_homes(root, top, homes, limit=10000):
+    """(the first stray path or None, the sorted tuple of entries seen) for a folder of the clone that git lists as one
+    untracked or ignored entry and that holds nested worktrees. Walked on the file system, symlinks not followed: every
+    entry must be a nested worktree's own directory (not descended) or a plain directory on the way to one. A file, a
+    link or any other directory beside them is a stray."""
+    seen, stack = [], [top.rstrip('/')]
+    while stack:
+        rel = stack.pop()
+        with os.scandir(os.path.join(root, rel)) as entries:
+            for item in entries:
+                child = rel + '/' + item.name
+                if len(seen) >= limit:
+                    return child, ()
+                seen.append(child)
+                if child + '/' in homes:
+                    continue
+                if item.is_dir(follow_symlinks=False) and any(h.startswith(child + '/') for h in homes):
+                    stack.append(child)
+                    continue
+                return child, ()
+    return None, tuple(sorted(seen))
+
+
+def _wt_git(root, admin_rel, work_rel, args, seconds):
+    """git for one linked worktree of the clone at `root`, with its admin entry (and work tree) named explicitly: once
+    the clone is moved aside, the worktree's own .git file still names the old path."""
+    named = ['--git-dir=' + os.path.join(root, admin_rel)]
+    if work_rel is not None:
+        named.append('--work-tree=' + os.path.join(root, work_rel))
+    return _git_out(os.path.join(root, work_rel) if work_rel is not None else root, named + list(args), seconds)
+
+
+def _lock_holder_alive(text):
+    """For a lock reason such as Claude Code's `claude agent <id> (pid N start <time>)`: True when that process still
+    runs (the same pid and start time, or one this user cannot inspect), False when it has ended or the pid now belongs
+    to a later process, None when the reason names no process."""
+    match = _LOCK_HOLDER.search(text)
+    if not match:
+        return None
+    pid, started = int(match.group(1)), ' '.join(match.group(2).split())
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # another user's process, or a pid that cannot be signalled: it may be the holder
+    try:
+        done = subprocess.run(['/bin/ps', '-o', 'lstart=', '-p', str(pid)], capture_output=True, text=True, timeout=5,
+                              env={'PATH': '/bin:/usr/bin', 'LC_ALL': 'C'}, cwd=os.sep)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    if done.returncode != 0:
+        return False if not done.stdout.strip() else True
+    return ' '.join(done.stdout.split()) == started
+
+
+def _admin_hints(admin):
+    """Every commit an admin entry's small files name (ORIG_HEAD, a tool's base marker): counted as local work."""
+    found = set()
+    for entry in sorted(os.listdir(admin)):
+        file = os.path.join(admin, entry)
+        if entry in CLONE_WT_NOT_HINTS or os.path.islink(file) or not os.path.isfile(file):
+            continue
+        if os.path.getsize(file) > 64 * 1024:
+            raise ValueError('an admin file is unusually large')
+        with open(file, 'rb') as handle:
+            found |= set(_SHA.findall(handle.read().decode('ascii', 'replace')))
+    return {sha for sha in found if sha.strip('0')}
+
+
+def _clone_worktrees(path, gitdir, step):
+    """(refusal or None, nested) for the linked worktrees the clone's registry names (goodqa#17119 C2). A worktree whose
+    directory lies outside the clone and still exists is refused: removing the clone would orphan it. One whose
+    directory is gone (prunable) keeps only its admin entry. Every entry's HEAD and the commits its small files name
+    are local work (its HEAD reflog is in the clone's own reflog listing), and a prunable entry's index must equal its
+    HEAD. One inside the clone is listed in nested['inside'] for its own checks.
+    Every entry refuses when it has an operation in progress, refs of its own (bisect, worktree refs) or a lock held by
+    a running process or for a reason this route cannot read."""
+    registry = os.path.join(gitdir, 'worktrees')
+    nested = {'inside': [], 'prunable': 0, 'tips': set()}
     try:
         info = os.lstat(registry)
     except FileNotFoundError:
-        return None
+        return None, nested
     if not stat.S_ISDIR(info.st_mode):
-        return 'the linked-worktree registry is not a plain directory'
-    count = len(os.listdir(registry))
-    if count:
-        return 'it has %d linked worktree(s); remove each one first with ah worktree-remove' % count
-    return None
+        return 'the linked-worktree registry is not a plain directory', nested
+    names = sorted(os.listdir(registry))
+    if len(names) > CLONE_MAX_WORKTREES:
+        return 'it has %d linked worktrees, more than this route checks (%d)' % (len(names), CLONE_MAX_WORKTREES), nested
+    for name in names:
+        admin = os.path.join(registry, name)
+        shown = _clean_reason(name)[:40]
+        if os.path.islink(admin) or not os.path.isdir(admin):
+            return 'linked worktree entry %s is not a plain directory' % shown, nested
+        try:
+            with open(os.path.join(admin, 'gitdir'), 'rb') as handle:
+                pointer = handle.read(4097).decode('utf-8').strip()
+        except (OSError, UnicodeError):
+            return 'linked worktree entry %s has no readable gitdir file' % shown, nested
+        work = pointer[:-len('/.git')] if pointer.endswith('/.git') else ''
+        if not work.startswith('/') or '\x00' in work or os.path.normpath(work) != work:
+            return 'linked worktree entry %s names an unusual path' % shown, nested
+        inside = work.startswith(path + os.sep)
+        if os.path.lexists(work) and not inside:
+            return ('it has a linked worktree outside the clone (%s); remove that one first with ah worktree-remove'
+                    % shown), nested
+        for marker in CLONE_WT_IN_PROGRESS:
+            if os.path.lexists(os.path.join(admin, marker)):
+                return 'linked worktree %s has an operation in progress (%s)' % (shown, marker), nested
+        for _top, _dirs, files in os.walk(os.path.join(admin, 'refs')):
+            if files:
+                return 'linked worktree %s has refs of its own (bisect or worktree refs are on no remote)' % shown, nested
+        lock = os.path.join(admin, 'locked')
+        if os.path.lexists(lock):
+            try:
+                with open(lock, 'rb') as handle:
+                    alive = _lock_holder_alive(handle.read(4096).decode('utf-8', 'replace'))
+            except OSError:
+                alive = None
+            if alive is not False:
+                return ('linked worktree %s is locked by a process that is still running' % shown if alive else
+                        'linked worktree %s is locked for a reason that names no process' % shown), nested
+        if os.path.lexists(os.path.join(admin, 'config.worktree')):
+            bad = _config_refusal(_git_out(path, ['config', '--file', os.path.join(admin, 'config.worktree'), '-z',
+                                                  '--list'], step(2.0)), allow_worktree_config=True)
+            if bad:
+                return 'linked worktree %s: %s' % (shown, bad), nested
+        admin_rel = os.path.relpath(admin, path)
+        nested['tips'] |= _admin_hints(admin)
+        # its HEAD reflog needs no read here: the clone's `reflog show --all` already lists every worktree's (git
+        # rev-list, --single-worktree: "By default, all working trees will be examined"), prunable ones included
+        nested['tips'].add(_wt_git(path, admin_rel, None, ['rev-parse', '--verify', 'HEAD'], step(2.0)).strip())
+        if inside:
+            nested['inside'].append((admin_rel, os.path.relpath(work, path)))
+            continue
+        try:  # its directory is gone: only the index can still hold work
+            _wt_git(path, admin_rel, None, ['diff-index', '--cached', '--quiet', 'HEAD', '--'], step(3.0))
+        except ValueError:
+            return 'linked worktree %s (its directory is gone) has staged changes, or they cannot be read' % shown, nested
+        nested['prunable'] += 1
+    return None, nested
 
+
+def _nested_worktree_refusal(path, admin_rel, work_rel, cfg, scale, step):
+    """(refusal or None, state) for one linked worktree inside the clone: a real directory whose .git file points back
+    to its admin entry, with a clean status under the same ignored-file policy, no gitlink, no hidden index entry and no
+    submodule. `state` is what the removal re-checks."""
+    work, admin = os.path.join(path, work_rel), os.path.join(path, admin_rel)
+    shown = _clean_reason(work_rel)[:60]
+    if os.path.realpath(work) != work or not os.path.isdir(work):
+        return 'nested worktree %s is not a plain directory' % shown, None
+    dotgit = os.path.join(work, '.git')
+    try:
+        with open(dotgit, 'rb') as handle:
+            back = handle.read(4097).decode('utf-8').strip()
+    except (OSError, UnicodeError):
+        return 'nested worktree %s has no readable .git file' % shown, None
+    if os.path.islink(dotgit) or back != 'gitdir: ' + admin:
+        return 'nested worktree %s does not point back to its own admin entry' % shown, None
+    if os.path.lexists(os.path.join(work, '.gitmodules')):
+        return 'nested worktree %s has submodules' % shown, None
+    for entry in _wt_git(path, admin_rel, work_rel, ['ls-files', '-s', '-z'], step(3.0)).split('\x00'):
+        if entry.startswith('160000'):
+            return 'nested worktree %s tracks an embedded repository (gitlink)' % shown, None
+    for entry in _wt_git(path, admin_rel, work_rel, ['ls-files', '-v', '-z'], step(3.0)).split('\x00'):
+        if entry and entry[0] != 'H':
+            return 'nested worktree %s has a file hidden from git status' % shown, None
+    status = _wt_git(path, admin_rel, work_rel, CLONE_STATUS_ARGS, step(3.0))
+    ignored_ok, ignored_top_ok = set(cfg['ignored_ok']), set(cfg['ignored_top_ok'])
+    for entry in filter(None, status.split('\x00')):
+        name = entry[3:]
+        leaf = name.rstrip('/').rsplit('/', 1)[-1]
+        top = '/' not in name.rstrip('/')
+        if not entry.startswith('!! '):
+            return 'nested worktree %s is not clean (modified, staged or untracked files)' % shown, None
+        if not (name.endswith('/') and (leaf in ignored_ok or (top and leaf in ignored_top_ok))):
+            return 'nested worktree %s holds an ignored file outside the regenerable folders (%s)' % (
+                shown, _clean_reason(name)[:40]), None
+        found = _nested_repo(os.path.join(work, name), limit=int(250000 * scale), deep=leaf not in ignored_ok,
+                             seconds=step(1.5))
+        if found == 'large':
+            return 'an ignored build directory of nested worktree %s is too large to check in time' % shown, None
+        if found:
+            return 'an ignored build directory of nested worktree %s holds a nested repository' % shown, None
+    head = _wt_git(path, admin_rel, work_rel, ['rev-parse', '--verify', 'HEAD'], step(2.0)).strip()
+    return None, (status, head)
 
 
 CLONE_LIVE_SECONDS = 6 * 3600  # a session whose main WAL or any owner moved in this window counts as live
@@ -3085,17 +3282,26 @@ def _clone_policy(base=None):
     return dict(base, reproducible_clone=merged)
 
 
-def _clone_state(path, seconds=CLONE_RECHECK_SECONDS):
-    """What the removal re-checks after moving the clone aside: the very status and ref listings the verifier read, and
-    HEAD. Run only on a clone whose config the verifier has vetted."""
-    return (_git_out(path, CLONE_STATUS_ARGS, seconds), _git_out(path, CLONE_REFS_ARGS, seconds),
-            _git_out(path, ['rev-parse', '--verify', 'HEAD'], seconds).strip())
+def _clone_state(path, facts, seconds=CLONE_RECHECK_SECONDS):
+    """What the removal re-checks after moving the clone aside, read exactly as the verifier read it: the clone's
+    status, ref listing and HEAD, the full listing of each folder that holds nested worktrees, and each nested
+    worktree's status and HEAD. Run only on a clone whose config the verifier has vetted."""
+    status = _git_out(path, CLONE_STATUS_ARGS, seconds)
+    homes = [work_rel + '/' for _, work_rel in facts.get('_nested') or []]
+    details = [_worktree_homes(path, entry[3:], homes) for entry in filter(None, status.split('\x00'))
+               if homes and entry[:3] in ('!! ', '?? ') and entry.endswith('/') and any(h.startswith(entry[3:]) for h in homes)]
+    details = [seen if not stray else ('stray', stray) for stray, seen in details]
+    states = [(_wt_git(path, admin_rel, work_rel, CLONE_STATUS_ARGS, seconds),
+               _wt_git(path, admin_rel, work_rel, ['rev-parse', '--verify', 'HEAD'], seconds).strip())
+              for admin_rel, work_rel in facts.get('_nested') or []]
+    return (status, _git_out(path, CLONE_REFS_ARGS, seconds),
+            _git_out(path, ['rev-parse', '--verify', 'HEAD'], seconds).strip(), details, states)
 
 
 def _verify_clone(path, authenticated, policy):
     report = {'path': path, 'removable': False, 'reason': None, 'head': None, 'remotes': {}, 'commits_checked': None,
               'local_refs': None, 'local_ref_names': [], 'stale_tracking_refs': None, 'process_check': None,
-              'pull_proof_tips': None, 'session_liveness': None, 'bytes': None,
+              'pull_proof_tips': None, 'nested_worktrees': None, 'session_liveness': None, 'bytes': None,
               'clone_verifier': CLONE_VERIFIER_VERSION}
     facts = {}
     if not isinstance(path, str) or '\x00' in path or not os.path.isabs(path):
@@ -3118,7 +3324,7 @@ def _verify_clone(path, authenticated, policy):
                                             pull_ls=authenticated_pull_heads if authenticated else None,
                                             delegated=True, facts=facts)
         for key in ('head', 'remotes', 'commits_checked', 'local_refs', 'local_ref_names', 'stale_tracking_refs',
-                    'pull_proof_tips'):
+                    'pull_proof_tips', 'nested_worktrees'):
             if key in facts:
                 report[key] = facts[key]
     if reason is None:
@@ -3175,7 +3381,8 @@ def remove_clone(path, authenticated=False, policy=None, *, _after_rename=None):
     if after is None or not stat.S_ISDIR(after.st_mode) or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
         report.update(removable=False, reason='the path changed while it was verified')
         return report
-    expected = (facts.get('_status'), facts.get('_refs'), report['head'])
+    expected = (facts.get('_status'), facts.get('_refs'), report['head'], facts.get('_details') or [],
+                facts.get('_worktree_states') or [])
     parent, leaf = os.path.split(path)
     quarantine = os.path.join(parent, '.%s.clone-remove-%s' % (leaf[:80], _secrets.token_hex(6)))
     if os.path.lexists(quarantine):
@@ -3198,7 +3405,7 @@ def remove_clone(path, authenticated=False, policy=None, *, _after_rename=None):
             _after_rename(quarantine)
         if not _same_worktree_directory(quarantine, (before.st_dev, before.st_ino)):
             problem = 'the moved directory is not the verified one'
-        elif _clone_state(quarantine) != expected:
+        elif _clone_state(quarantine, facts) != expected:
             problem = 'the clone changed after it was verified (its status, refs or HEAD)'
         else:
             problem, report['process_check'] = clone_process_refusal(quarantine, _clone_created(quarantine))

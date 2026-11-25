@@ -259,11 +259,9 @@ class Refused(Base):
         self.refresh_live()
         self.assertRefused(self.verify(), 'moved since the last fetch')
 
-    def test_any_linked_worktree_present_or_prunable(self):
+    def test_a_linked_worktree_outside_the_clone_that_still_exists(self):
         git(self.clone, 'worktree', 'add', '-q', str(self.base / 'wt'), '-b', 'side')
-        self.assertRefused(self.verify(), 'linked worktree')
-        shutil.rmtree(self.base / 'wt')  # its directory is gone, its admin entry is not
-        self.assertRefused(self.verify(), 'linked worktree')
+        self.assertRefused(self.verify(), 'linked worktree outside the clone (wt)')
 
     def test_remote_that_does_not_answer(self):
         self.live = {}
@@ -372,6 +370,144 @@ class HookUnchanged(Base):
         git(self.clone, 'commit', '-q', '-m', 'local only')
         self.assertEqual(cg.reproducible_clone_refusal(str(self.clone), self.policy),
                          '1 local commit(s) are not on the remote')
+
+
+class NestedWorktrees(Base):
+    """goodqa#17119 C2: linked worktrees of the clone are verified one by one instead of refused as a class."""
+
+    def inside(self, name='agent-x', ignored=True):
+        if ignored:
+            (self.clone / '.git' / 'info' / 'exclude').write_text('.claude/\n')
+        work = self.clone / '.claude' / 'worktrees' / name
+        git(self.clone, 'worktree', 'add', '-q', '--detach', str(work), 'HEAD')
+        return work, self.clone / '.git' / 'worktrees' / name
+
+    def outside(self, name='wt'):
+        work = self.base / name
+        git(self.clone, 'worktree', 'add', '-q', '--detach', str(work), 'HEAD')
+        return work, self.clone / '.git' / 'worktrees' / name
+
+    def commit_in(self, work, text='work only here\n'):
+        (work / 'w.txt').write_text(text)
+        git(work, 'add', '.')
+        git(work, 'commit', '-q', '-m', 'in the worktree')
+
+    def test_a_clean_published_worktree_inside_is_verified_and_removed(self):
+        for ignored in (True, False):
+            with self.subTest(ignored=ignored):
+                if not ignored:
+                    self.setUp()
+                self.inside(ignored=ignored)
+                report = self.verify()
+                self.assertTrue(report['removable'], report)
+                self.assertEqual(report['nested_worktrees'], {'inside': 1, 'prunable': 0})
+        result = cg.remove_clone(str(self.clone), policy=self.policy)
+        self.assertTrue(result['removed'], result)
+        self.assertFalse(os.path.lexists(self.clone))
+
+    def test_a_stray_file_next_to_the_nested_worktrees(self):
+        work, _ = self.inside()
+        (work.parent / 'notes.txt').write_text('mine\n')
+        self.assertRefused(self.verify(), 'files next to its nested worktrees (.claude/worktrees/notes.txt)')
+        (work.parent / 'notes.txt').unlink()
+        (self.clone / '.claude' / 'settings.json').write_text('{}\n')
+        self.assertRefused(self.verify(), 'files next to its nested worktrees (.claude/settings.json)')
+
+    def test_a_dirty_nested_worktree(self):
+        work, _ = self.inside()
+        (work / 'a.txt').write_text('changed\n')
+        self.assertRefused(self.verify(), 'nested worktree .claude/worktrees/agent-x is not clean')
+        git(work, 'checkout', '-q', '--', 'a.txt')
+        (work / '.env').write_text('x\n')
+        (self.clone / '.git' / 'info' / 'exclude').write_text('.claude/\n.env\n')
+        self.assertRefused(self.verify(), 'holds an ignored file outside the regenerable folders')
+
+    def test_a_commit_only_the_nested_worktree_holds(self):
+        work, admin = self.inside()
+        self.commit_in(work)  # detached: no branch, and with its reflog gone only the worktree's HEAD holds it
+        (admin / 'logs' / 'HEAD').unlink()
+        self.assertRefused(self.verify(), '1 local commit(s) are not on the remote')
+
+    def test_a_commit_only_the_nested_worktrees_reflog_holds(self):
+        work, _ = self.inside()
+        self.commit_in(work)
+        git(work, 'checkout', '-q', '--detach', 'refs/remotes/origin/main')
+        self.assertRefused(self.verify(), '1 local commit(s) are not on the remote')
+
+    def test_a_commit_an_admin_file_names(self):
+        work, admin = self.inside()
+        self.commit_in(work)
+        (admin / 'CLAUDE_BASE').write_text(git(work, 'rev-parse', 'HEAD') + '\n')
+        git(work, 'checkout', '-q', '--detach', 'refs/remotes/origin/main')
+        git(work, 'reflog', 'expire', '--expire=now', '--all')
+        self.assertEqual(git(work, 'reflog', 'show', '--format=%H', 'HEAD'), '')
+        self.assertRefused(self.verify(), '1 local commit(s) are not on the remote')
+
+    def test_locks(self):
+        _, admin = self.inside()
+        started = subprocess.run(['/bin/ps', '-o', 'lstart=', '-p', str(os.getpid())], capture_output=True,
+                                 text=True).stdout.strip()
+        (admin / 'locked').write_text('claude agent agent-x (pid %d start %s)\n' % (os.getpid(), started))
+        self.assertRefused(self.verify(), 'locked by a process that is still running')
+        (admin / 'locked').write_text('kept by hand\n')
+        self.assertRefused(self.verify(), 'locked for a reason that names no process')
+        ended = subprocess.Popen([sys.executable, '-c', 'pass'])
+        ended.wait()
+        (admin / 'locked').write_text('claude agent agent-x (pid %d start %s)\n' % (ended.pid, started))
+        self.assertTrue(self.verify()['removable'])
+        (admin / 'locked').write_text('claude agent agent-x (pid %d start Mon Jan  1 00:00:00 2001)\n' % os.getpid())
+        self.assertTrue(self.verify()['removable'])  # the pid now belongs to a later process
+
+    def test_an_operation_in_progress_or_refs_of_its_own(self):
+        _, admin = self.inside()
+        (admin / 'MERGE_HEAD').write_text(git(self.clone, 'rev-parse', 'HEAD') + '\n')
+        self.assertRefused(self.verify(), 'has an operation in progress (MERGE_HEAD)')
+        (admin / 'MERGE_HEAD').unlink()
+        (admin / 'refs' / 'bisect').mkdir(parents=True)
+        (admin / 'refs' / 'bisect' / 'bad').write_text(git(self.clone, 'rev-parse', 'HEAD') + '\n')
+        self.assertRefused(self.verify(), 'has refs of its own')
+
+    def test_a_worktree_that_points_elsewhere(self):
+        work, _ = self.inside()
+        (work / '.git').write_text('gitdir: /elsewhere/.git/worktrees/agent-x\n')
+        self.assertRefused(self.verify(), 'does not point back to its own admin entry')
+
+    def test_a_prunable_worktree_needs_its_head_and_index_published(self):
+        work, _ = self.outside()
+        shutil.rmtree(work)
+        report = self.verify()
+        self.assertTrue(report['removable'], report)
+        self.assertEqual(report['nested_worktrees'], {'inside': 0, 'prunable': 1})
+        self.setUp()
+        work, _ = self.outside()
+        self.commit_in(work)
+        shutil.rmtree(work)
+        self.assertRefused(self.verify(), '1 local commit(s) are not on the remote')
+        self.setUp()
+        work, _ = self.outside()
+        (work / 'a.txt').write_text('staged only\n')
+        git(work, 'add', 'a.txt')
+        shutil.rmtree(work)
+        self.assertRefused(self.verify(), 'has staged changes')
+
+    def test_a_change_inside_a_nested_worktree_after_the_verification(self):
+        self.inside()
+
+        def edit(quarantine):
+            Path(quarantine, '.claude', 'worktrees', 'agent-x', 'late.txt').write_text('late\n')
+        result = cg.remove_clone(str(self.clone), policy=self.policy, _after_rename=edit)
+        self.assertFalse(result['removed'])
+        self.assertIn('changed after it was verified', result['reason'])
+        self.assertTrue((self.clone / '.claude' / 'worktrees' / 'agent-x' / 'late.txt').is_file())
+
+    def test_a_stray_file_after_the_verification(self):
+        self.inside()
+
+        def edit(quarantine):
+            Path(quarantine, '.claude', 'worktrees', 'late.txt').write_text('late\n')
+        result = cg.remove_clone(str(self.clone), policy=self.policy, _after_rename=edit)
+        self.assertFalse(result['removed'])
+        self.assertIn('changed after it was verified', result['reason'])
 
 
 class PullProof(Base):
