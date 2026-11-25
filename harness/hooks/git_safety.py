@@ -94,12 +94,14 @@ def git_environment(*, isolated=False, allow_hooks=False, preserve_identity=Fals
 
 
 def _bounded_git(repo: Path, args: list[str], env: dict[str, str], *, timeout: int,
-                 limit: int, input_file=None, reject_stderr=False) -> tuple[int, bytes]:
-    """Bound metadata output and time without exposing path/config values in errors."""
+                 limit: int, input_file=None) -> tuple[int, bytes]:
+    """Bound metadata output and time without exposing path/config values in errors.
+
+    Only the exit code and stdout decide. Text git writes to stderr (a warning, a GIT_TRACE line) is discarded:
+    it used to refuse the sparse proof, which then failed on diagnostics rather than on what the index holds."""
     command = ['git', '-C', str(repo), *args]
     process = subprocess.Popen(command, env=env, stdin=input_file or subprocess.DEVNULL,
-                               stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE if reject_stderr else subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                start_new_session=True)
     data = bytearray()
     deadline = time.monotonic() + timeout
@@ -107,9 +109,7 @@ def _bounded_git(repo: Path, args: list[str], env: dict[str, str], *, timeout: i
     try:
         with selectors.DefaultSelector() as selector:
             selector.register(process.stdout, selectors.EVENT_READ)
-            if reject_stderr:
-                selector.register(process.stderr, selectors.EVENT_READ)
-            open_streams = 2 if reject_stderr else 1
+            open_streams = 1
             while True:
                 remaining = deadline - time.monotonic()
                 ready = selector.select(max(0, remaining))
@@ -120,8 +120,6 @@ def _bounded_git(repo: Path, args: list[str], env: dict[str, str], *, timeout: i
                     if not chunk:
                         selector.unregister(key.fileobj)
                         open_streams -= 1
-                    elif key.fileobj is process.stderr:
-                        raise OSError('source Git sparse metadata emitted a warning')
                     else:
                         data.extend(chunk)
                     if len(data) > limit:
@@ -141,8 +139,6 @@ def _bounded_git(repo: Path, args: list[str], env: dict[str, str], *, timeout: i
             signal_group(process.pid, signal.SIGKILL)
             process.wait()
         process.stdout.close()
-        if reject_stderr:
-            process.stderr.close()
 
 
 def _sparse_settings(repo, env, budget):
@@ -306,7 +302,7 @@ def _prove_sparse(repo, env, budget, settings, index, flags):
         for options in ([], ['--no-cone', '--rules-file', frozen.name]):
             input_file.seek(0)
             code, matched = _bounded_git(repo, ['sparse-checkout', 'check-rules', '-z', *options],
-                env, timeout=budget(), limit=40_000_000, input_file=input_file, reject_stderr=True)
+                env, timeout=budget(), limit=40_000_000, input_file=input_file)
             records = matched.split(b'\0')[:-1] if matched.endswith(b'\0') else []
             if (code or (matched and not matched.endswith(b'\0')) or
                     len(records) != len(set(records)) or set(records) != included):
