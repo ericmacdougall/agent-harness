@@ -248,6 +248,12 @@ class ReminderTests(Base):
         self.assertEqual(out["hookSpecificOutput"]["additionalContext"],
                          "A rejected question pauses only that question; keep every independent stream moving.")
 
+    def test_the_reminder_is_said_at_most_once_per_30_minutes(self):  # context budget, 2026-11-24
+        payload = {"hook_event_name": "PermissionDenied", "session_id": SESSION}
+        self.assertIn("hookSpecificOutput", self.ig.cmd_reject(payload))
+        self.assertEqual(self.ig.cmd_reject(payload), {})
+        self.assertEqual(self.ig.cmd_reject(dict(payload, agent_id="a1b2c3d4")), {})
+
     def test_ordinary_failure_injects_nothing(self):  # NEG-6
         self.assertEqual(self.ig.cmd_reject({"hook_event_name": "PostToolUseFailure", "error": "exit 1: no such file"}), {})
 
