@@ -2,7 +2,8 @@
 """Agent log backup companion (GoodQA #14471): freshness check, SessionStart alert, status and restore.
 
 The backup itself is harness/bin/log-backup.sh (copy only, scheduled by launchd or systemd). It writes
-~/.agent-harness/logs/log-backup.last-ok only after every source copied cleanly. A run skipped because of a held
+~/.agent-harness/logs/log-backup.last-ok with the oldest per-source success stamp (log-backup.src.d), once every
+tier-1 source has one. A run skipped because of a held
 lock writes log-backup.last-skip instead, which this tool never treats as success.
 
   check          exit 0 fresh, 1 stale, 2 missing or invalid (a future timestamp is invalid), 3 transcripts fresh but
