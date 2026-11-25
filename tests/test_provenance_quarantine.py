@@ -1,6 +1,7 @@
-"""S3a (GoodQA goodqa#14791): sourced ask_resolved (G5), unsourced-entry quarantine with a bounded stop lint (P11), and
-`ah note --source auto --dry-run`. Fail on d0c6351: ask_resolved took any token with no source, unsourced
-scope/decision rows carried no quarantine flag and nothing surfaced them, and `ah note` did not exist.
+"""S3a (GoodQA goodqa#14791): sourced ask_resolved (G5), unsourced entries flagged and written (P11), and
+`ah note --source auto --dry-run`. The quarantine stop lint that blocked on unsourced rows was removed in the harness
+redesign (2026-11-24): an unsourced row is recorded, labelled and usable, and nothing blocks on it
+(tests/test_provenance_loose.py).
 """
 import datetime as dt
 import json
@@ -15,7 +16,6 @@ from unittest import mock
 
 HOOKS = Path(__file__).resolve().parents[1] / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
-import provenance_hooks as ph  # noqa: E402
 
 SESSION = "sess-quar-0001"
 
@@ -111,20 +111,20 @@ class Quarantine(Base):
         self.assertTrue(row.get("unsourced"))
         self.assertEqual(row["note"], "we go with python")
 
-    def test_rejected_source_is_refused_and_nothing_is_written(self):
-        """A source that was given but does not parse is a caller error: refuse it (exit 2, REFUSED) and append no
-        row, so the stop hook never has to quarantine it later (main WAL w842c8dfc127, 2026-11-06). Fail before the
-        fix: wal_note printed the rejection and still wrote the row with unsourced=True."""
-        before = len(self.rows())
+    def test_untraced_source_is_written_and_labelled_unsourced(self):
+        """2026-11-24 (inverts the 2026-11-06 refusal): a source that does not trace is kept as given, the row is
+        written with unsourced=True and the warning names the cause; nothing is refused for a source's form."""
         for src in ("inferred: from af794b88 ledger read ; QAC journal whens -- free text inputs are not sources",
                     "whatever I say", "ticket:not-a-ticket"):
             with self.subTest(src):
+                before = len(self.rows())
                 rc, doc = self.note("--event", "decision", "--note", "we go with python", "--source", src)
-                self.assertEqual(rc, 2, doc)
-                self.assertEqual(doc.get("status"), "REFUSED")
-                self.assertIn("rejected", doc.get("problem", ""))
-                self.assertEqual(len(self.rows()), before)
-        # a missing source in warn mode still writes (quarantined), unchanged
+                self.assertEqual(rc, 0, doc)
+                self.assertEqual(doc.get("status"), "WROTE")
+                self.assertEqual(len(self.rows()), before + 1)
+                self.assertTrue(self.rows()[-1].get("unsourced"))
+                self.assertEqual(self.rows()[-1]["source"], src)  # kept as given
+        # a missing source still writes, flagged
         rc, doc = self.note("--event", "decision", "--note", "no source at all")
         self.assertEqual(rc, 0, doc)
         self.assertTrue(self.rows()[-1].get("unsourced"))
@@ -152,47 +152,6 @@ class Quarantine(Base):
         self.assertIn("af794b88 ledger read", msg)
         self.assertIn("inferred input", msg)
         self.assertNotIn("Source must start with", msg)
-
-    def test_stop_lint_blocks_after_the_grace_bounded_and_names_the_fix(self):
-        now = time.time()
-        old = {"at": iso(now - 11 * 60), "event": "decision", "id": "wquar0000001", "note": "old unsourced", "unsourced": True}
-        fresh = {"at": iso(now - 2 * 60), "event": "scope", "id": "wquar0000002", "note": "fresh unsourced", "unsourced": True}
-        sourced = {"at": iso(now - 20 * 60), "event": "decision", "id": "wquar0000003", "note": "cited", "source": "ticket:GoodQA goodqa#14791"}
-        with open(self.wal, "a") as fh:
-            for r in (sourced, fresh):
-                fh.write(json.dumps(r) + "\n")
-        payload = {"session_id": SESSION, "hook_event_name": "Stop", "stop_hook_active": False}
-        self.assertEqual(ph.quarantine_block(SESSION, payload, now=now), {})  # within the grace: nothing
-        with open(self.wal, "a") as fh:
-            fh.write(json.dumps(old) + "\n")
-        out = ph.quarantine_block(SESSION, payload, now=now)
-        self.assertEqual(out.get("decision"), "block")
-        self.assertIn("wquar0000001", out["reason"])
-        self.assertIn("note --source auto --dry-run", out["reason"])
-        self.assertNotIn("wquar0000002", out["reason"])  # the fresh one is not nagged yet
-        blocks = 1 + sum(1 for _ in range(5) if ph.quarantine_block(SESSION, payload, now=now).get("decision") == "block")
-        self.assertEqual(blocks, ph.QUARANTINE_MAX_BLOCKS)
-        later = ph.quarantine_block(SESSION, payload, now=now)
-        self.assertNotIn("decision", later)
-        self.assertIn("wquar0000001", later.get("systemMessage", ""))  # still named, never silent
-        active = dict(payload, stop_hook_active=True)
-        self.assertNotIn("decision", ph.quarantine_block(SESSION, active, now=now))
-        with mock.patch.dict(os.environ, {"CLAUDE_CODE_ENTRYPOINT": "sdk-cli"}):
-            self.assertEqual(ph.quarantine_block(SESSION, payload, now=now), {})  # headless sessions are not gated
-        # M3/M1: an allowlisted tool row is never quarantined; a self-claimed `by` is
-        with open(self.wal, "a") as fh:
-            fh.write(json.dumps({"at": iso(now - 3600), "event": "decision", "id": "wquar0000009", "note": "LADDER tool row",
-                                 "unsourced": True, "by": "escalation"}) + "\n")
-            fh.write(json.dumps({"at": iso(now - 3600), "event": "decision", "id": "wquar000000a", "note": "my own claim",
-                                 "unsourced": True, "by": "me"}) + "\n")
-        ids = [r["id"] for r in ph.quarantined_entries(SESSION, now, 600)]
-        self.assertNotIn("wquar0000009", ids)
-        self.assertIn("wquar000000a", ids)
-        # M2: a re-cite whose own source is rejected does not clear the original
-        with open(self.wal, "a") as fh:
-            fh.write(json.dumps({"at": iso(now - 60), "event": "decision", "id": "wquar000000b", "note": "[re-cites wquar0000001] x",
-                                 "source": "whatever I say", "unsourced": True, "recites": "wquar0000001"}) + "\n")
-        self.assertIn("wquar0000001", [r["id"] for r in ph.quarantined_entries(SESSION, now, 600)])
 
 
 class NoteSourceAuto(base.Env):
@@ -240,10 +199,6 @@ class NoteSourceAuto(base.Env):
         self.assertTrue(last.get("assumption"))  # M4: auto is an assumption, labelled
         self.assertEqual(last.get("recites"), "wab5c0000001")
         self.assertFalse(last.get("unsourced"))
-        # B1: the sanctioned fix clears the quarantine; the lint must not block again
-        payload = {"session_id": SESSION, "hook_event_name": "Stop", "stop_hook_active": False}
-        self.assertEqual(ph.quarantined_entries(SESSION, now + 3600, 0), [])
-        self.assertEqual(ph.quarantine_block(SESSION, payload, now=now + 3600), {})
 
     def test_by_is_an_allowlist(self):
         env = dict(os.environ, HOME=str(self.home))
@@ -252,21 +207,19 @@ class NoteSourceAuto(base.Env):
         self.assertEqual(p.returncode, 2)
         self.assertIn("allowlist", p.stderr)
 
-    def test_note_reports_a_rejected_source_as_refused_and_writes_nothing(self):
-        """M2: when the chosen source cannot be backed here, `ah note` must not say ok. Since the wal_note refusal
-        (2026-11-06) a rejected ancestor source (here a user: turn with no transcript on this host) is refused outright
-        and no row is appended, instead of being written quarantined."""
+    def test_note_with_an_unbackable_source_is_written_unsourced(self):
+        """M2: when the chosen source cannot be backed here, `ah note` must not say ok. Since 2026-11-24 the row is
+        written labelled unsourced (it was refused and dropped from 2026-11-06)."""
         now = time.time()
         with open(self.wal, "a") as fh:
             fh.write(json.dumps({"at": iso(now - 600), "event": "scope", "id": "wsrc00000002", "note": "unbackable ancestor",
                                  "source": 'user:12345678-1234-1234-1234-123456789abc/12345678-1234-1234-1234-123456789abd "gone"'}) + "\n")
         before = len(self.rows())
         rc, done = self.ah("note", "--wal", str(self.wal), "--source", "auto", "--note", "follow-up")
-        self.assertEqual(rc, 3, done)
         self.assertFalse(done["ok"])
-        self.assertTrue(done.get("refused"), done)
-        self.assertIn("rejected", done.get("problem", ""))
-        self.assertEqual(len(self.rows()), before)
+        self.assertFalse(done.get("refused"), done)
+        self.assertEqual(len(self.rows()), before + 1)
+        self.assertTrue(self.rows()[-1].get("unsourced"))
 
     def test_no_ancestor_is_refused_not_guessed(self):
         rc, plan = self.ah("note", "--wal", str(self.wal), "--source", "auto", "--dry-run", "--note", "orphan decision")
