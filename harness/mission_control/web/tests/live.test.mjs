@@ -60,6 +60,58 @@ test('a refused stream goes offline and reconnects with a new stream, not a poll
   live.stop();
 });
 
+test('a ledger read for another session reloads the state once (goodqa#15961 review A-7)', async () => {
+  state.pin = { display: 'sess-1' };
+  await live.start();
+  const es = sources[sources.length - 1];
+  fetches.length = 0;
+  es.emit('ledger', { session: 'sess-1', goals: { items: [] }, requirements: { items: [] }, status: {} });
+  assert.deepEqual(fetches, [], 'same session: no reload');
+  es.emit('ledger', { session: 'sess-2', goals: { items: [] }, requirements: { items: [] }, status: {} });
+  await new Promise(resolve => realSet(resolve, 0));
+  assert.deepEqual(fetches, ['/api/state'], 'the pin moved: one state reload');
+  delete state.pin;
+  live.stop();
+});
+
+test('PR 262 v2 F3: a page opened unpinned reloads once when the session arrives, and later writes name it', async () => {
+  state.pin = { display: '' };
+  await live.start();
+  const es = sources[sources.length - 1];
+  fetches.length = 0;
+  state.pin = { display: 'sess-9' };                 // the pin lands after the page opened
+  es.emit('ledger', { session: 'sess-9', goals: { items: [] }, requirements: { items: [] }, status: {} });
+  await new Promise(resolve => realSet(resolve, 0));
+  assert.deepEqual(fetches, ['/api/state'], 'empty to a real session: one state reload');
+  es.emit('ledger', { session: 'sess-9', goals: { items: [] }, requirements: { items: [] }, status: {} });
+  await new Promise(resolve => realSet(resolve, 0));
+  assert.deepEqual(fetches, ['/api/state'], 'the same session again: no second reload');
+  const bodies = [];
+  const ok = { ok: true, status: 200, json: async () => ({}) };
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => { bodies.push(JSON.parse(init?.body || '{}')); return ok; };
+  await live.sendApproval({ ask_id: 'a', digest: 'd', decision: 'approve', client_key: 'k' }).catch(() => {});
+  globalThis.fetch = realFetch;
+  assert.equal(bodies.length, 1);
+  assert.equal(bodies[0].session, 'sess-9', 'the write names the session the page now shows');
+  delete state.pin;
+  live.stop();
+});
+
+test('PR 262 v2 F3: a reload that still finds no pin does not loop', async () => {
+  state.pin = { display: '' };
+  await live.start();
+  const es = sources[sources.length - 1];
+  fetches.length = 0;
+  for (let i = 0; i < 3; i++) {
+    es.emit('ledger', { session: 'sess-7', goals: { items: [] }, requirements: { items: [] }, status: {} });
+    await new Promise(resolve => realSet(resolve, 0));
+  }
+  assert.deepEqual(fetches, ['/api/state'], 'one reload for that session, not one per ledger frame');
+  delete state.pin;
+  live.stop();
+});
+
 test('a 401 on state shows signed out', async () => {
   globalThis.fetch = async () => ({ ok: false, status: 401, json: async () => ({}) });
   await live.start();

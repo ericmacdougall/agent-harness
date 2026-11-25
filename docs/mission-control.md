@@ -22,6 +22,8 @@ One scrolling page with six views (Overview, Requirements, Archive, Activity, To
 
 The top bar always shows the connection (Live, Reconnecting, Offline, Signed out) and the age of the last server message. The page opens one SSE stream and never polls `/api/state` on a timer; after a drop it resyncs once on reconnect. The 3D topology loads only when its tab is first opened (`#gl=off` still forces the static view). Every long text is clamped with a disclosure, and every list shows one page with "show more", so volume does not take over the page.
 
+The Topology tab draws the live org graph (goodqa#15950) through one Topology read. Every node, label, list row, inspector field and animation goes through that read: when it is stale or unknown, nodes are dimmed and marked "last known" or "not known now", nothing moves, and an open inspector refreshes to the same state (or closes when its node is gone). GoodQA ticket reads are part of that read: a failed or malformed ticket read makes it partial, and the work item and its initiative show the last good copy as "last known". A ticket that restricted work is on never reaches the graph by any route (held, named in a task, blocks, blocked-by or parent link): no node, title, edge, count or fetch. Before the first owner read says which tickets are restricted, no ticket is shown or fetched.
+
 ### Requirements, Archive and the archive rule
 
 Asks and requirements are live or archived by one deterministic rule (`archive.py`). The first match wins, each row says which rule and why, nothing is deleted, and an item returns to live on the next read if its cause reverses.
