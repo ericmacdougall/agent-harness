@@ -44,6 +44,7 @@ DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report
                     'model_tiers.py', 'model_tiers.json', 'escalation.py', 'tier_gate.py',
                     # Destructive and config-dump command guard (GoodQA #14471): launcher plus analyser.
                     'command_guard.py', 'command_guard_hook.py', 'redact.py', 'kill_guard.py', 'kill_guard_policy.json', 'merge_gate.py', 'bg_job.py', 'task_recovery.py',
+                    'command_guard_config.py', 'protected_paths.py',  # command_guard imports them per command (goodqa#17155)
                     'copy_hygiene.py', 'lifecycle_cleanup.py',
                     'shell_words.py',  # the shell reader merge_gate and copy_hygiene share (goodqa#16811)
                     # Dropped-owner gate on Codex Stop and its reads (goodqa#14791 P18)

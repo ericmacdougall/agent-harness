@@ -613,6 +613,8 @@ WS = ' \t\r\f\v'
 RESERVED = {'if', 'then', 'else', 'elif', 'do', 'while', 'until', '{', '}', '!', 'time', 'fi', 'done', 'esac',
             'function', 'coproc', ';;'}
 NONEXEC_HEADS = {'for', 'case', 'select'}
+# text that names one of the files of protected_paths.PROTECTED_WRITE_GLOBS: used only when command_guard_config.py itself fails
+CONFIG_FILE_TEXT = re.compile(r'(?i)\.claude[\\/]+(?:claude\.md|settings[^\\/\s\'"]*\.json)|\.codex[\\/]+(?:config\.toml|hooks\.json)')
 
 
 def _unq(text):
@@ -4341,6 +4343,7 @@ class Analyzer:
         head_nonexec = bool(words) and not words[0].quoted and words[0].text in NONEXEC_HEADS
         assigns, rest = self._skip_assigns(words)
         self._note_temp_uses(assigns, rest)
+        self.config_files('judge_command', assigns, rest, cmd, pl, idx, depth)
         # redirections apply to every command, including the bare `> file` truncation
         self.redirects(cmd, pl, idx, bool(rest), depth)
         if head_nonexec:
@@ -4393,6 +4396,19 @@ class Analyzer:
                     if c.words and norm_name(c.words[0].text) == 'tee':
                         for w in _nondash(c.words[1:]):
                             ctx.secret_files.add(norm_path(w.text, ctx).casefold())
+
+    def config_files(self, judge, *args):
+        """CLAUDE.md, settings and Codex config are read, never written (goodqa#17155, command_guard_config.py). A failure of
+        that rule refuses only a command whose text names one of those files; it never blocks another command."""
+        try:
+            import command_guard_config
+            getattr(command_guard_config, judge)(self, *args)
+        except (Blocked, TimeoutError, RecursionError, MemoryError):
+            raise
+        except Exception as error:  # noqa: BLE001 - narrow fallback, see above
+            if CONFIG_FILE_TEXT.search(getattr(self.ctx, 'raw_top', '') or ''):
+                self.ctx.add(LOG_DELETE, 'protected-config', 'the CLAUDE.md and settings rule failed (%s) and the command '
+                             'names one of those files' % type(error).__name__, 'use the Read tool; run command_guard.py doctor')
 
     def bind_loop_var(self, words):
         """`for d in LIST`: bind d to the first protected-looking item (else the first item) so `rm "$d"` resolves."""
@@ -6736,6 +6752,7 @@ class Analyzer:
 
     def code(self, code, depth):
         ctx = self.ctx
+        self.config_files('judge_code', code, depth)
         # destroyer words inside a regex pattern are data: the log-delete text rule reads the code without them
         blanked = blank_regex_patterns(code) if read_only_pattern_script(code) else code
         for f in fallback_scan(code, ctx.c):

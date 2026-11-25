@@ -86,7 +86,9 @@ def blob_id(data):
 # on the paths the table exercises (safe_input via load_policy, redact), and this tool, so a stale self-test cannot pass. Nothing
 # else is pinned: unrelated files (ah.py and the rest) may differ between hosts without making the run unreliable.
 # provenance.py is loaded only by the no-backup override path, which no case in the table reaches.
-PINNED = ("command_guard.py", "command_guard_hook.py", "guard_selftest.py", "redact.py", "safe_input.py")
+# command_guard_config.py and protected_paths.py run for every command (goodqa#17155).
+PINNED = ("command_guard.py", "command_guard_config.py", "command_guard_hook.py", "guard_selftest.py", "protected_paths.py",
+          "redact.py", "safe_input.py")
 
 
 def manifest(hooks_dir, rule="bulk_staging"):
