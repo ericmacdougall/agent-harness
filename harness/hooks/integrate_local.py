@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from git_safety import _bounded_git, git_environment, require_safe_source, unsupported_git_environment
@@ -47,7 +48,7 @@ INDEX_MAX_SECONDS = 30
 INDEX_HEADER_BYTES = 9  # tag, space, six-digit mode, space
 JOURNAL_MAX_ENTRIES = 4096
 JOURNAL_SCAN_SECONDS = 30
-NONEMPTY_UNITTEST = (
+NONEMPTY_UNITTEST_RUNNER = (
     'import sys, threading, unittest\n'
     'class NonemptyResult(unittest.TextTestResult):\n'
     '    def __init__(self, *args, **kwargs):\n'
@@ -87,9 +88,71 @@ NONEMPTY_UNITTEST = (
     '                    and not self._callback_mismatch and self.wasSuccessful())\n'
     'class NonemptyRunner(unittest.TextTestRunner):\n'
     '    resultclass = NonemptyResult\n'
+)
+NONEMPTY_UNITTEST = NONEMPTY_UNITTEST_RUNNER + (
     "program = unittest.main(module=None, argv=['unittest', *sys.argv[1:]], "
     'testRunner=NonemptyRunner, exit=False)\n'
     'sys.exit(0 if program.result.merge_check_passed() else 1)\n'
+)
+NATIVE_TEST_ROOT = "native/codex"
+NATIVE_TEST_DIRS = tuple(NATIVE_TEST_ROOT.split('/'))
+NATIVE_TEST_STAT = (
+    'st_dev', 'st_ino', 'st_mode', 'st_nlink', 'st_uid', 'st_gid',
+    'st_size', 'st_mtime_ns', 'st_ctime_ns',
+)
+NONEMPTY_NATIVE_TEST = NONEMPTY_UNITTEST_RUNNER + (
+    'import importlib.util, json, os, stat\n'
+    'from contextlib import ExitStack\n'
+    'from pathlib import Path\n'
+    f'dirs = {NATIVE_TEST_DIRS!r}\n'
+    f'leaf_fields = {NATIVE_TEST_STAT!r}\n'
+    'path = Path(sys.argv[1])\n'
+    'root = path.parents[len(dirs)]\n'
+    'expected_dirs, expected_leaf = json.loads(sys.argv[2])\n'
+    'def dir_id(info):\n'
+    '    return [info.st_dev, info.st_ino]\n'
+    'def leaf_id(info):\n'
+    '    return [getattr(info, field) for field in leaf_fields]\n'
+    'def same_named_root():\n'
+    '    return root.resolve(strict=True) == root and dir_id(root.lstat()) == expected_dirs[0]\n'
+    'try:\n'
+    '    with ExitStack() as stack:\n'
+    '        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW\n'
+    '        directory = os.open(".", flags)\n'
+    '        stack.callback(os.close, directory)\n'
+    '        if dir_id(os.fstat(directory)) != expected_dirs[0] or not same_named_root():\n'
+    '            raise OSError("Native Python check checkout changed")\n'
+    '        parents = []\n'
+    '        for part, expected in zip(dirs, expected_dirs[1:]):\n'
+    '            parents.append(directory)\n'
+    '            directory = os.open(part, flags, dir_fd=directory)\n'
+    '            stack.callback(os.close, directory)\n'
+    '            if dir_id(os.fstat(directory)) != expected:\n'
+    '                raise OSError("Native Python check directory changed")\n'
+    '        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)\n'
+    '        with os.fdopen(fd, "rb") as source:\n'
+    '            before = os.fstat(source.fileno())\n'
+    '            if not stat.S_ISREG(before.st_mode) or leaf_id(before) != expected_leaf:\n'
+    '                raise OSError("Native Python check source changed")\n'
+    '            data = source.read()\n'
+    '            if leaf_id(os.fstat(source.fileno())) != expected_leaf or len(data) != before.st_size:\n'
+    '                raise OSError("Native Python check source changed while reading")\n'
+    '            code = compile(data, str(path), "exec")\n'
+    '            if not same_named_root() or any(\n'
+    '                dir_id(os.stat(part, dir_fd=parent, follow_symlinks=False)) != expected\n'
+    '                for parent, part, expected in zip(parents, dirs, expected_dirs[1:])\n'
+    '            ) or leaf_id(os.stat(path.name, dir_fd=directory, follow_symlinks=False)) != expected_leaf:\n'
+    '                raise OSError("Native Python check selection changed before execution")\n'
+    '    spec = importlib.util.spec_from_file_location(path.stem, path)\n'
+    '    module = importlib.util.module_from_spec(spec)\n'
+    '    sys.modules[spec.name] = module\n'
+    '    sys.path[:0] = [str(path.parent), os.getcwd()]\n'
+    '    exec(code, vars(module))\n'
+    '    suite = unittest.defaultTestLoader.loadTestsFromModule(module)\n'
+    '    result = NonemptyRunner().run(suite)\n'
+    'except SystemExit:\n'
+    '    sys.exit(1)\n'
+    'sys.exit(0 if result.merge_check_passed() else 1)\n'
 )
 
 
@@ -217,6 +280,45 @@ def node_file(repo, relative):
     if not path.is_file() or not path.resolve(strict=True).is_relative_to(root):
         raise CheckInterpreterError('Node check must name an existing regular file in the repository')
     return path
+
+
+@contextmanager
+def pinned_native_test(repo, name):
+    """Hold the qualified directory/file inodes until the selected check exits."""
+    with ExitStack() as stack:
+        try:
+            root = Path(repo).resolve(strict=True)
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            directory = os.open(root, flags)
+            stack.callback(os.close, directory)
+            info = os.fstat(directory)
+            identities = [[info.st_dev, info.st_ino]]
+            for part in NATIVE_TEST_DIRS:
+                info = os.stat(part, dir_fd=directory, follow_symlinks=False)
+                if stat.S_ISLNK(info.st_mode):
+                    raise CheckInterpreterError('Native Python check path contains a symbolic link')
+                directory = os.open(part, flags, dir_fd=directory)
+                stack.callback(os.close, directory)
+                identities.append([info.st_dev, info.st_ino])
+                opened = os.fstat(directory)
+                if identities[-1] != [opened.st_dev, opened.st_ino]:
+                    raise CheckInterpreterError('Native Python check directory changed')
+            info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if stat.S_ISLNK(info.st_mode):
+                raise CheckInterpreterError('Native Python check path contains a symbolic link')
+            if not stat.S_ISREG(info.st_mode):
+                raise CheckInterpreterError('Native Python check must name a regular file in the repository')
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+            stack.callback(os.close, fd)
+            expected = [getattr(info, field) for field in NATIVE_TEST_STAT]
+            opened = os.fstat(fd)
+            if expected != [getattr(opened, field) for field in NATIVE_TEST_STAT]:
+                raise CheckInterpreterError('Native Python check source changed')
+        except CheckInterpreterError:
+            raise
+        except OSError:
+            raise CheckInterpreterError('Native Python check could not bind its repository path') from None
+        yield root, root.joinpath(*NATIVE_TEST_DIRS, name), json.dumps([identities, expected])
 
 
 def node_reporter():
@@ -514,6 +616,14 @@ def run(repo, command, *, timeout=None, discard_output=False, env=None, sink=Non
         return run_node(repo, command, environment, timeout, sink)
     executed = command
     if command and command[0] in CHECK_PYTHON_NAMES:
+        options = command[1:]
+        if focused_unittest(options) and options[4] == NATIVE_TEST_ROOT:
+            # Use isolated stdlib and the selected source only. An ordinary
+            # discovery pass would import nested packages even with a literal -p.
+            with pinned_native_test(repo, options[6]) as (root, selected, identity):
+                interpreter = resolve_check_interpreter(command[0], environment)
+                return run_process([interpreter, '-I', '-B', '-c', NONEMPTY_NATIVE_TEST, str(selected), identity],
+                                   cwd=root, timeout=timeout, env=environment, **output_options)
         executed = [resolve_check_interpreter(command[0], environment), *command[1:]]
     if (discard_output and len(command) >= 4 and command[0] in CHECK_PYTHON_NAMES
             and command[1:4] == ['-m', 'unittest', 'discover']):
@@ -578,12 +688,9 @@ FOCUSED_TEST_FILE = re.compile(r"test_[A-Za-z0-9_]{1,100}\.py")
 
 
 def focused_unittest(options):
-    """`-m unittest discover -s tests -p <one literal test_*.py name>`: one file name, no glob, path or extra argv
-    (discovery matches that name in tests/ and its subpackages).
-
-    A name that matches no file is still safe: run() wraps every `-m unittest discover` check so that an empty or
-    all-skipped discovery fails (Python before 3.12 would otherwise exit zero)."""
-    return (len(options) == 7 and options[:6] == ["-m", "unittest", "discover", "-s", "tests", "-p"]
+    """Allow one literal test name in each known root with the same exact argv."""
+    return (len(options) == 7 and options[:4] == ["-m", "unittest", "discover", "-s"]
+            and options[4] in {"tests", NATIVE_TEST_ROOT} and options[5] == "-p"
             and FOCUSED_TEST_FILE.fullmatch(options[6]) is not None)
 
 

@@ -238,6 +238,177 @@ class CheckInterpreter(unittest.TestCase):
             self.run_checks_in({'test_a.py': bad}, 'test_a.py')
         self.assertEqual(raised.exception.status, 'DELIVERED_CHECK_FAILED')
 
+    NATIVE_CHECK = 'python3 -m unittest discover -s native/codex -p test_build_proof.py'
+
+    def run_native_check(self, repo):
+        checks = self.delivery.approved_commands([self.NATIVE_CHECK])
+        bindir = self.root / 'bin'
+        bindir.mkdir(exist_ok=True)
+        if not (bindir / 'python3').exists():
+            os.symlink(sys.executable, bindir / 'python3')
+        with patch.dict(os.environ, {'PATH': str(bindir) + os.pathsep + os.environ['PATH']}):
+            self.delivery.run_checks(repo, [], checks, 60, self.root / 'logs')
+
+    def test_delivery_runs_exact_native_file_with_repository_imports(self):
+        repo = self.root / 'repo'
+        native = repo / 'native' / 'codex'
+        package = native / 'nested'
+        package.mkdir(parents=True)
+        (repo / 'project_data.py').write_text('base = 19\n')
+        (native / 'fixture_data.py').write_text('increment = 23\n')
+        (native / 'test_build_proof.py').write_text(
+            'import unittest\nfrom project_data import base\nfrom fixture_data import increment\n'
+            'class T(unittest.TestCase):\n    def test_literal(self):\n'
+            '        self.assertEqual(base + increment, 42)\n')
+        (package / '__init__.py').write_text('raise AssertionError("nested package imported")\n')
+        (package / 'test_build_proof.py').write_text('raise AssertionError("nested test imported")\n')
+        (native / 'test_other.py').write_text('raise AssertionError("unselected sibling imported")\n')
+        self.run_native_check(repo)
+
+    def test_delivery_native_check_requires_a_non_skipped_success(self):
+        cases = {
+            'missing': None,
+            'empty': 'import unittest\n',
+            'early exit': 'raise SystemExit(0)\n',
+            'skipped': 'import unittest\n@unittest.skip("fixture")\nclass T(unittest.TestCase):\n'
+                       '    def test_skip(self):\n        self.fail("should be skipped")\n',
+            'fail': 'import unittest\nclass T(unittest.TestCase):\n'
+                    '    def test_fail(self):\n        self.assertEqual(1, 2)\n',
+        }
+        for label, contents in cases.items():
+            with self.subTest(label=label):
+                repo = self.root / label
+                target = repo / 'native' / 'codex' / 'test_build_proof.py'
+                target.parent.mkdir(parents=True)
+                if contents is not None:
+                    target.write_text(contents)
+                with self.assertRaises(self.delivery.DeliveryError) as raised:
+                    self.run_native_check(repo)
+                self.assertEqual(raised.exception.status, 'DELIVERED_CHECK_FAILED')
+
+    def test_delivery_native_paths_refuse_links_and_special_files_before_spawn(self):
+        repo = self.root / 'repo'
+        native = repo / 'native'
+        proof_dir = native / 'codex'
+        selected = proof_dir / 'test_build_proof.py'
+        external = self.root / 'external'
+        (external / 'codex').mkdir(parents=True)
+        external_test = external / 'codex' / selected.name
+        external_test.write_text(self.GOOD)
+        repo.mkdir()
+        cases = ((native, external), (proof_dir, external / 'codex'), (selected, external_test))
+        for link, target in cases:
+            with self.subTest(link=link.name):
+                link.parent.mkdir(parents=True, exist_ok=True)
+                link.symlink_to(target)
+                with patch.dict(self.delivery.run_check.__globals__, {'run_process': self.unexpected_native_process}):
+                    with self.assertRaises(self.delivery.DeliveryError) as raised:
+                        self.run_native_check(repo)
+                self.assertEqual(raised.exception.status, 'DELIVERED_CHECK_FAILED')
+                self.assertIn('symbolic link', raised.exception.message)
+                link.unlink()
+        os.mkfifo(selected)
+        with patch.dict(self.delivery.run_check.__globals__, {'run_process': self.unexpected_native_process}):
+            with self.assertRaises(self.delivery.DeliveryError) as raised:
+                self.run_native_check(repo)
+        self.assertEqual(raised.exception.status, 'DELIVERED_CHECK_FAILED')
+        self.assertIn('regular file', raised.exception.message)
+
+    def unexpected_native_process(self, *args, **kwargs):
+        self.fail('Invalid native test path reached the process runner')
+
+    def test_delivery_native_leaf_changed_to_link_after_path_check_is_refused(self):
+        repo = self.root / 'repo'
+        selected = repo / 'native' / 'codex' / 'test_build_proof.py'
+        selected.parent.mkdir(parents=True)
+        selected.write_text(self.GOOD)
+        escaped = self.root / 'escape.py'
+        escaped.write_text(self.GOOD)
+        run = self.delivery.run_check.__globals__['run_process']
+
+        def replace_before_loader(command, **kwargs):
+            if command[1:4] == ['-I', '-B', '-c']:
+                selected.unlink()
+                selected.symlink_to(escaped)
+            return run(command, **kwargs)
+
+        with patch.dict(self.delivery.run_check.__globals__, {'run_process': replace_before_loader}):
+            with self.assertRaises(self.delivery.DeliveryError) as raised:
+                self.run_native_check(repo)
+        self.assertEqual(raised.exception.status, 'DELIVERED_CHECK_FAILED')
+        self.assertTrue(selected.is_symlink(), 'fixture missed the loader boundary')
+
+    def test_delivery_native_rejects_identity_changes_before_module_exec(self):
+        for change in ('root-directory', 'root-symlink-back', 'regular-leaf', 'same-leaf-write'):
+            with self.subTest(change=change):
+                base = self.root / change
+                repo = base / 'repo'
+                selected = repo / 'native' / 'codex' / 'test_build_proof.py'
+                selected.parent.mkdir(parents=True)
+                marker = base / 'foreign-code-ran'
+                marked = f'from pathlib import Path\nPath({str(marker)!r}).touch()\n{self.GOOD}'
+                original = self.GOOD + '#' + ' ' * (len(marked) - len(self.GOOD) - 1)
+                selected.write_text(marked if change == 'root-symlink-back' else original)
+                initial = selected.stat()
+                run = self.delivery.run_check.__globals__['run_process']
+                attempted = []
+
+                def substitute_before_loader(command, **kwargs):
+                    if command[1:4] == ['-I', '-B', '-c']:
+                        attempted.append(change)
+                        if change in {'root-directory', 'root-symlink-back'}:
+                            parked = repo.with_name('parked')
+                            repo.rename(parked)
+                            if change == 'root-symlink-back':
+                                repo.symlink_to(parked, target_is_directory=True)
+                            else:
+                                selected.parent.mkdir(parents=True)
+                                selected.write_text(marked)
+                        elif change == 'regular-leaf':
+                            replacement = selected.with_name('replacement.py')
+                            replacement.write_text(marked)
+                            replacement.replace(selected)
+                            self.assertNotEqual(selected.stat().st_ino, initial.st_ino)
+                        else:
+                            selected.write_text(marked)
+                            os.utime(selected, ns=(initial.st_atime_ns, initial.st_mtime_ns))
+                            current = selected.stat()
+                            self.assertEqual((current.st_ino, current.st_mtime_ns, current.st_size),
+                                             (initial.st_ino, initial.st_mtime_ns, initial.st_size))
+                            self.assertNotEqual(current.st_ctime_ns, initial.st_ctime_ns)
+                    return run(command, **kwargs)
+
+                with patch.dict(self.delivery.run_check.__globals__, {'run_process': substitute_before_loader}):
+                    with self.assertRaises(self.delivery.DeliveryError) as raised:
+                        self.run_native_check(repo)
+                self.assertEqual(raised.exception.status, 'DELIVERED_CHECK_FAILED')
+                self.assertEqual(attempted, [change], 'fixture missed the loader boundary')
+                self.assertFalse(marker.exists(), 'replacement code was evaluated')
+
+    def test_delivery_native_arguments_keep_exact_literal_selection(self):
+        prefix = 'python3 -m unittest discover -s '
+        cases = [
+            prefix + 'native/codex',
+            prefix + '../native/codex -p test_build_proof.py',
+            prefix + './native/codex -p test_build_proof.py',
+            prefix + 'native//codex -p test_build_proof.py',
+            prefix + 'native/codex/ -p test_build_proof.py',
+            prefix + '/native/codex -p test_build_proof.py',
+            prefix + 'native/elsewhere -p test_build_proof.py',
+            self.NATIVE_CHECK + ' -v',
+            self.NATIVE_CHECK + ' -t .',
+            self.NATIVE_CHECK + ' ; false',
+            self.NATIVE_CHECK.replace('test_build_proof.py', "'test_*.py'"),
+            self.NATIVE_CHECK.replace('test_build_proof.py', '../test_build_proof.py'),
+            self.NATIVE_CHECK.replace('test_build_proof.py', 'nested/test_build_proof.py'),
+            self.NATIVE_CHECK.replace('test_build_proof.py', "'test_build_proof.py;false'"),
+        ]
+        for command in cases:
+            with self.subTest(command=command):
+                with self.assertRaises(self.delivery.DeliveryError) as raised:
+                    self.delivery.approved_commands([command])
+                self.assertEqual((raised.exception.status, raised.exception.code), ('BLOCKED_POLICY', 2))
+
 
 class TailRedaction(unittest.TestCase):
     @classmethod
