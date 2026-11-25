@@ -4,8 +4,10 @@ F11 was a gating argument (forced=recorded_guard(row) at --rollback and --resume
 test derives, from ah_install.py's own AST, every guard_gate call site, the call itself, each gating argument it
 passes (with a value that does not already remove it) and each condition that skips it, and fails when
 tests/mutants_guard_install_gate.py has no variant for one of them (GATE_COVERAGE), when a variant does not remove what
-it is listed for, or when a variant names no end-to-end test (KILLERS) going through that route's public entry. The
-mutant runner then proves each named test fails against its variant. This module is not in the runner's SUITES: it
+it is listed for, or when a variant names no end-to-end test (KILLERS) going through that route's public entry. It
+also fails when a guard_gate parameter (keyword-only included) is neither in GATING nor in the runner's NON_GATING
+list, which maps the parameters that name the command (host, ref, ticket) to their stamp-key variants. The mutant
+runner then proves each named test fails against its variant. This module is not in the runner's SUITES: it
 reads the source, so it would fail in every call-site variant's tree and "kill" variants no behaviour test noticed.
 """
 import ast
@@ -37,14 +39,26 @@ def _value(node):
         return node  # not a literal: an expression, which a removal would replace
 
 
+def _gate_def(tree):
+    return next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "guard_gate")
+
+
+def parameters(source: str) -> list:
+    """Every parameter of guard_gate: positional, keyword-only, *args and **kwargs."""
+    a = _gate_def(ast.parse(source)).args
+    return ([x.arg for x in a.posonlyargs + a.args + a.kwonlyargs] + ([a.vararg.arg] if a.vararg else [])
+            + ([a.kwarg.arg] if a.kwarg else []))
+
+
 @functools.lru_cache(maxsize=64)
 def call_sites(source: str) -> tuple:
     """((function, call node, {param: value or expression}, [skip conditions], dead), ...) of every guard_gate call.
     Cached per source text; callers only read the result."""
     tree = ast.parse(source)
-    gate = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "guard_gate")
-    params = [a.arg for a in gate.args.args]
-    defaults = dict(zip(params[len(params) - len(gate.args.defaults):], (_value(d) for d in gate.args.defaults)))
+    a = _gate_def(tree).args
+    params = [x.arg for x in a.posonlyargs + a.args]  # the ones a positional argument can fill
+    defaults = dict(zip(params[len(params) - len(a.defaults):], (_value(d) for d in a.defaults)))
+    defaults.update({k.arg: _value(d) for k, d in zip(a.kwonlyargs, a.kw_defaults) if d is not None})
     out = []
     for func in (n for n in tree.body if isinstance(n, ast.FunctionDef)):
         parents = {}
@@ -138,9 +152,61 @@ def problems(source: str, coverage: dict, variants: list, killers: dict) -> list
     return out
 
 
+def unclassified(source: str, non_gating: dict, variants: list, killers: dict) -> list:
+    """Every guard_gate parameter is in GATING (inventoried per call site above) or in NON_GATING, with variants that
+    exist, still apply and name an end-to-end test, or with a written reason for having none."""
+    out = []
+    params = parameters(source)
+    by_name = {v[0]: v for v in variants}
+    for p in params:
+        if p not in GATING and p not in non_gating:
+            out.append("guard_gate parameter %s is neither gating nor named non-gating" % p)
+    for p in sorted((set(GATING) | set(non_gating)) - set(params)):
+        out.append("stale entry %s: guard_gate has no such parameter" % p)
+    for p, cover in sorted(non_gating.items()):
+        if isinstance(cover, str):
+            if not cover.strip():
+                out.append("non-gating %s: no variant and no reason" % p)
+            continue
+        if not cover:
+            out.append("non-gating %s: no variant and no reason" % p)
+        for n in cover:
+            v = by_name.get(n)
+            if v is None:
+                out.append("non-gating %s: unknown variant %r" % (p, n))
+            elif (ROOT / v[1]).read_text().count(v[2]) != 1:
+                out.append("non-gating %s: variant %r's text no longer occurs exactly once" % (p, n))
+            elif not killers.get(n):
+                out.append("non-gating %s: variant %r names no end-to-end test" % (p, n))
+    return out
+
+
 class Coverage(unittest.TestCase):
     def setUp(self):
         self.source = SOURCE.read_text()
+
+    def test_every_guard_gate_parameter_is_classified(self):
+        self.assertEqual(unclassified(self.source, mutants.NON_GATING, mutants.VARIANTS, mutants.KILLERS), [])
+        self.assertEqual(set(parameters(self.source)), set(GATING) | set(mutants.NON_GATING))
+
+    def test_an_unclassified_parameter_is_reported(self):
+        old = "def guard_gate(host, ref, files, ticket, home, kind_, allow_older=False, forced=(), allow_remote=False):\n"
+        self.assertEqual(self.source.count(old), 1)
+        for new, name in ((old.replace("):", ", *, skip_receipt=False):"), "skip_receipt"),  # keyword-only
+                          (old.replace("allow_remote=False", "allow_remote=False, **extra"), "extra")):
+            with self.subTest(name):
+                self.assertIn("guard_gate parameter %s is neither gating nor named non-gating" % name,
+                              unclassified(self.source.replace(old, new), mutants.NON_GATING, mutants.VARIANTS, mutants.KILLERS))
+        non_gating = dict(mutants.NON_GATING, ticket=(), home="")
+        found = unclassified(self.source, non_gating, mutants.VARIANTS, mutants.KILLERS)
+        self.assertIn("non-gating ticket: no variant and no reason", found)
+        self.assertIn("non-gating home: no variant and no reason", found)
+        killers = {k: v for k, v in mutants.KILLERS.items() if k != "stamp key ignores the host"}
+        self.assertIn("non-gating host: variant 'stamp key ignores the host' names no end-to-end test",
+                      unclassified(self.source, mutants.NON_GATING, mutants.VARIANTS, killers))
+        self.assertIn("stale entry gone: guard_gate has no such parameter",
+                      unclassified(self.source, dict(mutants.NON_GATING, gone=("stamp key ignores the host",)),
+                                   mutants.VARIANTS, mutants.KILLERS))
 
     def test_every_gating_control_has_a_variant_and_an_end_to_end_test(self):
         self.assertEqual(problems(self.source, mutants.GATE_COVERAGE, mutants.VARIANTS, mutants.KILLERS), [])

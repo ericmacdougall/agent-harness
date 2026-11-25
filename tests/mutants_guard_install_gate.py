@@ -118,6 +118,19 @@ VARIANTS = [
      '            raise Unreadable("%s: %s" % (name, type(error).__name__)) from None\n', "            continue\n"),
     ("data and run-by-name files unlisted", GF, '    "dropbox_budget.conf", "domain_checklists.json",\n',
      '    "domain_checklists.json",\n'),
+    # the stamp key: main's stamp covers that exact host, ref, file set and ticket (the non-gating call-site arguments)
+    ("stamp key ignores the host", GF,
+     '    return [str(host), str(ref), ",".join(sorted(str(f) for f in (files or ()))), str(ticket)]\n',
+     '    return [str(ref), ",".join(sorted(str(f) for f in (files or ()))), str(ticket)]\n'),
+    ("stamp key ignores the ref", GF,
+     '    return [str(host), str(ref), ",".join(sorted(str(f) for f in (files or ()))), str(ticket)]\n',
+     '    return [str(host), ",".join(sorted(str(f) for f in (files or ()))), str(ticket)]\n'),
+    ("stamp key ignores the files", GF,
+     '    return [str(host), str(ref), ",".join(sorted(str(f) for f in (files or ()))), str(ticket)]\n',
+     '    return [str(host), str(ref), str(ticket)]\n'),
+    ("stamp key ignores the ticket", GF,
+     '    return [str(host), str(ref), ",".join(sorted(str(f) for f in (files or ()))), str(ticket)]\n',
+     '    return [str(host), str(ref), ",".join(sorted(str(f) for f in (files or ())))]\n'),
     # launch_check
     ("no terminal needed", LC, '        if not facts["stdin_tty"]:\n', "        if False:\n"),
     ("agent variables ignored", LC, "        if marker:\n", "        if False:\n"),
@@ -187,6 +200,10 @@ KILLERS = {
     "ref gate ignores the ref's guard files": (G + "test_a_file_that_is_a_guard_file_only_at_the_ref_is_gated",),
     "ref gate: ssh or a multiplexer always allowed": (G + "test_a_ref_only_install_over_ssh_needs_the_users_flag",),
     "ref-only guard files left out of the record": (G + "test_the_record_lists_the_refs_guard_files_too",),
+    "stamp key ignores the host": (G + "test_a_stamp_covers_only_its_exact_command",),
+    "stamp key ignores the ref": (G + "test_a_stamp_covers_only_its_exact_command",),
+    "stamp key ignores the files": (G + "test_a_stamp_covers_only_its_exact_command",),
+    "stamp key ignores the ticket": (G + "test_a_stamp_covers_only_its_exact_command",),
     "the refusal names the flag": ("LaunchCheck.test_ssh_or_a_multiplexer_refuses_unless_the_user_typed_the_flag",
                                    G + "test_an_install_over_ssh_or_in_a_multiplexer_needs_the_users_flag",
                                    G + "test_a_resume_over_ssh_or_in_a_multiplexer_needs_the_users_flag",
@@ -200,7 +217,7 @@ KILLERS = {
 # the source and fails on a missing or stale key.
 GATE_COVERAGE = {
     ("install_files", "call"): ("gate never consulted",),
-    ("install_files", "files"): ("install: no files reach the gate",),
+    ("install_files", "files"): ("install: no files reach the gate", "stamp key ignores the files"),  # also a stamp-key part
     ("install_files", "allow_older"): ("install: --allow-older not passed to the gate",),
     ("install_files", "allow_remote"): ("install: ssh or a multiplexer always allowed",),
     ("install_files", "skip: dry_run"): ("a dry run writes",),
@@ -222,6 +239,17 @@ GATE_COVERAGE = {
     ("_run", "allow_remote"): ("ref gate: ssh or a multiplexer always allowed",),
     ("_run", "skip: not dry_run and gate is None and ref_guard"): ("a dry run writes",
                                                                    "ref-only guard files left out of the record"),
+}
+
+# guard_gate's parameters that are not in the coverage test's GATING list: they name the command rather than lift or
+# narrow the gate, so GATE_COVERAGE does not inventory them per call site. Each maps to the variants that drop it from
+# main's stamp key (host, ref and ticket, like files, are parts of guard_files.install_stamp_parts), or to the reason it
+# has none. tests/test_guard_gate_coverage.py fails on a guard_gate parameter, keyword-only included, in neither list.
+NON_GATING = {
+    "host": ("stamp key ignores the host",),
+    "ref": ("stamp key ignores the ref",),
+    "ticket": ("stamp key ignores the ticket",),
+    "home": "it only says where the stamp and the audit are read; every call site passes the installer's own home",
 }
 
 FAILED = re.compile(r"^(?:FAIL|ERROR): (\w+) \(([\w.]+)\)", re.M)
