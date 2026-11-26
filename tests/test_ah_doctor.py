@@ -26,9 +26,11 @@ LABEL = re.compile(r'echo "([A-Za-z0-9_]+)=\$\?"')
 class Fake:
     """A runner: sandbox calls answer from `outcome` (proven | leak | twin_refused | nosandbox), the rest canned."""
 
-    def __init__(self, outcome="proven", loaded=(), gh_auth=0, visibility="PRIVATE", python="3.13.1"):
+    def __init__(self, outcome="proven", loaded=(), gh_auth=0, visibility="PRIVATE", python="3.13.1", repos=None,
+                 rulesets=None):
         self.outcome, self.loaded, self.gh_auth = outcome, set(loaded), gh_auth
         self.visibility, self.python, self.calls = visibility, python, []
+        self.repos, self.rulesets = repos, rulesets or {}
 
     def __call__(self, argv, env=None, cwd=None, timeout=None):
         self.calls.append(list(argv))
@@ -57,6 +59,11 @@ class Fake:
             return self.gh_auth, "", ""
         if name == "gh" and argv[1:3] == ["repo", "view"]:
             return 0, self.visibility + "\n", ""
+        if name == "gh" and argv[1:3] == ["repo", "list"]:
+            return (0, json.dumps(self.repos), "") if self.repos is not None else (1, "", "HTTP 401")
+        if name == "gh" and argv[1] == "api" and argv[2].endswith("/rulesets"):
+            slug = argv[2][len("repos/"):-len("/rulesets")]
+            return 0, json.dumps([{"name": n} for n in self.rulesets.get(slug, [])]), ""
         if name.startswith("python"):
             if "version_info" in argv[-1]:
                 return 0, self.python + "\n", ""
@@ -274,8 +281,56 @@ class Checks(Base):
 
     def test_python_and_gh(self):
         self.assertEqual(self.result(self.run_doctor(Fake(python="3.8.10")), "python")["status"], "FAILED")
-        self.assertEqual(self.result(self.run_doctor(Fake(gh_auth=1)), "gh")["status"], "FAILED")
+        with mock.patch.object(ah_doctor, "account_home", return_value=os.path.realpath(self.home)):
+            self.assertEqual(self.result(self.run_doctor(Fake(gh_auth=1)), "gh")["status"], "FAILED")
         self.assertEqual(self.result(self.run_doctor(), "gh")["status"], "OK")
+
+    def test_gh_in_a_temporary_home_on_macos_is_unproven_not_failed(self):
+        """The keychain search follows $HOME, so gh cannot log in from a temporary home (plan 6.2 step 4)."""
+        with mock.patch.object(ah_doctor, "account_home", return_value="/Users/someone-else"):
+            r = self.result(self.run_doctor(Fake(gh_auth=1)), "gh")
+        self.assertEqual(r["status"], "UNPROVEN")
+        self.assertIn("keychain", r["summary"])
+
+    def test_each_launchd_label_is_checked_once(self):
+        labels = ah_doctor._labels(ah_doctor.Ctx(self.home, Fake(), "darwin", self.which, None, None, None, 0, {}))
+        self.assertEqual(len(labels), len(set(labels)), labels)
+        fake = Fake()
+        self.run_doctor(fake, roles=())
+        prints = [c[-1] for c in fake.calls if os.path.basename(c[0]) == "launchctl"]
+        self.assertEqual(len(prints), len(set(prints)), prints)
+
+    def test_credential_shaped_files_outside_the_deny_list_are_listed(self):
+        (self.home / ".config" / "acme").mkdir(parents=True)
+        (self.home / ".config" / "acme" / "api-token").write_text("x")
+        (self.home / ".config" / "billing.env").write_text("x")
+        (self.home / ".config" / "goodqa").mkdir()
+        (self.home / ".config" / "goodqa" / "user-token").write_text("x")   # denied: not listed
+        (self.home / ".config" / "app.json").write_text("{}")             # not credential-shaped
+        (self.home / ".vault-token").write_text("x")
+        r = self.result(self.run_doctor(roles=()), "secrets-readable")
+        self.assertEqual(r["status"], "FAILED")
+        for name in ("~/.config/acme/api-token", "~/.config/billing.env", "~/.vault-token"):
+            self.assertIn(name, r["detail"]["paths"])
+        self.assertFalse([p for p in r["detail"]["paths"] if "goodqa" in p or "app.json" in p], r["detail"]["paths"])
+        (self.home / ".agent-harness" / "local.json").write_text(json.dumps(
+            {"sandbox_extra_deny_read": ["~/.config/acme", "~/.config/billing.env", "~/.vault-token"]}))
+        self.assertEqual(self.result(self.run_doctor(roles=()), "secrets-readable")["status"], "OK")
+
+    def test_active_repositories_without_the_merge_rule_fail(self):
+        now = ah_doctor.parse_iso("2026-11-26T00:00:00Z")
+        repos = [{"nameWithOwner": "o/active", "pushedAt": "2026-11-20T00:00:00Z", "viewerPermission": "ADMIN"},
+                 {"nameWithOwner": "o/guarded", "pushedAt": "2026-11-25T00:00:00Z", "viewerPermission": "ADMIN"},
+                 {"nameWithOwner": "o/old", "pushedAt": "2025-01-01T00:00:00Z", "viewerPermission": "ADMIN"},
+                 {"nameWithOwner": "x/theirs", "pushedAt": "2026-11-25T00:00:00Z", "viewerPermission": "WRITE"}]
+        fake = Fake(repos=repos, rulesets={"o/guarded": ["harness-merge-rule"], "o/active": ["other"]})
+        r = self.result(self.run_doctor(fake, roles=(), now=now), "rulesets")
+        self.assertEqual(r["status"], "FAILED")
+        self.assertEqual(r["detail"]["missing"], ["o/active"])
+        self.assertIn("ah repo protect o/active", r["summary"])
+        fake = Fake(repos=repos, rulesets={"o/guarded": ["harness-merge-rule"], "o/active": ["harness-merge-rule"]})
+        self.assertEqual(self.result(self.run_doctor(fake, roles=(), now=now), "rulesets")["status"], "OK")
+        self.assertEqual(self.result(self.run_doctor(Fake(), roles=(), now=now), "rulesets")["status"], "UNPROVEN")
 
     def test_backup(self):
         r = self.result(self.run_doctor(), "backup")
@@ -392,6 +447,20 @@ class Cli(Base):
     def test_bad_role(self):
         code, _, err = self.cli(["--role", "owner"])
         self.assertEqual(code, 2)
+
+    def test_no_probes_runs_the_checks_and_creates_nothing(self):
+        """For a real host: no probe file in ~/.agent-harness/work or $HOME, and no sandbox run at all."""
+        self.secret()
+        before = sorted(str(p) for p in self.home.rglob("*"))
+        for argv in (["--no-probes", "--json"], ["--role", "none", "--json"]):
+            fake = Fake()
+            code, out, _ = self.cli(argv, runner=fake)
+            ids = [r["id"] for r in json.loads(out)["results"]]
+            self.assertIn("switch", ids)
+            self.assertFalse([i for i in ids if i.startswith(("probe.", "codex."))], ids)
+            self.assertFalse([c for c in fake.calls if os.path.basename(c[0]) in ("sandbox-exec", "bwrap")])
+        self.assertEqual(sorted(str(p) for p in self.home.rglob("*")), before)
+        self.assertEqual(self.cli(["--no-probes", "--codex"])[0], 2)
 
 
 if __name__ == "__main__":

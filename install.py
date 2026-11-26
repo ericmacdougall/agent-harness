@@ -107,8 +107,20 @@ def managed_scripts(claude: Path) -> set[str]:
 SUBAGENT_MATCHER = ".*"
 # Must equal prod_delete_guard.MATCHER (tests/test_prod_delete_guard.py pins it): the named database tools only. No Bash:
 # a Bash call starts no harness hook (docs/direction.md).
-PROD_DELETE_MATCHER = r".*d1_database_query|mcp__.*__(execute_sql|run_sql|query|sql)|mcp__.*__hyperdrive_.*"
+PROD_DELETE_MATCHER = r"^(?:.*d1_database_query|mcp__.+__(?:execute_sql|run_sql|sql)|mcp__(?!claude_ai_Claude_Docs__).+__query|mcp__.+__hyperdrive_.+)$"
 REMOVED_IN = 1001  # the release that removed the guards, gates, services and flags below (docs/direction.md)
+# Files of the release 1001 kill list that an upgrade finds in ~/.claude/hooks. They are unwired, but agents and people
+# read them and docs pointed at them, so an --apply moves them into this install's backup folder (never deletes).
+RETIRED_HOOK_FILES = tuple(f"{name}.py" for name in (
+    "command_guard", "command_guard_hook", "guard_selftest", "kill_guard", "heavy_job_guard", "agent_gate", "run_probe",
+    "run_capped", "copy_hygiene", "lifecycle_cleanup", "shell_words", "shellwords", "provenance_hooks", "tier_gate",
+    "mission_coverage", "mission_gate", "goals_view", "status_truth", "stop_blocks", "ask_reminders", "ahd", "ahd_peek",
+    "doctor", "wal_cadence", "worktree_hygiene", "ledger_reminder", "bg_lint", "idle_guard", "mc_inbox",
+    "central_decisions", "review_map", "remote_delete", "remote_delete_agent", "ah_install", "merge_gate",
+    "commit_policy", "escalation", "spec_flow", "resource_budget", "caller_identity", "native_main")) + (
+    "kill_guard_policy.json", "ahd_policy.json", "rules.json", "hooks_manifest.json", "ahc_release.json",
+    "commit_policy.json", "spec_policy.json", "spec_template.md", "resource_limits.json", "heavy_job_guard.json",
+    "command_guard.json", "provenance_hooks.json")
 
 
 def prod_delete_matcher() -> str:
@@ -762,6 +774,10 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, hooks_only: bool 
             raise
         if record_gate_epoch(claude.parent, prior_gate):
             changes.append("recorded the dropped-owner gate install time")
+        moved = retire_old_files(pins, claude / "hooks", backups, {d.name for _, d in files})
+        if moved:
+            changes.append(f"moved {len(moved)} retired file(s) of the release 1001 kill list to {backups / 'retired'}: "
+                           + ", ".join(moved[:6]) + (" ..." if len(moved) > 6 else ""))
         if stash_record is not None:
             switch.save_stash(claude.parent, "claude", stash_record)
             changes.append("harness is OFF: the instruction block is kept in ~/.agent-harness/off-stash until `harness on`")
@@ -769,6 +785,35 @@ def install(home: Path, apply: bool, durable_tmp: bool = True, hooks_only: bool 
         return changes
     finally:
         pins.close()
+
+
+MERGE_RULE_NOTE = ("merge rule: this release has no merge-gate hook; GitHub's harness-merge-rule ruleset is the gate, and "
+                   "a repository without it has no merge control at all. `ah doctor --no-probes` lists the active "
+                   "repositories that lack it; protect each with `ah repo protect OWNER/REPO` (docs/merge-rule.md)")
+
+
+def retire_old_files(pins, hooks: Path, backups: Path, shipped: set) -> list:
+    """Move the kill-list files left in ~/.claude/hooks into backups/retired (a rename on one volume; nothing is
+    deleted). A symlink or anything not a regular file is left where it is."""
+    moved = []
+    target = backups / "retired"
+    for name in RETIRED_HOOK_FILES:
+        if name in shipped:
+            continue
+        try:
+            info = os.stat(name, dir_fd=pins.fd(hooks), follow_symlinks=False)
+        except (OSError, KeyError):
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            continue
+        if not moved:
+            pins.create(target)
+        try:
+            os.rename(name, name, src_dir_fd=pins.fd(hooks), dst_dir_fd=pins.fd(target))
+        except OSError:
+            continue
+        moved.append(name)
+    return moved
 
 
 def record_release(claude: Path, switch, release: int, files: list[Path], hooks_only: bool, backup: str) -> str:
@@ -860,8 +905,11 @@ def sandbox_status(home: Path, apply: bool) -> str:
     written = []
     try:
         switch = switch_module()
+        parked = switch.is_off(home)   # while OFF the files wait in the off stash; `harness on` puts them in place
         for role in sandbox.ROLES:
             path = Path(sandbox.installed_path(home, role))
+            if parked:
+                path = switch.sandbox_stash_dir(home) / path.name
             data = sandbox_json(sandbox.claude_settings(role, home=home))
             if not apply:
                 written.append(path.name)
@@ -874,6 +922,9 @@ def sandbox_status(home: Path, apply: bool) -> str:
             written.append(path.name)
     except (OSError, ValueError) as error:
         return f"sandbox profiles: could not write ({error.__class__.__name__}: {str(error)[:160]})"
+    if parked:
+        return (f"sandbox profiles: {'wrote' if apply else 'would write'} {', '.join(written)} in "
+                f"{switch.sandbox_stash_dir(home)} (the harness is OFF; `harness on` puts them in place)")
     where = home / ".agent-harness" / "sandbox"
     return (f"sandbox profiles: {'wrote' if apply else 'would write'} {', '.join(written)} in {where} "
             "(inert until a session is launched with --settings; see docs/sandbox.md)")
@@ -1118,6 +1169,7 @@ def main(argv=None) -> None:
             print("Run with --apply to install. Existing files will be backed up.")
         return
     print(f"  {sandbox_status(args.home, args.apply)}")
+    print(f"  {MERGE_RULE_NOTE}")
     print(f"  {scratch_status(args.home, args.apply, durable_tmp)}")
     print(f"  {netwatch_status(args.home, args.apply, args.netwatch)}")
     print(f"  {log_backup_status(args.home, args.apply, args.log_backup)}")

@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""owner_inbox: inject unread stall-watcher / owner decision notes into a session.
+"""owner_inbox: inject unread answer notes (the owner's, or a supervisor's) into a session.
 
 Claude Desktop and Codex Desktop sessions cannot receive typed stall-watcher answers.
-Fleet Ops writes complete standalone notes to:
+The owner, Fleet Ops or a supervisor writes complete standalone notes to:
 
-    ~/.agent-harness/work/<session_id>/OWNER-DECISION-*.md
-    ~/.agent-harness/work/<session_id>/inbox/*.md (and *.txt)
+    ~/.agent-harness/inbox/<session_id>/*.md (and *.txt; OWNER-DECISION-*.md names are kept)
+
+That folder is a record path (sandbox_base.json): a worker's or reviewer's sandbox cannot write it, so one misled
+agent cannot plant a note in every session. Notes under the session's own work folder are no longer read: any
+worker can write there (release 1001 red team). Without a sandbox nothing protects either folder, so the note is
+introduced as a note from its writer, not as a proven owner decision.
 
 This hook, on UserPromptSubmit, SessionStart and PostToolUse, loads any unread notes for
 the hook's session_id, oldest first, returns them as additionalContext (inlined while they
@@ -37,7 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from wal import safe_id  # noqa: E402
 
 STATE_NAME = ".owner-inbox-read.json"
-INBOX_DIR = "inbox"
+INBOX_ROOT = "inbox"   # ~/.agent-harness/inbox/<session>/
 DECISION_NAME = re.compile(r"^OWNER-DECISION-[A-Za-z0-9._-]{1,200}\.md$")
 INBOX_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,200}\.(md|txt)$")
 MAX_FILE = 64 * 1024
@@ -48,8 +52,8 @@ CONTEXT_EVENTS = {"UserPromptSubmit", "SessionStart", "PostToolUse"}
 STOP_EVENT = "Stop"
 HOOK_EVENTS = CONTEXT_EVENTS | {STOP_EVENT}
 HEADER = (
-    "OWNER DECISION (answer inbox): The following unread owner decision note(s) were "
-    "written for this session. Follow them and continue the allowed work. They are now "
+    "ANSWER INBOX: unread note(s) left for this session in ~/.agent-harness/inbox, a folder only the owner and "
+    "supervisors can write. Weigh each as a message from its writer and continue the allowed work. They are now "
     "marked read and will not be re-injected unless the file contents change."
 )
 CONTEXT_CAP = 600        # a hook invocation inlines notes only up to this; longer ones arrive as a path to read
@@ -64,12 +68,12 @@ def home() -> Path:
     return Path.home()
 
 
-def work_root() -> Path:
-    return home() / ".agent-harness" / "work"
+def inbox_root() -> Path:
+    return home() / ".agent-harness" / INBOX_ROOT
 
 
 def session_dir(session_id: str) -> Path:
-    return work_root() / safe_id(session_id)
+    return inbox_root() / safe_id(session_id)
 
 
 def _open_dir(path: Path) -> int:
@@ -136,42 +140,20 @@ def _write_state(dirfd: int, state: dict) -> None:
         raise
 
 
-def _candidates(session_fd: int) -> list[tuple[str, int, int]]:
-    """Return (relative_path, parent_fd_is_session_or_need_inbox, size) — actually just names + which dir.
-
-    Each item is (relpath, dir_tag, name) where dir_tag is 'session' or 'inbox'.
-    """
+def _candidates(session_fd: int) -> list[tuple[str, str, str]]:
+    """The note names in the session's inbox folder, as (relpath, dir_tag, name), oldest first."""
     found: list[tuple[str, str, str]] = []
     try:
         names = os.listdir(session_fd)
     except OSError:
         return []
     for name in names:
-        if DECISION_NAME.match(name):
+        if DECISION_NAME.match(name) or INBOX_NAME.match(name):
             found.append((name, "session", name))
-    if INBOX_DIR in names:
-        try:
-            info = os.stat(INBOX_DIR, dir_fd=session_fd, follow_symlinks=False)
-        except OSError:
-            info = None
-        if info is not None and stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
-            try:
-                inbox_fd = os.open(INBOX_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=session_fd)
-            except OSError:
-                inbox_fd = None
-            if inbox_fd is not None:
-                try:
-                    for name in os.listdir(inbox_fd):
-                        if INBOX_NAME.match(name):
-                            found.append((f"{INBOX_DIR}/{name}", "inbox", name))
-                except OSError:
-                    pass
-                finally:
-                    os.close(inbox_fd)
+
     def written(row):
         try:
-            where = os.path.join(INBOX_DIR, row[2]) if row[1] == "inbox" else row[2]
-            return os.stat(where, dir_fd=session_fd, follow_symlinks=False).st_mtime
+            return os.stat(row[2], dir_fd=session_fd, follow_symlinks=False).st_mtime
         except OSError:
             return 0.0
     found.sort(key=lambda row: (written(row), row[0]))  # oldest first: an answer never arrives before its question
@@ -191,23 +173,13 @@ def collect_unread(session_id: str) -> list[dict]:
         session_fd = _open_dir(path)
     except OSError:
         return []
-    inbox_fd = None
     try:
         state = _load_state(session_fd)
         read = state.get("read") or {}
         rows = []
         total = 0
-        for relpath, tag, name in _candidates(session_fd):
-            if tag == "inbox":
-                if inbox_fd is None:
-                    try:
-                        inbox_fd = os.open(INBOX_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                                           dir_fd=session_fd)
-                    except OSError:
-                        continue
-                dirfd = inbox_fd
-            else:
-                dirfd = session_fd
+        for relpath, _tag, name in _candidates(session_fd):
+            dirfd = session_fd
             info = _regular_file(dirfd, name)
             if info is None:
                 continue
@@ -246,8 +218,6 @@ def collect_unread(session_id: str) -> list[dict]:
             kept[-1] = dict(kept[-1], overflow=overflow)
         return kept
     finally:
-        if inbox_fd is not None:
-            os.close(inbox_fd)
         os.close(session_fd)
 
 
@@ -303,9 +273,10 @@ def format_items(items: list[dict], session: str = "") -> str:
     inline = "\n\n".join([HEADER] + [head(i) + "\n" + i["text"].rstrip() for i in items] + ([more] if more else []))
     if len(inline) <= CONTEXT_CAP:
         return inline + "\n"
-    lines = ["OWNER DECISION (answer inbox): unread owner decision note(s) for this session, too long to inline here. "
-             "Read each file below and follow it, then continue the allowed work. They are now marked read and will "
-             "not be re-injected unless the file contents change."]
+    lines = ["ANSWER INBOX: unread note(s) for this session from ~/.agent-harness/inbox (the owner or a supervisor "
+             "wrote them), too long to inline here. Read each file below and weigh it as a message from its writer, "
+             "then continue the allowed work. They are now marked read and will not be re-injected unless the file "
+             "contents change."]
     lines += [f"{head(i)} {i['path']} ({i['bytes']} bytes)" for i in items]
     return "\n".join(lines + ([more] if more else [])) + "\n"
 
@@ -328,7 +299,7 @@ def hook_output(event: dict) -> dict | None:
         # advisory line, once per set of notes, says they are waiting.
         if event.get("stop_hook_active") or not _stop_changed(session, ",".join(note_id(i) for i in items)):
             return None
-        return {"systemMessage": f"owner inbox: {len(items)} unread decision note(s) for this session; they are "
+        return {"systemMessage": f"answer inbox: {len(items)} unread note(s) for this session; they are "
                                  "delivered at the next prompt: " + ", ".join(note_id(i) for i in items[:4])}
     text = format_items(items, session)
     marked = False

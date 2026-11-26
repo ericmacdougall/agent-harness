@@ -337,9 +337,14 @@ class ReviewRound5(Base):
         self.assertEqual(ah.write(self.home, "task.dispose", dict(args, ref=self.OPEN_ASK), SESSION, "wait-open-01")["result"],
                          "applied")
         self.stopped_with_note("plaindrop002", "work", NOW - 86400)
-        ah.write(self.home, "task.dispose", dict(args, agent="plaindrop002", ref=self.OPEN_ASK), SESSION, "wait-open-02")
+        with self.assertRaises(ah.AhError):   # goodqa#15943: one open ask excuses one owner, and it is handoffowner's
+            ah.write(self.home, "task.dispose", dict(args, agent="plaindrop002", ref=self.OPEN_ASK), SESSION,
+                     "wait-open-02")
+        second = "w0aaaaaaaaab"
+        jl(self.w / "main.jsonl", [{"at": iso(NOW - 6900), "event": "ask", "id": second, "note": "which region?"}])
+        ah.write(self.home, "task.dispose", dict(args, agent="plaindrop002", ref=second), SESSION, "wait-open-03")
         self.assertNotIn("plaindrop002", self.owners()["undisposed"])
-        jl(self.w / "main.jsonl", [{"at": iso(NOW - 10), "event": "ask_resolved", "ref": self.OPEN_ASK, "note": "answered"}])
+        jl(self.w / "main.jsonl", [{"at": iso(NOW - 10), "event": "ask_resolved", "ref": second, "note": "answered"}])
         self.assertIn("plaindrop002", self.owners()["undisposed"])  # the answer ends the wait; the owner needs a decision
 
     def test_a_retry_with_the_same_key_is_a_duplicate_after_the_clock_or_reachability_moves(self):

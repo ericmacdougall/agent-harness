@@ -21,7 +21,11 @@ Nothing asks for a guard, an approval, a WAL note or a ticket. Each run adds one
 3. It moves the marked harness block out of `~/.claude/CLAUDE.md` (and the Codex block out of `~/.codex/AGENTS.md`) into `~/.agent-harness/off-stash/`. Sessions started while off get no harness rules. Your own text outside the markers is not touched.
 4. It stops the harness background jobs that are loaded: the LaunchAgents `<prefix>log-backup`, `<prefix>backup-watch`, `<prefix>ops-watch` (`<prefix>` is local.json `launchd_label_prefix`), `com.agent-harness.mission-control` and an old `com.agent-harness.floor`; on Linux the systemd user units `log-backup.timer`, `backup-watch.timer`, `ops-watch.timer` and an old `agent-harness-floor.path`, when their unit file is in `~/.config/systemd/user/`. It records which ones it stopped. netwatch keeps running.
 
-`harness off --keep-services` does steps 1 to 3 and leaves the background jobs running. `--services` is accepted and does nothing (it was the opt-in before release 1001).
+5. It moves the generated sandbox files (`~/.agent-harness/sandbox/*.json`) into `~/.agent-harness/off-stash/sandbox/`. `peer_review.py` treats `reviewer.claude.json` as its switch, so reviews run without the reviewer boundary while off; a launch that names one of the files with `--settings` fails to start until `harness on`. An install while off writes the files into the stash.
+6. It comments out an `ah-<role>` `default_permissions` line in `~/.codex/config.toml` (prefix `# agent-harness off: `), so new Codex sessions do not start in a harness profile.
+7. A managed drop-in (`/Library/Application Support/ClaudeCode/managed-settings.d/50-agent-harness.json`, Linux `/etc/claude-code/...`) is root's file: `off` cannot move it, so it prints the one `sudo mv ... .off` line that does, and `harness status` repeats it while the drop-in is in force.
+
+`harness off --keep-services` does steps 1 to 3 and 5 to 7 and leaves the background jobs running. `--services` is accepted and does nothing (it was the opt-in before release 1001).
 
 ## What `off` does not do
 
@@ -31,7 +35,7 @@ Nothing asks for a guard, an approval, a WAL note or a ticket. Each run adds one
 
 ## `on`
 
-`harness on` puts the stashed blocks back exactly where they were. If you edited the file while the harness was off, it appends the block at the end and keeps your edits. It then restarts only the services that `off` stopped, and removes the flag last. `on` and `off` are safe to run twice.
+`harness on` puts the stashed blocks back exactly where they were. If you edited the file while the harness was off, it appends the block at the end and keeps your edits. It puts the sandbox files back, restores the Codex `default_permissions` line, prints the `sudo mv` line that puts a parked managed drop-in back, then restarts only the services that `off` stopped, and removes the flag last. `on` and `off` are safe to run twice.
 
 An install while the harness is off installs files and wiring but leaves the instruction block in the stash, refreshed to the new version. It does not touch the flag or the stash.
 

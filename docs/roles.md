@@ -10,9 +10,16 @@ settings was top rung on every call, docs/direction.md "Decisions taken").
 | Role | Who | Writes (enforced by the sandbox, docs/sandbox.md) | May by role (`ah_roles`) |
 |---|---|---|---|
 | `owner` | a person in a terminal: no `AH_ROLE`, no agent marker | everything (no sandbox) | delete anywhere, handle secrets, grant every approval kind, name supervisors |
-| `supervisor` | launched with `AH_ROLE=supervisor`, or an agent session the owner recorded with `ah supervisor set` | worker scope plus `~/.agent-harness/approvals.jsonl` | delete in its own folder and its supervised projects; handle secrets; grant approvals inside its projects except `secret`, `spend`, `harness` |
-| `worker` | launched with `AH_ROLE=worker`; also any agent the harness cannot place (least privilege) | the project, its session folder and temp directory, caches | delete in its own folder and the checkouts it made; secrets only through `ah secret exec` |
+| `supervisor` | launched with `AH_ROLE=supervisor`, or an agent session the owner recorded with `ah supervisor set` | worker scope plus `~/.agent-harness/approvals.jsonl` and the answer inbox `~/.agent-harness/inbox` | delete in its own folder and its supervised projects; handle secrets; grant approvals inside its projects except `secret`, `spend`, `harness` |
+| `worker` | launched with `AH_ROLE=worker`; also any agent the harness cannot place (least privilege) | the project, `$TMPDIR`, caches and the harness session area (every session's folder under `~/.agent-harness/work`, not only its own; docs/sandbox.md) | delete in its own folder and the checkouts it made; secrets only through `ah secret exec` |
 | `reviewer` | launched with `AH_ROLE=reviewer` (the review runner does this) | its `$TMPDIR` only; Edit and Write tools removed | as a worker |
+
+Decided against the owner's words of 2026-11-24, stated plainly: he asked that Fable and Astra may delete files and
+handle secrets "even outside" their projects. Model names grant nothing now, and a supervisor deletes only in its own
+folder and its supervised projects. The owner's own interactive `claude` session carries `CLAUDECODE`, so it is a
+worker unless he records it (`ah supervisor set --session <id>`), or works in his own terminal, which is the owner
+role and deletes anywhere. A wider supervisor (`delete_anywhere`) is not built: it would hand every supervisor's
+sub-agents the same reach (they share its environment).
 
 ## How the role is decided
 

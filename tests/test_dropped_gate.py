@@ -224,8 +224,8 @@ class GateTests(Base):
         with self.assertRaises(ah.AhError) as cm:
             self.dispose("waiting", "disp-wait-noref", until=iso(NOW + 3600))
         self.assertEqual(cm.exception.code, "bad_request")
-        with self.assertRaises(ah.AhError):
-            self.dispose("waiting", "disp-wait-badref", until=iso(NOW + 3600), ref="my own excuse")
+        with self.assertRaises(ah.AhError):   # a ref says what it waits on in any words, but not nothing
+            self.dispose("waiting", "disp-wait-badref", until=iso(NOW + 3600), ref="   ")
         with self.assertRaises(ah.AhError):  # the ask id must exist in this session's WAL
             self.dispose("waiting", "disp-wait-noask", until=iso(NOW + 3600), ref="wa5b00000009")
         self.dispose("waiting", "disp-wait-ok", until=iso(NOW + 3600), ref="wa5b00000001")

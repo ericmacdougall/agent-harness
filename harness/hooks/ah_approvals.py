@@ -461,7 +461,7 @@ PATH_HINT = ("Fix: ask the owner or a supervisor session to run it; the owner ru
 ASK = "ask the owner or a supervisor session"
 
 
-def caller(as_user=False, user_msg=None, env=None, home=None, verify=None):
+def caller(as_user=False, user_msg=None, env=None, home=None, verify=None, kind=None):
     """("user" | "supervisor:<session>", source or None). Raises Refused for a worker or a reviewer.
 
     The role is the launch role (ah_roles.launch_role), never the model. The owner: no AH_ROLE and no agent marker
@@ -476,12 +476,18 @@ def caller(as_user=False, user_msg=None, env=None, home=None, verify=None):
         return "user", None
     session = calling_session(env)
     if as_user:
+        if kind in OWNER_ONLY_KINDS:
+            # The cited message is checked only for being one of the owner's turns, not for asking for this grant,
+            # so an agent cannot record an owner-only approval this way (release 1001 red team).
+            raise Refused(f"--as-user cannot record a {kind} approval: the owner runs `ah approve {kind} ...` in his "
+                          "own terminal")
         if not user_msg:
             raise Refused("--as-user needs --user-msg <id from `ah user-msg --recent 3`>")
         if not session:
             raise Refused("--as-user needs the calling session (CLAUDE_CODE_SESSION_ID)")
         text = (verify or verify_user_msg)(session, user_msg)
-        return "user", f'{user_msg} "{" ".join(text.split())[:200]}"'
+        return "user", (f'{user_msg} "{" ".join(text.split())[:200]}" (recorded by {role} session {session}, '
+                        f'{source})')
     if role == "supervisor":
         if not session:
             raise Refused("a supervisor grants under its session id, and CLAUDE_CODE_SESSION_ID (or CODEX_THREAD_ID) is "
@@ -643,7 +649,7 @@ def _run(args, env, home) -> int:
     """One dispatch; main() turns Refused, ValueError and OSError into exit codes 3, 2 and 3."""
     if args.cmd == "approve":
         try:
-            who, source = caller(args.as_user, args.user_msg, env=env, home=home)
+            who, source = caller(args.as_user, args.user_msg, env=env, home=home, kind=args.kind)
         except Refused as error:
             raise Refused(f"{error} The command to run: `{_approve_hint(args)}`.") from None
         scope = {"project": args.project, "pr": args.pr, "path": args.path, "task": args.task, "pids": args.pids,

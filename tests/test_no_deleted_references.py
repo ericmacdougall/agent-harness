@@ -34,10 +34,8 @@ DELETED_TREES = ("cmd", "internal", "console", "plugins/harness-tui", "native/co
                  "install_tui_plugin.py")
 # Shipped files that still name a deleted file, each with the reason it is not a launch of it. Keep this short.
 KNOWN = {
-    "harness/hooks/mc_chat.py": "Mission Control chat prints `mc_inbox.py reply ...` as the way to answer a dashboard "
-                                "message; mc_inbox.py (kill list) is deleted, so that reply path is gone. The "
-                                "dashboard stays as a read-only view (docs/direction.md); removing its chat is its "
-                                "own change",
+    "harness/hooks/mc_chat.py": "its docstring records that mc_inbox.py (kill list) was deleted and the Claude reply "
+                                "route with it; no code launches it",
 }
 # Docs this branch owns; the others are listed for the integrator (they still describe the deleted parts).
 OPERATOR_DOCS = ("README.md", "docs/off-switch.md", "docs/local-config.md", "docs/operations.md",

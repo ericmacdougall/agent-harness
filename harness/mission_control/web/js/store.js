@@ -165,7 +165,7 @@ export function chatAccess(current = state, responder = current.responder, sessi
   if (current.connection !== 'live') return { disabled: true, presence: current.connection.toUpperCase(), notice: current.connection === 'offline' ? 'Mission Control is offline. Your draft stays here; sending resumes when it is back.' : 'Reconnecting to the stream. Sending is paused; your draft is kept.' };
   if (responder === 'claude') {
     const main = current.chatAvailability.claude[session];
-    if (!main?.attached) return { disabled: true, presence: 'NO MAIN', notice: 'No Claude main is attached. In main, run `python3 ~/.claude/hooks/mc_inbox.py wait --session <id>` in the background.' };
+    if (!main?.attached) return { disabled: true, presence: 'NO MAIN', notice: 'Claude main cannot receive dashboard messages since release 1001 (mc_inbox.py was removed). Use the Codex switch, or leave a note in ~/.agent-harness/inbox/<session>/.' };
     if (!main.waiting) return { disabled: false, presence: 'BUSY', notice: 'Main is busy. It will see your message at its next stop.' };
   } else {
     const codex = current.chatAvailability.codex;
@@ -256,7 +256,7 @@ export function setApproveTransport(send) { approveTransport = send; }
 export function decisionAccess(ask, current = state) {
   if (!ask?.approvable) return { disabled: true, notice: ask?.blocked || 'This ask cannot be decided here. Answer with a reply.' };
   const access = askReplyAccess(ask, current);
-  if (access.disabled) return { disabled: true, notice: access.presence === 'NO MAIN' ? 'Main is not attached, so a decision cannot be delivered. In main, run `python3 ~/.claude/hooks/mc_inbox.py wait --session <id>` in the background.' : access.notice };
+  if (access.disabled) return { disabled: true, notice: access.presence === 'NO MAIN' ? 'Claude main cannot receive dashboard decisions since release 1001 (mc_inbox.py was removed). Leave a note in ~/.agent-harness/inbox/<session>/ instead.' : access.notice };
   return { disabled: false, notice: '' };
 }
 function setDecision(askId, value) {

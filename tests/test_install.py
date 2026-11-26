@@ -236,6 +236,24 @@ class InstallerTests(unittest.TestCase):
         self.assertNotIn("PostToolUseFailure", hooks)  # an event left empty by the upgrade goes
         self.assertTrue(any(h.get("command") == "other-prompt" for g in hooks["UserPromptSubmit"] for h in g["hooks"]))
 
+    def test_an_upgrade_moves_the_retired_guard_files_into_the_backup(self):
+        """The release 1001 red team: an upgrade from 1000 left command_guard.py, merge_gate.py and the rest on disk."""
+        hooks_dir = self.claude / "hooks"
+        hooks_dir.mkdir(parents=True)
+        for name in ("command_guard.py", "merge_gate.py", "kill_guard_policy.json", "commit_policy.json"):
+            (hooks_dir / name).write_text("# release 1000\n")
+        (hooks_dir / "my_own_hook.py").write_text("# the user's\n")
+        os.symlink(hooks_dir / "my_own_hook.py", hooks_dir / "tier_gate.py")   # not a regular file: left alone
+        changes = install(self.home, apply=True)
+        for name in ("command_guard.py", "merge_gate.py", "kill_guard_policy.json", "commit_policy.json"):
+            self.assertFalse((hooks_dir / name).exists(), name)
+            kept = list((self.claude / "agent-harness-backups").glob("*/retired/" + name))
+            self.assertEqual(len(kept), 1, name)
+            self.assertEqual(kept[0].read_text(), "# release 1000\n")
+        self.assertTrue((hooks_dir / "my_own_hook.py").exists())
+        self.assertTrue((hooks_dir / "tier_gate.py").is_symlink())
+        self.assertTrue(any("retired file" in c for c in changes), changes)
+
     def test_removed_flags_fail_loudly_before_anything_is_written(self):
         for flag in ("--services", "--no-provenance-hooks", "--no-command-guard", "--floor-watch", "--no-floor-watch"):
             with self.subTest(flag=flag):
@@ -245,6 +263,16 @@ class InstallerTests(unittest.TestCase):
                 self.assertEqual(done.returncode, 2)
                 self.assertIn(f"install.py: {flag} was removed in release 1001:", done.stderr)
                 self.assertEqual(list(self.claude.iterdir()), [])
+
+    def test_while_off_the_sandbox_files_go_to_the_off_stash(self):
+        import install as installer  # noqa: PLC0415
+        switch = installer.switch_module()
+        (self.home / ".agent-harness").mkdir(exist_ok=True)
+        (self.home / ".agent-harness" / "OFF").write_text("{}")
+        line = installer.sandbox_status(self.home, apply=True)
+        self.assertIn("OFF", line)
+        self.assertFalse((self.home / ".agent-harness" / "sandbox" / "reviewer.claude.json").exists())
+        self.assertTrue((switch.sandbox_stash_dir(self.home) / "reviewer.claude.json").is_file())
 
     def test_sandbox_files_are_written_private_and_equal_to_ah_sandbox(self):
         import install as installer  # noqa: PLC0415

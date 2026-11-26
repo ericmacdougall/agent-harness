@@ -11,7 +11,8 @@ managed-settings.d), codex (three `[permissions.ah-<role>]` tables), codex-launc
 profile), codex-requirements (an /etc/codex/requirements.toml body). Nothing here installs anything, writes a real
 settings file, registers a hook or reads command text: the operating-system sandbox and the vendor's permission rules
 enforce what this module only describes. The role data is sandbox_base.json beside this file; ~/.agent-harness/
-local.json adds sandbox_allowed_domains, sandbox_extra_deny_read, sandbox_extra_write, sandbox_role, and every host
+local.json adds sandbox_allowed_domains, sandbox_extra_deny_read, sandbox_extra_write, sandbox_excluded_commands
+(worker and supervisor), sandbox_role, and every host
 named under hosts, remote_worktree_hosts and trusted_git_hosts joins the network allow-list. A key of the wrong type
 falls back to its default (the ah_local rule). Standard library only, Python 3.9.
 """
@@ -33,7 +34,12 @@ MANAGED_NAME = "50-agent-harness.json"
 MANAGED_DIRS = {"darwin": "/Library/Application Support/ClaudeCode", "linux": "/etc/claude-code"}
 LOCAL_MAX = 256 * 1024
 HOST_RE = re.compile(r"^(?:\*\.)?[A-Za-z0-9](?:[A-Za-z0-9-]{0,62})(?:\.[A-Za-z0-9-]{1,63})*$")
-REVIEWER_TOOLS = ("Edit", "NotebookEdit", "Write")   # a bare tool name in deny removes the tool (Claude Code)
+REVIEWER_TOOLS = ("Edit", "NotebookEdit", "Write")
+# Inside workspace roots .git is writable for git commit, merge, stash and gc, except hooks/, config and
+# config.worktree, which stay read-only (as Claude Code keeps them): a planted hook or a program-valued config key
+# would run later, unsandboxed, in the owner's own git. The more specific path wins; the codex sandbox run proved
+# commit, merge, stash and gc work and that writing or renaming hooks/ and config is refused.
+GIT_READ_ONLY = (".git/hooks", ".git/config", ".git/config.worktree")
 DESCRIPTIONS = {
     "worker": "Agent Harness worker: project and session folder writable, secrets unreadable, records read-only",
     "reviewer": "Agent Harness reviewer: read-only, secrets unreadable",
@@ -127,8 +133,18 @@ def domains(role, home=None, local=None) -> list:
     return _unique(list(data["network_allow"]) + [h for h in extra if HOST_RE.match(h) and len(h) <= 253])
 
 
+def tool_spellings(command, home=None) -> list:
+    """One harness tool's exclusion under the spellings an agent uses: ~/, $HOME/ and the absolute home. The absolute
+    form is the resolved home, so the installer (which resolves) and doctor or `ah sandbox show` render one file."""
+    if " ~/" not in command:
+        return [command]
+    absolute = os.path.realpath(str(_home(home))).rstrip("/") + "/"   # resolved: one file whoever renders it
+    return _unique([command, command.replace(" ~/", " $HOME/", 1), command.replace(" ~/", " " + absolute, 1)])
+
+
 def lists(role, home=None, local=None) -> dict:
-    """The role's lists in ~/ form: deny_read, deny_write, allow_write, excluded, domains, project_read_only."""
+    """The role's lists in ~/ form: deny_read, deny_write, allow_write, excluded, domains, network_open,
+    project_read_only, secret_globs."""
     _check_role(role)
     data, local = base(), _local(home, local)
     deny_read = _unique(list(data["secret_paths"]) + _strings(local, "sandbox_extra_deny_read"))
@@ -140,9 +156,15 @@ def lists(role, home=None, local=None) -> dict:
         extra = list(data["supervisor_write_extra"])
         allow_write += extra
         deny_write = [p for p in deny_write if p not in extra]
+    excluded = list(data["excluded_commands"].get(role, []))
+    if role in ("worker", "supervisor"):
+        for command in data["harness_tools"]:
+            excluded += tool_spellings(command, home)
+        excluded += _strings(local, "sandbox_excluded_commands")
     return {"deny_read": deny_read, "deny_write": _unique(deny_write), "allow_write": _unique(allow_write),
-            "excluded": _unique(data["excluded_commands"].get(role, [])), "domains": domains(role, home, local),
-            "project_read_only": role == "reviewer"}
+            "excluded": _unique(excluded), "domains": domains(role, home, local),
+            "network_open": role in data["open_network"], "project_read_only": role == "reviewer",
+            "secret_globs": list(data["secret_globs"])}
 
 
 def expand(path, home) -> str:
@@ -173,6 +195,7 @@ def claude_settings(role, home=None, local=None, project=None) -> dict:
     deny = []
     for path in found["deny_read"]:
         deny += [f"Read({path})", f"Read({path}/**)"]     # a Read deny also blocks Edit and Write there
+    deny += [f"Read({pattern})" for pattern in found["secret_globs"]]   # project .env files, wherever they are
     for path in found["deny_write"]:
         deny += [f"Edit({path})", f"Edit({path}/**)"]     # Edit rules cover every built-in file-editing tool
     deny_write = list(found["deny_write"])
@@ -183,13 +206,24 @@ def claude_settings(role, home=None, local=None, project=None) -> dict:
     filesystem = {"denyRead": found["deny_read"], "denyWrite": deny_write}
     if found["allow_write"]:
         filesystem["allowWrite"] = found["allow_write"]
+    # Local ports (dev servers, test servers, a browser's debugging port) always bind. Outbound network stays open
+    # for workers and supervisors in the first version (docs/direction.md): with no allowedDomains the proxy filters
+    # nothing. A reviewer keeps a strict GitHub-only list.
+    network = {"allowLocalBinding": True, "allowMachLookup": list(base()["mach_lookup"])}
+    if not found["network_open"]:
+        network.update(allowedDomains=found["domains"], strictAllowlist=True)
     box = {"enabled": True, "failIfUnavailable": True, "allowUnsandboxedCommands": False,
-           "autoAllowBashIfSandboxed": True, "filesystem": filesystem,
-           "network": {"allowedDomains": found["domains"], "strictAllowlist": True}}
+           "autoAllowBashIfSandboxed": True, "filesystem": filesystem, "network": network}
     if found["excluded"]:
         box["excludedCommands"] = found["excluded"]
+    permissions = {"deny": _unique(deny)}
+    if role == "reviewer":
+        # Only the reviewer refuses bypass mode. Workers and supervisors keep the owner's normal launch
+        # (--dangerously-skip-permissions): the sandbox and the deny rules are the boundary, and deny rules hold in
+        # bypass mode too. Disabling it silently dropped every Edit, Write and MCP call back to a prompt.
+        permissions["disableBypassPermissionsMode"] = "disable"
     return {"env": {"AH_ROLE": role, "AH_ROLE_SOURCE": f"ah-sandbox:{role}"}, "sandbox": box,
-            "permissions": {"deny": _unique(deny), "disableBypassPermissionsMode": "disable"}}
+            "permissions": permissions}
 
 
 def managed_settings(role, home=None, local=None) -> dict:
@@ -236,10 +270,11 @@ def codex_profile(role, home=None, local=None) -> str:
            f"extends = {_q(':read-only' if role == 'reviewer' else ':workspace')}", "", f"[{name}.filesystem]"]
     out += [f"{_q(path)} = {_q(mode)}" for path, mode in entries.items()]
     if role != "reviewer":
-        out += ["", f'[{name}.filesystem.":workspace_roots"]',
-                '".git" = "write"  # .git is read-only inside workspace roots; git commit needs it']
-    out += ["", f"[{name}.network]", "enabled = true", "", f"[{name}.network.domains]"]
-    out += [f"{_q(host)} = \"allow\"" for host in found["domains"]]
+        out += ["", f'[{name}.filesystem.":workspace_roots"]', '".git" = "write"']
+        out += [f'{_q(path)} = "read"' for path in GIT_READ_ONLY]
+    out += ["", f"[{name}.network]", "enabled = true"]
+    if not found["network_open"]:
+        out += ["", f"[{name}.network.domains]"] + [f"{_q(host)} = \"allow\"" for host in found["domains"]]
     return "\n".join(out) + "\n"
 
 

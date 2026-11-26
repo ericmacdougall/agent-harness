@@ -344,6 +344,12 @@ def owner_override_approval(repo, pr, approval_id, env=None, home=None):
 
 # ---- command lines ------------------------------------------------------------------------------------------------
 
+def agent_caller(env=None) -> bool:
+    """True inside an agent session (the ah_approvals rule: an agent marker, a session id or a launch AH_ROLE)."""
+    import ah_approvals  # noqa: PLC0415 - a sibling module
+    return ah_approvals.in_agent(env)
+
+
 def _print_json(value):
     json.dump(value, sys.stdout, sort_keys=True, indent=2)
     sys.stdout.write("\n")
@@ -424,6 +430,13 @@ def review_status_main(argv=None, runner=None) -> int:
         check_sha(args.sha)
         if args.action == "post":
             description = args.description
+            if args.state == "success" and not (args.owner_override or args.approval) and agent_caller():
+                # A passing harness/review is what GitHub merges on. The review runner posts it in-process
+                # (peer_review.post_review_result), never through this command, so an agent asking for it here is a
+                # careless or misled one; the owner's terminal and the owner override still post it.
+                raise ValueError("an agent does not post a passing harness/review: run the review "
+                                 "(`peer_review.py pr --github-repo %s --pr N`), which posts it on the head it "
+                                 "reviewed; the owner can post it from his own terminal" % args.repo)
             if args.owner_override or args.approval:
                 if not (args.owner_override and args.approval and args.pr):
                     raise ValueError("--owner-override needs --approval ID and --pr N together")

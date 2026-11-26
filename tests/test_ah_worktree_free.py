@@ -92,6 +92,58 @@ class FreeWorktree(unittest.TestCase):
                                                                'failed': False}):
             self.assertIn('process', aw.free_worktree(str(self.linked))['reason'])
 
+    def test_an_ignored_env_file_or_local_database_is_never_removed_with_or_without_rescue(self):
+        # the release 1001 red team: HEAD on origin, an ignored .env and data/db.sqlite were deleted with removed:true
+        (self.linked / '.gitignore').write_text('.env\ndata/\nnode_modules/\n')
+        git(self.linked, 'add', '.gitignore')
+        git(self.linked, 'commit', '-q', '-m', 'ignore')
+        self.publish()
+        (self.linked / '.env').write_text('KEY=1\n')
+        (self.linked / 'data').mkdir()
+        (self.linked / 'data/db.sqlite').write_bytes(b'db')
+        for rescue in (False, True):
+            report = aw.free_worktree(str(self.linked), rescue=rescue, patch_dir=str(self.home / 'patches'))
+            self.assertFalse(report['removable'], report)
+            self.assertFalse(report['removed'])
+            self.assertIn('.env', report['reason'])
+            self.assertIn('data/', report['reason'])
+            self.assertTrue((self.linked / '.env').exists())
+            self.assertTrue((self.linked / 'data/db.sqlite').exists())
+
+    def test_the_ignored_file_refusal_lists_the_offending_paths(self):
+        status = '\x00'.join(['!! f%d.env' % n for n in range(7)] + ['!! node_modules/', '?? new.txt']) + '\x00'
+        text = aw.ignored_refusal(str(self.linked), status)
+        for n in range(5):
+            self.assertIn('f%d.env' % n, text)
+        self.assertNotIn('f5.env', text)
+        self.assertIn('(and 2 more)', text)
+        self.assertNotIn('node_modules', text)
+
+    def test_only_regenerable_build_directories_without_a_repository_may_go(self):
+        (self.linked / '.gitignore').write_text('node_modules/\nbuild/\n__pycache__/\n')
+        git(self.linked, 'add', '.gitignore')
+        git(self.linked, 'commit', '-q', '-m', 'ignore')
+        self.publish()
+        (self.linked / 'node_modules/pkg').mkdir(parents=True)
+        (self.linked / 'node_modules/pkg/index.js').write_text('x')
+        (self.linked / 'build').mkdir()
+        (self.linked / 'src/__pycache__').mkdir(parents=True)
+        (self.linked / 'src/__pycache__/m.pyc').write_bytes(b'x')
+        (self.linked / 'node_modules/dep/.git').mkdir(parents=True)  # a nested repository inside a build directory
+        report = aw.free_worktree(str(self.linked))
+        self.assertFalse(report['removable'], report)
+        self.assertIn('nested repository', report['reason'])
+        (self.linked / 'node_modules/dep/.git').rmdir()
+        report = aw.free_worktree(str(self.linked))
+        self.assertTrue(report['removed'], report)
+        self.assertFalse(self.linked.exists())
+
+    def test_a_build_directory_name_below_the_top_is_not_regenerable_unless_it_is_a_cache(self):
+        offenders, build = aw.ignored_offenders('!! sub/build/\x00!! sub/node_modules/\x00!! dist/\x00!! dist\x00')
+        self.assertEqual(offenders, ['sub/build/', 'dist'])
+        self.assertEqual(build, ['sub/node_modules/', 'dist/'])
+
+
 class LogPush(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory(prefix='log-push-')

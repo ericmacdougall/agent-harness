@@ -382,7 +382,7 @@ ah approvals                                                                   #
 
 ### Commands and rollout
 
-- `install.py --apply` copies the hook and registers it with the matcher `.*d1_database_query|mcp__.*__(execute_sql|run_sql|query|sql)|mcp__.*__hyperdrive_.*`, plus each `db_tool_patterns` tool that does not match `Bash`.
+- `install.py --apply` copies the hook and registers it with the matcher `^(?:.*d1_database_query|mcp__.+__(?:execute_sql|run_sql|sql)|mcp__(?!claude_ai_Claude_Docs__).+__query|mcp__.+__hyperdrive_.+)$`, plus each `db_tool_patterns` tool that does not match `Bash`.
 - Tests: `python3 -m unittest tests.test_prod_delete_guard`. They judge text only and never run SQL.
 - Rollback: revert the commit and reinstall.
 

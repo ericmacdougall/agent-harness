@@ -10,8 +10,8 @@ file (tests).
 |---|---|---|---|
 | `hosts` | `{name: {"role", "os": "linux"\|"macos"\|"windows", "limits": {...}}}` | `ah kill --host` (Windows hosts take the PowerShell route); every name is added to the sandbox network allow-list ([sandbox](sandbox.md)) | none |
 | `heavy_job_host` | host name | Mission Control's remote WAL probe (off when unset) | none |
-| `remote_worktree_hosts` | list of host names | `ah worktree-remove --host`; added to the sandbox network allow-list | none (only `local`) |
-| `trusted_git_hosts` | list of host names | added to the sandbox network allow-list | `github.com` only |
+| `remote_worktree_hosts` | list of host names | `ah worktree-remove --host`; added to the sandbox network allow-list (kept for a later allow-list; workers' network is open) | none (only `local`) |
+| `trusted_git_hosts` | list of host names | added to the sandbox network allow-list (kept for a later allow-list; workers' network is open) | `github.com` only |
 | `backup_remotes` | `{rclone type: [remote names]}` | the log backup (`backup_remotes.b2`) | none |
 | `launchd_label_prefix` | dotted prefix ending in `.` | the launchd labels of log-backup, backup-watch, ops-watch (`harness off` stops them) | `com.agent-harness.` |
 | `protected_label_prefixes` | list of prefixes | `ah kill`: jobs with these labels need the owner's approval to stop (the label prefix above is always added) | none |
@@ -24,7 +24,7 @@ file (tests).
 | `reap_idle_hours` | number of hours | `ah reap run`: how long a session folder must be idle before it may be removed (`--idle-hours` on the command line wins) | `48` |
 | `session_tmpdir` | `true` or `false` | `session_env.py`: `false` stops it exporting `TMPDIR=~/.agent-harness/tmp/<key>` (the first 8 characters of a lowercase UUID session id, else 8 hex characters of its SHA-256) to the session's shell commands | `true` |
 | `session_quota_gb` | number of GB | `session_env.py`: a session whose folder was last measured above this gets one extra line at session start naming its three largest directories; nothing is refused | `10` |
-| `sandbox_allowed_domains`, `sandbox_extra_deny_read`, `sandbox_extra_write`, `sandbox_role` | lists of hosts or paths; a role name | `ah sandbox` and the sandbox files `install.py` writes: see [sandbox](sandbox.md) | none; `sandbox_role` is `worker` |
+| `sandbox_allowed_domains`, `sandbox_extra_deny_read`, `sandbox_extra_write`, `sandbox_excluded_commands`, `sandbox_role` | lists of hosts or paths; a role name | `ah sandbox` and the sandbox files `install.py` writes: see [sandbox](sandbox.md) | none; `sandbox_role` is `worker` |
 
 Keys the harness does not know are ignored. A key of the wrong type falls back to its default.
 

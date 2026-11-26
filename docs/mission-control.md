@@ -264,8 +264,8 @@ Sending is idempotent:
 
 | Runtime | How chat reaches it | Limits |
 | --- | --- | --- |
-| Claude Code CLI (main) | Main runs `python3 ~/.claude/hooks/mc_inbox.py wait --session <session-id>` as a background task. It wakes when a message arrives, prints the framed message and exits; main answers with `mc_inbox.py reply <id>` (text on stdin) and re-arms the waiter. The installed `mc_inbox.py hook` on UserPromptSubmit points the registered session at a message it missed, and once per 30 minutes tells a session whose waiter is not running to re-arm it. A session stays the chat target for 12 hours after its last `wait` heartbeat. | Only the session you pick in the dashboard receives a Claude message. There is no Stop registration (2026-11-24); the prompt hook's text is a fixed pointer. The hook reads only its own session's target file, so an unregistered session pays one failed file open per prompt. Subagents never act on chat. With no registered session, the page says "no main attached" and does not accept Claude messages. |
-| Codex CLI | The dashboard's Codex switch runs `codex exec --json` read-only on your ChatGPT subscription and streams the reply. The installer also ships `~/.codex/agent-harness/mc_inbox.py`, so a Codex session can list waiting Codex message ids (`pending --to codex`) by hand. The responder claims each message atomically, so it is answered once. | There is no Codex hook and no API-key fallback. When Codex is busy, rate-limited or not signed in, the page shows why and when it resets. Codex keys hook trust by position, so the installer adds no Codex hook. |
+| Claude Code CLI (main) | None since release 1001: `mc_inbox.py` (the waiter and its `reply` command) is on the kill list and deleted. The dashboard says so instead of offering to send. For an answer a Claude session must see, leave a note in the answer inbox, `~/.agent-harness/inbox/<session-id>/` (injected at its next prompt). | No dashboard reply from Claude main. |
+| Codex CLI | The dashboard's Codex switch runs `codex exec --json` read-only on your ChatGPT subscription and streams the reply. The responder claims each message atomically, so it is answered once. | There is no Codex hook and no API-key fallback. When Codex is busy, rate-limited or not signed in, the page shows why and when it resets. Codex keys hook trust by position, so the installer adds no Codex hook. |
 | Claude desktop | Ask the app to "check the dashboard". Its harness-tui plugin calls `mc_pending`, which attaches the app as the chat target `claude-desktop` and lists its unread ids (queued, or read but not yet answered) with their status. Pick `claude-desktop` in the dashboard's session picker to send to it. `mc_read` returns one verified, framed message and `mc_reply` answers it. | The desktop app has no Stop hook, so it never wakes on its own: a message waits until you ask the app to check. The tools never see messages for a terminal session. |
 | ChatGPT / Codex desktop | There is no hook point and no supported MCP path from this harness. Use the dashboard's Codex switch, which runs the Codex CLI. | Messages are not delivered into the desktop app. |
 
@@ -337,7 +337,7 @@ The demo feed also writes two tool-call records each pulse (seen with "Show tool
 
 - Stop the service: `launchctl bootout gui/$(id -u)/com.agent-harness.mission-control`. To keep it off across installs, run `python3 install.py --apply --no-mission-control`.
 - Go back to the previous app: the installer keeps it at `~/.agent-harness/mission-control/app.prev/`. Swap it back into `app/` and restart. You can also reinstall from an earlier harness commit.
-- Remove the hooks: reinstall a harness version without them. `mc_inbox.py hook` fails open and does nothing for a session that has not registered, so leaving it in place is harmless.
+- Remove the hooks: release 1001 no longer installs `mc_inbox.py`; an upgrade moves an old copy into the install backup.
 
 ## Not yet
 

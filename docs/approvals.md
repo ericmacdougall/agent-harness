@@ -41,7 +41,9 @@ Who is calling is the launch role (docs/roles.md, `ah_roles.launch_role`), never
 - **The owner.** A command with no `AH_ROLE` and no agent marker (`CLAUDECODE`, `CODEX_THREAD_ID`,
   `CODEX_TOOL_CALL_ID`, `CODEX_SANDBOX`, `AI_AGENT`) in its environment is the owner. An agent may record the
   owner's answer with `--as-user --user-msg <id>`, citing the owner's own message by the id `ah user-msg --recent 3`
-  prints; the cited words are stored with the record.
+  prints; the cited words are stored with the record, with the recording session's role and id. The check is only
+  that the id is one of the owner's turns, not that its words ask for this grant, so `--as-user` never records
+  `secret`, `spend` or `harness`: the owner runs those himself.
 - **A supervisor session**, for the projects it supervises: a session launched with `AH_ROLE=supervisor`, or an agent
   session the owner recorded with `ah supervisor set --session S`. Its projects are its own `roles.json` entry, else
   the role default entry (`ah supervisor set --role-default --project DIR`). This includes `top-rung` for a named task

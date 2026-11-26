@@ -77,7 +77,15 @@ def merge(number):
 
 
 def post_status(sha, state, description):
-    return ah("review-status", "post", "--repo", PROBE, "--sha", sha, "--state", state, "--description", description)
+    """Posted as the review runner does, in-process (peer_review.post_review_result calls ah_repo directly): the
+    command line refuses a passing status from inside an agent, and this probe may be run from one."""
+    sys.path.insert(0, str(AH_REPO.parent))
+    import ah_repo  # noqa: PLC0415
+    try:
+        ah_repo.post_review_status(PROBE, sha, state, description)
+        return subprocess.CompletedProcess([], 0, "", "")
+    except (ah_repo.GitHubError, ValueError) as error:
+        return subprocess.CompletedProcess([], 1, "", str(error))
 
 
 def main(argv):

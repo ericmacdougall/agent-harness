@@ -1,8 +1,11 @@
 # `ah doctor`: the host self-test
 
 ```
-ah doctor [--json] [--role worker|reviewer|supervisor|all] [--strict] [--codex]
+ah doctor [--json] [--role worker|reviewer|supervisor|all|none] [--no-probes] [--strict] [--codex]
 ```
+
+`--no-probes` (the same as `--role none`) runs every check below and no probe: nothing is created anywhere, no
+sandbox is started. Use it on a real host.
 
 Exit codes:
 - 0: nothing FAILED. UNPROVEN is a warning, unless `--strict` makes it count.
@@ -34,7 +37,8 @@ Reads go to `/dev/null` and only exit codes are kept, so no probe prints file co
 |---|---|---|
 | `secrets` | read 1 byte of each `secret_paths` file (the first regular file under a folder) | read a file in the probe project |
 | `records` | create a file under each existing `record_paths` folder, or open an existing record file for append without writing (a missing file such as `OFF` is never created) | write in `~/.agent-harness/work` (reviewer: read the project) |
-| `write-scope` | write `$HOME/ah-doctor-outside-*` | write, `git init` and `git commit` in the probe project (reviewer: read it) |
+| `write-scope` | write `$HOME/ah-doctor-outside-*` | write and `git commit` in the probe project, a repository made before the sandbox runs (reviewer: read it) |
+| `git-hooks` (`--codex`, worker, supervisor) | write a file in the project's `.git/hooks`; append to `.git/config` | `git commit` in the project |
 | `read-only` (reviewer) | write in the probe project | read it |
 | `approvals` (worker, supervisor) | worker: append to a stand-in `approvals.jsonl`; supervisor: append to a stand-in `roles.json` | worker: write the project; supervisor: append to the stand-in `approvals.jsonl` |
 | `network` (`--codex`) | `curl https://example.com` | `curl https://github.com` (UNPROVEN while `features.network_proxy` is off) |
@@ -60,7 +64,9 @@ model call, so it is proven by `tests/e2e_combined.py` rather than by doctor.
 | `codex-trust` | each Codex harness handler's trust hash (sha256 of `{event_name, hooks:[{type, command, timeout, async}]}`) equals its `config.toml` entry | UNPROVEN: "review in /hooks" |
 | `shim` | `harness` on PATH carries the switch-shim mark in its first 4 KiB | another program has the name |
 | `python` | `python3` on PATH is 3.9 or newer | older or missing |
-| `gh`, `mechanism` | gh installed and `gh auth status` ok; sandbox-exec or a working bwrap | gh missing or logged out (mechanism missing is UNPROVEN) |
+| `gh`, `mechanism` | gh installed and `gh auth status` ok; sandbox-exec or a working bwrap | gh missing or logged out (UNPROVEN on macOS when `$HOME` is not this account's home: the login keychain follows `$HOME`; mechanism missing is UNPROVEN) |
+| `rulesets` | the account's repositories that are not archived, admin, and pushed within 30 days (at most 20) carry `harness-merge-rule` (`gh repo list`, `gh api repos/R/rulesets`) | any lacks it: release 1001 has no merge hook, so it has no merge control (UNPROVEN when gh cannot list) |
+| `secrets-readable` | credential-shaped names (token, secret, key, `.env`, `auth.json`, `id_*`, ...) in `$HOME`'s dot files and two levels of `~/.config` that no role's `deny_read` covers | any is found: listed, with "add to `sandbox_extra_deny_read`" |
 | `backup` | age of `~/.agent-harness/logs/log-backup.last-ok` | older than 24 h, or installed with no valid marker (UNPROVEN when not installed) |
 | `rescue-remote` | `rescue_remote` visibility (`gh repo view --json visibility`) | PUBLIC; unset says saves go to bundles |
 | `disk` | used space of the home volume | above 70% (the reaper's timer threshold) |

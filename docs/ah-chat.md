@@ -39,8 +39,8 @@ GoodQA's `send_direct_message` (`POST /v1/orgs/:org/dm/:user`) stores each messa
   - `ah chat allow --list` prints the listed ids and changes nothing.
   - The file lives under ah's home (`AH_HOME`, else the home directory), the same root as the stamp, the ledger and the WAL. The proof reads main's WAL and the user's transcript, so an entry holds only on the host where main runs (the Mac).
 - **Limit of the protection.**
-  - No command_guard rule covers this file. An agent's file tool can append a line, but that line allows nobody.
-  - **Main's WAL is not write-protected either** (GoodQA goodqa#17008, CRITICAL). On 2026-11-24 command_guard allowed `>>`, `tee -a` and a Python one-liner appending to `~/.claude/wals/<session>/main.jsonl`, and no hook refuses a Write or Edit there (only Claude Code's worktree isolation stops an isolated agent).
+  - Nothing write-protects this file (the command guard is deleted in release 1001). An agent's file tool can append a line, but that line allows nobody.
+  - **Main's WAL is not write-protected either** (GoodQA goodqa#17008, CRITICAL). In a sandboxed session `~/.claude` is write-protected for Bash, but the note command runs outside the sandbox and the file tools follow permission rules, so an agent can still append to `~/.claude/wals/<session>/main.jsonl`.
   - So an agent that forges both a decision row and a line can still message a person, but only someone the user named in his own words whose GoodQA member name contains that name. A member who sets a matching display name also passes.
 
 ### Adding a person and replying, step by step
@@ -214,8 +214,7 @@ Rows for `ah chat send` (tests in `tests/test_ah_chat_send.py`). The send also h
 ## Tests
 
 - `python3 -I tests/test_ah_chat.py` runs against a loopback stub of the MCP endpoint that answers with the server's real row shapes. It uses two sentinel tokens and scans every output and every file the command writes.
-- `python3 -I tests/test_command_guard_ah_chat.py` covers the command guard.
 - `python3 -B tests/mutants_ah_chat.py` is the failing-first check. Each broken variant of `ah_chat.py` must fail the tests.
 - `python3 -I tests/test_ah_chat_send.py` covers `ah chat send` against the same stub, with the real mission_gate hook minting the stamp; `python3 -B tests/mutants_ah_chat_send.py` is its failing-first check (every control has a mutant).
 
-The command guard needed one small change for the dm-read token file: the credential path rule for `~/.config/goodqa/user-token` now also names `dm-read-token`.
+`ah chat` runs outside the sandbox (docs/sandbox.md, harness tools) because its tokens live under `~/.config/goodqa`, a secret path no sandboxed shell can read.

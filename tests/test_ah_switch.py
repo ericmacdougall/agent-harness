@@ -179,6 +179,44 @@ class SwitchRoundTrip(TempHome):
         self.assertEqual(len(log), 4)
         self.assertIn("off by", log[0])
 
+    def test_off_reaches_the_sandbox_files_and_the_codex_default_profile(self):
+        """The release 1001 red team: off left the role files (peer_review's reviewer switch) and Codex's
+        default_permissions = "ah-worker" in force, so off did not mean off once the boundary was rolled out."""
+        os.environ.pop("CODEX_HOME", None)
+        box = self.home / ".agent-harness" / "sandbox"
+        box.mkdir(parents=True)
+        for role in ("worker", "reviewer", "supervisor"):
+            (box / f"{role}.claude.json").write_text('{"role": "%s"}\n' % role)
+        config = self.write('model = "x"\ndefault_permissions = "ah-worker" # agent-harness-codex\n'
+                            '[permissions.ah-worker]\ndescription = "d"\n', ".codex/config.toml")
+        before = config.read_bytes()
+        result = ah_switch.switch_off(self.home)
+        self.assertEqual(sorted(result["sandbox_stashed"]), ["reviewer.claude.json", "supervisor.claude.json",
+                                                             "worker.claude.json"])
+        self.assertFalse((box / "reviewer.claude.json").exists())   # the review runner's switch is off
+        self.assertEqual(result["codex_default_permissions"], "parked")
+        self.assertIn('# agent-harness off: default_permissions = "ah-worker"', config.read_text())
+        import tomllib
+        self.assertNotIn("default_permissions", tomllib.loads(config.read_text()))
+        self.assertIn("sandbox files stashed", ah_switch.status_line(ah_switch.status(self.home)))
+        on = ah_switch.switch_on(self.home)
+        self.assertFalse(on["off"])
+        self.assertEqual(config.read_bytes(), before)
+        self.assertEqual((box / "reviewer.claude.json").read_text(), '{"role": "reviewer"}\n')
+        self.assertEqual(list(ah_switch.sandbox_stash_dir(self.home).glob("*.json")), [])
+
+    def test_off_prints_the_sudo_line_for_a_managed_drop_in(self):
+        managed = self.home / "managed" / "50-agent-harness.json"
+        managed.parent.mkdir()
+        managed.write_text("{}")
+        with mock.patch.object(ah_switch, "MANAGED_FILES", (str(managed),)):
+            notes = ah_switch.switch_off(self.home)["managed"]
+            self.assertEqual(notes, [f"sudo mv {managed} {managed}.off"])
+            self.assertIn("managed drop-in still enforces", ah_switch.status_line(ah_switch.status(self.home)))
+            self.assertTrue(managed.exists())   # never moved without root
+            os.rename(managed, str(managed) + ".off")
+            self.assertEqual(ah_switch.switch_on(self.home)["managed"], [f"sudo mv {managed}.off {managed}"])
+
     def test_block_absent_and_file_missing_still_switch(self):
         path = self.write("only mine\n")
         ah_switch.switch_off(self.home)

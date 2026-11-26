@@ -3,11 +3,14 @@
 
   off [--reason TEXT] [--keep-services]  create ~/.agent-harness/OFF (every hook launcher exits 0 at once, running
                                     sessions too), move the harness instruction blocks out of ~/.claude/CLAUDE.md and
-                                    ~/.codex/AGENTS.md into ~/.agent-harness/off-stash/, and stop the harness
-                                    LaunchAgents (Linux: systemd user units) and remember which. Off means off:
-                                    only --keep-services leaves the background jobs running.
-  on                                put the stashed blocks back exactly, start the services `off` stopped, remove the
-                                    flag last.
+                                    ~/.codex/AGENTS.md into ~/.agent-harness/off-stash/, move the generated sandbox
+                                    files (~/.agent-harness/sandbox, the review runner's switch) there too, comment
+                                    out an `ah-<role>` default_permissions line in ~/.codex/config.toml, and stop the
+                                    harness LaunchAgents (Linux: systemd user units) and remember which. A managed
+                                    drop-in needs root: off prints the one sudo line that moves it aside. Off means
+                                    off: only --keep-services leaves the background jobs running.
+  on                                put the stashed blocks and sandbox files back exactly, restore the Codex line,
+                                    start the services `off` stopped, remove the flag last.
   status [--json]                   one line (or JSON): on or off, since when, by whom, what is stashed, the floor.
   floor-check                       report (never repair) that an installer that predates the floor (an old checkout's
                                     install.py) overwrote the installed release. Nothing rewrites settings.json except
@@ -399,6 +402,88 @@ def start_services(home, run=None, system=None) -> tuple:
     return started, failed
 
 
+# ----------------------------------------------------------------------------- the boundary while off
+SANDBOX_DIR = ".agent-harness/sandbox"
+SANDBOX_STASH = "sandbox"                     # under ~/.agent-harness/off-stash/
+CODEX_PARKED = "# agent-harness off: "        # the prefix `off` puts before an ah-<role> default_permissions line
+CODEX_DEFAULT = re.compile(r'^default_permissions\s*=\s*"ah-[a-z]+"')
+MANAGED_FILES = ("/Library/Application Support/ClaudeCode/managed-settings.d/50-agent-harness.json",
+                 "/etc/claude-code/managed-settings.d/50-agent-harness.json")
+
+
+def sandbox_stash_dir(home) -> Path:
+    return ah_dir(home) / "off-stash" / SANDBOX_STASH
+
+
+def _move_json(source: Path, target: Path) -> list:
+    """Move every regular *.json file from source to target (one rename each, replacing); never through a symlink."""
+    moved = []
+    if source.is_symlink() or not source.is_dir():
+        return moved
+    for path in sorted(source.glob("*.json")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        private_dir(target)
+        os.replace(path, target / path.name)
+        moved.append(path.name)
+    return moved
+
+
+def stash_sandbox(home) -> list:
+    """The generated role files leave ~/.agent-harness/sandbox: peer_review treats reviewer.claude.json as its switch,
+    and nothing should be launched with a harness boundary while the harness is off."""
+    return _move_json(home / SANDBOX_DIR, sandbox_stash_dir(home))
+
+
+def restore_sandbox(home) -> list:
+    return _move_json(sandbox_stash_dir(home), home / SANDBOX_DIR)
+
+
+def _rewrite_codex(home, park: bool) -> str:
+    path = Path(os.environ.get("CODEX_HOME") or home / ".codex") / "config.toml"
+    text = read_text(path) if path.is_file() and not path.is_symlink() else None
+    if text is None:
+        return "none"
+    lines, changed = text.splitlines(keepends=True), False
+    for i, line in enumerate(lines):
+        if park and CODEX_DEFAULT.match(line):
+            lines[i], changed = CODEX_PARKED + line, True
+        elif not park and line.startswith(CODEX_PARKED) and CODEX_DEFAULT.match(line[len(CODEX_PARKED):]):
+            lines[i], changed = line[len(CODEX_PARKED):], True
+    if not changed:
+        return "none"
+    write_atomic(path, "".join(lines).encode("utf-8"))
+    return "parked" if park else "restored"
+
+
+def park_codex_default(home) -> str:
+    """Comment out an `ah-<role>` default_permissions line, so new Codex sessions do not start in a harness profile."""
+    return _rewrite_codex(home, True)
+
+
+def restore_codex_default(home) -> str:
+    return _rewrite_codex(home, False)
+
+
+def managed_notes(on: bool) -> list:
+    """The sudo line for each managed drop-in on this host (root owns it; the switch never runs sudo)."""
+    out = []
+    for path in MANAGED_FILES:
+        parked = path + ".off"
+        if not on and os.path.exists(path):
+            out.append(f"sudo mv {shlex.quote(path)} {shlex.quote(parked)}")
+        if on and os.path.exists(parked):
+            out.append(f"sudo mv {shlex.quote(parked)} {shlex.quote(path)}")
+    return out
+
+
+def _guarded(step):
+    try:
+        return step()
+    except OSError as error:
+        return f"error: {error.__class__.__name__}"
+
+
 # ----------------------------------------------------------------------------- off / on / status
 def switch_off(home=None, reason="", services=True, run=None, system=None) -> dict:
     """Off means off: the flag first, then the instruction blocks, then (unless services=False) the background jobs."""
@@ -415,8 +500,11 @@ def switch_off(home=None, reason="", services=True, run=None, system=None) -> di
             blocks[flavor] = stash_block(home, flavor)
         except OSError as error:
             blocks[flavor] = f"error: {error.__class__.__name__}"
+    sandbox = _guarded(lambda: stash_sandbox(home))
+    codex_default = _guarded(lambda: park_codex_default(home))
     stopped = stop_services(home, run, system) if services else []
-    result = {"off": True, "was_off": was_off, "blocks": blocks, "services_stopped": stopped}
+    result = {"off": True, "was_off": was_off, "blocks": blocks, "services_stopped": stopped,
+              "sandbox_stashed": sandbox, "codex_default_permissions": codex_default, "managed": managed_notes(False)}
     log_line(home, "switch.log", f"off by {getpass.getuser()} reason={clean(reason)!r} was_off={was_off} "
                                  + " ".join(f"{k}={v}" for k, v in blocks.items())
                                  + (f" services={','.join(stopped) or 'none'}" if services else ""))
@@ -432,13 +520,18 @@ def switch_on(home=None, run=None, system=None) -> dict:
         except OSError as error:
             blocks[flavor] = f"error: {error.__class__.__name__}"
             errors.append(flavor)
+    sandbox = _guarded(lambda: restore_sandbox(home))
+    codex_default = _guarded(lambda: restore_codex_default(home))
+    if isinstance(sandbox, str) or codex_default.startswith("error"):
+        errors.append("sandbox")
     started, failed = start_services(home, run, system)
     flag = flag_path(home)
     was_off = flag.exists()
     if was_off and not errors:
         os.unlink(flag)  # last: until here every hook stayed silent
     result = {"off": flag.exists(), "was_off": was_off, "blocks": blocks, "services_started": started,
-              "services_failed": failed}
+              "services_failed": failed, "sandbox_restored": sandbox, "codex_default_permissions": codex_default,
+              "managed": managed_notes(True)}
     log_line(home, "switch.log", f"on by {getpass.getuser()} was_off={was_off} "
                                  + " ".join(f"{k}={v}" for k, v in blocks.items())
                                  + f" services={','.join(started) or 'none'}" + (f" failed={','.join(failed)}" if failed else ""))
@@ -453,6 +546,8 @@ def status(home=None) -> dict:
     return {"off": is_off(home), "flag": flag_info(home),
             "stashed": [f for f in FLAVORS if stash_path(home, f).exists()],
             "services_stopped": [i.get("name") for i in services if isinstance(i, dict)] if isinstance(services, list) else [],
+            "sandbox_stashed": sorted(p.name for p in sandbox_stash_dir(home).glob("*.json")),
+            "managed": managed_notes(not is_off(home)),
             "installed": (state or {}).get("flavors", {}) if isinstance(state, dict) else {},
             "floor": (floor or {}).get("flavors", {}) if isinstance(floor, dict) else {}}
 
@@ -471,6 +566,10 @@ def status_line(data: dict) -> str:
         extra.append("instructions stashed: " + ", ".join(data["stashed"]))
     if data["services_stopped"]:
         extra.append("services stopped: " + ", ".join(data["services_stopped"]))
+    if data.get("sandbox_stashed"):
+        extra.append("sandbox files stashed: " + ", ".join(data["sandbox_stashed"]))
+    if data.get("managed"):
+        extra.append("a managed drop-in still enforces the sandbox; to lift it run: " + " && ".join(data["managed"]))
     return "harness: OFF " + " ".join(bits) + ("; " + "; ".join(extra) if extra else "") + tail + "; turn on: harness on"
 
 
@@ -873,7 +972,9 @@ def main(argv=None) -> int:
             print(json.dumps(result, indent=2))
         else:
             print(status_line(status(home)) + (f"; could not restart: {', '.join(result['services_failed'])}"
-                                               if result["services_failed"] else ""))
+                                               if result["services_failed"] else "")
+                  + ("; to put the managed drop-in back run: " + " && ".join(result["managed"])
+                     if result["managed"] else ""))
         return 0 if not result["off"] else 1
     if args.cmd == "status":
         data = status(home)

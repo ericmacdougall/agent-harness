@@ -94,6 +94,19 @@ class Store(unittest.TestCase):
         with self.assertRaises(ap.Refused):
             ap.caller(True, None, env=PLAIN_AGENT_ENV, home=self.home, verify=verify)
 
+    def test_as_user_never_records_an_owner_only_kind_and_names_who_recorded_it(self):
+        """The release 1001 red team: --as-user returned "user" for any kind, citing any owner turn."""
+        verify = lambda session, msg: "sure"  # noqa: E731 - any human turn
+        for kind in ap.OWNER_ONLY_KINDS:
+            with self.subTest(kind=kind), self.assertRaises(ap.Refused):
+                ap.caller(True, "uuid:good", env=PLAIN_AGENT_ENV, home=self.home, verify=verify, kind=kind)
+            code, out = self.cli(["approve", kind, "--as-user", "--user-msg", "uuid:good"], env=PLAIN_AGENT_ENV)
+            self.assertEqual(code, 3, (kind, out))
+        self.assertEqual(ap.list_approvals(home=self.home), [])
+        who, source = ap.caller(True, "uuid:good", env=PLAIN_AGENT_ENV, home=self.home, verify=verify, kind="merge")
+        self.assertEqual(who, "user")
+        self.assertIn("recorded by worker session " + PLAIN_AGENT_ENV["CLAUDE_CODE_SESSION_ID"], source)
+
     def test_only_the_owner_names_supervisors(self):
         code, out = self.cli(["supervisor", "set", "--session", SUP, "--project", str(self.other)], env=AGENT_ENV)
         self.assertEqual(code, 3)

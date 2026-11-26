@@ -207,7 +207,16 @@ def main():
         if not re.fullmatch(r'w[0-9a-f]{11}', args.recites) or not args.source:
             parser.error('--recites needs an entry id (w + 11 hex) and a --source on this row')
         record['recites'] = args.recites
-    append(path, record)
+    try:
+        append(path, record)
+    except PermissionError:
+        # The sandbox keeps ~/.claude write-protected; the note command runs outside it only when it is its own
+        # command, spelled as excluded (sandbox_base.json harness_tools). A compound command stays sandboxed.
+        print(json.dumps({'status': 'REFUSED', 'code': 'sandbox', 'wal': str(path),
+                          'message': 'the sandbox refused the write. Run the note as its own command, not after '
+                                     '`cd ... &&` or in a pipeline: python3 ~/.claude/hooks/wal_note.py --wal '
+                                     f'{path} --event {args.event} ...'}))
+        return 3
     for warning in warnings:
         print('wal_note: warning: ' + warning, file=sys.stderr)
     print(json.dumps({'status': 'WROTE', 'event': args.event, 'id': record['id'], 'wal': str(path),

@@ -150,7 +150,9 @@ TOOL_COMMAND_FIELDS = (
 TOOL_IS_PRODUCTION_BY_CONSTRUCTION = re.compile(r"(?i)^mcp__.*__(d1_database_query|hyperdrive_.*)$")
 TOOL_DB_FIELDS = ("database_id", "databaseId", "database", "database_name", "databaseName", "id")
 # The built-in matcher; install.py registers matcher(), which adds the local db_tool_patterns. No Bash (release 1001).
-MATCHER = r".*d1_database_query|mcp__.*__(execute_sql|run_sql|query|sql)|mcp__.*__hyperdrive_.*"
+# Anchored (Claude Code reads an unanchored matcher as a substring regex): the release 1001 red team found the old one
+# firing on mcp__claude_ai_Claude_Docs__query and on any mcp__*__query_* tool.
+MATCHER = r"^(?:.*d1_database_query|mcp__.+__(?:execute_sql|run_sql|sql)|mcp__(?!claude_ai_Claude_Docs__).+__query|mcp__.+__hyperdrive_.+)$"
 LOCAL_DEFAULT_FIELDS = ("command", "cmd", "script", "sql", "query", "payload")
 
 

@@ -220,6 +220,29 @@ class ExecListTests(Fakes):
         self.assertNotIn(VALUE, done.stdout)
 
 
+class RmTests(Fakes):
+    def test_rm_is_refused_for_a_worker_and_runs_for_the_owner(self):
+        """The release 1001 red team: docs said the command guard gated rm; it was deleted, and rm had no check."""
+        target = self.tmp / 'vault'
+        target.mkdir()
+        self.ah('put', 'K', '--from', 'stdin', '--to', 'file:%s/' % target, stdin=VALUE)
+        self.assertTrue((target / 'K').exists())
+
+        def rm(**env):
+            full = {'PATH': '%s:/usr/bin:/bin' % self.bin, 'HOME': str(self.home), 'FAKE_STATE': str(self.state), **env}
+            return subprocess.run([sys.executable, str(HOOKS / 'ah.py'), 'secret', 'rm', 'K', '--store',
+                                   'file:%s' % target], env=full, capture_output=True, timeout=60, check=False)
+        for env in ({'AH_ROLE': 'worker', 'AH_ROLE_SOURCE': 'ah-sandbox:worker'},
+                    {'AH_ROLE': 'reviewer', 'AH_ROLE_SOURCE': 'ah-sandbox:reviewer'}, {'CLAUDECODE': '1'}):
+            done = rm(**env)
+            self.assertEqual(done.returncode, 3, done.stdout)
+            self.assertIn(b'only the owner or a supervisor', done.stdout)
+            self.assertTrue((target / 'K').exists())
+        done = rm()   # the owner's terminal: no agent marker, no AH_ROLE
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertFalse((target / 'K').exists())
+
+
 class MaskerTests(unittest.TestCase):
     def test_values_split_across_chunks_are_masked(self):
         import redact

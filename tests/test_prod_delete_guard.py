@@ -164,8 +164,10 @@ class Detection(Case):
                      "mcp__x__run_sql", "mcp__x__query", "mcp__x__sql", "mcp__cloudflare__hyperdrive_configs_list"):
             with self.subTest(name=name):
                 self.assertTrue(re.fullmatch(pdg.MATCHER, name))
-        for name in ("Bash", "PowerShell", "Write", "Edit", "Read", "Agent"):
+        for name in ("Bash", "PowerShell", "Write", "Edit", "Read", "Agent", "mcp__claude_ai_Claude_Docs__query",
+                     "mcp__x__query_history", "mcp__x__sql_lint_extra"):
             self.assertFalse(re.fullmatch(pdg.MATCHER, name), name)
+            self.assertFalse(re.search(pdg.MATCHER, name), name)   # as Claude Code reads it: a JavaScript search
         self.assertFalse(re.fullmatch(pdg.matcher(), "Bash"))
 
     def test_a_bash_payload_is_not_judged_even_when_a_local_pattern_names_bash(self):

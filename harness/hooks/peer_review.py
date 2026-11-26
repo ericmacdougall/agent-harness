@@ -1601,7 +1601,8 @@ def post_review_result(binding, head, passed, report, reviewer, run_id, runner=N
         entry = ah_repo.post_review_status(binding['repo'], head, state, description, runner=runner)
     except (ah_repo.GitHubError, ValueError) as error:
         import shlex  # noqa: PLC0415
-        print('The review stands, but harness/review was not confirmed on GitHub: %s\nFinish it with: '
+        print('The review stands, but harness/review was not confirmed on GitHub: %s\nRun the same review again; '
+              'or the owner, in his own terminal (outside any agent), runs: '
               'ah review-status post --repo %s --sha %s --state %s --description %s'
               % (diagnostics.sanitize(error), binding['repo'], head, state, shlex.quote(description)), file=sys.stderr)
         return 4

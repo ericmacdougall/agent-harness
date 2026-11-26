@@ -18,7 +18,7 @@ Ten Claude Code registrations, every one through `ah_hook.py` (so `harness off` 
 | SubagentStart | `.*` | `wal.py subagent` (10 s) | the sub-agent note log; `ah owners` needs the row |
 | SubagentStop | `.*` | `wal.py subagent_stop` (10 s) | `ah owners` sees an owner stop |
 | SubagentStop | `.*` | `autosave.py` (30 s, async) | the save (docs/lifecycle.md) |
-| UserPromptSubmit | | `owner_inbox.py hook` (5 s) | the file inbox for the owner's answers |
+| UserPromptSubmit | | `owner_inbox.py hook` (5 s) | the answer inbox: notes in `~/.agent-harness/inbox/<session>/`, a record path only the owner and supervisors can write |
 | Stop | | `autosave.py` (30 s, async) | the save |
 | Stop | | `dropped_gate.py` (15 s) | the one turn-end handoff nudge, once per set of owners |
 | SessionEnd | | `autosave.py` (30 s) | the last save |

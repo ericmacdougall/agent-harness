@@ -102,5 +102,30 @@ class Status(unittest.TestCase):
         self.assertIn("FAILED", ah.status_text(r))
 
 
+
+
+class SandboxRefusal(unittest.TestCase):
+    """The release 1001 red team: a note written as part of a compound command stays sandboxed, and ~/.claude is
+    write-protected there, so the write fails. wal_note says how to proceed instead of a traceback."""
+
+    def test_a_refused_write_names_the_command_to_run_alone(self):
+        sys.path.insert(0, str(HOOKS))
+        import wal_note
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"HOME": tmp}):
+            wal = Path(tmp) / ".claude" / "wals" / SESSION / "main.jsonl"
+            wal.parent.mkdir(parents=True)
+            argv = ["wal_note.py", "--wal", str(wal), "--event", "handoff", "--note", "left: tests"]
+            out = __import__("io").StringIO()
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(wal_note, "append",
+                                                                         side_effect=PermissionError(1, "EPERM")), \
+                    mock.patch("sys.stdout", out):
+                code = wal_note.main()
+        self.assertEqual(code, 3)
+        answer = json.loads(out.getvalue())
+        self.assertEqual((answer["status"], answer["code"]), ("REFUSED", "sandbox"))
+        self.assertIn("as its own command", answer["message"])
+        self.assertIn("python3 ~/.claude/hooks/wal_note.py --wal", answer["message"])
+
+
 if __name__ == "__main__":
     unittest.main()

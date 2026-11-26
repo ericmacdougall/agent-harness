@@ -5,7 +5,17 @@ Reads are local and read-only, JSON by default (--text for a summary). ah is the
 state: each write takes the store flock, validates, checks its idempotency key, then appends to an
 append-only ledger plus audit log. Comments GoodQA cannot take now go to a spool (`ah spool drain`).
 
-Slice 1 commands: owners, user-msg, ticket get|comments|comment, disk, task register|status|done, write result, spool drain.
+Commands with their own module (each answers --help):
+  doctor          prove this host's boundary and check the install (docs/doctor.md); --no-probes for a real host
+  sandbox         the per-role sandbox and permission settings (docs/sandbox.md)
+  repo            the merge rule on GitHub: protect | status (docs/merge-rule.md)
+  review-status   post or show the harness/review status (docs/merge-rule.md)
+  approve, approvals, supervisor   the one approvals store and the supervisor list (docs/approvals.md)
+  secret          clipboard to a secret store, and use it without printing it (docs/secrets.md)
+  reap, co        session folders: scan, save, remove; a checkout in the session folder (docs/lifecycle.md)
+  log-push        push a log to the private log repository, verify it, then remove the local copy
+  off, on, switch-status   the off switch (docs/off-switch.md)
+The rest are listed below.
 """
 from __future__ import annotations
 
@@ -1597,18 +1607,17 @@ def precheck(op: str, args: dict) -> None:
                 raise AhError("bad_request", f"task.dispose waiting: --until may be at most {cap // 3600} h after now"
                                              + (" (GoodQA could not confirm the ticket)" if args.get("ref_unverified") else "")
                                              + "; renew the wait when it expires")
-            ref = args.get("ref") or ""
-            if not (ASK_ID_RE.match(ref) or TICKET_RE.match(ref)):
-                raise AhError("bad_request", "task.dispose waiting: --ref must be an ask id (w + 11 hex) or 'GoodQA <project>#N'; "
-                                             "a wait must name what it waits on")
+            ref = (args.get("ref") or "").strip()
+            if not ref or len(ref) > FREE_TEXT_MAX or not ref.isprintable():
+                raise AhError("bad_request", "task.dispose waiting: --ref says what it waits on (an ask id, a ticket, a "
+                                             f"person or an event; at most {FREE_TEXT_MAX} characters)")
         elif args["kind"] == "reassigned":
             if not OWNER_ID_RE.match(args.get("ref") or ""):
                 raise AhError("bad_request", "task.dispose reassigned: --ref <replacement agent id> is required")
         elif args["kind"] in liveness.CLOSING:
             reason = (args.get("reason") or "").strip()
-            if len(reason) < REASON_MIN or len(set(re.findall(r"[a-z0-9]+", reason.lower()))) < REASON_MIN_WORDS:
-                raise AhError("reason", f"task.dispose {args['kind']}: --reason must say what you verified about this "
-                                        f"owner ({REASON_MIN}+ characters, {REASON_MIN_WORDS}+ different words)")
+            if not reason:
+                raise AhError("reason", f"task.dispose {args['kind']}: --reason says why, in your own words")
             if args["kind"] == "closed":
                 if not (ASK_ID_RE.match(args.get("deployed") or "") and LIVE_TEST_RE.match(args.get("live_test") or "")):
                     raise AhError("evidence", "task.dispose closed means done, and done means deployed to live and tested: "
@@ -1617,9 +1626,6 @@ def precheck(op: str, args: dict) -> None:
                                               "that will not ship is --kind superseded|wontdo --ref <ticket>")
                 if args.get("evidence"):
                     raise AhError("evidence", "task.dispose closed: --evidence is retired; give --deployed and --live-test")
-            elif not TICKET_RE.match(args.get("ref") or ""):
-                raise AhError("evidence", f"task.dispose {args['kind']}: --ref 'GoodQA <project>#N' (the ticket that "
-                                          "records why) is required")
         elif args["kind"] == "legacy" and (args.get("evidence") or args.get("deployed") or args.get("live_test")):
             raise AhError("bad_request", "task.dispose legacy takes no evidence: it records that nobody verified the owner")
     elif op == "deadline.add":
@@ -2076,8 +2082,7 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
         if args["kind"] == "reassigned" and not (_wal_has(main_wal, "subagent", None, agent=ref)
                                                 or (main_wal.parent / f"{ref}.jsonl").is_file()):
             raise AhError("bad_request", f"task.dispose reassigned: {ref} is not an agent of this session", 3)
-        if (args["kind"] == "closed" and not args.get("deploy_at")) or (args["kind"] == "legacy" and not args.get("gate_epoch")) \
-                or (args["kind"] in ("superseded", "wontdo") and not args.get("ref_checked")):
+        if (args["kind"] == "closed" and not args.get("deploy_at")) or (args["kind"] == "legacy" and not args.get("gate_epoch")):
             raise AhError("evidence", f"task.dispose {args['kind']}: evidence was not verified", 3)  # preflight sets these
         if args["kind"] in liveness.CLOSING:
             _closing_checks(args, ledger, time.time())
@@ -2385,8 +2390,7 @@ def task_list(home: Path, open_only: bool = False) -> dict:
 
 # ------------------------------------------------------------------ dispose guard (goodqa#14791, the 19-owner loop)
 
-REASON_MIN = 40  # characters of a closing reason
-REASON_MIN_WORDS = 6  # different words in it
+FREE_TEXT_MAX = 200  # a waiting --ref: what it waits on, in any words (release 1001: no ticket grammar)
 REASON_REPEAT_S = 7 * 86400  # a normalized reason may not repeat another owner's within this window
 CLOSE_BURST_MAX = 3  # distinct owners one actor may try to close ...
 CLOSE_BURST_WINDOW_S = 600  # ... within this window; the next one is refused as a possible bulk close
@@ -2418,9 +2422,8 @@ def _finished_check(home: Path, args: dict) -> str:
     row = next((r for r in rows if r.get("agent_id") == agent), None)
     if row is None:
         raise AhError("unknown_agent", f"task.dispose finished: {agent} is not an agent or task WAL of session {session}", 3)
-    if row.get("state") not in FINISHED_STATES and not row.get("result_at"):
-        raise AhError("not_finished", f"task.dispose finished: {agent} is {row.get('state')}: its process is still "
-                                      "running and it has not reported finished; wait for it, or use waiting/reassigned", 3)
+    # Release 1001: no check that the process stopped. A reviewer or fixer that returned its result is finished
+    # whatever its process looks like; the caller's word (and its optional --reason) is the record.
     caller = env_session()
     if not caller or caller == session:  # the registering session's own call (ah's session is the caller's)
         return "session"
@@ -2690,13 +2693,7 @@ def _dispose_preflight(home: Path, args: dict) -> dict:
                                   "not verified")
         return args
     if kind in ("superseded", "wontdo"):
-        found = _ticket_exists(args["ref"])
-        if found is False:
-            raise AhError("evidence", f"task.dispose {kind}: {args['ref']} does not exist", 3)
-        if found is None:
-            raise AhError("evidence_unverifiable", f"task.dispose {kind}: GoodQA could not confirm {args['ref']}; retry", 3)
-        args["ref_checked"] = True
-        return args
+        return args   # a free-text reason (and an optional --ref) is the record; no ticket grammar or lookup
     ctx = _owner_context(home, session, agent, ledger)
     dep, dnamed = _deploy_record(home, session, args["deployed"], ctx)
     _lt, lnamed = _live_test(home, session, args["live_test"], ctx, parse_ts(dep.get("at")) or 0.0)
@@ -2728,7 +2725,7 @@ def _closing_checks(args: dict, ledger: list, now: float) -> None:
                                                      f"{a.get('agent')} and names this owner only through a shared "
                                                      "ticket; cite a record that names this owner", 3)
         at = parse_ts(r.get("received_at")) or 0.0
-        if now - at < REASON_REPEAT_S and _reason_shape(a.get("reason") or "", a.get("agent") or "") == shape:
+        if args["kind"] == "closed" and a.get("kind") == "closed" and now - at < REASON_REPEAT_S and _reason_shape(a.get("reason") or "", a.get("agent") or "") == shape:
             raise AhError("reason", f"task.dispose {args['kind']}: this reason repeats the one used for {a.get('agent')}; "
                                     "say what you verified about this owner", 3)
 
@@ -3620,13 +3617,14 @@ def build_parser():
                     help="WAL id of the deploy, release or install record (done means deployed live and tested)")
     dp = ks.add_parser("dispose", help="record the decision for a DROPPED owner: resumed, reassigned, waiting or closed")
     dp.add_argument("--agent", required=True)
-    dp.add_argument("--kind", required=True, choices=list(DISPOSE_KINDS),
-                    help="finished: the task ended or reported finished (a reviewer, a fixer); no evidence needed")
-    dp.add_argument("--ref", help="waiting: ask id or ticket; reassigned: replacement agent id")
+    dp.add_argument("--kind", required=True, choices=list(DISPOSE_KINDS) + ["done"],
+                    help="finished (or done): the task is finished, in your words (--reason); no evidence, no ticket")
+    dp.add_argument("--ref", help="waiting: what it waits on, any words; reassigned: replacement agent id; "
+                                  "superseded, wontdo: optional")
     dp.add_argument("--until", help="waiting: ISO time when the wait expires")
     dp.add_argument("--ack-handoff", dest="ack_handoff", action="store_true",
                     help="waiting: main acknowledges this owner's handoff while the wait is live (main only)")
-    dp.add_argument("--reason", help="closed, superseded, wontdo: what you verified about this owner (40+ characters)")
+    dp.add_argument("--reason", help="why, in your own words (required for closed, superseded, wontdo)")
     dp.add_argument("--deployed", help="closed: WAL id of the deploy, release or install record naming this owner")
     dp.add_argument("--live-test", dest="live_test", help="closed: REALLY_TESTED id run against the live target")
     dp.add_argument("--evidence", help=argparse.SUPPRESS)  # retired: closed takes --deployed and --live-test
@@ -3673,7 +3671,7 @@ def build_parser():
     sp.add_argument("action", choices=["drain", "ack", "retry"])
     sp.add_argument("jobs", nargs="*", help="ack: spool job file names (<ms>-<hash>.json)")
     sp.add_argument("--evidence", help="ack: why these jobs are settled (the delivered comment, the ticket); 10+ characters")
-    al = sub.add_parser("alert", help="raise or clear an alert in the ops-watch ring (ahd, goodqa#14848)")
+    al = sub.add_parser("alert", help="raise or clear an alert in the ops-watch ring")
     al.add_argument("action", choices=["raise", "clear"])
     al.add_argument("--alert-key", required=True)
     al.add_argument("--source", required=True)
@@ -3805,7 +3803,8 @@ def run(args, home: Path) -> dict:
                     a[opt] = getattr(args, opt)
             return write(home, "task.register", a, s, args.key)
         if args.sub == "dispose":
-            a = {"agent": args.agent, "session": s or "", "kind": args.kind, "at": iso(time.time())}
+            kind = FINISHED if args.kind == "done" else args.kind   # `done` is the plain word for finished
+            a = {"agent": args.agent, "session": s or "", "kind": kind, "at": iso(time.time())}
             for opt in ("ref", "until", "reason", "evidence", "deployed", "live_test", "ack_handoff"):
                 if getattr(args, opt):
                     a[opt] = getattr(args, opt)

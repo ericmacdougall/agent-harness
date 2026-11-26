@@ -44,7 +44,7 @@ def _remote_hosts():
 REMOTE_HOSTS = _remote_hosts()
 HOSTS = ("local",) + REMOTE_HOSTS
 MAX_REASON = 500
-VERIFIER_VERSION = 3
+VERIFIER_VERSION = 4  # 4: ignored files that are not build output refuse (release 1001 review)
 PATH_RE = re.compile(r"/[A-Za-z0-9_@+=:,.-]+(?:/[A-Za-z0-9_@+=:,.-]+)*")
 
 
@@ -498,7 +498,7 @@ def _worktree_audit(record):
         pass
 
 
-FREE_VERIFIER_VERSION = 3
+FREE_VERIFIER_VERSION = VERIFIER_VERSION
 
 
 SESSION_ENDED_SECONDS = 2 * 3600
@@ -537,6 +537,62 @@ def session_ended(session, home=None, now=None, seconds=SESSION_ENDED_SECONDS):
     return now - newest >= seconds
 
 
+# Ignored paths that are only ever generated: at any depth, or (generic names) only at the top of the worktree.
+IGNORED_OK = ('node_modules', '__pycache__', '.pytest_cache', '.mypy_cache', '.ruff_cache')
+IGNORED_TOP_OK = ('.venv', 'venv', 'dist', 'build', 'target', '.next', '.gradle')
+NESTED_SCAN_ENTRIES = 250000
+NESTED_SCAN_SECONDS = 5.0
+
+
+def ignored_offenders(status):
+    """The ignored paths in a `git status -z --ignored=matching` listing that are not a whole regenerable build
+    directory, and the regenerable directories themselves (each still checked for a nested repository)."""
+    offenders, build_dirs = [], []
+    for entry in filter(None, status.split('\x00')):
+        if not entry.startswith('!! '):
+            continue
+        name = entry[3:]
+        leaf = name.rstrip('/').rsplit('/', 1)[-1]
+        top = '/' not in name.rstrip('/')
+        if name.endswith('/') and (leaf in IGNORED_OK or (top and leaf in IGNORED_TOP_OK)):
+            build_dirs.append(name)
+        else:
+            offenders.append(name)
+    return offenders, build_dirs
+
+
+def _nested_repo(directory, deadline):
+    """True when a .git entry (a nested repository or worktree) is in the directory or below it; 'large' when the
+    walk hit its entry or time bound."""
+    seen = 0
+    for top, dirs, files in os.walk(directory):
+        if '.git' in dirs or '.git' in files:
+            return True
+        seen += len(dirs) + len(files)
+        if seen > NESTED_SCAN_ENTRIES or time.monotonic() > deadline:
+            return 'large'
+    return False
+
+
+def ignored_refusal(path, status):
+    """None when every ignored path is a whole regenerable build directory holding no repository; else the refusal,
+    naming up to five offending paths (printable ASCII: names come from the worktree)."""
+    offenders, build_dirs = ignored_offenders(status)
+    if offenders:
+        shown = [re.sub(r'[^\x20-\x7e]', '?', n)[:80] for n in offenders[:5]]
+        more = len(offenders) - len(shown)
+        return ('it holds an ignored file or folder that is not a whole regenerable build directory: %s%s'
+                % (', '.join(shown), ' (and %d more)' % more if more > 0 else ''))
+    deadline = time.monotonic() + NESTED_SCAN_SECONDS
+    for name in build_dirs:
+        found = _nested_repo(os.path.join(path, name), deadline)
+        if found == 'large':
+            return 'an ignored build directory is too large to check for nested repositories in time'
+        if found:
+            return 'an ignored build directory holds a nested repository (%s)' % re.sub(r'[^\x20-\x7e]', '?', name)[:80]
+    return None
+
+
 def _rescue_name(path, head):
     base = re.sub(r'[^A-Za-z0-9._-]', '-', os.path.basename(path.rstrip(os.sep)) or 'worktree')[:60].strip('.-') or 'wt'
     return '%s-%s' % (base, head[:12])
@@ -572,6 +628,9 @@ def free_worktree_state(path, home=None, now=None):
         status = _git_out(path, ['status', '--porcelain=v1', '-z', '--untracked-files=all'], 60.0)
         facts['dirty'] = [e[3:] for e in status.split('\x00') if len(e) > 3][:20]
         facts['dirty_count'] = len([e for e in status.split('\x00') if len(e) > 3])
+        ignored = _git_out(path, ['status', '--porcelain=v1', '-z', '--untracked-files=normal',
+                                  '--ignored=matching', '--no-renames'], 60.0)
+        facts['ignored_refusal'] = ignored_refusal(path, ignored)
         head = facts['head']
         published = False
         if head:
@@ -602,13 +661,19 @@ def free_worktree(path, rescue=False, patch_dir=None, dry_run=False, home=None, 
     if facts['busy']:
         report['reason'] = 'a process is using the worktree as its working directory (pid %d, %s)' % facts['busy'][0]
         return report
+    if facts.get('ignored_refusal'):
+        # `git worktree remove` deletes ignored files (a .env, a local database) and neither the patch (`git add -A`)
+        # nor a rescue ref holds them, so they are never removed here, --rescue or not (the release 1000 rule).
+        report['reason'] = facts['ignored_refusal'] + ('; move the files you want to keep out of the worktree (or delete '
+                                                        'them yourself), then run the same command again')
+        return report
     dirty, head = facts['dirty_count'] > 0, facts['head']
     free = not dirty and (facts['published'] or facts['session_ended'] or not head)
     if not free and not rescue:
         why = ('it has %d uncommitted change(s)' % facts['dirty_count']) if dirty else (
             'its HEAD is not on a remote branch and its session %s is still active' % (facts['owner_session'] or '(unknown)'))
-        report['reason'] = (why + '; a supervisor of the project or a Fable/Astra agent may run the same command with '
-                            '--rescue (it saves the commits to refs/rescue/<name> and the changes to a patch first)')
+        report['reason'] = (why + '; run the same command with --rescue (it saves the commits to refs/rescue/<name> '
+                            'and the changes to a patch first)')
         return report
     report['removable'] = True
     name = _rescue_name(path, head or 'unborn')

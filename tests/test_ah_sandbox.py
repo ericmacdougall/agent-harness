@@ -56,8 +56,27 @@ class ClaudeSettings(Home):
             self.assertIs(box["enabled"], True, role)
             self.assertIs(box["failIfUnavailable"], True, role)
             self.assertIs(box["allowUnsandboxedCommands"], False, role)
-            self.assertIs(box["network"]["strictAllowlist"], True, role)
-            self.assertEqual(self.settings(role)["permissions"]["disableBypassPermissionsMode"], "disable")
+            self.assertIs(box["network"]["allowLocalBinding"], True, role)   # dev and test servers bind
+            self.assertEqual(box["network"]["allowMachLookup"], ["com.apple.trustd.agent"], role)  # gh's TLS check
+
+    def test_bypass_mode_is_refused_only_for_reviewers(self):
+        """The owner launches with --dangerously-skip-permissions. disableBypassPermissionsMode in the worker file
+        silently dropped that launch to prompting (the red team's real run: a Write inside the project was denied)."""
+        self.assertEqual(self.settings("reviewer")["permissions"]["disableBypassPermissionsMode"], "disable")
+        for role in ("worker", "supervisor"):
+            self.assertNotIn("disableBypassPermissionsMode", self.settings(role)["permissions"], role)
+            self.assertNotIn("disableBypassPermissionsMode", ah_sandbox.managed_settings(role, home=self.home)
+                             ["permissions"], role)
+
+    def test_network_stays_open_for_workers_and_supervisors(self):
+        """docs/direction.md: outbound network stays open in the first version. No allowedDomains, no strict list."""
+        for role in ("worker", "supervisor"):
+            network = self.settings(role)["sandbox"]["network"]
+            self.assertNotIn("allowedDomains", network, role)
+            self.assertNotIn("strictAllowlist", network, role)
+        reviewer = self.settings("reviewer")["sandbox"]["network"]
+        self.assertIs(reviewer["strictAllowlist"], True)
+        self.assertEqual(reviewer["allowedDomains"], BASE["reviewer_network_allow"])
 
     def test_secrets_denied_to_shell_and_read_tool(self):
         for role in ah_sandbox.ROLES:
@@ -67,13 +86,30 @@ class ClaudeSettings(Home):
                 self.assertIn(path, deny_read, role)
                 self.assertIn(f"Read({path})", deny, role)
                 self.assertIn(f"Read({path}/**)", deny, role)
+            for pattern in BASE["secret_globs"]:
+                self.assertIn(f"Read({pattern})", deny, role)
+                self.assertNotIn(pattern, deny_read, role)   # the sandbox lists take paths, not globs
+
+    def test_the_key_files_found_readable_on_the_owners_host_are_denied(self):
+        """The red team read these inside the worker sandbox at d095790c."""
+        for path in ("~/.codex/auth.json", "~/.config/goodqa", "~/.config/fish-audio.env", "~/.config/anthropic",
+                     "~/.config/openai-arxiv-keys", "~/.config/anthropic-arxiv-keys", "~/.config/dataforseo",
+                     "~/.git-credentials", "~/.npmrc", "~/.pypirc", "~/.claude/.credentials.json"):
+            self.assertIn(path, BASE["secret_paths"], path)
+        self.assertIn("**/.env", BASE["secret_globs"])
+
+    def test_the_keychain_stays_readable_so_gh_and_git_push_work(self):
+        """With ~/Library/Keychains read-denied, gh and git over https could not authenticate in the sandbox (the
+        e2e: gh api user 1, git ls-remote of a private repository 128). Keychain items stay behind securityd."""
+        for role in ah_sandbox.ROLES:
+            self.assertNotIn("~/Library/Keychains", self.settings(role)["sandbox"]["filesystem"]["denyRead"])
 
     def test_records_unwritable(self):
         for role in ah_sandbox.ROLES:
             data = self.settings(role)
             deny_write, deny = data["sandbox"]["filesystem"]["denyWrite"], data["permissions"]["deny"]
             for path in BASE["record_paths"]:
-                if role == "supervisor" and path == "~/.agent-harness/approvals.jsonl":
+                if role == "supervisor" and path in BASE["supervisor_write_extra"]:
                     continue
                 self.assertIn(path, deny_write, (role, path))
                 self.assertIn(f"Edit({path})", deny, (role, path))
@@ -126,6 +162,37 @@ class ClaudeSettings(Home):
         self.assertEqual(code, 2)
         self.assertIn("reviewer", err)
 
+    def test_the_harness_tools_run_outside_the_sandbox_under_three_spellings(self):
+        """ah secret (clipboard, gcloud), ah kill and ah worktree-remove (audit rows), ah log-push (deletes records),
+        ah chat (its token), wal_note (~/.claude/wals) and the review runner (model logins) cannot work sandboxed.
+        The real run proved ~/, $HOME/ and the absolute spelling are each excluded, and an unlisted one is not."""
+        for role in ("worker", "supervisor"):
+            excluded = self.settings(role)["sandbox"]["excludedCommands"]
+            for tool in ("wal_note.py *", "peer_review.py *", "ah.py secret *", "ah.py kill *",
+                         "ah.py worktree-remove *", "ah.py log-push *", "ah.py chat *"):
+                for prefix in ("python3 ~/.claude/hooks/", "python3 $HOME/.claude/hooks/",
+                               f"python3 {os.path.realpath(self.home)}/.claude/hooks/"):
+                    self.assertIn(prefix + tool, excluded, (role, prefix, tool))
+            self.assertNotIn("python3 ~/.claude/hooks/ah.py approve *", excluded)   # approvals stay sandboxed
+            for command in ("go *", "jest *", "npx jest *", "npx playwright *"):
+                self.assertIn(command, excluded, (role, command))
+        self.assertEqual(self.settings("reviewer")["sandbox"].get("excludedCommands", []), [])
+
+    def test_local_json_adds_excluded_commands_for_workers_only(self):
+        self.local({"sandbox_excluded_commands": ["node tools/browser-test.js *", 7, ""]})
+        self.assertIn("node tools/browser-test.js *", self.settings("worker")["sandbox"]["excludedCommands"])
+        self.assertIn("node tools/browser-test.js *", self.settings("supervisor")["sandbox"]["excludedCommands"])
+        self.assertEqual(self.settings("reviewer")["sandbox"].get("excludedCommands", []), [])
+
+    def test_the_answer_inbox_is_a_record_only_supervisors_write(self):
+        inbox = "~/.agent-harness/inbox"
+        worker, sup = self.settings("worker"), self.settings("supervisor")
+        self.assertIn(inbox, worker["sandbox"]["filesystem"]["denyWrite"])
+        self.assertIn(f"Edit({inbox}/**)", worker["permissions"]["deny"])
+        self.assertIn(inbox, self.settings("reviewer")["sandbox"]["filesystem"]["denyWrite"])
+        self.assertIn(inbox, sup["sandbox"]["filesystem"]["allowWrite"])
+        self.assertNotIn(inbox, sup["sandbox"]["filesystem"]["denyWrite"])
+
     def test_worker_write_scope_and_exclusions(self):
         worker = self.settings("worker")
         self.assertEqual(worker["sandbox"]["filesystem"]["allowWrite"], BASE["worker_write"])
@@ -148,8 +215,8 @@ class ClaudeSettings(Home):
             self.settings("admin")
 
     def test_network_allow_list(self):
-        worker = self.settings("worker")["sandbox"]["network"]["allowedDomains"]
-        self.assertEqual(worker, BASE["network_allow"])
+        """The worker list is kept for a later allow-list measured in shadow; only the reviewer enforces one now."""
+        self.assertEqual(ah_sandbox.domains("worker", home=self.home), BASE["network_allow"])
         reviewer = self.settings("reviewer")["sandbox"]["network"]["allowedDomains"]
         self.assertEqual(reviewer, BASE["reviewer_network_allow"])
 
@@ -158,7 +225,7 @@ class ClaudeSettings(Home):
                     "trusted_git_hosts": ["git.example.org", 7], "sandbox_allowed_domains": ["*.corp.example"],
                     "sandbox_extra_deny_read": ["~/.vault"], "sandbox_extra_write": ["~/build-out"]})
         data = self.settings("worker")
-        domains = data["sandbox"]["network"]["allowedDomains"]
+        domains = ah_sandbox.lists("worker", home=self.home)["domains"]
         for name in ("worker-1", "wt-2", "git.example.org", "*.corp.example"):
             self.assertIn(name, domains)
         self.assertNotIn("bad host!", domains)
@@ -170,8 +237,7 @@ class ClaudeSettings(Home):
 
     def test_local_dict_argument_wins_over_file(self):
         self.local({"sandbox_allowed_domains": ["file.example"]})
-        data = ah_sandbox.claude_settings("worker", home=self.home, local={"sandbox_allowed_domains": ["arg.example"]})
-        domains = data["sandbox"]["network"]["allowedDomains"]
+        domains = ah_sandbox.lists("worker", home=self.home, local={"sandbox_allowed_domains": ["arg.example"]})["domains"]
         self.assertIn("arg.example", domains)
         self.assertNotIn("file.example", domains)
 
@@ -288,8 +354,10 @@ class Codex(Home):
             self.assertEqual(fs[path], "deny")
         self.assertEqual(fs["~/.agent-harness/approvals.jsonl"], "read")
         self.assertEqual(fs[":workspace_roots"][".git"], "write")
+        for path in (".git/hooks", ".git/config", ".git/config.worktree"):   # a planted hook would run unsandboxed
+            self.assertEqual(fs[":workspace_roots"][path], "read", path)
         self.assertIs(worker["network"]["enabled"], True)
-        self.assertEqual(worker["network"]["domains"]["github.com"], "allow")
+        self.assertNotIn("domains", worker["network"])   # open, as for Claude Code
 
     def test_reviewer_and_supervisor(self):
         perms = self.parsed()["permissions"]
@@ -307,7 +375,7 @@ class Codex(Home):
         perms = self.parsed()["permissions"]
         self.assertEqual(perms["ah-worker"]["filesystem"]["~/.vault"], "deny")
         self.assertEqual(perms["ah-worker"]["filesystem"]["~/out"], "write")
-        self.assertEqual(perms["ah-worker"]["network"]["domains"]["w1"], "allow")
+        self.assertIn("w1", ah_sandbox.lists("worker", home=self.home)["domains"])
         self.assertNotIn("~/out", perms["ah-reviewer"]["filesystem"])
 
     def test_quoting_survives_odd_paths(self):

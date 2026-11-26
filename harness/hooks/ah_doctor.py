@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """`ah doctor`: prove on this host that the boundary denies what it claims, and check the install (docs/doctor.md).
 
-    ah doctor [--json] [--role worker|reviewer|supervisor|all] [--strict] [--codex]
+    ah doctor [--json] [--role worker|reviewer|supervisor|all|none] [--no-probes] [--strict] [--codex]
+
+`--no-probes` (the same as `--role none`) runs the checks only: nothing is created or written anywhere, which is how
+to run doctor on a real host without the probe files in ~/.agent-harness/work and $HOME.
 
 Every sandbox probe has three parts. The control proves the target is real outside the sandbox (the file exists and
 this user can read it; the folder is writable). The denial runs the same operation inside the role's sandbox and must
@@ -23,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import pwd
 import hashlib
 import json
 import os
@@ -57,6 +61,12 @@ TRUST_KEY = re.compile(r'^\s*\[hooks\.state\."((?:[^"\\]|\\.)*)"\]\s*$')
 TRUST_HASH = re.compile(r'^\s*trusted_hash\s*=\s*"([^"]*)"\s*$')
 APP_CODEX = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
 SECRET_WALK = 500
+# Names that look like a credential (the doctor's coverage check, `secrets-readable`); matched on file names only.
+CREDENTIAL_NAME = re.compile(r"(?i)(token|secret|credential|passw|api[-_]?key|auth\.json$|\.env$|^\.env\b|\.pem$|"
+                             r"\.key$|-keys?$|^id_(rsa|dsa|ecdsa|ed25519)$|netrc$|pgpass$|\.p12$|\.pfx$|\.keystore$)")
+CREDENTIAL_SCAN = 4000      # directory entries looked at, at most
+RULESET_REPOS = 20          # active repositories checked for the merge rule, at most
+RULESET_ACTIVE_DAYS = 30
 GIT_ENV = {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"}
 
 
@@ -299,6 +309,9 @@ class ProbeSet:
         for path in (self.project, self.tmp, self.standin):
             path.mkdir(mode=0o700)
         (self.project / "README").write_text("ah doctor probe project\n")
+        # The project is a repository before any sandbox runs, as a real checkout is: Codex keeps .git/hooks and
+        # .git/config read-only inside a workspace root, so `git init` there is refused by design (docs/sandbox.md).
+        ctx.runner(["git", "init", "-q", str(self.project)], env=ctx.env(**GIT_ENV), cwd=str(self.base), timeout=60)
         for name in ("approvals.jsonl", "roles.json"):
             (self.standin / name).write_text("")
 
@@ -422,13 +435,31 @@ def probe_write_scope(ps, mech, role, lists, prefix):
         text = "a write outside every writable root was refused; reading the project worked"
     else:
         name = f"twin-{secrets.token_hex(4)}"
-        probe.add("t0", f"echo ok > {name} && git init -q . && git add {name} && "
+        probe.add("t0", f"echo ok > {name} && {{ [ -d .git ] || git init -q . ; }} && git add {name} && "
                         "git -c user.name=ah-doctor -c user.email=doctor@invalid -c commit.gpgsign=false "
                         "-c core.hooksPath=/dev/null commit -qm probe")
         targets["t0"] = "write, git init and git commit inside the project"
         text = "a write outside the project and every writable root was refused; git commit inside it worked"
     code, codes, err = probe.run(ps.ctx)
     return verdict(rid, mech, code, codes, err, ["d0"], ["t0"], text, targets=targets)
+
+
+def probe_git_hooks(ps, mech, role, lists, prefix):
+    """Codex: .git/hooks and .git/config stay read-only in a workspace root, so a planted hook cannot run later in the
+    owner's own git; a commit still works (the twin)."""
+    rid = f"{prefix}.{role}.git-hooks"
+    probe = Probe(rid, mech, ps.spec(role, lists), ps.project, ps.env())
+    hook = ps.project / ".git" / "hooks" / f"ah-doctor-{secrets.token_hex(4)}"
+    probe.add("d0", f"echo x > {shlex.quote(str(hook))}")
+    probe.add("d1", f"echo '# ah doctor' >> {shlex.quote(str(ps.project / '.git' / 'config'))}")
+    probe.cleanup.append(str(hook))
+    name = f"hooks-twin-{secrets.token_hex(4)}"
+    probe.add("t0", f"echo ok > {name} && git add {name} && git -c user.name=ah-doctor -c user.email=doctor@invalid "
+                    "-c commit.gpgsign=false -c core.hooksPath=/dev/null commit -qm probe")
+    code, codes, err = probe.run(ps.ctx)
+    return verdict(rid, mech, code, codes, err, ["d0", "d1"], ["t0"], ".git/hooks and .git/config are read-only; "
+                   "git commit works", targets={"d0": ".git/hooks/<new file>", "d1": "append to .git/config",
+                                                "t0": "git commit inside the project"})
 
 
 def probe_read_only(ps, mech, role, lists, prefix):
@@ -500,6 +531,8 @@ def role_probes(ctx, ps, role, mech, prefix, codex_text=None) -> list:
     elif prefix == "probe":
         out.append(probe_approvals(ps, mech, role, lists, prefix))
     if prefix == "codex":
+        if role != "reviewer":
+            out.append(probe_git_hooks(ps, mech, role, lists, prefix))
         out.append(probe_network(ps, mech, role, lists, prefix, codex_text))
     return out
 
@@ -532,7 +565,9 @@ def _labels(ctx) -> list:
     out = []
     for label in ah_switch.MAC_LABELS:   # computed when ah_switch was imported: its prefix may be another home's
         suffix = label.rsplit(".", 1)[-1]   # the job names have no dot (ahd, log-backup, mission-control, floor)
-        out += [n for n in (label, prefix + suffix, DEFAULT_PREFIX + suffix) if n not in out]
+        for name in (label, prefix + suffix, DEFAULT_PREFIX + suffix):
+            if name not in out:          # one at a time: the three spellings are often the same label
+                out.append(name)
     return out
 
 
@@ -789,13 +824,117 @@ def check_python(ctx) -> dict:
     return result("python", "OK", f"{python} is {out.strip()}")
 
 
+def account_home() -> str:
+    """This account's own home directory (the password database), whatever $HOME says."""
+    try:
+        return os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir)
+    except (KeyError, OSError):
+        return ""
+
+
 def check_gh(ctx) -> dict:
     gh = ctx.which("gh")
     if not gh:
         return result("gh", "FAILED", "gh is not installed (reviews, the merge rule and saves use it)")
     if ctx.runner([gh, "auth", "status"], env=ctx.env(), timeout=30)[0] != 0:
+        if ctx.system == "darwin" and real(ctx.home) != account_home():
+            # macOS keeps gh's token in the login keychain, and the keychain search follows $HOME: a temporary
+            # home cannot reach it, so this says nothing about the account (the release 1001 e2e).
+            return result("gh", "UNPROVEN", f"gh is not authenticated under {ctx.home}, which is not this account's "
+                          "home; the login keychain follows $HOME, so the real login cannot be seen from here")
         return result("gh", "FAILED", "gh is not authenticated (gh auth login)")
     return result("gh", "OK", "gh is installed and authenticated")
+
+
+def _covered(path: str, denied) -> bool:
+    return any(path == d or path.startswith(d.rstrip("/") + "/") for d in denied)
+
+
+def check_secrets_readable(ctx) -> dict:
+    """The credential-shaped files in $HOME's dot files and ~/.config (two levels) that no role's deny list covers:
+    the secrets probe only proves the paths that are listed, so this lists what is left readable."""
+    denied = [real(p) for p in ah_sandbox.role_lists("worker", ctx.home, ctx.local)["deny_read"]]
+    found, seen = [], 0
+    roots = [(ctx.home, 1, True), (ctx.home / ".config", 2, False)]
+    for root, depth, dot_only in roots:
+        stack = [(root, 0)]
+        while stack and seen < CREDENTIAL_SCAN:
+            folder, level = stack.pop()
+            try:
+                names = sorted(os.listdir(folder))
+            except OSError:
+                continue
+            for name in names:
+                seen += 1
+                if seen > CREDENTIAL_SCAN:
+                    break
+                if dot_only and level == 0 and not name.startswith("."):
+                    continue
+                path = os.path.join(str(folder), name)
+                full = real(path)
+                if _covered(full, denied) or name in (".Trash", "Library"):
+                    continue
+                if CREDENTIAL_NAME.search(name):
+                    try:
+                        if os.access(path, os.R_OK):
+                            found.append(str(Path("~") / os.path.relpath(path, str(ctx.home))))
+                    except OSError:
+                        pass
+                    continue
+                if level + 1 < depth and os.path.isdir(path) and not os.path.islink(path):
+                    stack.append((Path(path), level + 1))
+    if found:
+        shown = ", ".join(found[:8]) + (f" (+{len(found) - 8} more)" if len(found) > 8 else "")
+        return result("secrets-readable", "FAILED", f"{len(found)} credential-shaped file(s) no role denies: {shown}; "
+                      "add them to local.json sandbox_extra_deny_read", paths=found[:50])
+    return result("secrets-readable", "OK", f"no credential-shaped file outside the deny list ({seen} entries looked at)")
+
+
+def _pushed_at(repo) -> float:
+    try:
+        return parse_iso(str(repo.get("pushedAt") or ""))
+    except ValueError:
+        return 0.0
+
+
+def check_rulesets(ctx) -> dict:
+    """Release 1001 unregisters the merge gate hook; the harness-merge-rule ruleset on GitHub is the gate now. Lists
+    the account's active repositories (admin, not archived, pushed within RULESET_ACTIVE_DAYS) without it."""
+    gh = ctx.which("gh")
+    if not gh:
+        return result("rulesets", "UNPROVEN", "gh is not installed; cannot list repositories without the merge rule")
+    code, out, err = ctx.runner([gh, "repo", "list", "--no-archived", "--limit", "100", "--json",
+                                 "nameWithOwner,pushedAt,viewerPermission"], env=ctx.env(), timeout=60)
+    try:
+        repos = json.loads(out) if code == 0 else None
+    except ValueError:
+        repos = None
+    if not isinstance(repos, list):
+        return result("rulesets", "UNPROVEN", f"cannot list this account's repositories with gh ({tail(err) or code})")
+    cutoff = ctx.now - RULESET_ACTIVE_DAYS * 86400
+    active = [r["nameWithOwner"] for r in repos if isinstance(r, dict) and isinstance(r.get("nameWithOwner"), str)
+              and r.get("viewerPermission") == "ADMIN" and _pushed_at(r) >= cutoff]
+    active = active[:RULESET_REPOS]
+    missing, unknown = [], []
+    for slug in active:
+        code, out, _err = ctx.runner([gh, "api", f"repos/{slug}/rulesets"], env=ctx.env(), timeout=30)
+        try:
+            names = [x.get("name") for x in json.loads(out)] if code == 0 else None
+        except (ValueError, AttributeError, TypeError):
+            names = None
+        if names is None:
+            unknown.append(slug)
+        elif "harness-merge-rule" not in names:
+            missing.append(slug)
+    if missing:
+        return result("rulesets", "FAILED", f"{len(missing)} active repositor{'y has' if len(missing) == 1 else 'ies have'}"
+                      " no harness-merge-rule, and release 1001 has no merge hook: " + ", ".join(missing[:8])
+                      + f" (run `ah repo protect {missing[0]}` for each)", missing=missing, unknown=unknown)
+    if unknown:
+        return result("rulesets", "UNPROVEN", "could not read the rulesets of " + ", ".join(unknown[:8]),
+                      unknown=unknown)
+    return result("rulesets", "OK", f"{len(active)} active repositor{'y has' if len(active) == 1 else 'ies have'} the "
+                  "merge rule" if active else "no active repository of this account to protect")
 
 
 def check_mechanism(ctx, mech) -> dict:
@@ -926,9 +1065,9 @@ def run(home=None, roles=ah_sandbox.ROLES, codex=False, strict=False, runner=Non
         mech = Mechanism(ctx)
         results += [check_switch(ctx), check_files(ctx, "claude"), check_files(ctx, "codex"),
                     check_wiring(ctx, "claude"), check_wiring(ctx, "codex"), check_imports(ctx, ps.tmp),
-                    check_codex_trust(ctx), check_shim(ctx), check_python(ctx), check_gh(ctx),
+                    check_codex_trust(ctx), check_shim(ctx), check_python(ctx), check_gh(ctx), check_rulesets(ctx),
                     check_mechanism(ctx, mech), check_backup(ctx), check_rescue(ctx), check_disk(ctx),
-                    check_managed(ctx), check_sandbox_files(ctx)]
+                    check_managed(ctx), check_sandbox_files(ctx), check_secrets_readable(ctx)]
         for role in roles:
             results += role_probes(ctx, ps, role, mech, "probe")
         if codex:
@@ -961,7 +1100,9 @@ def main(argv=None, runner=None, system=None, which=None, disk_usage=None, tmp_r
     parser = argparse.ArgumentParser(prog="ah doctor", description="Prove this host's boundary and check the "
                                      "install (docs/doctor.md).")
     parser.add_argument("--json", action="store_true")
-    parser.add_argument("--role", default="all", help="worker, reviewer, supervisor or all (default)")
+    parser.add_argument("--role", default="all", help="worker, reviewer, supervisor, all (default) or none")
+    parser.add_argument("--no-probes", action="store_true",
+                        help="the checks only: no probe file is created anywhere (for a real host); same as --role none")
     parser.add_argument("--strict", action="store_true", help="UNPROVEN counts as a failure")
     parser.add_argument("--codex", action="store_true", help="also run the probes under the real `codex sandbox`")
     parser.add_argument("--home", help="the home to check (tests; default $HOME)")
@@ -970,10 +1111,16 @@ def main(argv=None, runner=None, system=None, which=None, disk_usage=None, tmp_r
         args = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
     except SystemExit as stop:
         return int(stop.code or 0)
-    if args.role != "all" and args.role not in ah_sandbox.ROLES:
-        print(f"ah doctor: --role is one of {', '.join(ah_sandbox.ROLES)} or all", file=sys.stderr)
+    if args.role not in ("all", "none") and args.role not in ah_sandbox.ROLES:
+        print(f"ah doctor: --role is one of {', '.join(ah_sandbox.ROLES)}, all or none", file=sys.stderr)
         return 2
-    roles = ah_sandbox.ROLES if args.role == "all" else (args.role,)
+    if args.no_probes or args.role == "none":
+        roles = ()
+        if args.codex:
+            print("ah doctor: --codex runs probes; it does not go with --no-probes", file=sys.stderr)
+            return 2
+    else:
+        roles = ah_sandbox.ROLES if args.role == "all" else (args.role,)
     report = run(home=args.home, roles=roles, codex=args.codex, strict=args.strict, runner=runner, system=system,
                  which=which, disk_usage=disk_usage, managed_dir=args.managed_dir, tmp_root=tmp_root)
     sys.stdout.write(json.dumps(report, indent=2, sort_keys=True) + "\n" if args.json else text_report(report))

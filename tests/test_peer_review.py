@@ -2424,6 +2424,8 @@ class GitHubReviewStatusTests(unittest.TestCase):
         self.assertTrue((self.root / 'usage-state' / 'runs' / run_id / 'settled.json').exists())
         self.assertIn('ah review-status post --repo o/r --sha %s --state success --description' % self.head,
                       result.stderr)
+        self.assertIn('own terminal (outside any agent)', result.stderr)   # not an agent's one-line way round
+        self.assertNotIn('Finish it with', result.stderr)
         self.assertIn('receipt ' + run_id, result.stderr)
 
     def test_a_readback_that_differs_exits_four(self):

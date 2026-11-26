@@ -65,21 +65,23 @@ def is_dead(agent: str, r: dict) -> bool:
 
 
 def message(undisposed: list, rows: dict) -> str:
-    """At most CONTEXT_CAP characters: the owners, then the one command (with its kinds) that records a decision."""
-    names = []
-    for agent in undisposed:
-        r = rows.get(agent) or {}
-        if agent.startswith("dl") and not r:
-            names.append(f"deadline {agent} missed")
-        elif "handoff-unacked" in (r.get("flags") or []):
-            names.append(f"{agent} handed off {_age(r)} ago, unacknowledged")
-        else:
-            names.append(f"{agent} DROPPED {_age(r)} ({r.get('ticket') or 'no ticket'})")
-    shown = "; ".join(names[:6]) + (f"; +{len(names) - 6} more" if len(names) > 6 else "")
-    text = (f"Owner(s) with no recorded decision (goodqa#14791): {shown}. Record one each: `ah task dispose --agent ID "
-            "--kind resumed` (after resuming), or --kind reassigned --ref NEW_ID, --kind waiting --ref ASK_OR_TICKET "
-            "--until ISO, --kind closed --reason R --deployed WAL_ID --live-test TEST_ID, --kind superseded|wontdo --ref "
-            "TICKET --reason R. Detail: ah owners.")
+    """At most CONTEXT_CAP characters: one line per kind of subject, each with the command that settles it. A
+    finished owner takes a free-text reason, nothing else (release 1001: no deploy evidence, no ticket grammar)."""
+    deadlines = [a for a in undisposed if a.startswith("dl") and not rows.get(a)]
+    handoffs = [a for a in undisposed if a not in deadlines and "handoff-unacked" in ((rows.get(a) or {}).get("flags") or [])]
+    dropped = [a for a in undisposed if a not in deadlines and a not in handoffs]
+    lines = ["Owner(s) with no recorded decision (detail: ah owners):"]
+    if deadlines:
+        lines.append(f"deadline {', '.join(deadlines[:3])} missed: `ah deadline done --id {deadlines[0]}` once it is met")
+    for agent in handoffs[:3]:
+        lines.append(f"{agent} handed off {_age(rows.get(agent) or {})} ago, unacknowledged: `ah task dispose --agent "
+                     f"{agent} --kind resumed` (you took it) or --kind reassigned --ref NEW_ID")
+    if dropped:
+        shown = ", ".join(f"{a} ({_age(rows.get(a) or {})})" for a in dropped[:4])
+        more = f" +{len(dropped) - 4} more" if len(dropped) > 4 else ""
+        lines.append(f"DROPPED {shown}{more}: `ah task dispose --agent ID --kind finished --reason 'WHY'`, or --kind "
+                     "resumed, reassigned --ref NEW_ID, waiting --ref 'WHAT' --until ISO, superseded|wontdo --reason 'WHY'")
+    text = "\n  - ".join(lines)
     return text if len(text) <= CONTEXT_CAP else text[:CONTEXT_CAP - 3] + "..."
 
 

@@ -294,9 +294,35 @@ class ProtectTests(unittest.TestCase):
         self.assertEqual((code, value["protected"], value["ruleset"]), (0, True, 900))
 
 
+AGENT_ENV_NAMES = AGENT_VARS + ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "AH_ROLE")
+
+
 class PostReviewStatusTests(unittest.TestCase):
     def setUp(self):
         self.gh = FakeGh()
+        patcher = mock.patch.dict(os.environ, {k: v for k, v in os.environ.items() if k not in AGENT_ENV_NAMES},
+                                  clear=True)   # the owner's terminal, whatever session runs the suite
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_an_agent_cannot_post_a_passing_review_from_the_command_line(self):
+        """The release 1001 red team: any agent could post success with one advertised command. The runner posts
+        in-process; failure and pending stay open to agents (they unlock nothing)."""
+        for name, value in (("CLAUDECODE", "1"), ("CODEX_THREAD_ID", "t"), ("AH_ROLE", "worker"),
+                            ("CLAUDE_CODE_SESSION_ID", "11111111-2222-3333-4444-555555555555")):
+            with self.subTest(name=name), mock.patch.dict(os.environ, {name: value}):
+                code, _, err = run_main(["post", "--repo", "o/r", "--sha", SHA, "--state", "success",
+                                         "--description", "PASS"], self.gh, ah_repo.review_status_main)
+                self.assertEqual(code, 2)
+                self.assertIn("peer_review.py pr", err)
+        self.assertEqual(self.gh.calls, [])
+        with mock.patch.dict(os.environ, {"CLAUDECODE": "1"}):
+            code, _, err = run_main(["post", "--repo", "o/r", "--sha", SHA, "--state", "failure", "--description",
+                                     "BLOCK"], self.gh, ah_repo.review_status_main)
+        self.assertEqual(code, 0, err)
+        code, _, err = run_main(["post", "--repo", "o/r", "--sha", SHA, "--state", "success", "--description",
+                                 "PASS"], self.gh, ah_repo.review_status_main)
+        self.assertEqual(code, 0, err)   # the owner's own terminal
 
     def test_posts_the_harness_review_context_for_the_exact_sha_and_reads_it_back(self):
         entry = ah_repo.post_review_status("o/r", SHA, "success", "PASS by Codex; receipt " + "e" * 32,
@@ -397,7 +423,7 @@ class OwnerOverrideTests(unittest.TestCase):
         self.gh = FakeGh()
         self.home = tempfile.mkdtemp(prefix="ah-repo-home-")
         self.addCleanup(lambda: __import__("shutil").rmtree(self.home, ignore_errors=True))
-        clean = {k: v for k, v in os.environ.items() if k not in AGENT_VARS}
+        clean = {k: v for k, v in os.environ.items() if k not in AGENT_ENV_NAMES}
         clean.update(HOME=self.home, AH_HOME=self.home)
         patcher = mock.patch.dict(os.environ, clean, clear=True)
         patcher.start()

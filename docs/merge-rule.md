@@ -50,6 +50,11 @@ newest `harness/review` entry is the one it sent, with the same state and descri
 newer entry from someone else, fails with exit 1. A description longer than GitHub's 140 characters is cut before
 it is sent. `show` prints the newest entry.
 
+`post --state success` refuses inside an agent (an agent marker, a session id or a launch `AH_ROLE`, the
+`ah_approvals.in_agent` rule) and names the review to run instead: the review runner posts in-process, never through
+this command, so an agent asking for a passing status here is a careless or misled one. `failure`, `error` and
+`pending` stay open to agents; they unlock nothing.
+
 `--owner-override --approval ID --pr N` is the owner's path for a pull request the reviewer blocked. It runs only
 outside an agent, in the owner's own terminal. It needs a live `ah approve merge --project owner/repo --pr N` record
 with that id, and the description names the approval. Approvals bind to the pull request; reviews bind to the commit.
@@ -70,8 +75,9 @@ the receipt is settled, it posts for the exact HEAD it reviewed:
 There are two verdicts, PASS and BLOCK. A finding the reviewer would defer to a ticket blocks, and the pull request
 goes to the owner's queue. When nothing is posted the head stays unmergeable, and the failure is never counted.
 
-If the post or the readback fails, the review result stands, the exit code is 4, and stderr prints the one
-`ah review-status post ...` command that finishes the job.
+If the post or the readback fails, the review result stands and the exit code is 4. stderr says to run the same review
+again, or prints the `ah review-status post ...` line for the owner to run in his own terminal (an agent's copy of
+that line is refused for a passing status).
 
 A fix pushed after the review is a new commit with no status, so GitHub refuses the merge until the new head is
 reviewed. This replaces the old 150-line allowance. Re-review happens automatically; nobody files a new card for it.
@@ -85,10 +91,14 @@ permission profile when `config.toml` declares it; otherwise it keeps `--sandbox
 
 ## What this does not cover
 
-- Workers can read `gh`'s credentials so they can push and open pull requests. With them, a determined agent could
-  post `harness/review` itself. This is settled when the reviewer posts through an identity that workers cannot
-  read (direction, "never" list).
-- A repository the owner never ran `ah repo protect` on has no merge rule.
+- Workers can use `gh`'s credentials so they can push and open pull requests (the sandbox leaves the login keychain
+  readable; docs/sandbox.md). With them an agent could still post `harness/review` itself through `gh api`, past the
+  command's refusal. The required check names no `integration_id`, so any token with status scope satisfies it. Both
+  are settled only when the reviewer posts through an identity workers cannot read (a GitHub App), and the ruleset
+  pins that app's integration id (direction, "never" list). Not built.
+- A repository the owner never ran `ah repo protect` on has no merge rule, and release 1001 has no merge-gate hook
+  either. `ah doctor` (`rulesets`) lists the account's active repositories without `harness-merge-rule`, and the
+  installer says so; protect each before relying on the rule.
 - `--no-main-stamp` is accepted and ignored for one release.
 
 ## Proof against the real GitHub

@@ -541,8 +541,9 @@ def main(argv=None) -> None:
         return
     print(f'  {netwatch_status(args.home, args.apply, args.netwatch)}')
     if args.apply:
-        print('Review and trust the new user hooks with /hooks in a new Codex session (release '
-              f'{REMOVED_IN} changed the hook layout, so the trust hashes changed).')
+        print('REQUIRED: Codex skips every harness hook until you trust it. Start a new Codex session, open /hooks '
+              f'and trust the harness hooks (release {REMOVED_IN} changed the hook layout, so '
+              'the trust hashes changed); `ah doctor` (codex-trust) counts the ones still untrusted.')
 
 
 if __name__ == '__main__':

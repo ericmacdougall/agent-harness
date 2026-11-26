@@ -31,7 +31,7 @@ except (ImportError, SyntaxError):  # Python < 3.11 has no tomllib
     install_codex = None
 
 TOOL_EVENTS = ("PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionDenied")
-DB_MATCHER = r".*d1_database_query|mcp__.*__(execute_sql|run_sql|query|sql)|mcp__.*__hyperdrive_.*"
+DB_MATCHER = r"^(?:.*d1_database_query|mcp__.+__(?:execute_sql|run_sql|sql)|mcp__(?!claude_ai_Claude_Docs__).+__query|mcp__.+__hyperdrive_.+)$"
 # (event, matcher, script, args, timeout, async) in file order
 CLAUDE_TABLE = [
     ("PreToolUse", DB_MATCHER, "prod_delete_guard.py", (), 30, False),
