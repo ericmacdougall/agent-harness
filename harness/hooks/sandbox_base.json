@@ -1,0 +1,73 @@
+{
+  "schema": 1,
+  "about": "Role data for ah_sandbox.py (docs/sandbox.md). Data, not code: paths start with ~/ so one file serves every user. local.json adds sandbox_allowed_domains, sandbox_extra_deny_read, sandbox_extra_write and sandbox_role.",
+  "secret_paths": [
+    "~/.ssh",
+    "~/.aws",
+    "~/.gnupg",
+    "~/.netrc",
+    "~/.kube",
+    "~/.docker/config.json",
+    "~/.config/gcloud",
+    "~/.config/rclone",
+    "~/.kimi-code",
+    "~/.password-store",
+    "~/Library/Keychains"
+  ],
+  "record_paths": [
+    "~/.claude/projects",
+    "~/.codex/sessions",
+    "~/.codex/archived_sessions",
+    "~/.agent-harness/logs",
+    "~/.agent-harness/approvals.jsonl",
+    "~/.agent-harness/roles.json",
+    "~/.agent-harness/OFF",
+    "~/.agent-harness/off-stash",
+    "~/.agent-harness/releases",
+    "~/.agent-harness/rescue",
+    "~/.agent-harness/sandbox",
+    "~/.agent-harness/local.json",
+    "~/.agent-harness/install-state.json",
+    "~/.agent-harness/floor.json",
+    "~/.claude/hooks",
+    "~/.codex/agent-harness"
+  ],
+  "worker_write": [
+    "~/.agent-harness/work",
+    "~/.agent-harness/tmp",
+    "~/.agent-harness/scratch",
+    "~/.agent-harness/state",
+    "~/.agent-harness/codex-wals",
+    "~/.claude/wals",
+    "~/.npm",
+    "~/.cache",
+    "~/Library/Caches"
+  ],
+  "supervisor_write_extra": [
+    "~/.agent-harness/approvals.jsonl"
+  ],
+  "network_allow": [
+    "github.com",
+    "api.github.com",
+    "codeload.github.com",
+    "*.githubusercontent.com",
+    "ghcr.io",
+    "registry.npmjs.org",
+    "pypi.org",
+    "files.pythonhosted.org",
+    "proxy.golang.org",
+    "sum.golang.org"
+  ],
+  "reviewer_network_allow": [
+    "github.com",
+    "api.github.com",
+    "codeload.github.com",
+    "*.githubusercontent.com"
+  ],
+  "excluded_commands": {
+    "worker": ["ssh", "ssh *", "scp *", "docker", "docker *", "python3 ~/.claude/hooks/wal_note.py *"],
+    "supervisor": ["ssh", "ssh *", "scp *", "docker", "docker *", "python3 ~/.claude/hooks/wal_note.py *",
+                   "harness *"],
+    "reviewer": []
+  }
+}
