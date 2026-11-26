@@ -716,10 +716,12 @@ class Py39Tests(unittest.TestCase):
 
     def test_installers_ship_the_files(self):
         root = HOOKS.parents[1]
-        for installer in ("install.py", "install_codex.py"):
-            text = (root / installer).read_text()
-            for name in ("domain_gates.py", "domain_checklists.json"):
-                self.assertIn(name, text, (installer, name))
+        sys.path.insert(0, str(root))
+        import install  # install_codex ships install.HOOKS minus its CLAUDE_ONLY names
+        claude_only = (root / "install_codex.py").read_text().split("CLAUDE_ONLY = ", 1)[1].split("\n", 1)[0]
+        for name in ("domain_gates.py", "domain_checklists.json"):
+            self.assertIn(name, install.HOOKS)
+            self.assertNotIn(name, claude_only)
 
 
 if __name__ == "__main__":

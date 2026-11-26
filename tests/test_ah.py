@@ -982,12 +982,9 @@ class ReviewRound1(GoodQABase):
     def test_partial_install_gives_json_not_traceback(self):
         out = io.StringIO()
         with mock.patch.object(ah, "run", side_effect=ModuleNotFoundError("safe_input")), contextlib.redirect_stdout(out):
-            rc = ah.main(["doctor"])
+            rc = ah.main(["sessions"])
         self.assertEqual(rc, 4)
         self.assertEqual(json.loads(out.getvalue()), {"ok": False, "code": "internal", "type": "ModuleNotFoundError"})
-        with mock.patch.dict(os.environ, {"AH_EXPECT_AHD": "0"}):  # this test is about partial installs, not the daemon (goodqa#14791 S1d)
-            self.assertTrue(ah.doctor()["ok"])
-        self.assertFalse(ah.doctor()["ok"])  # with the daemon expected and not running, doctor fails
 
     def test_naive_iso_is_utc_and_user_at_host_rejected(self):
         self.assertEqual(ah.parse_ts("2026-11-04T10:00:00"), ah.parse_ts("2026-11-04T10:00:00Z"))
@@ -1403,6 +1400,54 @@ class TicketRefRound2(WriteTests):
         ah._spool_comment(self.home, {"ticket": "GoodQA goodqa#77", "body": "fine", "operation_id": "ah:fine-1"})
         r = ah.spool_drain(self.home)
         self.assertEqual((r["drained"], r["pending"]), (1, 1))  # the valid job still went out
+
+
+class Release1001Dispatch(unittest.TestCase):
+    """`ah sandbox|doctor|repo|review-status` reach the boundary and gate modules (plan section 1); the commands whose
+    code lived in a deleted module answer once, with the release and the reason, and exit 2."""
+
+    def fake(self, name, **functions):
+        import types  # noqa: PLC0415
+        module = types.ModuleType(name)
+        for attr, fn in functions.items():
+            setattr(module, attr, fn)
+        patcher = mock.patch.dict(sys.modules, {name: module})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_the_new_words_dispatch_to_their_modules_with_the_rest_of_argv(self):
+        seen = []
+        self.fake("ah_sandbox", main=lambda argv: seen.append(("sandbox", argv)) or 0)
+        self.fake("ah_doctor", main=lambda argv: seen.append(("doctor", argv)) or 1)
+        self.fake("ah_repo", main=lambda argv: seen.append(("repo", argv)) or 3,
+                  review_status_main=lambda argv: seen.append(("review-status", argv)) or 0)
+        self.assertEqual(ah.main(["sandbox", "show", "--role", "worker"]), 0)
+        self.assertEqual(ah.main(["doctor", "--json"]), 1)
+        self.assertEqual(ah.main(["repo", "protect", "o/r"]), 3)
+        self.assertEqual(ah.main(["review-status", "show", "--repo", "o/r", "--sha", "a" * 40]), 0)
+        self.assertEqual(seen, [("sandbox", ["show", "--role", "worker"]), ("doctor", ["--json"]),
+                                ("repo", ["protect", "o/r"]),
+                                ("review-status", ["show", "--repo", "o/r", "--sha", "a" * 40])])
+
+    def test_removed_commands_say_so_and_exit_2(self):
+        for word in ("goals", "limits", "guard-selftest", "decision", "approve-top", "heartbeat",
+                     "apply"):
+            with self.subTest(word=word):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(ah.main([word, "--anything"]), 2)
+                data = json.loads(out.getvalue())
+                self.assertEqual(data["code"], "removed")
+                self.assertIn(f"ah: {word} was removed in release 1001:", data["message"])
+
+    def test_the_status_verdict_rule_lives_in_ah(self):
+        self.assertEqual(ah.check_verdict({"note": "REALLY_TESTED t1: PASS on live"}), "PASS")
+        self.assertEqual(ah.check_verdict({"note": "REALLY_TESTED t1: it FAILED"}), "FAIL")
+        self.assertEqual(ah.check_verdict({"note": "REALLY_TESTED t1 ran", "result": "fail"}), "FAIL")
+        self.assertEqual(ah.check_verdict({"note": "REALLY_TESTED t1 ran"}), "UNSTATED")
+        self.assertEqual(ah.check_verdict({"event": "deploy", "note": "deployed abc1234"}), "DEPLOY")
+        self.assertTrue(ah.is_deploy_record({"note": "DEPLOYED v1.2.3 to prod"}))
+        self.assertFalse(ah.is_deploy_record({"event": "deploy", "note": "deployed in 2.5 minutes"}))
 
 
 if __name__ == "__main__":

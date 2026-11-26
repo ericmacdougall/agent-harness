@@ -1,0 +1,151 @@
+{
+  "hooks": {
+    "Interrupt": [
+      {
+        "hooks": [
+          {
+            "command": "python3 /HOME/.codex/agent-harness/ah_hook.py wal.py hook",
+            "timeout": 1,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "python3 /HOME/.codex/agent-harness/ah_hook.py wal.py hook",
+            "timeout": 10,
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "command": "python3 /HOME/.codex/agent-harness/ah_hook.py commit_policy.py hook",
+            "timeout": 60,
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "command": "python3 /HOME/.codex/agent-harness/ah_hook.py merge_gate.py hook",
+            "timeout": 60,
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "command": "python3 /HOME/.codex/agent-harness/ah_hook.py command_guard_hook.py hook",
+            "timeout": 30,
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "command": "python3 /HOME/.codex/agent-harness/ah_hook.py kill_guard.py hook",
+            "timeout": 30,
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "command": "python3 /HOME/.codex/agent-harness/ah_hook.py heavy_job_guard.py",
+            "timeout": 30,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "python3 /HOME/.codex/agent-harness/ah_hook.py wal.py hook",
+            "timeout": 10,
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "command": "python3 /HOME/.codex/agent-harness/ah_hook.py owner_inbox.py hook",
+            "timeout": 5,
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "command": "python3 /HOME/.codex/agent-harness/ah_hook.py session_env.py",
+            "timeout": 10,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "command": "python3 /HOME/.codex/agent-harness/ah_hook.py wal.py hook",
+            "timeout": 10,
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "command": "python3 /HOME/.codex/agent-harness/ah_hook.py autosave.py",
+            "timeout": 30,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "command": "python3 /HOME/.codex/agent-harness/ah_hook.py wal.py hook",
+            "timeout": 10,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "command": "python3 /HOME/.codex/agent-harness/ah_hook.py wal.py hook",
+            "timeout": 10,
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "command": "python3 /HOME/.codex/agent-harness/ah_hook.py owner_inbox.py hook",
+            "timeout": 5,
+            "type": "command"
+          }
+        ]
+      }
+    ]
+  }
+}

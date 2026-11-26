@@ -376,13 +376,11 @@ class FixedMetadataReader(unittest.TestCase):
 
 class Packaging(unittest.TestCase):
     def test_both_manifests_copy_native_review_adapter(self):
-        import ast
-        for name, variable in (("install.py", "HOOKS"), ("install_codex.py", "DELIVERY_HELPERS")):
+        import importlib
+        sys.path.insert(0, str(ROOT))
+        for name, variable in (("install", "HOOKS"), ("install_codex", "DELIVERY_HELPERS")):
             with self.subTest(name=name):
-                module = ast.parse((ROOT / name).read_text())
-                value = next(node.value for node in module.body if isinstance(node, ast.Assign)
-                             and any(isinstance(t, ast.Name) and t.id == variable for t in node.targets))
-                self.assertEqual(ast.literal_eval(value).count("native_main.py"), 1)
+                self.assertEqual(list(getattr(importlib.import_module(name), variable)).count("native_main.py"), 1)
 
 
 if __name__ == "__main__":

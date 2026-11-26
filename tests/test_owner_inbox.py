@@ -225,13 +225,14 @@ class Install(unittest.TestCase):
         self.assertIn("owner_inbox.py", install_codex.DELIVERY_HELPERS)
         self.assertIn(str(Path("/h/.claude") / "hooks" / "owner_inbox.py"),
                       install.managed_scripts(Path("/h/.claude")))
-        hooks = install.managed_hooks(Path("/h/.claude"), True)
-        for event, arg in (("UserPromptSubmit", "hook"), ("SessionStart", "hook"), ("PostToolUse", "hook")):
+        hooks = install.managed_hooks(Path("/h/.claude"))
+        for event, count in (("UserPromptSubmit", 1), ("SessionStart", 0), ("PostToolUse", 0)):  # release 1001
             found = [h for g in hooks.get(event, []) for h in g["hooks"]
                      if (install.hook_argv(h) or [""])[0].endswith("owner_inbox.py")]
-            self.assertEqual(len(found), 1, event)
-            self.assertEqual(install.hook_argv(found[0])[1:], [arg])
-            self.assertNotIn("onFailure", found[0], "the inbox hook fails open")
+            self.assertEqual(len(found), count, event)
+            for handler in found:
+                self.assertEqual(install.hook_argv(handler)[1:], ["hook"])
+                self.assertNotIn("onFailure", handler, "the inbox hook fails open")
         merged = install_codex.merge_hooks({}, Path("/h/.codex"))["hooks"]
         for event in ("UserPromptSubmit", "SessionStart"):
             commands = [h["command"] for g in merged[event] for h in g["hooks"]]
@@ -245,12 +246,6 @@ class Install(unittest.TestCase):
         for event in ("UserPromptSubmit", "SessionStart"):
             commands = [h["command"] for g in again[event] for h in g["hooks"]]
             self.assertEqual(sum("owner_inbox.py" in c for c in commands), 1, event)
-        manifest = json.loads((HOOKS / "hooks_manifest.json").read_text())
-        ids = {h["id"]: h for h in manifest["hooks"]}
-        for rid in ("owner_inbox:prompt", "owner_inbox:session-start", "owner_inbox:posttool"):
-            self.assertEqual(ids[rid]["status"], "installed", rid)
-        self.assertNotIn("owner_inbox:stop", ids)  # no Stop registration since 2026-11-24
-        self.assertIn("codex", ids["owner_inbox:prompt"]["flavors"])
 
 class Crossing(Base):
     """2026-11-24: relayed answers crossed questions. Notes now arrive oldest first, carry an id and what they answer,

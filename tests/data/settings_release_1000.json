@@ -1,0 +1,786 @@
+{
+  "hooks": {
+    "PermissionDenied": [
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "idle_guard.py",
+              "reject"
+            ],
+            "command": "python3",
+            "timeout": 5,
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "mission_gate.py",
+              "posttool"
+            ],
+            "command": "python3",
+            "timeout": 5,
+            "type": "command"
+          }
+        ],
+        "matcher": "Bash"
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "tier_gate.py",
+              "dispatch"
+            ],
+            "command": "python3",
+            "timeout": 10,
+            "type": "command"
+          }
+        ],
+        "matcher": "Agent|Task|SendMessage"
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "provenance_hooks.py",
+              "answer"
+            ],
+            "command": "python3",
+            "timeout": 10,
+            "type": "command"
+          }
+        ],
+        "matcher": "AskUserQuestion"
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "mission_gate.py",
+              "posttool"
+            ],
+            "command": "python3",
+            "timeout": 5,
+            "type": "command"
+          }
+        ],
+        "matcher": "Bash"
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "owner_inbox.py",
+              "hook"
+            ],
+            "command": "python3",
+            "timeout": 5,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "idle_guard.py",
+              "reject"
+            ],
+            "command": "python3",
+            "timeout": 5,
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "mission_gate.py",
+              "posttool"
+            ],
+            "command": "python3",
+            "timeout": 5,
+            "type": "command"
+          }
+        ],
+        "matcher": "Bash"
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "command_guard_hook.py",
+              "hook"
+            ],
+            "command": "python3",
+            "timeout": 30,
+            "type": "command"
+          }
+        ],
+        "matcher": "Bash|PowerShell"
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "kill_guard.py",
+              "hook"
+            ],
+            "command": "python3",
+            "timeout": 30,
+            "type": "command"
+          }
+        ],
+        "matcher": "Bash|PowerShell"
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "wal.py",
+              "pretool"
+            ],
+            "command": "python3",
+            "onFailure": "block",
+            "timeout": 10,
+            "type": "command"
+          },
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "merge_gate.py",
+              "hook"
+            ],
+            "command": "python3",
+            "timeout": 60,
+            "type": "command"
+          }
+        ],
+        "matcher": "Agent|Task|Workflow|Bash|PowerShell|Write|Edit|MultiEdit|NotebookEdit"
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "tier_gate.py",
+              "hook"
+            ],
+            "command": "python3",
+            "onFailure": "block",
+            "timeout": 10,
+            "type": "command"
+          }
+        ],
+        "matcher": "Agent|Task|Workflow|Bash"
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "commit_policy.py",
+              "hook"
+            ],
+            "command": "python3",
+            "onFailure": "block",
+            "timeout": 60,
+            "type": "command"
+          },
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "bg_lint.py"
+            ],
+            "command": "python3",
+            "timeout": 5,
+            "type": "command"
+          }
+        ],
+        "matcher": "Bash"
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "heavy_job_guard.py"
+            ],
+            "command": "python3",
+            "timeout": 10,
+            "type": "command"
+          }
+        ],
+        "matcher": "Bash"
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "copy_hygiene.py",
+              "pretool"
+            ],
+            "command": "python3",
+            "timeout": 5,
+            "type": "command"
+          }
+        ],
+        "matcher": "Bash"
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "prod_delete_guard.py"
+            ],
+            "command": "python3",
+            "timeout": 30,
+            "type": "command"
+          }
+        ],
+        "matcher": "Bash|.*d1_database_query|mcp__.*__(execute_sql|run_sql|query|sql)|mcp__.*__hyperdrive_.*"
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "agent_gate.py"
+            ],
+            "command": "python3",
+            "timeout": 10,
+            "type": "command"
+          }
+        ],
+        "matcher": "Agent|Task|Workflow"
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "spec_flow.py",
+              "hook"
+            ],
+            "command": "python3",
+            "onFailure": "block",
+            "timeout": 60,
+            "type": "command"
+          }
+        ],
+        "matcher": "^mcp__.*[Gg][Oo][Oo][Dd][Qq][Aa].*__(close_issue_done|close_issue_wont_fix|update_issue|bulk_update_issues|archive_issue|reassign_issue|call_api)$"
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "provenance_hooks.py",
+              "ask-gate"
+            ],
+            "command": "python3",
+            "timeout": 10,
+            "type": "command"
+          }
+        ],
+        "matcher": "AskUserQuestion"
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "dropped_gate.py",
+              "pretool"
+            ],
+            "command": "python3",
+            "timeout": 5,
+            "type": "command"
+          }
+        ],
+        "matcher": "Bash"
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "mission_gate.py",
+              "pretool"
+            ],
+            "command": "python3",
+            "timeout": 5,
+            "type": "command"
+          }
+        ],
+        "matcher": "Bash"
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "autosave.py"
+            ],
+            "command": "python3",
+            "timeout": 30,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "wal.py",
+              "session"
+            ],
+            "command": "python3",
+            "timeout": 10,
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "copy_hygiene.py",
+              "session-start"
+            ],
+            "command": "python3",
+            "timeout": 5,
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "log_backup.py",
+              "session-start"
+            ],
+            "command": "python3",
+            "timeout": 10,
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "status_truth.py",
+              "session-start"
+            ],
+            "command": "python3",
+            "timeout": 10,
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "ledger_reminder.py"
+            ],
+            "command": "python3",
+            "timeout": 3,
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "owner_inbox.py",
+              "hook"
+            ],
+            "command": "python3",
+            "timeout": 5,
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "session_env.py"
+            ],
+            "command": "python3",
+            "timeout": 10,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "provenance_hooks.py",
+              "stop-lint"
+            ],
+            "command": "python3",
+            "timeout": 10,
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "dropped_gate.py"
+            ],
+            "command": "python3",
+            "timeout": 15,
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "mission_gate.py"
+            ],
+            "command": "python3",
+            "timeout": 15,
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "idle_guard.py",
+              "stop"
+            ],
+            "command": "python3",
+            "timeout": 15,
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "wal_cadence.py"
+            ],
+            "command": "python3",
+            "timeout": 30,
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "worktree_hygiene.py"
+            ],
+            "command": "python3",
+            "timeout": 20,
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "autosave.py"
+            ],
+            "async": true,
+            "command": "python3",
+            "timeout": 30,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "wal.py",
+              "subagent"
+            ],
+            "command": "python3",
+            "timeout": 10,
+            "type": "command"
+          }
+        ],
+        "matcher": ".*"
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "tier_gate.py",
+              "start"
+            ],
+            "command": "python3",
+            "timeout": 10,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "wal.py",
+              "subagent_stop"
+            ],
+            "command": "python3",
+            "timeout": 10,
+            "type": "command"
+          }
+        ],
+        "matcher": ".*"
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "tier_gate.py",
+              "stop"
+            ],
+            "command": "python3",
+            "timeout": 10,
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "dropped_gate.py",
+              "subagent-stop"
+            ],
+            "command": "python3",
+            "timeout": 15,
+            "type": "command"
+          }
+        ],
+        "matcher": ".*"
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "wal_cadence.py"
+            ],
+            "command": "python3",
+            "timeout": 30,
+            "type": "command"
+          }
+        ],
+        "matcher": ".*"
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "worktree_hygiene.py"
+            ],
+            "command": "python3",
+            "timeout": 20,
+            "type": "command"
+          }
+        ],
+        "matcher": ".*"
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "autosave.py"
+            ],
+            "async": true,
+            "command": "python3",
+            "timeout": 30,
+            "type": "command"
+          }
+        ],
+        "matcher": ".*"
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "wal.py",
+              "prompt"
+            ],
+            "command": "python3",
+            "onFailure": "block",
+            "timeout": 10,
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "provenance_hooks.py",
+              "prompt"
+            ],
+            "command": "python3",
+            "timeout": 10,
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "idle_guard.py",
+              "reject"
+            ],
+            "command": "python3",
+            "timeout": 5,
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "status_truth.py",
+              "prompt"
+            ],
+            "command": "python3",
+            "timeout": 10,
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "mc_inbox.py",
+              "hook"
+            ],
+            "command": "python3",
+            "timeout": 5,
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "args": [
+              "/HOME/.claude/hooks/ah_hook.py",
+              "owner_inbox.py",
+              "hook"
+            ],
+            "command": "python3",
+            "timeout": 5,
+            "type": "command"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(python3 ~/.claude/hooks/wal_note.py *)",
+      "Bash(python3 ~/.claude/hooks/publish_feature.py *)",
+      "Bash(python3 ~/.claude/hooks/integrate_local.py *)",
+      "Bash(python3 ~/.claude/hooks/deliver.py *)",
+      "Bash(python3 ~/.claude/hooks/commit_policy.py check-message *)",
+      "Bash(python3 ~/.claude/hooks/commit_policy.py check-range *)",
+      "Bash(python3 ~/.claude/hooks/commit_policy.py report *)",
+      "Bash(python3 ~/.claude/hooks/merge_gate.py check *)",
+      "Bash(python3 ~/.claude/hooks/merge_gate.py report *)",
+      "Bash(python3 ~/.claude/hooks/spec_flow.py lint *)",
+      "Bash(python3 ~/.claude/hooks/spec_flow.py status *)",
+      "Bash(python3 ~/.claude/hooks/resource_budget.py check *)",
+      "Bash(python3 ~/.claude/hooks/resource_budget.py capacity *)",
+      "Bash(python3 ~/.claude/hooks/ah.py owners*)",
+      "Bash(python3 ~/.claude/hooks/ah.py user-msg*)",
+      "Bash(python3 ~/.claude/hooks/ah.py disk*)",
+      "Bash(python3 ~/.claude/hooks/ah.py ticket get*)",
+      "Bash(python3 ~/.claude/hooks/ah.py ticket comments*)",
+      "Bash(python3 ~/.claude/hooks/ah.py write result*)",
+      "Bash(python3 ~/.claude/hooks/ah.py task list*)",
+      "Bash(python3 ~/.claude/hooks/workdir.py prune)",
+      "Bash(python3 ~/.claude/hooks/ah_switch.py status*)"
+    ]
+  }
+}

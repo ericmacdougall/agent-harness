@@ -229,22 +229,6 @@ class DeadlineReachesTheProvider(unittest.TestCase):
         self.assertIn('--timeout must be between 1 and 3600', err)
         self.assertEqual((seen['run'], seen['begin']), ([], []))
 
-    def test_guard_a_daemon_shaped_call_stays_inside_the_ahc_review_wall(self):
-        # Guard (holds at base too): ahc_runner passes --timeout 720 and leases for core.TIMEOUTS['review'].
-        import ahc_core
-        code, seen, out, err = self.review('--author-rung', 'R3', '--timeout', '720', '--no-main-stamp')
-        self.assertEqual(code, 0, err)
-        self.assertEqual(seen['begin'], [(1440, 2880)])
-        self.assertLessEqual(seen['begin'][0][0], ahc_core.TIMEOUTS['review'])
-
-    def test_the_daemon_timeout_fits_its_wall_at_every_rung(self):
-        import ahc_core
-        policy = rd.load_policy(HOOKS / 'review_policy.json')
-        for rung, entry in tiers.load_policy()['rungs'].items():
-            with self.subTest(rung=rung):
-                seconds = rd.provider_deadline(policy, rung, entry['effort'], requested=720)[0]
-                self.assertLessEqual(2 * seconds, ahc_core.TIMEOUTS['review'])
-
     def test_the_timeout_message_names_run_rung_provider_and_both_steps(self):
         # AC-3, from the dominant real shape: Codex hit its usage limit, then the Claude fallback timed out.
         def outcome(name):
@@ -419,24 +403,6 @@ class TimeoutsOnTheLadder(unittest.TestCase):
         self.assertIn('($5 of $60)', note)
         block = self.ledger.record('h22-n', block_receipt('2'), kind='review', source='test')
         self.assertNotIn('timeout', esc.event_note(block, self.policy))  # positive control
-
-    def test_timeouts_at_the_launch_ceiling_say_so_and_name_the_way_on(self):
-        for salt in range(8):
-            status = self.ledger.record('h22-l', timeout_receipt(str(salt)), kind='review', source='test')
-        self.assertEqual((status['blocked_by'], status['timeout_launches']), (['max_review_launches'], 8))
-        note = esc.limit_note(status, self.policy)
-        self.assertIn('ladder limit reached for task h22-l (max_review_launches): 8 of 8 review launches spent', note)
-        self.assertIn('8 of the 8 spent launches were reviewer timeouts', note)
-        self.assertIn('not counted as ladder failures', note)
-        self.assertIn('human sign-off needed', note)
-        self.assertIn('no waiver or reset for a ladder limit', note)
-        import tier_gate
-        decision, reason, _, _ = tier_gate.decide_spawn(
-            {'tool_name': 'Agent', 'tool_input': {'prompt': 'fix it [task:h22-l]', 'description': 'owner',
-                                                  'subagent_type': 'task-owner'}, 'session_id': 's1'},
-            self.policy, self.ledger, session_id='s1')
-        self.assertEqual((decision, reason), ('deny', note))
-        # 2026-11-25: rescue.py no longer reads the ladder ledger (its rung is --rung or the lowest)
 
     def test_findings_at_the_launch_ceiling_do_not_mention_timeouts(self):
         # Positive control: eight distinct findings spend the same ceiling without a timeout sentence.

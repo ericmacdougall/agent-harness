@@ -23,17 +23,19 @@ SESSION = "11111111-2222-4333-8444-555555555555"
 
 
 def codex_helpers():
-    """DELIVERY_HELPERS without importing install_codex (it needs tomllib, Python 3.11+)."""
+    """DELIVERY_HELPERS without importing install_codex (it needs tomllib, Python 3.11+): install.HOOKS minus the
+    CLAUDE_ONLY names, read from the source."""
     import ast  # noqa: PLC0415
     tree = ast.parse((ROOT / "install_codex.py").read_text())
     for node in tree.body:
-        if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == "DELIVERY_HELPERS" for t in node.targets):
-            return tuple(ast.literal_eval(node.value))
-    raise AssertionError("DELIVERY_HELPERS not found")
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == "CLAUDE_ONLY" for t in node.targets):
+            claude_only = set(ast.literal_eval(node.value.args[0]))
+            return tuple(n for n in install.HOOKS if n not in claude_only)
+    raise AssertionError("CLAUDE_ONLY not found")
 
 
 class CodexHelpersRunAh(unittest.TestCase):
-    def test_ah_status_and_goals_run_from_only_the_codex_helpers(self):
+    def test_ah_status_runs_from_only_the_codex_helpers_and_goals_says_it_was_removed(self):
         with tempfile.TemporaryDirectory(prefix="codex-helpers-") as tmp:
             d = Path(tmp, "agent-harness")
             d.mkdir()
@@ -51,6 +53,8 @@ class CodexHelpersRunAh(unittest.TestCase):
                                    env=env, timeout=60, cwd=tmp)
                 self.assertNotIn("ModuleNotFoundError", p.stdout + p.stderr, argv)
                 self.assertNotEqual(p.returncode, 4, (argv, p.stdout[-300:]))
+            self.assertEqual(p.returncode, 2)
+            self.assertIn("was removed in release 1001", p.stdout)
 
 
 class InstallShipsTheMcpServer(unittest.TestCase):

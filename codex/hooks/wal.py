@@ -490,17 +490,8 @@ def hook() -> None:
         except OSError as error:
             note = degraded_note(error)
         print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": checkpoint_context(session, f"Session WAL: {main_wal}. Add redacted intent before edits, then decisions, checks, commits and handoffs. Hook metadata is not a semantic work log.") + note + ops_alert_context(event, session)}}))
-    elif event == "UserPromptSubmit":
-        prompt = str(data.get("prompt", ""))
-        record["prompt_chars"] = len(prompt)
-        note = ""
-        try:
-            append(main_wal, record)
-        except OSError as error:
-            # A full or read-only disk must not block the prompt (the turn would otherwise be refused): degrade
-            # to a note so the operator can run the recovery commands.
-            note = degraded_note(error)
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": checkpoint_context(session, f"Session WAL: {main_wal}. Use the fast path for small changes. For substantive work, scope and coordinate an owner. Record redacted intent before editing.") + note + ops_alert_context(event)}}))
+    elif event in ("UserPromptSubmit", "PreToolUse"):
+        return  # per-prompt and per-tool rows were removed in release 1001 (transcripts are the mechanical record)
     elif event == "SubagentStart":
         agent_id = safe_id(data.get("agent_id"))
         agent_type = safe_id(data.get("agent_type"))
@@ -513,18 +504,6 @@ def hook() -> None:
         except OSError as error:
             note = degraded_note(error)
         print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": f"Your private WAL: {agent_wal}. Read the main scope brief and decisions in {main_wal}; record redacted intent, tests, commits and handoff." + note + ops_alert_context(event)}}))
-    elif event == "PreToolUse":
-        agent_id = data.get("agent_id")
-        wal = root / f"agent-{safe_id(agent_id)}.jsonl" if agent_id else main_wal
-        tool_input = data.get("tool_input") or {}
-        input_chars = len(json.dumps(tool_input, ensure_ascii=False))
-        record.update({
-            "agent_id": safe_id(agent_id) if agent_id else None,
-            "tool": data.get("tool_name", ""),
-            "tool_use_id": data.get("tool_use_id", ""),
-            "input_chars": input_chars,
-        })
-        append(wal, record)
     else:
         raise ValueError(f"unknown event: {event}")
 

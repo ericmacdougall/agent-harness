@@ -1,29 +1,28 @@
 #!/usr/bin/env python3
 """The harness OFF/ON switch and the release floor (docs/off-switch.md).
 
-  off [--reason TEXT] [--services]  create ~/.agent-harness/OFF (every hook launcher exits 0 at once, running sessions
-                                    too), move the harness instruction blocks out of ~/.claude/CLAUDE.md and
-                                    ~/.codex/AGENTS.md into ~/.agent-harness/off-stash/, and with --services stop the
-                                    harness LaunchAgents (Linux: systemd user units) and remember which.
+  off [--reason TEXT] [--keep-services]  create ~/.agent-harness/OFF (every hook launcher exits 0 at once, running
+                                    sessions too), move the harness instruction blocks out of ~/.claude/CLAUDE.md and
+                                    ~/.codex/AGENTS.md into ~/.agent-harness/off-stash/, and stop the harness
+                                    LaunchAgents (Linux: systemd user units) and remember which. Off means off:
+                                    only --keep-services leaves the background jobs running.
   on                                put the stashed blocks back exactly, start the services `off` stopped, remove the
                                     flag last.
   status [--json]                   one line (or JSON): on or off, since when, by whom, what is stashed, the floor.
-  floor-check [--repair]            notice that an installer that predates the floor (an old checkout's install.py)
-                                    overwrote the installed release, and with --repair put the floor snapshot back.
+  floor-check                       report (never repair) that an installer that predates the floor (an old checkout's
+                                    install.py) overwrote the installed release. Nothing rewrites settings.json except
+                                    an explicit install.py --apply; `--repair` was removed in release 1001.
 
 No guard, approval, WAL note or ticket is needed for any of these. Every run appends one line to
-~/.agent-harness/logs/switch.log (floor repairs: logs/floor.log). Standard library only, Python 3.9, no imports from
-sibling modules: the floor LaunchAgent runs it with `python3 -I`.
+~/.agent-harness/logs/switch.log. Standard library only, Python 3.9, no imports from sibling modules.
 """
 from __future__ import annotations
 
 import argparse
-import copy
 import getpass
 import hashlib
 import json
 import os
-import plistlib
 import re
 import secrets
 import shlex
@@ -47,8 +46,9 @@ LAUNCHER = "ah_hook.py"
 INSTALL_STATE = "install-state.json"
 FLOOR_LABEL = "com.agent-harness.floor"
 FLOOR_UNIT = "agent-harness-floor"
-# What the installers register on a host (install.py --services/ahd, log_backup_install, backup_watch, ops_watch,
-# mission_control_install, ahc_install, and the floor watcher below). netwatch is a separate network monitor and stays.
+# What the installers register on a host (log_backup_install, backup_watch, ops_watch, mission_control_install), and
+# the floor watcher releases before 1001 installed (stopped while OFF wherever one is left). netwatch is a separate
+# network monitor and stays.
 
 
 def _label_prefix():
@@ -65,11 +65,11 @@ def _label_prefix():
     return "com.agent-harness."
 
 
-MAC_LABELS = tuple(_label_prefix() + n for n in ("ahd", "log-backup", "backup-watch", "ops-watch")) + (
+MAC_LABELS = tuple(_label_prefix() + n for n in ("log-backup", "backup-watch", "ops-watch")) + (
     "com.agent-harness.mission-control", FLOOR_LABEL)
-LINUX_UNITS = ("ahd.service", "log-backup.timer", "backup-watch.timer", "ops-watch.timer", "ahc-core.service",
-               "ahc-review.service", FLOOR_UNIT + ".path")
-PENDING_SECONDS = 900  # an install that marked itself pending this recently is never "repaired" underneath
+LINUX_UNITS = ("log-backup.timer", "backup-watch.timer", "ops-watch.timer", FLOOR_UNIT + ".path")
+REMOVED_IN = 1001  # the release that removed `floor-check --repair` and the floor watcher
+PENDING_SECONDS = 900  # an install that marked itself pending this recently is reported in progress, not as drift
 KEEP_RELEASES = 2
 
 
@@ -354,8 +354,11 @@ def stop_services(home, run=None, system=None) -> list:
             if run(["launchctl", "bootout", f"{domain}/{label}"]) in (0, 3, 113):
                 stopped.append({"kind": "launchd", "name": label, "plist": str(plist)})
     elif system == "linux":
+        units = home / ".config" / "systemd" / "user"
         for unit in LINUX_UNITS:
-            if unit in known or run(["systemctl", "--user", "is-active", "--quiet", unit]) != 0:
+            # only a unit file the harness wrote under this home: a test or staged home never stops the real user's jobs
+            if unit in known or not (units / unit).exists() \
+                    or run(["systemctl", "--user", "is-active", "--quiet", unit]) != 0:
                 continue
             enabled = run(["systemctl", "--user", "is-enabled", "--quiet", unit]) == 0
             if run(["systemctl", "--user", "disable" if enabled else "stop", *(["--now"] if enabled else []), unit]) == 0:
@@ -397,7 +400,8 @@ def start_services(home, run=None, system=None) -> tuple:
 
 
 # ----------------------------------------------------------------------------- off / on / status
-def switch_off(home=None, reason="", services=False, run=None, system=None) -> dict:
+def switch_off(home=None, reason="", services=True, run=None, system=None) -> dict:
+    """Off means off: the flag first, then the instruction blocks, then (unless services=False) the background jobs."""
     home = home_dir(home)
     private_dir(ah_dir(home))
     flag = flag_path(home)
@@ -636,7 +640,7 @@ def record_install(home, flavor, release, commit, files, settings_spec=None, ins
     prune_releases(home)
 
 
-# ----------------------------------------------------------------------------- hook wiring (floor repair)
+# ----------------------------------------------------------------------------- hook wiring (report only)
 def handler_tokens(handler) -> list:
     command = str(handler.get("command", ""))
     args = handler.get("args")
@@ -675,30 +679,18 @@ def uses_launcher(handler, hooks_dir) -> bool:
         os.path.join(hooks_dir, LAUNCHER))
 
 
-def repaired_hooks(hooks: dict, spec: dict) -> dict:
-    """The hooks object with every managed handler removed and the snapshot's managed groups appended per event:
-    the same result the installer's merge gives, so a repaired file matches a fresh install."""
-    names, hooks_dir, wanted = set(spec.get("names") or ()), spec["hooks_dir"], spec.get("groups") or {}
-    out = copy.deepcopy(hooks) if isinstance(hooks, dict) else {}
-    for event in sorted(set(out) | set(wanted)):
-        entries = out.get(event, [])
-        if not isinstance(entries, list):
-            continue
-        preserved = []
-        for group in entries:
+def managed_wiring(hooks, spec) -> list:
+    """[(event, matcher, handler JSON)] for every harness handler in a hooks object, in file order. Read only: the floor
+    check compares it with the snapshot's groups and never writes it back."""
+    names, hooks_dir = set(spec.get("names") or ()), spec["hooks_dir"]
+    out = []
+    for event in sorted(hooks) if isinstance(hooks, dict) else ():
+        for group in hooks[event] if isinstance(hooks[event], list) else ():
             if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
-                preserved.append(group)
                 continue
-            remaining = [h for h in group["hooks"] if not is_managed_handler(h, hooks_dir, names)]
-            if remaining == group["hooks"]:
-                preserved.append(group)
-            elif remaining:
-                preserved.append({**group, "hooks": remaining})
-        preserved.extend(copy.deepcopy(wanted.get(event, [])))
-        if preserved:
-            out[event] = preserved
-        elif entries:
-            del out[event]
+            for handler in group["hooks"]:
+                if is_managed_handler(handler, hooks_dir, names):
+                    out.append((event, group.get("matcher"), json.dumps(handler, sort_keys=True)))
     return out
 
 
@@ -721,8 +713,9 @@ def wiring_problems(hooks, spec) -> list:
     return out
 
 
-# ----------------------------------------------------------------------------- floor-check
-def check_flavor(home, flavor, entry, state, repair=False, now=None) -> dict:
+# ----------------------------------------------------------------------------- floor-check (report only)
+def check_flavor(home, flavor, entry, state, now=None) -> dict:
+    """What differs from the floor release. Writes nothing: the fix is `install.py --apply` from a current checkout."""
     now = time.time() if now is None else now
     home = home_dir(home)
     release = entry["release"]
@@ -756,75 +749,34 @@ def check_flavor(home, flavor, entry, state, repair=False, now=None) -> dict:
         if current != meta.get("sha256"):
             changed.append(rel)
     problems = []
-    settings_spec, new_hooks, settings_doc = snap.get("settings"), None, None
+    settings_spec = snap.get("settings")
     if isinstance(settings_spec, dict):
         settings_doc = read_json(home / settings_spec["path"])
         settings_doc = settings_doc if isinstance(settings_doc, dict) else {}
         current_hooks = settings_doc.get("hooks", {})
-        new_hooks = repaired_hooks(current_hooks, settings_spec)
-        if json.dumps(new_hooks, sort_keys=True) != json.dumps(current_hooks if isinstance(current_hooks, dict) else {},
-                                                                sort_keys=True):
+        if managed_wiring(current_hooks, settings_spec) != managed_wiring(settings_spec.get("groups") or {}, settings_spec):
             problems.extend(wiring_problems(current_hooks, settings_spec) or ["hook wiring differs from the floor"])
-        else:
-            new_hooks = None
-    off = is_off(home)
-    block_fix = None
     ispec = snap.get("instructions")
-    ipath = home / FLAVORS[flavor]["instructions"]
-    text = read_text(ipath)
+    text = read_text(home / FLAVORS[flavor]["instructions"])
     if text is not None:
         try:
             found = split_block(text, FLAVORS[flavor]["start"], FLAVORS[flavor]["end"])
         except Malformed:
             found = None
-        if found and off:
+        if found and is_off(home):
             problems.append("harness instructions present while OFF")
-            block_fix = "stash"
         elif found and signals and isinstance(ispec, dict) and ispec.get("block") and found[2] != ispec["block"]:
             problems.append("instructions block differs from the floor release")
-            block_fix = "replace"
     if changed and signals:
         problems.append(f"{len(changed)} managed file(s) differ from release {release}")
     result = {"state": "drift" if problems else "ok", "release": release, "problems": problems, "signals": signals,
               "changed_files": changed}
     if changed and not signals:
         result["note"] = f"{len(changed)} file(s) differ from the snapshot without an old-installer sign (hand edits?); left alone"
-    if not (repair and problems):
-        return result
-    fixed = []
-    if changed and signals:
-        root = ah_dir(home) / "releases" / str(release) / flavor / "files"
-        for rel in changed:
-            meta = snap["files"][rel]
-            # input-ok: the harness's own release and install files, read by the user's switch command
-            write_atomic(home / rel, (root / rel).read_bytes(), int(meta.get("mode") or 0o600))
-        fixed.append(f"{len(changed)} file(s)")
-    if new_hooks is not None:
-        settings_doc["hooks"] = new_hooks
-        write_atomic(home / settings_spec["path"], (json.dumps(settings_doc, indent=2) + "\n").encode())
-        fixed.append("hook wiring")
-    if block_fix == "stash":
-        stash_block(home, flavor)
-        fixed.append("instructions stashed (OFF)")
-    elif block_fix == "replace":
-        new_text, lead, _old, offset = split_block(text, FLAVORS[flavor]["start"], FLAVORS[flavor]["end"])
-        write_atomic(ipath, (new_text[:offset] + lead + ispec["block"] + new_text[offset:]).encode("utf-8"))
-        fixed.append("instructions block")
-
-    def change(state_):
-        flavors = state_.setdefault("flavors", {})
-        prior = flavors.get(flavor) if isinstance(flavors.get(flavor), dict) else {}
-        flavors[flavor] = {**prior, "release": release, "commit": entry.get("commit") or snap.get("commit"),
-                           "backup": backup or prior.get("backup"), "repaired_at": now_iso()}
-        state_["release"] = max(v.get("release", 0) for v in flavors.values() if isinstance(v, dict))
-    update_state(home, change)
-    result.update(state="repaired", fixed=fixed)
-    log_line(home, "floor.log", f"repaired {flavor} to release {release}: {', '.join(fixed)}; why: "
-                                + "; ".join(signals + problems))
     return result
 
 
-def floor_check(home=None, repair=False, now=None) -> dict:
+def floor_check(home=None, now=None) -> dict:
     home = home_dir(home)
     floor = read_json(ah_dir(home) / "floor.json")
     if not isinstance(floor, dict) or not isinstance(floor.get("flavors"), dict):
@@ -834,7 +786,7 @@ def floor_check(home=None, repair=False, now=None) -> dict:
     for flavor, entry in sorted(floor["flavors"].items()):
         if flavor in FLAVORS and isinstance(entry, dict) and isinstance(entry.get("release"), int):
             try:
-                out[flavor] = check_flavor(home, flavor, entry, state, repair, now)
+                out[flavor] = check_flavor(home, flavor, entry, state, now)
             except (OSError, ValueError, KeyError) as error:
                 out[flavor] = {"state": "error", "error": f"{error.__class__.__name__}: {clean(error)}"}
     bad = [f for f, r in out.items() if r["state"] in ("drift", "error")]
@@ -852,76 +804,40 @@ def floor_line(result) -> str:
         if r.get("note"):
             text += f" [{r['note']}]"
         parts.append(text)
-    tail = "" if result["ok"] else "; repair: harness floor-check --repair"
+    tail = "" if result["ok"] else "; fix: run install.py --apply from an up-to-date checkout"
     return "floor: " + ("; ".join(parts) or "nothing to check") + tail
 
 
-# ----------------------------------------------------------------------------- the floor watcher service
+# ----------------------------------------------------------------------------- the retired floor watcher
 def floor_watch_units(home, system=None) -> list:
-    """[(path, bytes)] for the watcher that runs `floor-check --repair` when the installed tree changes."""
+    """The files the floor watcher of releases before 1001 was installed as. Only its removal is left."""
     home = home_dir(home)
-    script = home / ".claude" / "hooks" / "ah_switch.py"
-    watched = [home / ".claude" / "hooks", home / ".claude" / "settings.json", ah_dir(home) / INSTALL_STATE]
-    if (home / ".codex" / "agent-harness").is_dir():
-        watched += [home / ".codex" / "agent-harness", home / ".codex" / "hooks.json"]
     if system_name(system) == "darwin":
-        plist = {"Label": FLOOR_LABEL,
-                 "ProgramArguments": ["/usr/bin/python3", "-I", str(script), "floor-check", "--repair", "--quiet"],
-                 "WatchPaths": [str(p) for p in watched], "ThrottleInterval": 30, "RunAtLoad": True,
-                 "Nice": 10, "LowPriorityIO": True, "StandardOutPath": "/dev/null",
-                 "StandardErrorPath": str(ah_dir(home) / "logs" / "floor.err")}
-        return [(home / "Library" / "LaunchAgents" / f"{FLOOR_LABEL}.plist", plistlib.dumps(plist))]
+        return [home / "Library" / "LaunchAgents" / f"{FLOOR_LABEL}.plist"]
     units = home / ".config" / "systemd" / "user"
-    path_unit = ("[Unit]\nDescription=agent harness release floor watcher (docs/off-switch.md)\n\n[Path]\n"
-                 + "".join(f"PathChanged={p}\n" for p in watched)
-                 + f"Unit={FLOOR_UNIT}.service\nTriggerLimitIntervalSec=30\nTriggerLimitBurst=1\n\n"
-                   "[Install]\nWantedBy=default.target\n")
-    service = ("[Unit]\nDescription=agent harness release floor check (docs/off-switch.md)\n\n[Service]\nType=oneshot\n"
-               f"ExecStart=/usr/bin/env python3 -I {shlex.quote(str(script))} floor-check --repair --quiet\nNice=10\n")
-    return [(units / f"{FLOOR_UNIT}.path", path_unit.encode()), (units / f"{FLOOR_UNIT}.service", service.encode())]
-
-
-def install_floor_watch(home, run=None, system=None) -> str:
-    run = run or default_run
-    home = home_dir(home)
-    system = system_name(system)
-    if system not in ("darwin", "linux"):
-        return f"floor watcher: not available on {system}"
-    private_dir(ah_dir(home) / "logs")
-    for path, data in floor_watch_units(home, system):
-        write_atomic(path, data, 0o644)
-    if system == "darwin":
-        domain = f"gui/{os.getuid()}"
-        plist = str(floor_watch_units(home, system)[0][0])
-        run(["launchctl", "enable", f"{domain}/{FLOOR_LABEL}"])
-        run(["launchctl", "bootout", f"{domain}/{FLOOR_LABEL}"])  # not loaded is fine; reload picks up new paths
-        code = run(["launchctl", "bootstrap", domain, plist])
-        return f"floor watcher: {FLOOR_LABEL} " + ("loaded" if code == 0 else f"bootstrap failed (exit {code})")
-    if run(["systemctl", "--user", "daemon-reload"]) != 0:
-        return "floor watcher: systemctl --user daemon-reload failed (no user session?); units written, not started"
-    code = run(["systemctl", "--user", "enable", "--now", f"{FLOOR_UNIT}.path"])
-    return f"floor watcher: {FLOOR_UNIT}.path " + ("enabled" if code == 0 else f"enable failed (exit {code})")
+    return [units / f"{FLOOR_UNIT}.path", units / f"{FLOOR_UNIT}.service"]
 
 
 def remove_floor_watch(home, run=None, system=None) -> str:
+    """Stop and delete an old release's floor watcher (it rewrote settings.json). Nothing installs it any more."""
     run = run or default_run
     home = home_dir(home)
     system = system_name(system)
     units = floor_watch_units(home, system) if system in ("darwin", "linux") else []
-    if not any(path.exists() for path, _ in units):
+    if not any(path.exists() for path in units):
         return "floor watcher: not installed"
     if system == "darwin":
         run(["launchctl", "bootout", f"gui/{os.getuid()}/{FLOOR_LABEL}"])
     else:
         run(["systemctl", "--user", "disable", "--now", f"{FLOOR_UNIT}.path"])
-    for path, _ in units:
+    for path in units:
         try:
             os.unlink(path)
         except FileNotFoundError:
             pass
     if system == "linux":
         run(["systemctl", "--user", "daemon-reload"])
-    return "floor watcher: removed"
+    return f"floor watcher: removed (release {REMOVED_IN} no longer runs it)"
 
 
 # ----------------------------------------------------------------------------- CLI
@@ -930,22 +846,25 @@ def main(argv=None) -> int:
                                                              "(docs/off-switch.md)")
     ap.add_argument("--home", help=argparse.SUPPRESS)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    off = sub.add_parser("off", help="turn the harness off now (hooks silent, instructions stashed)")
+    off = sub.add_parser("off", help="turn the harness off now (hooks silent, instructions stashed, background jobs "
+                                     "stopped)")
     off.add_argument("--reason", default="")
-    off.add_argument("--services", action="store_true", help="also stop the harness LaunchAgents / systemd user units")
+    off.add_argument("--keep-services", dest="keep_services", action="store_true",
+                     help="leave the harness LaunchAgents / systemd user units running")
+    off.add_argument("--services", action="store_true", help=argparse.SUPPRESS)  # the default since 1001; a no-op
     off.add_argument("--json", action="store_true")
     on = sub.add_parser("on", help="turn it back on")
     on.add_argument("--json", action="store_true")
     st = sub.add_parser("status", help="on or off, and the floor")
     st.add_argument("--json", action="store_true")
-    fc = sub.add_parser("floor-check", help="detect (and with --repair undo) an old installer's overwrite")
-    fc.add_argument("--repair", action="store_true")
+    fc = sub.add_parser("floor-check", help="report an old installer's overwrite (read only)")
+    fc.add_argument("--repair", action="store_true", help=argparse.SUPPRESS)  # removed in 1001: fails loudly
     fc.add_argument("--json", action="store_true")
     fc.add_argument("--quiet", action="store_true", help="print nothing unless something was found")
     args = ap.parse_args(argv)
     home = home_dir(args.home)
     if args.cmd == "off":
-        result = switch_off(home, args.reason, args.services)
+        result = switch_off(home, args.reason, services=not args.keep_services)
         print(json.dumps(result, indent=2) if args.json else status_line(status(home)))
         return 0
     if args.cmd == "on":
@@ -960,10 +879,14 @@ def main(argv=None) -> int:
         data = status(home)
         print(json.dumps(data, indent=2) if args.json else status_line(data))
         return 0
-    result = floor_check(home, repair=args.repair)
+    if args.repair:
+        print(f"harness floor-check: --repair was removed in release {REMOVED_IN}: nothing rewrites settings.json "
+              "except an explicit install.py --apply; run that from an up-to-date checkout", file=sys.stderr)
+        return 2
+    result = floor_check(home)
     if args.json:
         print(json.dumps(result, indent=2))
-    elif not args.quiet or any(r["state"] in ("drift", "repaired", "error") for r in result.get("flavors", {}).values()):
+    elif not args.quiet or any(r["state"] in ("drift", "error") for r in result.get("flavors", {}).values()):
         print(floor_line(result))
     return 0 if result["ok"] else 1
 

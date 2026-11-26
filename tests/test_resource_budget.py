@@ -12,7 +12,6 @@ from pathlib import Path
 HOOKS = Path(__file__).resolve().parents[1] / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
 os.environ["AH_LOCAL_CONFIG"] = str(Path(__file__).resolve().parent / "data" / "local_fixture.json")  # hermetic hosts
-import agent_gate  # noqa: E402
 import resource_budget as rb  # noqa: E402
 
 BUDGET = """# Plan
@@ -84,18 +83,6 @@ class Budget(unittest.TestCase):
         self.assertEqual(seen[0][0], "ssh")
         self.assertEqual((cap["host"], cap["cores"], cap["load1"]), ("worker-1", 192, 4.0))
         self.assertAlmostEqual(cap["mem_available_gb"], 130.86, places=2)
-
-    def test_limits_config_fifo_keeps_defaults(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            hooks = Path(tmp, "hooks")
-            hooks.mkdir()
-            for name in ("agent_gate.py", "resource_budget.py", "safe_input.py"):
-                (hooks / name).write_text((HOOKS / name).read_text())
-            os.mkfifo(hooks / "resource_limits.json")
-            out = subprocess.run([sys.executable, "-c", "import agent_gate;print(agent_gate.cap())"], cwd=str(hooks),
-                                 capture_output=True, text=True, timeout=15,
-                                 env=dict(os.environ, PYTHONPATH=str(hooks), AH_HOME=tmp))
-            self.assertEqual(out.stdout.strip(), "(16, False)")
 
     def test_cli_exit_codes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -176,125 +163,6 @@ class BudgetParsing(unittest.TestCase):
         code, text = rb.plan_gate(packet(host="worker-1", mem="1 GB", wall="5 min", checkpoint="none"), "enforce")
         self.assertEqual(code, 0)
         self.assertIn("WARN", text)
-
-
-class AgentGate(unittest.TestCase):
-    """The one owner cap (resource_limits.json max_live_owners): owners count, helpers never do; at the cap a short
-    advisory unless enforce is set."""
-
-    def wal(self, live, stopped=0, stale=0, now=None, helpers=0):
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        now = now or datetime.now(timezone.utc)
-        root = Path(tmp.name, "sess")
-        root.mkdir()
-        main = []
-        for i in range(live + stopped + stale + helpers):
-            started = now - timedelta(minutes=30 if live + stopped <= i < live + stopped + stale else 2)
-            kind = "red-team" if i >= live + stopped + stale else "task-owner"
-            main.append({"at": started.isoformat(), "event": "subagent", "agent_id": f"a{i}", "agent_type": kind})
-            stale_row = live + stopped <= i < live + stopped + stale
-            last = started + (timedelta(seconds=10) if stale_row else timedelta(minutes=1))
-            Path(root, f"agent-a{i}.jsonl").write_text(json.dumps({"at": last.isoformat(), "event": "pretool", "agent_id": f"a{i}"}) + "\n")
-            if live <= i < live + stopped:
-                main.append({"at": last.isoformat(), "event": "subagent_stop", "agent_id": f"a{i}"})
-        Path(root, "main.jsonl").write_text("\n".join(json.dumps(r) for r in main) + "\n")
-        return tmp.name, now.timestamp()
-
-    def test_at_the_cap_is_an_advisory_naming_the_count_and_enforce_denies(self):
-        root, now = self.wal(live=8)
-        result = agent_gate.decide("sess", now, root, 8, state_root=root + "/st", enforce=False)
-        self.assertEqual((result["action"], result["live"]), ("warn", 8))
-        self.assertIn("8 live owners", result["message"])
-        self.assertIn("proceeds", result["message"])
-        root, now = self.wal(live=8)
-        denied = agent_gate.decide("sess", now, root, 8, state_root=root + "/st", enforce=True)
-        self.assertEqual((denied["action"], denied["live"]), ("deny", 8))
-        root7, now7 = self.wal(live=7)
-        self.assertEqual(agent_gate.decide("sess", now7, root7, 8, state_root=root7 + "/st")["action"], "allow")
-
-    def test_helpers_are_never_counted_or_warned_about(self):
-        root, now = self.wal(live=7, helpers=12)  # 19 live agents, 7 of them owners
-        self.assertEqual(agent_gate.decide("sess", now, root, 8, state_root=root + "/st")["action"], "allow")
-        root, now = self.wal(live=8)
-        for helper in ("red-team", "click-tester", "reviewer", "fixer", "Explore", "Plan"):
-            self.assertEqual(agent_gate.decide("sess", now, root, 8, state_root=root + "/st", enforce=True,
-                                               subagent_type=helper)["action"], "allow", helper)
-        self.assertTrue(agent_gate.is_helper("z-explore-0123456789abcdef0123"))  # wal.safe_id spelling of Explore
-
-    def test_redteam_f7_burst_of_parallel_owner_spawns_is_limited_when_enforced(self):
-        root, now = self.wal(live=0)
-        results = [agent_gate.decide("sess", now, root, 8, state_root=root + "/st", enforce=True)["action"]
-                   for _ in range(12)]
-        self.assertEqual(results.count("allow"), 8)  # slots are reserved even before start records exist
-        self.assertEqual(results[8:], ["deny"] * 4)
-
-    def test_stopped_and_stale_agents_do_not_count(self):
-        root, now = self.wal(live=3, stopped=6, stale=6)
-        result = agent_gate.decide("sess", now, root, 8, state_root=root + "/st")
-        self.assertEqual((result["action"], result["live"]), ("allow", 3))
-
-    def test_one_cap_from_resource_limits_json_default_16_no_env_override(self):
-        shipped = json.loads((HOOKS / "resource_limits.json").read_text())
-        self.assertEqual((shipped["max_live_owners"], shipped["enforce"]), (16, False))
-        self.assertNotIn("max_agents", shipped)
-        self.assertNotIn("warn_agents", shipped)
-        with unittest.mock.patch.dict(os.environ, {"HARNESS_MAX_AGENTS": "3", "AH_HOME": tempfile.mkdtemp()}):
-            self.assertEqual(agent_gate.cap(), (16, False))  # the env override is gone
-        for live, expected in ((15, "allow"), (16, "warn"), (20, "warn")):
-            root, now = self.wal(live=live)
-            with unittest.mock.patch.dict(os.environ, {"AH_HOME": root}):
-                self.assertEqual(agent_gate.decide("sess", now, root, state_root=root + "/st")["action"], expected, live)
-
-    def test_hook_process_advises_denies_only_when_enforced_and_fails_open(self):
-        home = tempfile.mkdtemp()
-        wal_dir = Path(home, ".claude", "wals", "sess")
-        wal_dir.mkdir(parents=True)
-        now = datetime.now(timezone.utc)
-        lines = [json.dumps({"at": now.isoformat(), "event": "subagent", "agent_id": f"a{i}", "agent_type": "task-owner"})
-                 for i in range(17)]
-        wal_dir.joinpath("main.jsonl").write_text("\n".join(lines) + "\n")
-        env = dict(os.environ, HOME=home, AH_HOME=home, HARNESS_HEAVY_GUARD_FORCE="1")
-
-        def run(stdin):
-            return subprocess.run([sys.executable, str(HOOKS / "agent_gate.py")], input=stdin, capture_output=True, text=True, env=env)
-        spawn = json.dumps({"tool_name": "Agent", "session_id": "sess", "tool_input": {"subagent_type": "task-owner"}})
-        advised = run(spawn)
-        self.assertEqual(advised.returncode, 0)
-        self.assertIn("17 live owners", json.loads(advised.stdout)["hookSpecificOutput"]["additionalContext"])
-        helper = run(json.dumps({"tool_name": "Agent", "session_id": "sess", "tool_input": {"subagent_type": "red-team"}}))
-        self.assertEqual((helper.returncode, helper.stdout.strip()), (0, ""))
-        Path(home, ".agent-harness").mkdir(exist_ok=True)
-        Path(home, ".agent-harness", "limits.local.json").write_text(json.dumps(
-            {"values": {"enforce": {"value": True, "set_by": "user", "reason": "test"}}}))
-        denied = run(spawn)
-        self.assertEqual(denied.returncode, 2)
-        self.assertIn("cap 16, enforced", denied.stderr)
-        for raw in ("", "garbage", "[" * 100000, json.dumps({"tool_name": "Agent", "session_id": "../../etc"}),
-                    json.dumps({"tool_name": "Bash", "session_id": "sess"})):
-            self.assertEqual(run(raw).returncode, 0, raw[:20])
-
-
-class HeavyJobConcurrency(unittest.TestCase):
-    def test_third_heavy_job_on_the_mac_is_queued(self):
-        home = tempfile.mkdtemp()
-        state = Path(home, ".agent-harness", "state", "run_capped")
-        state.mkdir(parents=True)
-        sleepers = [subprocess.Popen(["sleep", "30"]) for _ in range(2)]
-        self.addCleanup(lambda: [p.kill() for p in sleepers])
-        for p in sleepers:
-            state.joinpath(f"{p.pid}.json").write_text("{}")
-        env = dict(os.environ, HOME=home, HARNESS_HEAVY_GUARD_FORCE="1")
-        command = "HARNESS_LOCAL_OK='xcode needs the mac' npm run build"
-        done = subprocess.run([sys.executable, str(HOOKS / "heavy_job_guard.py")], capture_output=True, text=True, env=env,
-                              input=json.dumps({"tool_name": "Bash", "tool_input": {"command": command}, "session_id": "s"}))
-        self.assertEqual(done.returncode, 2)
-        self.assertIn("already running on the Mac", done.stderr)
-        sleepers[0].kill()
-        sleepers[0].wait()
-        again = subprocess.run([sys.executable, str(HOOKS / "heavy_job_guard.py")], capture_output=True, text=True, env=env,
-                               input=json.dumps({"tool_name": "Bash", "tool_input": {"command": command}, "session_id": "s"}))
-        self.assertEqual(again.returncode, 0, again.stderr)  # one slot freed
 
 
 if __name__ == "__main__":

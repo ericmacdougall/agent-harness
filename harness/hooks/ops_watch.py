@@ -100,7 +100,6 @@ def defaults(host: str) -> dict:
                      "lookback_h": 24, "lookback_active_h": 168, "retire_h": 6, "ticket_quiet_h": 3, "max_ticket_lookups": 10,
                      "ticket_budget_s": 90, "gq": "~/.claude/goodqa-p0p1/gq.py",
                      "projects": {"goodqa": "1ae27b6b-f8f2-4e61-ab2d-c9c43fd162c3"}},
-        "idle_guard": {"enabled": True, "idle_min": 30, "wal_root": "~/.claude/wals", "lookback_h": 12},
         "peers": [],
         # goodqa#15234: point events (a refused copy, a foreign process stop) describe something that happened, not a
         # condition that can stop being true, so nothing ever cleared them. They expire after ttl_h without a repeat.
@@ -1972,80 +1971,6 @@ def check_liveness(cfg, state, runner, now):
     return out
 
 
-def check_idle_guard(cfg, state, runner, now):
-    """goodqa#15943: one high alert idle-guard:<session8> per recent session whose main and owners made no progress for
-    idle_min minutes while a stream holds a non-user next step (idle_guard.assess). The alert ends when progress
-    resumes or nothing actionable is left. A session that cannot be assessed raises nothing (the Stop hook fails open
-    too)."""
-    ic = cfg["idle_guard"]
-    home = Path(home_of(cfg))
-    root = Path(expand(home, ic["wal_root"]))
-    if root != home / ".claude" / "wals":
-        return []  # the owner view reads the real session root only
-    out = []
-    try:
-        sessions = [e for e in os.scandir(root) if e.is_dir(follow_symlinks=False)]
-    except OSError:
-        return []  # no session WALs on this host (a Codex-only install): nothing to assess, nothing to import
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    try:
-        import idle_guard  # noqa: PLC0415 - installed beside this file
-    except ImportError as error:  # a partial install: say so, never a check-error (receipt r3 F1)
-        return [alert("idle_guard", "idle-guard:unavailable", "warning",
-                      f"idle_guard.py is not installed beside ops_watch.py ({type(error).__name__}); main-idle detection is off",
-                      {"fix": "reinstall the harness"})]
-    for sess in sorted(sessions, key=lambda e: e.name):
-        try:
-            if os.stat(os.path.join(sess.path, "main.jsonl")).st_mtime < now - ic["lookback_h"] * 3600:
-                continue
-            a = idle_guard.assess(home, sess.name, now, float(ic["idle_min"]))
-        except Exception:  # noqa: BLE001 - one unreadable session never hides the others
-            continue
-        if a["idle"]:
-            names = ", ".join(s["agent"] for s in a["streams"][:6])
-            out.append(alert("idle_guard", f"idle-guard:{sess.name[:8]}", "high",
-                             f"main idle {round(a['idle_s'] / 60)}m with {len(a['streams'])} stream(s) holding a non-user next step: {names}",
-                             {"session": sess.name[:8], "idle_min": round(a["idle_s"] / 60),
-                              "streams": [{"agent": s["agent"], "next": s["next"]} for s in a["streams"][:12]]}))
-    return out
-
-
-def check_mission(cfg, state, runner, now):
-    """Mission coverage (goodqa#15565): mission:<goal>:uncovered (high, stop_block) and mission:<goal>:stalled
-    (warning) from mission_coverage.assess for the mission session (goals.json mission_session);
-    mission:goals:unreadable when the goals file cannot be trusted. Silent on a host without a goals file or a mission
-    session. Each full owner scan here is signed as the owner snapshot the Stop gate reads (ops-watch is its only
-    writer). When the scan is unavailable (overran mission.timeout_s, or ah failed) the last mission alerts are kept
-    and mission:scan:unavailable is raised: an unavailable scan never clears anything. When the set of uncovered goals
-    gains a goal it wakes main (mission_coverage.notify_main); when it empties it clears that notice."""
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    import mission_coverage as mc  # noqa: PLC0415 - installed beside this file
-    home = Path(home_of(cfg))
-    if not os.path.lexists(mc.goals_path(home)) and not mc.audit_segments(home):
-        return []
-    session = mc.mission_session_of(home)
-    if not session:
-        return []
-    timeout = float((cfg.get("mission") or {}).get("timeout_s", 120))
-    assessment = mc.assess(home, session, now, with_commits=True, deadline_s=timeout, save_snapshot=True)
-    if assessment.get("state") == "owners-unavailable":
-        kept = [{"check": "mission", "key": key, "severity": a.get("severity", "warning"),
-                 "message": a.get("message", ""), "detail": a.get("detail") or {}}
-                for key, a in (state.get("active") or {}).items()
-                if key.startswith("mission:") and key != "mission:scan:unavailable" and a.get("check") == "mission"]
-        return kept + [{"check": "mission", "key": "mission:scan:unavailable", "severity": "warning",
-                        "message": f"mission coverage could not list owners ({mc.clean(assessment.get('error'), 160)}); "
-                                   "the last mission alerts are kept", "detail": {"stop_block": False}}]
-    uncovered = sorted(r["id"] for r in assessment.get("results") or [] if r["state"] == "UNCOVERED")
-    notified = [g for g in state.get("mission_notified") or [] if isinstance(g, str)]
-    if set(uncovered) - set(notified):
-        mc.notify_main(uncovered, home=home, session=session)
-    elif notified and not uncovered:
-        mc.notify_main([], home=home, session=session)
-    state["mission_notified"] = uncovered
-    return mc.mission_alerts(assessment)
-
-
 # ---------------------------------------------------------------- run
 
 PENDING_NOTE_RE = re.compile(r"^\s*PENDING_REAL_TEST\s+([A-Za-z0-9][A-Za-z0-9._-]{0,40})\s*:")
@@ -2193,8 +2118,6 @@ DEFAULT_CHECKS = {
     "remote_units": check_remote_units,
     "proxmox_pool": check_proxmox_pool,
     "deploys": lambda c, s, r, n: check_deploys(c, s, r, n) if (c.get("deploys") or {}).get("enabled", True) else [],
-    "idle_guard": lambda c, s, r, n: check_idle_guard(c, s, r, n) if (c.get("idle_guard") or {}).get("enabled", True) else [],
-    "mission": lambda c, s, r, n: check_mission(c, s, r, n) if (c.get("mission") or {}).get("enabled", True) else [],
 }
 RUN_CHECK = "_run"    # internal errors; cleared by any completed run
 SINK_CHECK = "_sink"  # delivery failures; cleared when that sink recovers

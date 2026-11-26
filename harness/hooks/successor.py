@@ -50,6 +50,7 @@ BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 EVIDENCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,40}$")
 MAX_TEXT = 600
 LIVE_STATUSES = ("ready", "launched", "cap_wait")
+OWNER_CAP_OFF = 1 << 30  # the CLI's cap since release 1001 (no owner cap); succeed() keeps its cap argument for callers
 CAP_ALERT_REPEAT_S = 30 * 60
 CAP_REFRESH_S = 10 * 60  # a cap_wait this old is rewritten while the cap stays full (must be under the gate's 30 min limit)
 LIVE_TTL_S = 6 * 3600       # a ready or launched request holds its stream and a cap slot this long
@@ -429,12 +430,9 @@ def _cli(argv=None) -> int:
             print(json.dumps({"chain_ok": ok}))
             return 0 if ok else 2
         import ah
-        import model_tiers
-        import tier_gate
-        import resource_budget
-        policy = model_tiers.load_policy()
-        cap = int(resource_budget.owner_cap()["max"])  # the one owner cap (2026-11-24)
-        live = len(tier_gate.live_owner_ids(args.session, policy))
+        # Release 1001 deleted the owner cap with the model ladder (tier_gate, resource_budget): a successor is never
+        # held back by a count; `ah owners` still shows how many are live.
+        cap, live = OWNER_CAP_OFF, 0
         out = succeed(home, args.session, args.agent, owners_doc=ah.owners(home, args.session), live_count=live, cap=cap,
                       dry_run=args.dry_run, alert=ring_alert(home))
         print(json.dumps(out, sort_keys=True))

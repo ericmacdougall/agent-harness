@@ -381,37 +381,6 @@ def ops_session_line(state: dict, session: str, room: int = CONTEXT_CAP) -> str:
         return ""
 
 
-def ops_prompt_line(state: dict, session: str) -> str:
-    """Per prompt: only critical alerts this session can act on that it has not seen; '' otherwise. Never raises."""
-    try:
-        import ops_watch
-        seen = state.setdefault("seen", {})
-        text, ids = ops_watch.new_alerts_text(Path.home(), session, set(seen))
-        now = time.time()
-        for alert_id in ids:
-            seen.setdefault(alert_id, now)
-        return text
-    except Exception:
-        return ""
-
-
-def tmp_advisory_output(data: dict) -> tuple:
-    """Advisory only: count and message for durable state written under /tmp; never raises."""
-    try:
-        import workdir
-        paths = workdir.tmp_advisory(str(data.get("tool_name", "")), data.get("tool_input"),
-                                     data.get("scratchpad_dir"))
-        if not paths:
-            return 0, None
-        message = workdir.advisory_message(paths, data.get("session_id"))
-        output = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": message}}
-        if workdir.first_advisory(data.get("session_id")):
-            output["systemMessage"] = message  # shown to the user once per session
-        return len(paths), json.dumps(output)
-    except Exception:
-        return 0, None
-
-
 # Types that own or review work and need the full brief; every other type gets a WAL and a short note.
 OWNER_AGENT_TYPES = {"task-owner", "fixer", "red-team", "click-tester", "general-purpose", "claude"}
 
@@ -442,25 +411,8 @@ def main() -> None:
             ops = ops_session_line(state, session_id, CONTEXT_CAP - len(base) - len(extras) - 1)
             text = cap_text([base, (" " + ops).rstrip(), extras])
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}))
-    elif event == "prompt":
-        # Per prompt: nothing, unless this session was never told its WAL (no SessionStart reached it), or a critical
-        # alert it can act on is new. The triage reminder lives in the instructions, not here.
-        prompt = str(data.get("prompt", ""))
-        record["prompt_chars"] = len(prompt)
-        append(main_wal, record)
-        if is_subagent(data):
-            return
-        with ContextState(session_id) as state:
-            if not claim_emission(state, "wal:prompt", payload_fingerprint(data)):
-                return
-            if not state.get("announced"):
-                state["announced"] = time.time()
-                base = cap_text([f"Session WAL: {main_wal}.", work_dir_context(session_id, "session-late", data)])
-                text = cap_text([base, (" " + ops_session_line(state, session_id, CONTEXT_CAP - len(base) - 1)).rstrip()])
-            else:
-                text = cap_text([ops_prompt_line(state, session_id)])
-        if text:
-            print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": text}}))
+    elif event in ("prompt", "pretool"):
+        return  # per-prompt and per-tool rows were removed in release 1001 (transcripts are the mechanical record)
     elif event == "subagent":
         # A sub-agent gets its WAL path once (and an owner type one line of brief); never ops alerts or reminders.
         agent_id = safe_id(data.get("agent_id"))
@@ -480,31 +432,14 @@ def main() -> None:
         text = cap_text([context, work_dir_context(session_id, event, data)])
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "SubagentStart", "additionalContext": text}}))
     elif event == "subagent_stop":
-        # SubagentStop: lets spec_flow.py record when a click-test agent finished. Only ids that
-        # SubagentStart logged are recorded, so spurious stops (empty agent_type) leave no trace.
+        # SubagentStop: `ah owners` sees the owner stop. Only ids that SubagentStart logged are recorded, so spurious
+        # stops (empty agent_type) leave no trace.
         agent_id = safe_id(data.get("agent_id"))
         agent_wal = root / f"agent-{agent_id}.jsonl"
         if data.get("agent_id") and agent_wal.exists():
             record.update({"agent_id": agent_id, "agent_type": safe_id(data.get("agent_type"))})
             append(main_wal, record)
             append(agent_wal, record)
-    elif event == "pretool":
-        agent_id = data.get("agent_id")
-        wal = root / f"agent-{safe_id(agent_id)}.jsonl" if agent_id else main_wal
-        tool_input = data.get("tool_input") or {}
-        target = tool_input.get("file_path") or tool_input.get("command") or ""
-        record.update({
-            "agent_id": safe_id(agent_id) if agent_id else None,
-            "tool": data.get("tool_name", ""),
-            "tool_use_id": data.get("tool_use_id", ""),
-            "target_chars": len(str(target)),
-        })
-        advisories, output = tmp_advisory_output(data)
-        if advisories:
-            record["tmp_advisory"] = advisories  # a count only: paths stay out of the WAL
-        append(wal, record)
-        if output:
-            print(output)
     else:
         raise ValueError(f"unknown event: {event}")
 

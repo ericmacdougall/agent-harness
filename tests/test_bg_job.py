@@ -1,4 +1,4 @@
-"""bg_job.py and bg_lint.py (GoodQA #14513 Z12, #14472 Z11).
+"""bg_job.py (GoodQA #14513 Z12, #14472 Z11); the bg_lint hook was removed in release 1001.
 
 Real-process tests start only harmless scripts this test writes itself (sleepers, exit-N scripts) inside a private
 temp dir, and only ever signal PIDs this test started. Corpora are data files read by Python (never via a shell).
@@ -445,95 +445,18 @@ class WaitFile(Base):
         self.assertEqual(self.wait_file(target, "pid:1999999", timeout="5").returncode, 0)
 
 
-class LintCorpora(unittest.TestCase):
-    def test_positive_corpus(self):
-        import bg_lint
-        cases = json.loads((DATA / "bg_lint_positive.json").read_text())
-        self.assertGreaterEqual(len(cases), 12)
-        for case in cases:
-            codes = [c for c, _ in bg_lint.lint(case["command"])]
-            self.assertIn(case["expect"], codes, case["id"])
-            for _, message in bg_lint.lint(case["command"]):
-                self.assertIn("bg_job.py", message, case["id"])
-
-    def test_negative_corpus(self):
-        import bg_lint
-        cases = json.loads((DATA / "bg_lint_negative.json").read_text())
-        self.assertGreaterEqual(len(cases), 12)
-        for case in cases:
-            self.assertEqual(bg_lint.lint(case["command"]), [], case["id"])
-
-    def test_every_warning_names_bg_job(self):
-        import bg_lint
-        for case in json.loads((DATA / "bg_lint_positive.json").read_text()):
-            for code, message in bg_lint.lint(case["command"]):
-                self.assertIn("bg_job.py", message, case["id"])
-
-
-class LintBounded(unittest.TestCase):
-    def test_unclosed_substitutions_are_linear(self):
-        import bg_lint
-        for text in ("x=$(" * 40000, "x=$(a|" * 30000, "x=`" * 60000, ("a=$(b|" * 100) + "PIPESTATUS" + "x=$(" * 30000):
-            start = time.time()
-            bg_lint.lint(text + " echo ${PIPESTATUS[@]}")
-            self.assertLess(time.time() - start, 2.0, text[:12])
-
-
-class LintHook(unittest.TestCase):
-    def run_hook(self, payload):
-        return subprocess.run([sys.executable, str(HOOKS / "bg_lint.py")], input=payload, stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, universal_newlines=True, timeout=30)
-
-    def test_warns_and_never_blocks(self):
-        res = self.run_hook(json.dumps({"tool_name": "Bash", "tool_input": {"command": "a; nohup s & echo started"}}))
-        self.assertEqual(res.returncode, 0)
-        msg = json.loads(res.stdout)["hookSpecificOutput"]
-        self.assertEqual(msg["hookEventName"], "PreToolUse")
-        self.assertIn("bg_job.py", msg["additionalContext"])
-        self.assertNotIn("permissionDecision", msg)
-
-    def test_silent_on_clean_and_hostile_input(self):
-        for payload in (json.dumps({"tool_name": "Bash", "tool_input": {"command": "a && echo ok"}}),
-                        "not json", "{}", json.dumps({"tool_name": "Write", "tool_input": {"command": "a; echo ok"}}),
-                        json.dumps({"tool_name": "Bash", "tool_input": {"command": 5}}), "[" * 5000, ""):
-            res = self.run_hook(payload)
-            self.assertEqual(res.returncode, 0, payload[:20])
-            self.assertEqual(res.stdout, "", payload[:20])
-
-    def test_huge_command_is_bounded(self):
-        start = time.time()
-        res = self.run_hook(json.dumps({"tool_name": "Bash", "tool_input": {"command": "a; " * 100000 + "echo ok"}}))
-        self.assertEqual(res.returncode, 0)
-        self.assertLess(time.time() - start, 20)
-
-
 class Wiring(unittest.TestCase):
-    def test_installer_ships_and_registers_lint_as_advisory(self):
+    def test_both_installers_ship_the_helper_and_no_lint_hook(self):
         sys.path.insert(0, str(ROOT))
         import install
         self.assertIn("bg_job.py", install.HOOKS)
-        self.assertIn("bg_lint.py", install.HOOKS)
-        claude = Path("/nonexistent-claude-home/.claude")
-        self.assertIn(str(claude / "hooks" / "bg_lint.py"), install.managed_scripts(claude))
-        bash_groups = [g for g in install.managed_hooks(claude)["PreToolUse"] if g.get("matcher") == "Bash"]
-        lints = [h for g in bash_groups for h in g["hooks"] if (install.hook_argv(h) or [""])[0].endswith("bg_lint.py")]
-        self.assertEqual(len(lints), 1)
-        self.assertNotEqual(lints[0].get("onFailure"), "block")  # advisory: a lint failure must not block
-        self.assertTrue((HOOKS / "bg_job.py").is_file() and (HOOKS / "bg_lint.py").is_file())
+        self.assertNotIn("bg_lint.py", install.HOOKS)
 
     def test_codex_ships_helper(self):
-        text = (ROOT / "install_codex.py").read_text()
-        self.assertIn("'bg_job.py'", text)
-
-
-class RulesEntry(unittest.TestCase):
-    def test_rules_registry_entry(self):
-        entry = json.loads((ROOT / "docs" / "rules" / "bg-launch.json").read_text())["rules"][0]
-        self.assertEqual(entry["id"], "bg-launch")
-        cls, meth = entry["test"].split(".")
-        self.assertTrue(hasattr(globals()[cls], meth), entry["test"])
-        self.assertEqual(entry["test_file"], "tests/test_bg_job.py")
-        self.assertIn(entry["enforcement"], ("ENFORCED", "ALERT-ONLY", "NOT-ENFORCED"))
+        sys.path.insert(0, str(ROOT))
+        import install  # install_codex ships install.HOOKS minus its CLAUDE_ONLY names
+        self.assertIn("bg_job.py", install.HOOKS)
+        self.assertNotIn("bg_job.py", (ROOT / "install_codex.py").read_text().split("CLAUDE_ONLY = ", 1)[1].split("\n", 1)[0])
 
 
 if __name__ == "__main__":

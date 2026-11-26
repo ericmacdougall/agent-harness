@@ -340,18 +340,6 @@ class Legacy(Base):
         doc = self.owners()
         self.assertNotIn(a0, doc["legacy_unverified"])
 
-    def test_a_sub_agent_cannot_legacy_itself(self):
-        self.epoch(NOW - 1000)
-        with mock.patch.dict(os.environ, {"AH_AGENT_ID": agent(0)}):  # the owner, by its declared id
-            with self.assertRaises(ah.AhError) as cm:
-                self.dispose(agent(0), kind="legacy")
-        self.assertEqual(cm.exception.code, "forbidden")
-        for kind in ("legacy", "superseded", "wontdo"):
-            out = dropped_gate.cmd_pretool({"tool_name": "Bash", "agent_id": agent(1), "tool_input": {
-                "command": f"ah task dispose --agent {agent(0)} --kind {kind} --ref 'GoodQA goodqa#1'"}})
-            self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny", kind)
-
-
 class Grandfather(Base):
     N = 4
 
