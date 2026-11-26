@@ -1200,5 +1200,94 @@ class ReviewFixes(Case):
         self.assertEqual(self.refs(self.remotes / "agent-rescue.git"), {})
 
 
+class LifeVerifyFixes(Case):
+    """Each test here failed before the fix it is named for (verifier run lifeverify-328a, problems F1, F2, F4)."""
+
+    def clone(self, url, path):
+        subprocess.run(["git", "clone", "-q", url, str(path)], check=True, capture_output=True)
+        return path
+
+    def test_f1_held_files_of_an_earlier_life_with_nothing_in_git_are_never_rewritten(self):
+        self.seeded_remote("app")
+        url = "https://fixture.invalid/app.git"
+        for fresh in (False, True):   # the agent made it again (state file left), or the reaper's fresh save
+            with self.subTest(fresh=fresh):
+                path = self.root / ("co-%s" % fresh)
+                self.clone(url, path)
+                (path / ".env").write_text("DAY1_LOCAL=only-copy\n")
+                first = self.save(path)
+                self.assertEqual((first["ok"], first["where"], first["refs"]), (True, "nothing", {}), first)
+                shutil.rmtree(path)
+                self.clone(url, path)
+                (path / ".env").write_text("DAY2_LOCAL=x\n")
+                second = self.save(path, fresh=fresh)
+                self.assertTrue(second["ok"], second)
+                self.assertNotEqual(first["held_dir"], second["held_dir"])
+                self.assertEqual((Path(first["held_dir"]) / ".env").read_text(), "DAY1_LOCAL=only-copy\n")
+                self.assertEqual((Path(second["held_dir"]) / ".env").read_text(), "DAY2_LOCAL=x\n")
+                third = self.save(path)   # the same life, nothing changed: the same copy, no new one
+                self.assertEqual(third["held_dir"], second["held_dir"])
+
+    def test_f2_removing_the_mark_after_a_stopped_deletion_makes_a_fresh_copy_beside_the_proven_one(self):
+        repo = self.repo()
+        (repo / "README.md").write_text("UNCOMMITTED EDIT THAT EXISTS NOWHERE ELSE\n")
+        proven = self.save(repo, fresh=True)
+        self.assert_saved_remote(proven)
+        mark = repo / ".git" / git_save.REAPING
+        mark.write_text(json.dumps({key: proven[key] for key in ("where", "url", "refs", "bundle", "held_dir")}))
+        (repo / "README.md").unlink()   # what a deletion that stopped part way leaves
+        refused = self.save(repo, fresh=True)
+        self.assertFalse(refused["ok"])
+        prefix = os.path.commonprefix(sorted(proven["refs"]))
+        self.assertIn(prefix[:prefix.rindex("/") + 1] + "*", refused["reason"])
+        self.assertIn("stays untouched", refused["reason"])
+        self.assertIn("beside", refused["reason"])
+        mark.unlink()   # what the message allows
+        for fresh in (False, True):
+            again = self.save(repo, fresh=fresh)
+            self.assertTrue(again["ok"], again)
+            self.assertFalse(set(again["refs"]) & set(proven["refs"]))
+        there = self.refs(self.rescue)
+        for ref, commit in proven["refs"].items():
+            self.assertEqual(there.get(ref), commit, ref)
+        snapshot = proven["refs"][self.ref(proven, "/snapshot")]
+        self.assertIn("NOWHERE ELSE", self.git(self.rescue, "show", snapshot + ":README.md"))
+        later = self.save(repo, fresh=True)   # once the new copy is made, it is brought up to date in place
+        self.assertEqual(set(later["refs"]), set(again["refs"]))
+
+    def test_f2_a_deletion_recorded_in_the_state_file_holds_after_the_mark_is_gone(self):
+        repo = self.repo()
+        (repo / "README.md").write_text("ONLY COPY\n")
+        proven = self.save(repo, fresh=True)
+        git_save.note_reaping(git_save.facts(repo))   # what ah reap records before it deletes anything
+        (repo / "README.md").unlink()                 # the deletion took the file, and never wrote or kept a mark
+        again = self.save(repo, fresh=True)
+        self.assertTrue(again["ok"], again)
+        self.assertFalse(set(again["refs"]) & set(proven["refs"]))
+        there = self.refs(self.rescue)
+        for ref, commit in proven["refs"].items():
+            self.assertEqual(there.get(ref), commit, ref)
+
+    def test_f4_a_submodule_own_filter_program_never_runs_from_the_superproject(self):
+        marker = self.root / "filter-ran"
+        lib = self.repo("lib-src")
+        (lib / ".gitattributes").write_text("* filter=x\n")
+        self.commit(lib, ".gitattributes", "* filter=x\n")
+        top = self.repo("super")
+        self.git(top, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(lib), "lib")
+        self.git(top, "commit", "-q", "-m", "add lib")
+        subgit = top / ".git" / "modules" / "lib"
+        for key, value in (("filter.x.clean", "touch '%s'; cat" % marker), ("filter.x.smudge", "cat")):
+            subprocess.run(["git", "--git-dir", str(subgit), "config", key, value], check=True)
+        (top / "lib" / "README.md").write_text("edited inside the submodule\n")
+        os.utime(top / "lib" / "README.md", (1, 1))   # a stat change that makes git read the file again
+        git_save.facts(top)
+        self.assertFalse(marker.exists())
+        result = self.save(top, name="super")
+        self.assertFalse(marker.exists(), result)
+        git_save.unchanged(top, SESSION, result["proof"])   # what ah reap asks right before a deletion
+        self.assertFalse(marker.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

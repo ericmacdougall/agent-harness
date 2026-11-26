@@ -7,8 +7,10 @@ when `git bundle verify` passes, it lists every ref with its id and the file sit
 keep: a git error, a timeout or any doubt gives ok False with the reason. Nothing here reads command text or blocks a
 tool call, and the checkout's index, refs and working tree are never touched (a snapshot only adds objects). A nested
 checkout or a submodule is its own checkout: it is skipped here, call save() on it separately.
-Nothing saved is ever changed in place unless this checkout's own new save provably contains it: a checkout made
-again at the same path gets new names (a new stamp), so the copy of the one that went before is never touched.
+Nothing saved is ever changed in place without positive evidence that it is this checkout's own copy (the commits it
+named are still here) and never once `ah reap` began to delete the checkout: otherwise the save gets new names (a new
+stamp), so the copy of a checkout that went before, or a proven copy, is never touched. A superproject's git calls
+never look inside its submodules (--ignore-submodules=dirty), so no program a submodule's own config names runs.
 Network steps run in a scratch repository, so the checkout's own git config (url.insteadOf, core.sshCommand,
 credential.helper) never applies to them, and a checkout whose own config names a filter program is kept unread.
 Standard library only. Every git call has a timeout, no prompt, no pager, no optional locks and runs no hooks.
@@ -248,7 +250,8 @@ def facts(repo) -> dict:
     if filters:   # git would run that program on the files: nothing more is asked of git here
         f["errors"].append("its own git config names a filter program (%s), which is never run" % filters[0])
     if f["toplevel"] and not f["errors"]:
-        changes = ask("status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all").split("\0")
+        changes = ask("status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all",
+                      "--ignore-submodules=dirty").split("\0")   # a submodule is its own checkout, never entered
         f["untracked"] = sum(x.startswith("?? ") for x in changes)
         f["dirty"] = len(list(filter(None, changes))) > f["untracked"]
     objects = os.path.join(f["common_dir"], "objects")
@@ -342,7 +345,8 @@ def _snapshot(repo, session, cache=None, seen=None):
         for flag in ("--no-assume-unchanged", "--no-skip-worktree") if hidden else ():
             _must(top, "update-index", flag, "-z", "--stdin", env=env, stdin=hidden)   # hidden files are compared too
         changed = _must(top, "ls-files", "-z", "-m", "-d", "-o", "--exclude-standard", env=env)
-        changed += (_must(top, "diff-index", "--cached", "--name-only", "-z", head, env=env) if head
+        changed += (_must(top, "diff-index", "--cached", "--ignore-submodules=dirty", "--name-only", "-z", head,
+                          env=env) if head
                     else _must(top, "ls-files", "-z", "--cached", env=env))   # staged paths are judged too
         take, held = [], []
         for rel in sorted(set(filter(None, changed.split("\0")))):
@@ -623,17 +627,58 @@ def _store(repo, f, tips, where, checked) -> dict:
 
 
 def _continues(repo, saved, tips) -> bool:
-    """True when the copy saved last time may be brought up to date in place: this checkout still has its snapshot
-    commit, and every other commit it saved is reachable from the tips now. A checkout made again at the same path
-    fails this, so it gets a new stamp and the copy of the one before is never changed."""
+    """True only with positive evidence that the copy saved last time is this checkout's own, so it may be brought up
+    to date in place: that save named commits (refs or a snapshot), this checkout still has its snapshot commit, and
+    every other commit it saved is reachable from the tips now. A save that named no commit is no evidence. A checkout
+    made again at the same path fails this, so it gets a new stamp and the copy of the one before is never changed."""
     if not saved.get("stamp"):
         return False
     snap, old = saved.get("snapshot"), sorted(set((saved.get("refs") or {}).values()) - {saved.get("snapshot")})
+    if not snap and not old:
+        return False
     if snap and _git(repo, "cat-file", "-e", "%s^{commit}" % snap)[0] != 0:
         return False
     code, out, _err = _git(repo, "rev-list", "-1", "--stdin", stdin="".join(x + "\n" for x in old)
                            + "".join("^%s\n" % x for x in tips.values())) if old else (0, "", "")
     return code == 0 and not out.strip()
+
+
+def _held_already(top, keep, dest) -> bool:
+    """True when every file to hold already has its copy in `dest` with the same size and time, so holding them there
+    again would write nothing (_hold skips such a copy)."""
+    for rel in keep if dest else ():
+        try:
+            info = os.lstat(os.path.join(top, rel))
+            if not stat.S_ISREG(info.st_mode):
+                continue
+            old = os.lstat(os.path.join(dest, rel))
+        except OSError:
+            return False
+        if not stat.S_ISREG(old.st_mode) or (old.st_size, old.st_mtime_ns) != (info.st_size, info.st_mtime_ns):
+            return False
+    return bool(dest)
+
+
+def _stopped(mark, old) -> str:
+    """The refusal for a checkout `ah reap` began to delete: where its proven copy is, what removing the mark does."""
+    proof = _read_json(mark) or (old.get("saved") if isinstance(old.get("saved"), dict) else {})
+    refs, copy = sorted(proof.get("refs") or {}), "named in ~/.agent-harness/logs/reap.jsonl"
+    if proof.get("bundle"):
+        copy = "the bundle %s" % proof["bundle"]
+    elif refs:
+        prefix = os.path.commonprefix(refs)
+        copy = "the refs %s* on %s" % (prefix[:prefix.rfind("/") + 1], proof.get("url") or "the rescue remote")
+    if proof.get("held_dir"):
+        copy += " (held files: %s)" % proof["held_dir"]
+    return ("ah reap stopped part way through deleting it; removing its ah-reaping mark lets a fresh copy be made "
+            "beside its proven copy, which stays untouched: %s (the mark is %s)" % (copy, mark))
+
+
+def note_reaping(f) -> None:
+    """Record in the checkout's state file that `ah reap` begins to delete it, so no later save brings the proven copy
+    up to date in place, even once the mark in its git dir has gone. Raises OSError when it cannot be written."""
+    path = _state_file(f)
+    _write_json(path, dict(_read_json(path), reaping=True))
 
 
 def _measure(f, session, cache, seen):
@@ -669,12 +714,13 @@ def save(repo, session, name, host=None, budget_s=120, fresh=False) -> dict:
         f = facts(repo)
         if f["errors"]:
             raise SaveError(f["errors"][0])
-        if os.path.lexists(os.path.join(f["git_dir"], REAPING)):
-            raise SaveError("ah reap stopped part way through deleting it; its saved copy is named in "
-                            "~/.agent-harness/logs/reap.jsonl (delete %s to save it again)"
-                            % os.path.join(f["git_dir"], REAPING))
         top, state_file = f["toplevel"], _state_file(f)
         old, seen = _read_json(state_file), {}
+        if os.path.lexists(os.path.join(f["git_dir"], REAPING)):   # kept in the state file for after it is removed
+            if old.get("reaping") is not True:
+                with contextlib.suppress(OSError):   # the refusal below stands either way
+                    _write_json(state_file, dict(old, reaping=True))
+            raise SaveError(_stopped(os.path.join(f["git_dir"], REAPING), old))
         cache = old.get("scan") if isinstance(old.get("scan"), dict) else {}
         try:
             tips, commit, tree, keep, problem = _measure(f, session, cache, seen)
@@ -686,9 +732,15 @@ def save(repo, session, name, host=None, budget_s=120, fresh=False) -> dict:
         saved = saved if isinstance(saved, dict) else {}
         if commit:
             tips["snapshot"] = commit
-        if (fresh or not saved.get("stamp") or any(old.get(k) != v for k, v in mark.items())
-                or (saved.get("bundle") and not os.path.isfile(saved["bundle"]))):
-            stamp = (saved["stamp"] if _continues(top or f["git_dir"], saved, tips)
+        reaping = old.get("reaping") is True   # ah reap began to delete it: the proven copy is never updated
+        renew = (fresh or reaping or not saved.get("stamp") or any(old.get(k) != v for k, v in mark.items())
+                 or (saved.get("bundle") and not os.path.isfile(saved["bundle"])))
+        held_at = _home("rescue", "held", saved["place"]) if isinstance(saved.get("place"), str) else None
+        if (not renew and keep and not _held_already(top, keep, held_at)
+                and not _continues(top or f["git_dir"], saved, tips)):
+            renew = True   # the held files would change a copy that may be another life's: they get a new stamp
+        if renew:
+            stamp = (saved["stamp"] if not reaping and _continues(top or f["git_dir"], saved, tips)
                      else time.strftime("%Y%m%dT%H%M%SZ-", time.gmtime()) + os.urandom(2).hex())
             place = "%s/%s/%s-%s/%s" % (_slug(host or ah_log_push._host()), _slug(session), _slug(name),
                                         os.path.basename(state_file)[:8], stamp)

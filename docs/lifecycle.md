@@ -50,7 +50,10 @@ On a remote the refs are `refs/rescue/<host>/<session>/<name>-<8 hex>/<stamp>/` 
 session folder with `/` written as `-` (`top` when the session folder is itself the checkout); the 8 hex characters
 keep two checkouts of the same name apart. For a `--path` directory `<session>` is `loose` and `<name>` is the
 directory's name. `<stamp>` (UTC time and 4 hex) names one life of a checkout: later saves of the same checkout update
-its copy, but a checkout made again at the same path gets a new stamp, so nothing saved before is ever changed.
+its copy, but a checkout made again at the same path gets a new stamp, so nothing saved before is ever changed. A
+save goes on with a stamp only when the commits that stamp's copy named are still in the checkout. A copy that named
+no commit (only held files, such as an ignored `.env`) proves nothing, so a held file that changed is copied under a
+new stamp and the earlier copy stays as it was. A checkout that `ah reap` began to delete always gets a new stamp.
 
 Files that never go into a snapshot are copied to `~/.agent-harness/rescue/held/<host>/<session>/<name>-<8 hex>/
 <stamp>/` (directories 0700, files 0600; never through a symlink) and never pushed: secret-shaped names such as
@@ -71,7 +74,7 @@ ah co OWNER/REPO [--ref REF] [--name NAME]   # a checkout in <session folder>/co
 ah reap scan [--json] [--loose DIR ...] [--check-remote]   # read only: what is there, who owns it, what is unsaved
 ah reap run                                  # dry run: prints the plan, changes nothing
 ah reap run --apply [--idle-hours N]         # save, then delete what is eligible
-ah reap run --apply --if-above 70            # only when the disk is at least 70% full; oldest first
+ah reap run --apply --if-above 85            # only when the disk is at least 85% full; oldest first
 ah reap run --apply --session ID ...         # only these session folders (they must still be idle)
 ah reap run --apply --path /home/me/old-clone   # one named directory outside the work root
 ```
@@ -100,7 +103,9 @@ the log write failed, 3 refused (bad arguments, unsafe platform).
 
 A session folder is eligible when it has been idle for `reap_idle_hours` (default 48), or when it holds a `.done` file
 and has been idle for 1 hour. With `--if-above PCT` nothing happens below that disk use; at or above it, folders idle
-for 6 hours (or `--idle-hours`) go, oldest first, until use is 5 points below `PCT`.
+for at least 24 hours (a larger `--idle-hours` raises that, a smaller one does not lower it) go, oldest first, until
+use is 5 points below `PCT`. A live session that waits a night for its owner looks idle, so a shorter time would take
+its checkouts.
 
 For an eligible folder, in this order:
 
@@ -111,12 +116,17 @@ For an eligible folder, in this order:
    Inside a checkout such a directory goes only when git tracks nothing in it; a kept checkout loses it too. A
    directory that holds a `.git` entry anywhere (`pip install -e git+...` clones into `.venv/src/<name>`) is never
    removed this way: its checkouts are saved like any other.
-2. Every checkout in the folder and in the session temp directory is saved again (children first: a linked worktree
-   before its repository). Only a proven save allows its removal. A checkout that a path outside the folder depends
+2. Every checkout and every bare repository (a directory with `HEAD`, `objects` and `refs`) in the folder and in the
+   session temp directory is saved again (children first: a linked worktree before its repository); one that cannot
+   be saved is kept. Only a proven save allows its removal. A checkout that a path outside the folder depends
    on is kept.
 3. The folder is checked once more for use. Then each saved checkout is marked (`.git/ah-reaping`: no save runs over
    it while the mark is there), checked to hold exactly what was proven (no network), and deleted, read-only trees
-   included. A deletion that stops part way leaves the mark, and the checkout is kept and reported from then on.
+   included, and its state file in `~/.agent-harness/state/git-save` goes with it (in every mode, `--session` and
+   `--path` too), so a checkout made again at that path starts afresh. A deletion that stops part way leaves the
+   mark, and the checkout is kept and reported from then on, with the refs or the bundle of its proven copy.
+   Removing the mark lets a fresh copy be made beside that one, which stays untouched (the state file remembers that
+   a deletion was begun, so this holds even when the deletion took the mark itself).
    Loose files stay, and so does the folder itself unless it is itself a checkout.
 4. The rest of the session temp directory goes, except a `keep/` and what holds a kept checkout.
 5. Stopped docker containers and the volumes tied to that session (label `ah.session`, or a bind mount under the
@@ -128,7 +138,7 @@ Only one `ah reap run --apply` runs at a time.
 
 A run over everything (no `--session`, no `--path`) also removes what the harness itself left behind: directories in
 `~/.agent-harness/tmp` named like a temp key that belong to no folder of the work root, once idle for the same hours
-and unused; state files in `~/.agent-harness/state/git-save` whose checkout or session folder no longer exists; and
+and unused (one that holds a checkout or a bare repository stays); state files in `~/.agent-harness/state/git-save` whose checkout or session folder no longer exists; and
 mirrors in `~/.agent-harness/cache/git` that `ah co` has not used for 30 days (a mirror something borrows from stays).
 
 Every deletion is one JSON line in `~/.agent-harness/logs/reap.jsonl`, written before the deletion starts (no row,
@@ -172,8 +182,12 @@ What this does not cover:
 - A change made in the moment between the last check and the deletion is lost with the checkout.
 - A commit reachable only from the HEAD reflog (a detached HEAD that was left), and the repository of a submodule
   that was deinitialised (`.git/modules/<name>`), are not saved.
-- The content check reads files up to 1 MB as UTF-8 text: a secret in a larger file, or compressed, UTF-16 or base64
-  content, is not seen (its name rules still apply).
+- The content check reads files up to 1 MB as UTF-8 text: a secret in a larger file is not seen (its name rules
+  still apply).
+- Secrets in untracked files that are gzip-compressed, UTF-16 or base64 encoded are not detected, so such a file can
+  go into a snapshot on a remote.
+- Ignored tool output without a marker (`pyvenv.cfg`, `CACHEDIR.TAG` or a `.gitignore` of `*`) and outside the
+  rebuildable names is copied into `~/.agent-harness/rescue/held`, and nothing cleans that folder.
 - A repository that uses git-lfs is never removed.
 - A checkout elsewhere on disk that borrows objects through alternates, outside the places searched (the work root,
   two levels below the home folder, beside each `--path`), breaks when its lender goes.
@@ -187,8 +201,16 @@ What this does not cover:
 
 ## Running it on a timer (your choice)
 
-The installer schedules nothing. Run `ah reap run --if-above 70` (no `--apply`) first and read the plan. Then, to
-clean up whenever the disk passes 70%, add one of these yourself.
+The installer schedules nothing. Before you add a timer:
+
+- Read a dry run first: `ah reap run --if-above 85` (`ah reap run` without `--apply` changes nothing) prints what
+  would go.
+- Set `rescue_remote` to a private repository before installing. Without it the save pushes `refs/rescue/*` to each
+  project's own origin when `gh` reports that repository private, and otherwise writes bundles to the same disk the
+  timer is trying to free.
+- Saved copies (rescue refs, bundles, held files) are never removed automatically. Delete them yourself.
+
+Then, to clean up whenever the disk passes 85%, add one of these yourself.
 
 macOS, `~/Library/LaunchAgents/com.agent-harness.reap.plist`, then `launchctl load` that file:
 
@@ -199,7 +221,7 @@ macOS, `~/Library/LaunchAgents/com.agent-harness.reap.plist`, then `launchctl lo
   <key>Label</key><string>com.agent-harness.reap</string>
   <key>ProgramArguments</key><array>
     <string>/bin/sh</string><string>-c</string>
-    <string>exec python3 "$HOME/.claude/hooks/ah.py" reap run --apply --if-above 70</string>
+    <string>exec python3 "$HOME/.claude/hooks/ah.py" reap run --apply --if-above 85</string>
   </array>
   <key>StartInterval</key><integer>1800</integer>
 </dict></plist>
@@ -211,7 +233,7 @@ Linux, two files in `~/.config/systemd/user/`, then `systemctl --user enable --n
 # ah-reap.service
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 %h/.claude/hooks/ah.py reap run --apply --if-above 70
+ExecStart=/usr/bin/python3 %h/.claude/hooks/ah.py reap run --apply --if-above 85
 
 # ah-reap.timer
 [Timer]

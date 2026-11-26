@@ -8,11 +8,12 @@
 The path is the owner: a folder directly under ~/.agent-harness/work belongs to the session it is named after, and
 `--path` names one other folder exactly. Nothing here reads command text or blocks a tool call, and `run` changes
 nothing without --apply. In a folder idle long enough that no process uses, `run --apply` removes rebuildable
-directories (node_modules, .venv, target, ...; never one that holds a .git entry), every git checkout in the folder or
-its session temp directory that `git_save.save` proves saved (children first), the rest of that temp directory (the
-directory stays, so a session that comes back keeps its TMPDIR), and the stopped docker containers and the volumes
-tied to that session. A run over everything also removes the harness's own leftovers: temp directories of no folder,
-state files of checkouts that are gone, mirrors unused for 30 days. It never removes loose files, a folder with a
+directories (node_modules, .venv, target, ...; never one that holds a .git entry or a bare repository), every git
+checkout or bare repository in the folder or its session temp directory that `git_save.save` proves saved (children
+first) together with its git_save state file, the rest of that temp directory (the directory stays, so a session that
+comes back keeps its TMPDIR), and the stopped docker containers and the volumes tied to that session. A run over
+everything also removes the harness's own leftovers: temp directories of no folder, state files of checkouts that
+are gone, mirrors unused for 30 days. It never removes loose files, a folder with a
 .keep file, a keep/ directory or a checkout that holds one, the calling session's own folder, a symlink, anything on
 another file system, a running container, a docker image, an unlabelled container or anything under
 ~/.agent-harness/rescue. Unknown means keep: a git error, an unreadable directory, an unproven save, a checkout that
@@ -48,7 +49,7 @@ BIG_FILE = 100 * 1024 * 1024   # a larger file outside a checkout is reported by
 WALK_MAX = 3000000             # more entries than this in one folder: what it holds is unknown, so it is kept
 DEFAULT_HOURS, DONE_HOURS = 48, 1
 MIRROR_DAYS = 30               # a mirror in ~/.agent-harness/cache/git that `ah co` has not used for this long goes
-PRESSURE_HOURS, PRESSURE_DROP = 6, 5   # --if-above: the idle hours that are enough, and how far under PCT to stop
+PRESSURE_HOURS, PRESSURE_DROP = 24, 5   # --if-above: the fewest idle hours it takes, and how far under PCT to stop
 SESSION_ENV = ("AH_SESSION", "CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID")
 STOPPED = ("exited", "created", "dead")   # a container in any other state counts as use of its folder
 
@@ -177,16 +178,26 @@ def _rebuildable(path, checkout) -> bool:
     return code == 0 and not out
 
 
+def _bare(names) -> bool:
+    """True for the entry names of a bare repository (HEAD, objects and refs, no .git), as autosave.py finds them."""
+    names = set(names)
+    return ".git" not in names and {"HEAD", "objects", "refs"} <= names
+
+
 def _holds_checkout(path, dev) -> bool:
-    """True when a .git entry or another file system lies anywhere below `path`, or the walk cannot finish. Such a
-    directory is never removed whole as rebuildable (`pip install -e git+...` clones into .venv/src/<name>)."""
+    """True when a .git entry, a bare repository or another file system lies anywhere below `path`, or the walk cannot
+    finish. Such a directory is never removed whole as rebuildable (`pip install -e git+...` clones into
+    .venv/src/<name>)."""
     stack, seen = [path], 0
     while stack:
         current = stack.pop()
         try:
             if _dev(current) != dev:
                 return True
-            with os.scandir(current) as entries:
+            with os.scandir(current) as handle:
+                entries = list(handle)
+                if _bare(entry.name for entry in entries):
+                    return True
                 for entry in entries:
                     seen += 1
                     if entry.name == ".git" or seen > WALK_MAX:
@@ -199,9 +210,10 @@ def _holds_checkout(path, dev) -> bool:
 
 
 def _survey(folder) -> dict:
-    """One walk that never enters .git, keep/ or a rebuildable directory. Read only. `newest` is the latest change
-    of a file (directories do not count: removing a rebuildable directory changes its parent). A directory on
-    another file system (a mount point) is a problem: nothing there may be removed."""
+    """One walk that never enters .git, a bare repository, keep/ or a rebuildable directory. Read only. A bare
+    repository outside any checkout is listed with the checkouts, so it is saved before it goes. `newest` is the
+    latest change of a file (directories do not count: removing a rebuildable directory changes its parent). A
+    directory on another file system (a mount point) is a problem: nothing there may be removed."""
     found = {"checkouts": [], "rebuildable": [], "keep": [], "big": [], "newest": 0.0, "problem": None}
     stack, seen = [(folder, None)], 0
     try:
@@ -223,6 +235,9 @@ def _survey(folder) -> dict:
         if any(entry.name == ".git" for entry in entries):
             checkout = current
             found["checkouts"].append(current)
+        elif checkout is None and _bare(entry.name for entry in entries):   # inside a checkout: part of its own save
+            found["checkouts"].append(current)
+            continue
         for entry in entries:
             try:
                 info = entry.stat(follow_symlinks=False)
@@ -373,6 +388,8 @@ def _borrowed(checkouts) -> dict:
     found = {}
     for repo in checkouts:
         objects = os.path.join(repo, ".git", "objects")
+        if not os.path.lexists(os.path.join(repo, ".git")) and os.path.basename(repo) != ".git":
+            objects = os.path.join(repo, "objects")   # a bare repository
         try:
             with open(os.path.join(objects, "info", "alternates"), errors="surrogateescape") as handle:
                 lines = [line.strip() for line in handle.read(262144).splitlines()]
@@ -584,8 +601,8 @@ class _Run:
             blocker = next((other for other in sorted(before[repo]) if other in kept), None)
             if facts[repo]["errors"]:
                 kept[repo] = "git cannot read it: %s" % facts[repo]["errors"][0]
-            elif os.path.realpath(facts[repo]["toplevel"] or "") != repo:
-                kept[repo] = "git does not see a checkout of its own here"
+            elif os.path.realpath(facts[repo]["toplevel"] or facts[repo]["git_dir"] or "") != repo:
+                kept[repo] = "git does not see a checkout of its own here"   # a bare repository is its own git dir
             elif repo in circle:
                 kept[repo] = "it and another checkout depend on each other in a circle"
             elif repo in outside:
@@ -622,14 +639,24 @@ class _Run:
             if not kept[repo] and not git_save.unchanged(repo, session, saved[repo].get("proof")):
                 os.unlink(mark)
                 kept[repo] = "it changed after its save (a commit, a file moved in, an edit)"
+            if not kept[repo]:   # the state file remembers the mark, should the deletion take the mark and stop
+                try:
+                    git_save.note_reaping(f)
+                except OSError as error:
+                    os.unlink(mark)
+                    kept[repo] = "its state file cannot be written (%s)" % type(error).__name__
             if kept[repo]:
                 self.note("kept", "checkout", repo, look, kept[repo])
                 continue
             del kept[repo]
             if not self.remove(look, "checkout", repo, proof):
                 kept[repo] = "its deletion stopped part way"   # the mark stays
-            elif f["linked_worktree"] and os.path.dirname(f["git_dir"]) == os.path.join(f["common_dir"], "worktrees"):
+                continue
+            if f["linked_worktree"] and os.path.dirname(f["git_dir"]) == os.path.join(f["common_dir"], "worktrees"):
                 shutil.rmtree(f["git_dir"], ignore_errors=True)   # git would drop the entry of a removed worktree
+            state = git_save._state_file(f)   # a checkout made again at this path starts with no earlier life
+            if os.path.isfile(state) and not os.path.islink(state):
+                self.remove(look, "state", state, reason="the state of %s, which was removed" % repo)
         if look["tmp"] and _dirs(look["tmp"], files=True):   # emptied around what stays; the directory itself stays
             self.remove(look, "tmp", look["tmp"], reason="%s; contents only" % look["why"], contents=True,
                         spare=list(kept) + look["keep"])
@@ -762,6 +789,8 @@ def _run(args) -> int:
     hours = args.idle_hours
     if hours is None:
         hours = PRESSURE_HOURS if args.if_above is not None else _idle_default()
+    if args.if_above is not None:   # a live session waiting a night for its owner is not taken for disk space
+        hours = max(hours, PRESSURE_HOURS)
     every, claims, cache = not (named or paths), _claims(root), {}
     looks = [_look(path, claims=claims) for path in folders if every or os.path.basename(path) in named]
     looks += [_look(path, loose=True) for path in paths]
@@ -903,7 +932,8 @@ def main(argv=None) -> int:
     run.add_argument("--apply", action="store_true")
     run.add_argument("--idle-hours", type=float, metavar="N", help="default: reap_idle_hours in local.json, else 48")
     run.add_argument("--if-above", type=float, metavar="PCT",
-                     help="only when the disk is at least PCT%% full: oldest first, until it is 5 points under")
+                     help="only when the disk is at least PCT%% full: folders idle 24 hours or more (a larger "
+                          "--idle-hours raises that), oldest first, until it is 5 points under")
     run.add_argument("--session", nargs="+", action="extend", default=[], metavar="ID")
     run.add_argument("--path", nargs="+", action="extend", default=[], metavar="PATH",
                      help="one folder outside the work root, named exactly, treated as an ownerless folder")

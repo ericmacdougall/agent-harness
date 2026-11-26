@@ -1049,7 +1049,8 @@ class Checkouts(Case):
         for path, logged in seen:
             self.assertIn(path, logged)   # the row was on disk before the deletion began
         state = self.rows("removed", "state")   # the save's record of the deleted checkout goes with it
-        self.assertEqual([(row["session"], row["reason"]) for row in state], [(None, "%s no longer exists" % gone)])
+        self.assertEqual([(row["session"], row["reason"]) for row in state],
+                         [(SESSION, "the state of %s, which was removed" % gone)])   # at once, in every mode
         rows = [row for row in self.rows() if row["kind"] != "state"]
         self.assertEqual([(row["action"], row["kind"], row["path"]) for row in rows],
                          [("removed", "rebuildable", str(folder / "node_modules")),
@@ -1087,7 +1088,7 @@ class Checkouts(Case):
 class Pressure(Case):
     def folders(self):
         made = {}
-        for session, hours in ((SESSION, 30), (OTHER, 10), (THIRD, 2)):
+        for session, hours in ((SESSION, 50), (OTHER, 30), (THIRD, 10)):
             made[session] = self.folder(session)
             (made[session] / "node_modules").mkdir()
             self.age(made[session], hours)
@@ -1104,15 +1105,28 @@ class Pressure(Case):
             self.assertEqual(self.reap("run", "--apply", "--if-above", "70")[0], 0)
         self.assertTrue(all((folder / "node_modules").is_dir() for folder in made.values()))
 
-    def test_above_it_folders_idle_six_hours_go_oldest_first_until_five_points_under(self):
+    def test_above_it_folders_idle_a_day_go_oldest_first_until_five_points_under(self):
         made = self.folders()
         with mock.patch.object(ah_reap, "_disk_used", return_value=90):
             code, out = self.reap("run", "--apply", "--if-above", "70")
         self.assertEqual(code, 0, out)
         self.assertEqual(self.removed("rebuildable"), [str(made[SESSION] / "node_modules"),
                                                       str(made[OTHER] / "node_modules")])
-        self.assertTrue((made[THIRD] / "node_modules").is_dir())   # idle for two hours only
-        self.assertIn("needs 6 idle hours", out)
+        self.assertTrue((made[THIRD] / "node_modules").is_dir())   # idle for ten hours only
+        self.assertIn("needs 24 idle hours", out)
+
+    def test_f5_under_if_above_a_folder_idle_less_than_a_day_is_never_taken(self):
+        made = self.folders()   # a live session waiting for its owner for ten hours keeps its checkout
+        repo = self.repo(made[THIRD] / "co" / "app")
+        (repo / "wip.txt").write_text("half done\n")
+        self.age(made[THIRD], 10)
+        with mock.patch.object(ah_reap, "_disk_used", return_value=99):
+            code, out = self.reap("run", "--apply", "--if-above", "85", "--idle-hours", "2")
+        self.assertEqual(code, 0, out)
+        self.assertTrue((repo / "wip.txt").exists(), out)
+        self.assertTrue((made[THIRD] / "node_modules").is_dir())
+        self.assertIn("needs 24 idle hours", out)
+        self.assertFalse((made[SESSION] / "node_modules").exists())
 
     def test_it_stops_as_soon_as_the_disk_is_five_points_under(self):
         made = self.folders()
@@ -1685,6 +1699,138 @@ class ReviewFixes(Case):
         self.assertFalse((folder / "co").exists() and any((folder / "co").iterdir()), out)
         self.assertIn(str(app / "node_modules"), self.removed("rebuildable"))
         self.assertNotIn(str(app / ".venv"), self.removed("rebuildable"))
+
+
+class LifeVerifyFixes(Case):
+    """Each test here failed before the fix it is named for (verifier run lifeverify-328a, problems F1 to F4)."""
+
+    def temp(self, session=SESSION):
+        import session_env  # noqa: PLC0415
+        return Path(os.path.realpath(session_env.make_tmp(self.folder(session).name)))
+
+    def state_file(self, repo):
+        return self.home / ".agent-harness" / "state" / "git-save" / (
+            hashlib.sha256(os.fsencode(str(repo))).hexdigest() + ".json")
+
+    def held(self):
+        base = self.home / ".agent-harness" / "rescue" / "held"
+        return sorted(path.read_text() for path in base.rglob(".env")) if base.is_dir() else []
+
+    def bare_with(self, path, text, branch="only-here"):
+        """A bare repository at `path` that holds the only copy of one commit."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init", "-q", "--bare", str(path)], check=True)
+        work = self.repo(self.root / ("w-" + path.name))
+        only = self.commit(work, "only.txt", text)
+        self.git(work, "push", "-q", str(path), "HEAD:refs/heads/" + branch)
+        return only
+
+    def test_f1_a_deleted_checkout_takes_its_state_file_with_it_in_every_mode(self):
+        import autosave  # noqa: PLC0415
+        self.seeded_remote("app")
+        for mode in ("--session", "--path"):
+            with self.subTest(mode):
+                if mode == "--session":
+                    base = self.folder()
+                else:
+                    base = self.root / "loose-folder"
+                    base.mkdir()
+                repo = self.repo(base / "co" / "app", origin="https://fixture.invalid/app.git")
+                (repo / ".env").write_text("DAY1_LOCAL=only-copy\n")
+                if mode == "--session":
+                    self.assertEqual(autosave.run(SESSION), "")   # an ordinary turn end first
+                    self.assertTrue(self.state_file(repo).is_file())
+                code, out = self.apply(mode, SESSION if mode == "--session" else base)
+                self.assertEqual(code, 0, out)
+                self.assertFalse(repo.exists(), out)
+                self.assertFalse(self.state_file(repo).exists(), out)
+                self.assertIn(str(self.state_file(repo)), self.removed("state"))
+        self.repo(self.folder() / "co" / "app", origin="https://fixture.invalid/app.git")   # made again
+        (self.folder() / "co" / "app" / ".env").write_text("DAY2_LOCAL=x\n")
+        self.assertEqual(autosave.run(SESSION), "")
+        self.assertIn("DAY1_LOCAL=only-copy\n", self.held())
+
+    def test_f2_removing_the_mark_after_a_stopped_deletion_keeps_the_proven_copy(self):
+        import autosave  # noqa: PLC0415
+        for takes_the_mark in (False, True):
+            with self.subTest(takes_the_mark=takes_the_mark):
+                folder = self.folder()
+                repo = self.repo(folder / "co" / ("app%d" % takes_the_mark))
+                (repo / "README.md").write_text("UNCOMMITTED EDIT THAT EXISTS NOWHERE ELSE\n")
+                real = ah_reap._remove
+
+                def stops_part_way(path, repo=repo):
+                    if path == str(repo):
+                        os.unlink(os.path.join(path, "README.md"))
+                        if takes_the_mark:   # the deletion got as far as the mark itself
+                            os.unlink(os.path.join(path, ".git", git_save.REAPING))
+                        raise PermissionError(1, "Operation not permitted", path)
+                    return real(path)
+
+                with mock.patch.object(ah_reap, "_remove", side_effect=stops_part_way):
+                    code, out = self.apply()
+                self.assertEqual(code, 1, out)
+                proven = self.refs()
+                mark = repo / ".git" / git_save.REAPING
+                if not takes_the_mark:
+                    message = autosave.run(SESSION)
+                    self.assertIn("stays untouched", message)
+                    mark.unlink()   # what the message allows
+                self.assertEqual(autosave.run(SESSION), "")
+                now = self.refs()
+                for ref, commit in proven.items():
+                    self.assertEqual(now.get(ref), commit, ref)
+                self.assertGreater(len(now), len(proven))   # a fresh copy beside the proven one
+                self.assertEqual(self.apply()[0], 0)
+                for ref, commit in proven.items():
+                    self.assertEqual(self.refs().get(ref), commit, ref)
+
+    def test_f3_bare_repositories_are_saved_fresh_before_they_go_and_kept_when_that_fails(self):
+        folder, temp = self.folder(), self.temp()
+        in_tmp = temp / "tmp.Bb77Rr" / "scratch-remote.git"
+        in_folder = folder / "remote.git"
+        only_tmp = self.bare_with(in_tmp, "ONLY IN THE BARE REPO IN TMPDIR\n")
+        only_folder = self.bare_with(in_folder, "ONLY IN THE BARE REPO IN THE FOLDER\n")
+        unsaved = temp / "tmp.Cc88Ss" / "lfs-remote.git"
+        self.bare_with(unsaved, "IN A BARE REPO THAT USES LFS\n")
+        (unsaved / "lfs" / "objects").mkdir(parents=True)   # its save is never ok
+        code, out = self.apply()
+        self.assertEqual(code, 0, out)
+        commits = set(self.refs().values())
+        self.assertTrue({only_tmp, only_folder} <= commits, out)
+        self.assertIn(str(in_tmp), self.removed())
+        self.assertFalse(in_tmp.exists())
+        self.assertFalse(in_folder.exists())
+        self.assertTrue((unsaved / "HEAD").is_file(), out)
+        self.assertIn("git-lfs", out)
+
+    def test_f3_a_temp_directory_of_no_folder_that_holds_a_bare_repository_is_left(self):
+        orphan = self.home / ".agent-harness" / "tmp" / "abcdef01"
+        bare = orphan / "remote.git"
+        self.bare_with(bare, "ONLY IN THE ORPHAN TMP BARE REPO\n")
+        self.age(orphan, 100)
+        code, out = self.apply()
+        self.assertEqual(code, 0, out)
+        self.assertIn("holds the git checkout %s" % bare, out)
+        self.assertTrue((bare / "HEAD").is_file())
+
+    def test_f4_scan_and_run_never_run_a_submodule_own_filter_program(self):
+        marker = self.root / "filter-ran"
+        lib = self.repo(self.root / "lib-src")
+        self.commit(lib, ".gitattributes", "* filter=x\n")
+        top = self.repo(self.folder() / "dl" / "super")
+        self.git(top, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(lib), "lib")
+        self.git(top, "commit", "-q", "-m", "add lib")
+        subgit = top / ".git" / "modules" / "lib"
+        for key, value in (("filter.x.clean", "touch '%s'; cat" % marker), ("filter.x.smudge", "cat")):
+            subprocess.run(["git", "--git-dir", str(subgit), "config", key, value], check=True)
+        (top / "lib" / "README.md").write_text("edited inside the submodule\n")
+        os.utime(top / "lib" / "README.md", (1, 1))
+        code, out = self.reap("scan")
+        self.assertEqual(code, 0, out)
+        self.assertFalse(marker.exists(), out)
+        code, out = self.reap("run")
+        self.assertFalse(marker.exists(), out)
 
 
 if __name__ == "__main__":
