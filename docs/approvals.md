@@ -36,16 +36,25 @@ The store is mode 0600, written under a file lock, and read tolerantly: a corrup
 
 ## Who may grant
 
-- **The owner.** A command not running inside an agent's tool call (no `CLAUDECODE`, `CODEX_THREAD_ID`,
-  `CODEX_TOOL_CALL_ID`, `CODEX_SANDBOX` or `AI_AGENT` in its environment) is the owner. An agent may record the
+Who is calling is the launch role (docs/roles.md, `ah_roles.launch_role`), never the model.
+
+- **The owner.** A command with no `AH_ROLE` and no agent marker (`CLAUDECODE`, `CODEX_THREAD_ID`,
+  `CODEX_TOOL_CALL_ID`, `CODEX_SANDBOX`, `AI_AGENT`) in its environment is the owner. An agent may record the
   owner's answer with `--as-user --user-msg <id>`, citing the owner's own message by the id `ah user-msg --recent 3`
   prints; the cited words are stored with the record.
-- **A supervisor session**, for the projects it supervises (`~/.agent-harness/roles.json`, set by the owner with
-  `ah supervisor set`). This includes `top-rung` for a named task in those projects. `secret`, `spend` and `harness`
-  stay with the owner.
-- Anyone else is refused with the one command that proceeds.
+- **A supervisor session**, for the projects it supervises: a session launched with `AH_ROLE=supervisor`, or an agent
+  session the owner recorded with `ah supervisor set --session S`. Its projects are its own `roles.json` entry, else
+  the role default entry (`ah supervisor set --role-default --project DIR`). This includes `top-rung` for a named task
+  in those projects. `secret`, `spend` and `harness` stay with the owner.
+- **A worker or a reviewer** is refused (exit 3) with the `ah approve ...` command to hand to the owner or a supervisor
+  session.
 
-Limit: a sub-agent's shell carries its parent's session id, so a supervisor's sub-agents can grant inside the
+The operating system backs this. A worker's sandbox keeps `approvals.jsonl` and `roles.json` read-only, so a worker
+that exports `AH_ROLE=supervisor` still cannot write a record: the append fails and `ah approve` exits 3 with
+`cannot write <path> (<error>): this session's sandbox keeps it read-only, so ask the owner or a supervisor session to
+run <command>`, never a traceback.
+
+Limit: a sub-agent's shell carries its parent's environment, so a supervisor's sub-agents can grant inside the
 supervisor's projects too.
 
 ## Commands
@@ -57,23 +66,18 @@ ah approvals [--project P] [--kind K] [--all] [--json]
 ah approvals revoke <id>
 ah approvals check <kind> [--project P] [--repo R] [--pr N] [--path X] [--task T] [--pids N...] [--host H] [--head SHA] [--what TEXT]
 ah supervisor set --session S --project DIR [--project DIR...] [--harness]     # owner only
-ah supervisor clear --session S                                               # owner only
-ah supervisor list                                                            # projects, model, harness flag
-ah limits show | ah limits set KEY VALUE --reason R                           # see "Limits" below
+ah supervisor set --role-default --project DIR [--project DIR...] [--harness]  # owner only: launched supervisors
+ah supervisor clear --session S | --role-default                              # owner only
+ah supervisor list                                                            # entries, the role default, harness flag
 ```
-
-`ah approve-top` still verifies the owner's words for a top-rung task and records the ledger permission; it now also
-writes a `top-rung` approval here, so `ah approvals` shows it.
 
 ## Consumers
 
-- `tier_gate.py`: a live `top-rung` approval for the exact task (and, for a supervisor's, a spawn whose `cwd` is
-  inside its project) counts as the task's permission, beside the ledger permission and a signed central decision.
-  It applies to writers and to reviewers, so a supervisor can grant a top-rung reviewer.
-- Sibling guards call `ah_approvals.allowed(kind="merge"|"delete"|"kill", ...)` through a guarded import; the signature
-  is documented at the top of `ah_approvals.py` and is kept stable.
-- `central_decisions.py` stays what it is: a signed, cross-host publication of one top-rung permission for a
-  worker host. It is not a second local store, so it was left in place.
+- The tools call `ah_approvals.allowed(kind="merge"|"delete"|"kill", ...)` through a guarded import (`ah kill`,
+  `prod_delete_guard.py`, the owner override of `ah review-status`); the signature is documented at the top of
+  `ah_approvals.py` and is kept stable.
+- `ah approvals check top-rung --task T` is how an agent learns whether a Fable or Astra run for task `T` was approved.
+  It is advice in the standing rules: no hook reads the model.
 
 ## Harness maintainer
 
@@ -82,16 +86,8 @@ and rules, including weakening one that does not fit reality, with the owner's a
 alone: `ah approve harness --what "<guard or rule>" --reason ...` for one change, or `ah approve harness` without
 `--what` for a standing approval. Before the change the supervisor runs
 `ah approvals check harness --what "<guard or rule>"`. The flag is stored as `"harness": true` in the supervisor's
-`roles.json` entry, where `ah_roles` reads it.
-
-## Limits
-
-Numbers the harness enforces have one home: `resource_budget.LIMITS`, with repo defaults in
-`harness/hooks/resource_limits.json` and a local override in `~/.agent-harness/limits.local.json` (`ah limits set`).
-Loosening is always honoured. Tightening is honoured only when it was set by the owner or a supervisor; a tighter value
-anything else wrote is ignored with one line in `~/.agent-harness/logs/limits.log`. The owner cap is one number,
-`max_live_owners` (default 16): helpers, reviewers and testers are never counted; at the cap the spawn hook prints a
-short advisory unless `"enforce": true` is set.
+`roles.json` entry (or the role default entry), where `ah_roles.may_edit_harness` reads it together with a live
+`harness` approval.
 
 ## Migrating the old CLAUDE.md sections
 
