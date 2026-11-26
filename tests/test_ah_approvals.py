@@ -16,7 +16,11 @@ HOOKS = Path(__file__).resolve().parents[1] / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
 import ah_approvals as ap  # noqa: E402
 import ah_roles  # noqa: E402
-import resource_budget as rb  # noqa: E402
+
+try:  # resource_budget is not part of the approvals store; it may be removed with `ah limits` (release 1001)
+    import resource_budget as rb  # noqa: E402
+except ImportError:  # pragma: no cover - depends on the integrated tree
+    rb = None
 
 SUP = "11111111-2222-3333-4444-555555555555"
 AGENT_ENV = {"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": SUP}
@@ -170,6 +174,129 @@ class Store(unittest.TestCase):
         self.assertIn("standing", out)
 
 
+class LaunchRoles(unittest.TestCase):
+    """The role comes from the launch (AH_ROLE, ah_roles.launch_role), and the OS backs it: a sandbox that keeps
+    approvals.jsonl read-only turns a grant into a clean refusal that names the path (docs/roles.md)."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(prefix="approvals-launch-")
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name).resolve()
+        self.proj = self.home / "proj"
+        self.proj.mkdir()
+        self.other = self.home / "other"
+        self.other.mkdir()
+
+    def cli(self, argv, env):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = ap.main(argv, env=env, home=self.home)
+        return code, out.getvalue()
+
+    def supervisor_env(self, session=SUP):
+        return {"AH_ROLE": "supervisor", "AH_ROLE_SOURCE": "ah-sandbox:supervisor", "CLAUDECODE": "1",
+                "CLAUDE_CODE_SESSION_ID": session}
+
+    def test_supervisor_by_launch_role_grants_inside_its_projects(self):
+        ah_roles.set_role_default([str(self.proj)], home=self.home)  # no per-session entry: the role default
+        env = self.supervisor_env("77777777-2222-3333-4444-555555555555")
+        code, out = self.cli(["approve", "merge", "--project", str(self.proj), "--pr", "3", "--json"], env=env)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(json.loads(out)["approval"]["granted_by"], "supervisor:77777777-2222-3333-4444-555555555555")
+        code, out = self.cli(["approve", "merge", "--project", str(self.other)], env=env)
+        self.assertEqual(code, 3)
+        self.assertIn("projects it supervises", out)
+        for kind in ap.OWNER_ONLY_KINDS:
+            code, out = self.cli(["approve", kind, "--project", str(self.proj)], env=env)
+            self.assertEqual(code, 3, kind)
+            self.assertIn("owner", json.loads(out)["message"])
+
+    def test_supervisor_by_launch_role_without_any_entry_supervises_nothing(self):
+        code, out = self.cli(["approve", "merge", "--project", str(self.proj)], env=self.supervisor_env())
+        self.assertEqual(code, 3)
+        self.assertIn("(none)", out)
+
+    def test_worker_is_refused_with_the_hint_even_when_roles_json_names_it(self):
+        ah_roles.set_supervisor(SUP, [str(self.proj)], home=self.home)
+        env = {"AH_ROLE": "worker", "CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": SUP}
+        code, out = self.cli(["approve", "merge", "--project", str(self.proj), "--pr", "4"], env=env)
+        self.assertEqual(code, 3)
+        message = json.loads(out)["message"]
+        self.assertIn("worker", message)
+        self.assertIn("ah approve merge --project " + str(self.proj) + " --pr 4", message)
+        self.assertIn("ask the owner or a supervisor session", message)
+        self.assertEqual(ap.list_approvals(home=self.home), [])
+        reviewer = dict(env, AH_ROLE="reviewer")
+        self.assertEqual(self.cli(["approve", "merge", "--project", str(self.proj)], env=reviewer)[0], 3)
+
+    def test_ah_role_without_an_agent_marker_is_still_an_agent(self):
+        code, _ = self.cli(["approve", "merge", "--project", str(self.proj)], env={"AH_ROLE": "worker"})
+        self.assertEqual(code, 3)
+        self.assertTrue(ap.in_agent({"AH_ROLE": "worker"}))
+        self.assertFalse(ap.in_agent({}))
+
+    def test_a_read_only_store_gives_exit_3_with_the_path_not_a_traceback(self):
+        ah_roles.set_role_default([str(self.proj)], home=self.home)
+        store = ap.store_path(self.home)
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text("")
+        os.chmod(store, 0o400)  # what the worker sandbox does to approvals.jsonl (W1 record_paths)
+        self.addCleanup(os.chmod, store, 0o600)
+        for env in (self.supervisor_env(), {}):
+            with self.subTest(env=env):
+                code, out = self.cli(["approve", "merge", "--project", str(self.proj), "--pr", "9"], env=env)
+                self.assertEqual(code, 3, out)
+                result = json.loads(out)
+                self.assertEqual(result["code"], "refused")
+                self.assertIn(str(store), result["message"])
+                self.assertIn("ah approve merge --project " + str(self.proj) + " --pr 9", result["message"])
+                self.assertIn("ask the owner or a supervisor session", result["message"])
+        with mock.patch.object(ap, "_append", side_effect=PermissionError(1, "Operation not permitted")):
+            code, out = self.cli(["approve", "merge", "--project", str(self.proj)], env=self.supervisor_env())
+        self.assertEqual(code, 3)
+        self.assertIn("Operation not permitted", json.loads(out)["message"])
+
+    def test_a_read_only_store_on_revoke_is_a_clean_refusal(self):
+        record = ap.grant("merge", {"project": str(self.proj)}, "user", "", home=self.home)
+        with mock.patch.object(ap, "_append", side_effect=PermissionError(1, "Operation not permitted")):
+            code, out = self.cli(["approvals", "revoke", record["id"]], env={})
+        self.assertEqual(code, 3)
+        self.assertIn(str(ap.store_path(self.home)), json.loads(out)["message"])
+
+    def test_role_default_is_set_by_the_owner_only(self):
+        code, out = self.cli(["supervisor", "set", "--role-default", "--project", str(self.proj)],
+                             env=self.supervisor_env())
+        self.assertEqual(code, 3)
+        code, out = self.cli(["supervisor", "set", "--role-default", "--project", str(self.proj), "--harness"], env={})
+        self.assertEqual(code, 0, out)
+        self.assertEqual(ah_roles.load_roles(self.home)["supervisor"]["projects"], [str(self.proj)])
+        self.assertTrue(ah_roles.load_roles(self.home)["supervisor"]["harness"])
+        code, out = self.cli(["supervisor", "list"], env={})
+        self.assertEqual(json.loads(out)[ap.ROLE_DEFAULT_KEY]["projects"], [str(self.proj)])
+        code, out = self.cli(["supervisor", "clear", "--role-default"], env={})
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("supervisor", ah_roles.load_roles(self.home))
+        code, out = self.cli(["supervisor", "set", "--project", str(self.proj)], env={})
+        self.assertEqual(code, 2)  # neither --session nor --role-default
+
+    def test_a_read_only_roles_file_is_a_clean_refusal(self):
+        with mock.patch.object(ah_roles, "save_roles", side_effect=PermissionError(13, "Permission denied")):
+            code, out = self.cli(["supervisor", "set", "--session", SUP, "--project", str(self.proj)], env={})
+        self.assertEqual(code, 3)
+        self.assertIn("roles.json", json.loads(out)["message"])
+
+    def test_owner_only_kinds_stay_owner_only_for_every_agent_role(self):
+        ah_roles.set_supervisor(SUP, [str(self.proj)], home=self.home)
+        for env in (self.supervisor_env(), {"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": SUP}):
+            for kind in ap.OWNER_ONLY_KINDS:
+                with self.subTest(env=env, kind=kind):
+                    self.assertEqual(self.cli(["approve", kind, "--project", str(self.proj)], env=env)[0], 3)
+        for kind in ap.OWNER_ONLY_KINDS:
+            with self.subTest(owner=kind):
+                self.assertEqual(self.cli(["approve", kind, "--project", str(self.proj)], env={})[0], 0)
+
+
+@unittest.skipIf(rb is None, "resource_budget is not in this tree")
 class Limits(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory(prefix="limits-")
