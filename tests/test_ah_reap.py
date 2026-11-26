@@ -1833,5 +1833,61 @@ class LifeVerifyFixes(Case):
         self.assertFalse(marker.exists(), out)
 
 
+class BareInsideACheckout(Case):
+    """Each test here failed before the fix (verifier run lifeverify-dea7, gap G2): a bare repository inside a
+    checkout's ignored rebuildable directory went with the checkout, unsaved, and the dry run never showed it."""
+
+    def bare_with(self, path, text):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init", "-q", "--bare", str(path)], check=True)
+        work = self.repo(self.root / ("w-%d" % len(list(self.root.glob("w-*")))))
+        only = self.commit(work, "only.txt", text)
+        self.git(work, "push", "-q", str(path), "HEAD:refs/heads/only-here")
+        return only
+
+    def test_a_bare_repository_in_rebuildable_output_is_shown_and_saved_before_it_goes(self):
+        self.seeded_remote("app")
+        for ignored, rel in (("node_modules/\n", "node_modules/dep.git"), ("build/\n", "build/x.git"),
+                             (".venv/\n", ".venv/src/x.git")):
+            with self.subTest(rel):
+                repo = self.repo(self.folder() / "co" / rel.split("/")[0].strip("."),
+                                 origin="https://fixture.invalid/app.git")
+                (repo / ".git" / "info" / "exclude").write_text(ignored)
+                bare = repo / rel
+                only = self.bare_with(bare, "ONLY IN %s\n" % rel)
+                code, out = self.reap("run", "--idle-hours", "0")
+                self.assertEqual(code, 0, out)
+                self.assertIn("would remove  checkout  ", out)
+                self.assertIn(str(bare), out)
+                code, out = self.apply()
+                self.assertEqual(code, 0, out)
+                self.assertIn(only, set(self.refs().values()), out)
+                self.assertIn(str(bare), self.removed())
+                self.assertFalse(repo.exists(), out)
+
+    def test_a_bare_repository_whose_save_fails_keeps_its_checkout(self):
+        repo = self.repo(self.folder() / "co" / "app")
+        (repo / ".git" / "info" / "exclude").write_text("node_modules/\n")
+        bare = repo / "node_modules" / "dep.git"
+        self.bare_with(bare, "ONLY HERE, AND IT USES LFS\n")
+        (bare / "lfs" / "objects").mkdir(parents=True)   # its save is never ok
+        code, out = self.apply()
+        self.assertTrue((bare / "HEAD").is_file(), out)
+        self.assertTrue(repo.is_dir(), out)
+        self.assertIn("git-lfs", out)
+        self.assertIn("%s is kept" % bare, out)
+
+    def test_a_bare_repository_in_a_part_the_checkout_saves_itself_lets_the_checkout_go_in_the_same_run(self):
+        for ignored, rel in (("scratch/\n", "scratch/remote.git"), ("", "fixtures/remote.git")):
+            with self.subTest(rel):
+                repo = self.repo(self.folder() / "co" / rel.split("/")[0])
+                (repo / ".git" / "info" / "exclude").write_text(ignored)
+                only = self.bare_with(repo / rel, "ONLY IN %s\n" % rel)
+                code, out = self.apply()
+                self.assertEqual(code, 0, out)
+                self.assertIn(only, set(self.refs().values()), out)
+                self.assertFalse(repo.exists(), out)
+
+
 if __name__ == "__main__":
     unittest.main()

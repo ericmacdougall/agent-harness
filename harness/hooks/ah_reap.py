@@ -211,7 +211,8 @@ def _holds_checkout(path, dev) -> bool:
 
 def _survey(folder) -> dict:
     """One walk that never enters .git, a bare repository, keep/ or a rebuildable directory. Read only. A bare
-    repository outside any checkout is listed with the checkouts, so it is saved before it goes. `newest` is the
+    repository is listed with the checkouts, also inside a checkout (where it may sit in ignored rebuildable output that
+    the checkout's own save leaves out), so it is saved before it goes and the dry run shows it. `newest` is the
     latest change of a file (directories do not count: removing a rebuildable directory changes its parent). A
     directory on another file system (a mount point) is a problem: nothing there may be removed."""
     found = {"checkouts": [], "rebuildable": [], "keep": [], "big": [], "newest": 0.0, "problem": None}
@@ -235,7 +236,7 @@ def _survey(folder) -> dict:
         if any(entry.name == ".git" for entry in entries):
             checkout = current
             found["checkouts"].append(current)
-        elif checkout is None and _bare(entry.name for entry in entries):   # inside a checkout: part of its own save
+        elif _bare(entry.name for entry in entries):   # saved on its own, before the checkout around it
             found["checkouts"].append(current)
             continue
         for entry in entries:
@@ -624,9 +625,14 @@ class _Run:
         if why:
             self.note("kept", "folder", top, look, why)
             return
+        gone = set()
         for repo in [repo for repo in order if repo in saved and repo not in kept]:
             blocker = next((other for other in sorted(before[repo]) if other in kept), None)
             kept[repo] = blocker and "%s is kept, and it is inside this checkout or depends on it" % blocker
+            if not kept[repo] and any(other in gone and _inside(other, repo) and facts[other]["toplevel"] is None
+                                      for other in before[repo]):   # a bare repository inside was part of its save
+                saved[repo] = git_save.save(repo, session, _name(look, repo), fresh=True)   # proven as it is now
+                kept[repo] = _unproven(saved[repo], top)
             f, mark = facts[repo], os.path.join(facts[repo]["git_dir"], git_save.REAPING)
             proof = dict({key: saved[repo].get(key) for key in ("where", "url", "refs", "bundle", "held_dir")},
                          held=len(saved[repo].get("held") or ()))
@@ -652,6 +658,7 @@ class _Run:
             if not self.remove(look, "checkout", repo, proof):
                 kept[repo] = "its deletion stopped part way"   # the mark stays
                 continue
+            gone.add(repo)
             if f["linked_worktree"] and os.path.dirname(f["git_dir"]) == os.path.join(f["common_dir"], "worktrees"):
                 shutil.rmtree(f["git_dir"], ignore_errors=True)   # git would drop the entry of a removed worktree
             state = git_save._state_file(f)   # a checkout made again at this path starts with no earlier life

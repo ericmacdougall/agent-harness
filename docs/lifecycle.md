@@ -51,9 +51,13 @@ session folder with `/` written as `-` (`top` when the session folder is itself 
 keep two checkouts of the same name apart. For a `--path` directory `<session>` is `loose` and `<name>` is the
 directory's name. `<stamp>` (UTC time and 4 hex) names one life of a checkout: later saves of the same checkout update
 its copy, but a checkout made again at the same path gets a new stamp, so nothing saved before is ever changed. A
-save goes on with a stamp only when the commits that stamp's copy named are still in the checkout. A copy that named
-no commit (only held files, such as an ignored `.env`) proves nothing, so a held file that changed is copied under a
-new stamp and the earlier copy stays as it was. A checkout that `ah reap` began to delete always gets a new stamp.
+checkout's first save writes a random life token to `ah-life` in its own git dir (`.git/`, `.git/worktrees/<name>/`
+for a linked worktree, the repository itself for a bare one that is not inside another checkout) and records it in
+the state file; a clone or a worktree made again at the same path has another token or none, so it is a new life,
+even when it holds the earlier life's commits. A save goes on with a stamp only when the token is the one recorded
+and the commits that stamp's copy named are still in the checkout. A copy that named no commit (only held files, such
+as an ignored `.env`) proves nothing, so a held file that changed is copied under a new stamp and the earlier copy
+stays as it was. A checkout that `ah reap` began to delete always gets a new stamp.
 
 Files that never go into a snapshot are copied to `~/.agent-harness/rescue/held/<host>/<session>/<name>-<8 hex>/
 <stamp>/` (directories 0700, files 0600; never through a symlink) and never pushed: secret-shaped names such as
@@ -116,10 +120,11 @@ For an eligible folder, in this order:
    Inside a checkout such a directory goes only when git tracks nothing in it; a kept checkout loses it too. A
    directory that holds a `.git` entry anywhere (`pip install -e git+...` clones into `.venv/src/<name>`) is never
    removed this way: its checkouts are saved like any other.
-2. Every checkout and every bare repository (a directory with `HEAD`, `objects` and `refs`) in the folder and in the
-   session temp directory is saved again (children first: a linked worktree before its repository); one that cannot
-   be saved is kept. Only a proven save allows its removal. A checkout that a path outside the folder depends
-   on is kept.
+2. Every checkout and every bare repository (a directory with `HEAD`, `objects` and `refs`, also one inside a
+   checkout, such as in its ignored `node_modules/`) in the folder and in the session temp directory is saved again
+   (children first: a linked worktree before its repository, a bare repository before the checkout it sits in, which
+   is saved once more after it goes); one that cannot be saved is kept, and so is the checkout around it. Only a
+   proven save allows its removal. A checkout that a path outside the folder depends on is kept.
 3. The folder is checked once more for use. Then each saved checkout is marked (`.git/ah-reaping`: no save runs over
    it while the mark is there), checked to hold exactly what was proven (no network), and deleted, read-only trees
    included, and its state file in `~/.agent-harness/state/git-save` goes with it (in every mode, `--session` and

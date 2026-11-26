@@ -1289,5 +1289,110 @@ class LifeVerifyFixes(Case):
         self.assertFalse(marker.exists())
 
 
+class LifeToken(Case):
+    """Each test here failed before the life token (verifier run lifeverify-dea7, gap G1): the commits an earlier life
+    named reached the remote, or stayed in the shared repository, so a new life at the same path looked like it."""
+
+    def clone(self, url, path):
+        subprocess.run(["git", "clone", "-q", url, str(path)], check=True, capture_output=True)
+        return path
+
+    def test_a_new_clone_at_the_same_path_holding_the_earlier_commits_is_a_new_life(self):
+        for merge in (False, True):   # the earlier life pushed its branch, or it was also merged into main
+            with self.subTest(merge=merge):
+                origin = self.seeded_remote("app-%s" % merge)
+                url, path = "https://fixture.invalid/app-%s.git" % merge, self.root / ("co-%s" % merge)
+                self.clone(url, path)
+                self.git(path, "checkout", "-q", "-b", "fix")
+                day1 = self.commit(path, "fix.txt", "fix\n")
+                (path / ".env").write_text("DAY1_LOCAL=only-copy\n")
+                first = self.save(path)
+                self.assertTrue(first["ok"], first)
+                self.assertIn(day1, first["refs"].values())
+                self.git(path, "push", "-q", str(origin), "fix:main" if merge else "fix")
+                self.save(path)   # a turn end after the push
+                shutil.rmtree(path)   # the agent removes its own checkout and clones it again
+                self.clone(url, path)
+                if not merge:
+                    self.git(path, "checkout", "-q", "fix")
+                self.commit(path, "day2.txt", "day two\n")   # so this life's save names a commit of its own
+                (path / ".env").write_text("DAY2_LOCAL=x\n")
+                second = self.save(path)
+                self.assertTrue(second["ok"], second)
+                self.assertNotEqual(first["held_dir"], second["held_dir"])
+                self.assertEqual((Path(first["held_dir"]) / ".env").read_text(), "DAY1_LOCAL=only-copy\n")
+                self.assertEqual((Path(second["held_dir"]) / ".env").read_text(), "DAY2_LOCAL=x\n")
+                (path / ".env").write_text("DAY2_LOCAL=edited\n")   # the same life again: its own copy, in place
+                third = self.save(path)
+                self.assertEqual(third["held_dir"], second["held_dir"])
+                self.assertEqual((Path(first["held_dir"]) / ".env").read_text(), "DAY1_LOCAL=only-copy\n")
+
+    def test_a_worktree_removed_and_added_again_at_the_same_path_never_replaces_the_earlier_snapshot(self):
+        main = self.repo("main")
+        tree = self.root / "wt"
+        self.git(main, "worktree", "add", "-q", "-b", "feat", str(tree))
+        self.commit(tree, "feat.txt", "feat\n")
+        (tree / "README.md").write_text("LIFE ONE UNCOMMITTED EDIT\n")
+        first = self.save(tree, name="wt")
+        self.assert_saved_remote(first)
+        self.git(main, "worktree", "remove", "--force", str(tree))
+        self.git(main, "worktree", "add", "-q", str(tree), "feat")
+        (tree / "README.md").write_text("life two edit\n")
+        second = self.save(tree, name="wt")
+        self.assert_saved_remote(second)
+        self.assertFalse(set(first["refs"]) & set(second["refs"]))
+        there = self.refs(self.rescue)
+        for ref, commit in first["refs"].items():
+            self.assertEqual(there.get(ref), commit, ref)
+        snapshot = first["refs"][self.ref(first, "/snapshot")]
+        self.assertIn("LIFE ONE", self.git(self.rescue, "show", snapshot + ":README.md"))
+
+    def test_the_token_lives_in_the_checkout_own_git_dir_and_is_recorded(self):
+        main = self.repo("main")
+        self.git(main, "worktree", "add", "-q", "-b", "side", str(self.root / "side"))
+        bare = self.bare("lone")
+        self.git(main, "push", "-q", str(bare), "main")
+        for repo, git_dir in ((main, main / ".git"), (self.root / "side", main / ".git" / "worktrees" / "side"),
+                              (bare, bare)):
+            with self.subTest(str(repo)):
+                (repo / "wip.txt").write_text("wip\n") if repo != bare else None
+                self.assertTrue(self.save(repo, name=repo.name)["ok"])
+                token = (git_dir / git_save.LIFE).read_text().strip()
+                self.assertRegex(token, r"^[0-9a-f]{32}$")
+                state = json.loads(Path(git_save._state_file(git_save.facts(repo))).read_text())
+                self.assertEqual(state["life"], token)
+                self.assertEqual(self.git(repo, "status", "--porcelain") if repo != bare else "",
+                                 "?? wip.txt" if repo != bare else "")
+
+    def test_no_token_is_written_into_a_bare_repository_inside_another_checkout(self):
+        top = self.repo("top")
+        inner = top / "tests" / "fixture.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(inner)], check=True)
+        self.git(top, "add", "-f", "tests")
+        self.git(top, "commit", "-q", "-m", "a bare fixture")
+        self.git(self.repo("seed"), "push", "-q", str(inner), "main")
+        before = self.git(top, "status", "--porcelain", "--untracked-files=all")
+        self.assertTrue(self.save(inner, name="fixture")["ok"])
+        self.assertFalse((inner / git_save.LIFE).exists())
+        self.assertEqual(self.git(top, "status", "--porcelain", "--untracked-files=all"), before)
+
+    def test_a_missing_or_unreadable_token_never_continues_a_copy(self):
+        repo = self.repo()
+        (repo / ".gitignore").write_text(".env\n")
+        (repo / ".env").write_text("ONE\n")
+        (repo / "wip.txt").write_text("one\n")
+        first = self.save(repo)
+        (repo / ".git" / git_save.LIFE).unlink()   # what a new clone at this path looks like to the save
+        (repo / ".env").write_text("TWO-LONGER\n")
+        second = self.save(repo)
+        self.assertNotEqual(first["held_dir"], second["held_dir"])
+        self.assertEqual((Path(first["held_dir"]) / ".env").read_text(), "ONE\n")
+        (repo / ".git" / git_save.LIFE).write_text("not a token\n")
+        (repo / ".env").write_text("THREE-LONGER-STILL\n")
+        third = self.save(repo)
+        self.assertNotIn(third["held_dir"], (first["held_dir"], second["held_dir"]))
+        self.assertEqual((Path(second["held_dir"]) / ".env").read_text(), "TWO-LONGER\n")
+
+
 if __name__ == "__main__":
     unittest.main()

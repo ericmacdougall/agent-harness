@@ -7,10 +7,11 @@ when `git bundle verify` passes, it lists every ref with its id and the file sit
 keep: a git error, a timeout or any doubt gives ok False with the reason. Nothing here reads command text or blocks a
 tool call, and the checkout's index, refs and working tree are never touched (a snapshot only adds objects). A nested
 checkout or a submodule is its own checkout: it is skipped here, call save() on it separately.
-Nothing saved is ever changed in place without positive evidence that it is this checkout's own copy (the commits it
-named are still here) and never once `ah reap` began to delete the checkout: otherwise the save gets new names (a new
-stamp), so the copy of a checkout that went before, or a proven copy, is never touched. A superproject's git calls
-never look inside its submodules (--ignore-submodules=dirty), so no program a submodule's own config names runs.
+Nothing saved is ever changed in place without positive evidence that it is this checkout's own copy (the life token
+its first save wrote in its git dir is the one recorded, and the commits it named are still here) and never once
+`ah reap` began to delete the checkout: otherwise the save gets new names (a new stamp), so the copy of a checkout
+that went before, or a proven copy, is never touched. A superproject's git calls never look inside its submodules
+(--ignore-submodules=dirty), so no program a submodule's own config names runs.
 Network steps run in a scratch repository, so the checkout's own git config (url.insteadOf, core.sshCommand,
 credential.helper) never applies to them, and a checkout whose own config names a filter program is kept unread.
 Standard library only. Every git call has a timeout, no prompt, no pager, no optional locks and runs no hooks.
@@ -48,6 +49,7 @@ MAX_FILE = 20 * 1024 * 1024    # a larger file is never put in a snapshot; a lar
 SCAN_MAX = 1024 * 1024         # the content of a file up to this size is checked for secret shapes; larger: by name
 SCAN_TOTAL = 16 * 1024 * 1024  # more new content than this in unpushed commits: they go to the local bundle
 REAPING = "ah-reaping"         # in the git dir while `ah reap` deletes the checkout: no save may run over it
+LIFE = "ah-life"               # in the git dir: a random token of this life of the checkout, written by its first save
 HELD_MAX = 200 * 1024 * 1024   # more held bytes than this are not copied: the save is not ok and the checkout stays
 MAX_KEEPERS = 5000             # more ignored files than this are not judged: the save is not ok and the checkout stays
 HEX = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
@@ -626,12 +628,45 @@ def _store(repo, f, tips, where, checked) -> dict:
     return dict(out, where="bundle", refs=refs, bundle=path)
 
 
-def _continues(repo, saved, tips) -> bool:
+def _life(git_dir, bare=False):
+    """The life token in the checkout's own git dir (for a linked worktree its .git/worktrees/<name>, for a bare
+    repository the repository itself), written now when there is none. A checkout cloned or a worktree added again at
+    the same path starts without one, so it is a new life. None when it cannot be read or written: no life is known.
+    No token is written into a bare repository that lies inside another checkout's tree, where it would be a file of
+    that checkout: such a bare repository has no life, so its copies are never continued."""
+    path, parent = os.path.join(git_dir, LIFE), os.path.dirname(git_dir)
+    while bare and parent != os.path.dirname(parent):
+        if os.path.lexists(os.path.join(parent, ".git")):
+            return None
+        parent = os.path.dirname(parent)
+    for _ in range(2):
+        try:
+            with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as handle:
+                text = handle.read(64).decode("ascii", "replace").strip()
+            return text if re.fullmatch(r"[0-9a-f]{32}", text) else None
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return None
+        token = os.urandom(16).hex()
+        try:
+            with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "w") as handle:
+                handle.write(token + "\n")
+            return token
+        except FileExistsError:
+            continue   # another save wrote one just now: read that
+        except OSError:
+            return None
+    return None
+
+
+def _continues(repo, saved, tips, life, recorded) -> bool:
     """True only with positive evidence that the copy saved last time is this checkout's own, so it may be brought up
-    to date in place: that save named commits (refs or a snapshot), this checkout still has its snapshot commit, and
-    every other commit it saved is reachable from the tips now. A save that named no commit is no evidence. A checkout
-    made again at the same path fails this, so it gets a new stamp and the copy of the one before is never changed."""
-    if not saved.get("stamp"):
+    to date in place: this checkout's life token is the one recorded with that save, that save named commits (refs or
+    a snapshot), this checkout still has its snapshot commit, and every other commit it saved is reachable from the
+    tips now. A save that named no commit is no evidence. A checkout made again at the same path has a new token (or
+    none), so it gets a new stamp and the copy of the one before is never changed, even when it holds those commits."""
+    if not life or life != recorded or not saved.get("stamp"):
         return False
     snap, old = saved.get("snapshot"), sorted(set((saved.get("refs") or {}).values()) - {saved.get("snapshot")})
     if not snap and not old:
@@ -721,7 +756,7 @@ def save(repo, session, name, host=None, budget_s=120, fresh=False) -> dict:
                 with contextlib.suppress(OSError):   # the refusal below stands either way
                     _write_json(state_file, dict(old, reaping=True))
             raise SaveError(_stopped(os.path.join(f["git_dir"], REAPING), old))
-        cache = old.get("scan") if isinstance(old.get("scan"), dict) else {}
+        cache, life = old.get("scan") if isinstance(old.get("scan"), dict) else {}, _life(f["git_dir"], not top)
         try:
             tips, commit, tree, keep, problem = _measure(f, session, cache, seen)
         except SaveError:
@@ -734,19 +769,24 @@ def save(repo, session, name, host=None, budget_s=120, fresh=False) -> dict:
             tips["snapshot"] = commit
         reaping = old.get("reaping") is True   # ah reap began to delete it: the proven copy is never updated
         renew = (fresh or reaping or not saved.get("stamp") or any(old.get(k) != v for k, v in mark.items())
+                 or (life is not None and old.get("life") != life)   # a new life: a new stamp, recorded now
                  or (saved.get("bundle") and not os.path.isfile(saved["bundle"])))
+
+        def same():
+            return _continues(top or f["git_dir"], saved, tips, life, old.get("life"))
+
         held_at = _home("rescue", "held", saved["place"]) if isinstance(saved.get("place"), str) else None
-        if (not renew and keep and not _held_already(top, keep, held_at)
-                and not _continues(top or f["git_dir"], saved, tips)):
+        if not renew and keep and not _held_already(top, keep, held_at) and not same():
             renew = True   # the held files would change a copy that may be another life's: they get a new stamp
         if renew:
-            stamp = (saved["stamp"] if not reaping and _continues(top or f["git_dir"], saved, tips)
+            stamp = (saved["stamp"] if not reaping and same()
                      else time.strftime("%Y%m%dT%H%M%SZ-", time.gmtime()) + os.urandom(2).hex())
             place = "%s/%s/%s-%s/%s" % (_slug(host or ah_log_push._host()), _slug(session), _slug(name),
                                         os.path.basename(state_file)[:8], stamp)
             checked = saved.get("checked") if saved.get("stamp") == stamp else []
             saved = dict(_store(top or f["git_dir"], f, tips, place, checked or []), stamp=stamp, place=place)
-            _write_json(state_file, dict(mark, repo=top or f["git_dir"], at=time.time(), saved=saved, scan=seen))
+            _write_json(state_file, dict(mark, repo=top or f["git_dir"], at=time.time(), saved=saved, scan=seen,
+                                         life=life))
         elif seen != cache:
             _write_json(state_file, dict(old, scan=seen))
         res.update({k: saved.get(k) for k in ("where", "url", "refs", "bundle")})
