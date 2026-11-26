@@ -343,13 +343,15 @@ def managed_hooks(claude: Path, provenance: bool = True, command_guard: bool = T
         managed.setdefault(event, []).append({"hooks": [dict(owner_inbox)]})
     # Session lifecycle (docs/lifecycle.md). session_env makes the session folder, exports AH_SESSION, AH_WORK and
     # TMPDIR through CLAUDE_ENV_FILE and prints one line. autosave saves what the session's checkouts hold nowhere
-    # else (own budget 20 s). Both read no command text, never block and always exit 0, so no onFailure. autosave is
-    # synchronous: nothing in this repository confirms that Claude Code accepts "async" on a handler.
+    # else (own budget 20 s). Both read no command text, never block and always exit 0, so no onFailure. On Stop and
+    # SubagentStop autosave runs in the background ("async", supported since Claude Code 2.1.332), so a turn never
+    # waits for a push; on SessionEnd it stays synchronous, so the last save finishes before the session goes.
     managed["SessionStart"].append({"hooks": [{
         "type": "command", "command": "python3", "args": [str(claude / "hooks" / "session_env.py")], "timeout": 10}]})
     autosave = {"type": "command", "command": "python3", "args": [str(claude / "hooks" / "autosave.py")], "timeout": 30}
-    managed.setdefault("Stop", []).append({"hooks": [autosave]})
-    managed.setdefault("SubagentStop", []).append({"matcher": SUBAGENT_MATCHER, "hooks": [dict(autosave)]})
+    managed.setdefault("Stop", []).append({"hooks": [dict(autosave, **{"async": True})]})
+    managed.setdefault("SubagentStop", []).append({"matcher": SUBAGENT_MATCHER,
+                                                   "hooks": [dict(autosave, **{"async": True})]})
     managed.setdefault("SessionEnd", []).append({"hooks": [dict(autosave)]})
     return through_launcher(managed, claude)
 

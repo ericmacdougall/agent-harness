@@ -8,10 +8,12 @@
 The path is the owner: a folder directly under ~/.agent-harness/work belongs to the session it is named after, and
 `--path` names one other folder exactly. Nothing here reads command text or blocks a tool call, and `run` changes
 nothing without --apply. In a folder idle long enough that no process uses, `run --apply` removes rebuildable
-directories (node_modules, .venv, target, ...), the session's temp directory, every git checkout `git_save.save`
-proves saved (children first), and the docker containers and volumes tied to that session. It never removes loose
-files, a folder with a .keep file, a keep/ directory or a checkout that holds one, the calling session's own folder,
-a symlink, a docker image or an unlabelled container. Unknown means keep: a git error, an unreadable directory, an
+directories (node_modules, .venv, target, ...), the contents of the session's temp directory (the directory stays,
+so a session that comes back keeps its TMPDIR), every git checkout `git_save.save` proves saved (children first), and
+the docker containers and volumes tied to that session. A run over everything also removes the harness's own
+leftovers: temp directories of no folder, state files of checkouts that are gone, mirrors unused for 30 days. It never
+removes loose files, a folder with a .keep file, a keep/ directory or a checkout that holds one, the calling session's
+own folder, a symlink, a docker image, an unlabelled container or anything under ~/.agent-harness/rescue. Unknown means keep: a git error, an unreadable directory, an
 unproven save or a process inside the folder keeps the data, and the reason is printed. Every deletion is a row in
 ~/.agent-harness/logs/reap.jsonl, written before the deletion starts. Exit codes: 0 done or nothing to do,
 1 something failed, 3 refused. Standard library only.
@@ -19,6 +21,7 @@ unproven save or a process inside the folder keeps the data, and the reason is p
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import os
 import re
@@ -33,12 +36,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ah_local  # noqa: E402
 import ah_log_push  # noqa: E402
 import git_save  # noqa: E402
+import session_env  # noqa: E402  (tmp_key: the one name of a session's temp directory)
 import workdir  # noqa: E402
 from git_save import _git  # noqa: E402  (the one git runner: a timeout, no prompt, no pager, no repository hooks)
 
 BIG_FILE = 100 * 1024 * 1024   # a larger file outside a checkout is reported by scan and never deleted
 WALK_MAX = 3000000             # more entries than this in one folder: what it holds is unknown, so it is kept
 DEFAULT_HOURS, DONE_HOURS = 48, 1
+MIRROR_DAYS = 30               # a mirror in ~/.agent-harness/cache/git that `ah co` has not used for this long goes
 PRESSURE_HOURS, PRESSURE_DROP = 6, 5   # --if-above: the idle hours that are enough, and how far under PCT to stop
 SESSION_ENV = ("AH_SESSION", "CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID")
 
@@ -56,7 +61,11 @@ def _human(size) -> str:
 
 
 def _size(path) -> int:
-    return workdir._activity(Path(path), Path(path), WALK_MAX)[1]
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return 0
+    return workdir._activity(Path(path), Path(path), WALK_MAX)[1] if stat.S_ISDIR(info.st_mode) else info.st_size
 
 
 def _disk_used(path):
@@ -77,11 +86,13 @@ def _session():
     return next((os.environ[key] for key in SESSION_ENV if os.environ.get(key)), None)
 
 
-def _dirs(parent, links=False) -> list:
-    """Directories directly in `parent`, sorted; with `links` also symlinks (they are only ever reported)."""
+def _dirs(parent, links=False, files=False) -> list:
+    """Directories directly in `parent`, sorted; with `links` also symlinks (they are only ever reported), with
+    `files` every entry. Empty when `parent` cannot be read."""
     try:
         with os.scandir(parent) as entries:
-            return sorted(e.path for e in entries if e.is_dir(follow_symlinks=False) or (links and e.is_symlink()))
+            return sorted(e.path for e in entries
+                          if files or e.is_dir(follow_symlinks=False) or (links and e.is_symlink()))
     except OSError:
         return []
 
@@ -193,11 +204,20 @@ def _survey(folder) -> dict:
     return found
 
 
-def _look(path, loose=False) -> dict:
-    """What one folder is and holds: owner, last use, size, checkouts, rebuildable directories. Read only."""
+def _claims(root) -> collections.Counter:
+    """How many entries of the work root claim each temp directory name. Only a name claimed once has an owner."""
+    try:
+        return collections.Counter(session_env.tmp_key(name) for name in os.listdir(root))
+    except OSError:
+        return collections.Counter()
+
+
+def _look(path, loose=False, claims=None) -> dict:
+    """What one folder is, from cheap facts only: owner, session log, temp directory, .keep and .done. Read only.
+    What it holds (_survey) and when it last changed (_activity) cost a walk, so they are asked separately."""
     name = os.path.basename(path)
     look = {"path": path, "real": os.path.realpath(path), "name": name, "loose": loose, "owner": None, "tmp": None,
-            "skip": None}
+            "skip": None, "signs": [], "keep_file": False, "done": False}
     if os.path.islink(path) or not os.path.isdir(path):
         look["skip"] = "a symlink, which is never followed"
         return look
@@ -211,21 +231,58 @@ def _look(path, loose=False) -> dict:
                 look["owner"] = recorded
         except (OSError, ValueError, AttributeError):
             pass
-        tmp = git_save._home("tmp", name[:8])   # the TMPDIR session_env.py gives a session
-        twins = [other for other in os.listdir(os.path.dirname(path)) if other[:8] == name[:8]]
-        if workdir.SESSION_UUID.fullmatch(name) and twins == [name] and os.path.isdir(tmp) and not os.path.islink(tmp):
+        tmp = str(session_env.tmp_dir(name))   # the TMPDIR session_env.py gives a session; two claimants: nobody's
+        claims = _claims(os.path.dirname(path)) if claims is None else claims
+        if claims.get(session_env.tmp_key(name)) == 1 and os.path.isdir(tmp) and not os.path.islink(tmp):
             look["tmp"] = os.path.realpath(tmp)
     signs = workdir._transcripts(look["owner"]) if look["owner"] else []   # a live session keeps writing these
-    look.update(_survey(look["real"]), wal=str(wal))
-    last, size, complete = workdir._activity(Path(look["real"]), wal, WALK_MAX,
-                                             signs + ([Path(look["tmp"])] if look["tmp"] else []))
-    look.update(last=last, bytes=size, complete=complete, keep_file=os.path.lexists(os.path.join(path, workdir.KEEP)),
+    look.update(wal=str(wal), signs=[str(x) for x in [wal, wal.parent] + signs] + [look["tmp"]] * bool(look["tmp"]),
+                keep_file=os.path.lexists(os.path.join(path, workdir.KEEP)),
                 done=not loose and (os.path.lexists(os.path.join(path, workdir.DONE)) or workdir._marked_done(wal)))
     return look
 
 
+def _activity(look, since=None):
+    """(latest change, bytes, complete) of the folder, never following symlinks; its session log, transcripts and
+    temp directory count as changes too. With `since` the walk stops at the first change after it: such a folder is
+    not idle, and nothing more about it is needed."""
+    latest = max(workdir._mtime(Path(path)) for path in [look["real"]] + look["signs"])
+    size, seen, stack = 0, 0, [look["real"]]
+    while stack:
+        if since is not None and latest > since:
+            return latest, size, False
+        try:
+            with os.scandir(stack.pop()) as entries:
+                for entry in entries:
+                    seen += 1
+                    if seen > WALK_MAX:
+                        return latest, size, False
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    latest = max(latest, info.st_mtime)
+                    if stat.S_ISDIR(info.st_mode):
+                        stack.append(entry.path)
+                    else:
+                        size += info.st_size
+        except OSError:
+            return latest, size, False
+    return latest, size, True
+
+
+def _full(look) -> dict:
+    """The look with everything a report needs: what the folder holds, its size and when it last changed."""
+    if not look["skip"]:
+        look.update(_survey(look["real"]))
+        look["last"], look["bytes"], look["complete"] = _activity(look)
+    return look
+
+
 def _why_not(look, hours, own, named, table):
-    """Why this folder is left alone, or None when it may be reduced (then look["need"] and look["why"] are set)."""
+    """Why this folder is left alone, or None when it may be reduced (then look["need"] and look["why"] are set).
+    Cheapest first: nothing here asks git, and a folder changed within the idle time stops the walk at that change.
+    `table` gives the process table, read only once a folder is idle."""
     if look["skip"]:
         return look["skip"]
     if workdir._protected(Path(look["path"])):
@@ -234,14 +291,16 @@ def _why_not(look, hours, own, named, table):
         return "has a .keep file"
     if not look["loose"] and look["name"] == own and look["name"] not in named:
         return "the calling session's own folder (name it with --session to include it)"
-    if look["problem"] or not look["complete"]:
-        return look["problem"] or "too large or unreadable to tell when it was last used"
     look["need"] = min(hours, DONE_HOURS) if look["done"] else hours
+    since = time.time() - look["need"] * 3600
+    look["last"], look["bytes"], look["complete"] = _activity(look, since)
     idle = (time.time() - look["last"]) / 3600.0
-    if idle < look["need"]:
+    if look["last"] > since:
         return "used %.1f hours ago, needs %g idle hours" % (idle, look["need"])
+    if not look["complete"]:
+        return "too large or unreadable to tell when it was last used"
     look["why"] = "%sidle %.1f hours" % ("marked done, " if look["done"] else "", idle)
-    return _in_use(look, table)
+    return _in_use(look, table())
 
 
 def _recheck(look):
@@ -367,6 +426,9 @@ def _docker_list(looks):
 def _remove(path) -> None:
     """Delete a tree without following a symlink. Directories are made writable first (a read-only Go module cache
     stops a plain removal half way); files are never changed, because a file may be a hard link into a shared store."""
+    if not stat.S_ISDIR(os.lstat(path).st_mode):
+        os.unlink(path)   # a file or a symlink: the link goes, never what it points to
+        return
     own = {"follow_symlinks": False} if os.chmod in os.supports_follow_symlinks else {}
     stack = [path]
     while stack:
@@ -416,13 +478,21 @@ class _Run:
             return False
         return True
 
-    def remove(self, look, kind, path, saved=None, reason=None) -> bool:
-        """Log one deletion, then do it. True when the tree is gone."""
+    def remove(self, look, kind, path, saved=None, reason=None, contents=False) -> bool:
+        """Log one deletion, then do it. True when the tree is gone. `contents`: empty the directory and keep it
+        (mode 0700), as for a session temp directory, which a live but idle session still has as its TMPDIR."""
         size = _size(path)
         if not self.note("removed", kind, path, look, reason or look["why"], size, saved) or not self.apply:
             return False
         try:
-            _remove(path)
+            if contents:
+                if os.path.islink(path):
+                    raise OSError("it became a symlink")
+                os.chmod(path, 0o700)
+                for name in sorted(os.listdir(path)):
+                    _remove(os.path.join(path, name))
+            else:
+                _remove(path)
         except OSError as error:
             self.failed = True
             self.note("failed", kind, path, look, "partly removed: %s" % type(error).__name__)
@@ -435,8 +505,10 @@ class _Run:
         the session's containers and volumes."""
         top, session = look["real"], "loose" if look["loose"] else look["name"]   # the names autosave.py saves under
         why = _recheck(look) if self.apply else None
-        for path in [] if why else sorted(look["rebuildable"]) + [look["tmp"]] * bool(look["tmp"]):
-            self.remove(look, "tmp" if path == look["tmp"] else "rebuildable", path)
+        for path in [] if why else sorted(look["rebuildable"]):
+            self.remove(look, "rebuildable", path)
+        if not why and look["tmp"] and _dirs(look["tmp"], files=True):   # emptied; the directory itself stays
+            self.remove(look, "tmp", look["tmp"], reason="%s; contents only" % look["why"], contents=True)
         order, facts, before, outside, circle = ([], {}, {}, {}, ()) if why else _order(look["checkouts"], borrowed)
         saved, kept = {}, {}
         for repo in order:
@@ -488,6 +560,60 @@ class _Run:
                     self.note("failed", thing["kind"], thing["name"], look, "docker did not remove it")
 
 
+def _below(*parts) -> list:
+    """Directories directly in ~/.agent-harness/<parts>, none when that directory is itself a symlink."""
+    base = git_save._home(*parts)
+    return [] if os.path.islink(base) else _dirs(base)
+
+
+def _thing(path) -> dict:
+    """A look for something that belongs to no session: a stray temp directory, a state file, a mirror."""
+    return {"path": path, "real": os.path.realpath(path), "name": os.path.basename(path), "owner": None,
+            "loose": True, "tmp": None, "signs": [], "why": None}
+
+
+def _leftovers(run, root, hours, claims, table, borrowed) -> None:
+    """What the harness itself leaves behind: temp directories that belong to no folder of the work root (idle for
+    `hours` and unused: contents and directory), state files of checkouts and folders that no longer exist, and
+    mirrors `ah co` has not used for MIRROR_DAYS. A thing changed within its idle time is passed over in silence.
+    Nothing under ~/.agent-harness/rescue is ever removed here: a bundle or a held file may be the only copy."""
+    now = time.time()
+    found = [("tmp", path, hours) for path in _below("tmp")
+             if re.fullmatch(r"[0-9a-f]{8}", os.path.basename(path)) and not claims.get(os.path.basename(path))]
+    found += [("mirror", path, MIRROR_DAYS * 24) for owner in _below("cache", "git") for path in _dirs(owner)
+              if path.endswith(".git")]
+    for kind, path, need in found:
+        look = _thing(path)
+        last, _size_seen, complete = _activity(look, now - need * 3600)
+        if last > now - need * 3600:
+            continue
+        users = borrowed().get(os.path.realpath(os.path.join(path, "objects")), []) if kind == "mirror" else []
+        look["why"] = "%s, unused for %.1f hours" % ("belongs to no session folder" if kind == "tmp" else "a mirror",
+                                                    (now - last) / 3600.0)
+        why = (None if complete else "too large or unreadable to tell when it was last used") or (
+            "%s borrows its objects" % users[0] if users else None) or _in_use(look, table())
+        if why:
+            run.note("left", kind, path, look, why)
+        else:
+            run.remove(look, kind, path)
+    base = git_save._home("state", "git-save")
+    try:
+        names = [] if os.path.islink(base) else sorted(os.listdir(base))
+    except OSError:
+        names = []
+    for name in names:
+        path, session = os.path.join(base, name), re.fullmatch(r"session-(.+)\.json(?:\.lock)?", name)
+        if session:   # autosave.py's record of a session folder, and its lock
+            owner = os.path.join(root, session.group(1))
+        elif re.fullmatch(r"[0-9a-f]{64}\.json", name):   # git_save's record of one checkout
+            owner = git_save._read_json(path).get("repo")
+        else:
+            continue
+        if (isinstance(owner, str) and os.path.isabs(owner) and not os.path.lexists(owner)
+                and os.path.isfile(path) and not os.path.islink(path)):
+            run.remove(_thing(path), "state", path, reason="%s no longer exists" % owner)
+
+
 def _run(args) -> int:
     root, mine = os.path.realpath(str(workdir.work_root())), os.path.realpath(git_save._home())
     home, folders, paths = os.path.realpath(str(Path.home())), _dirs(root, links=True), []
@@ -518,35 +644,53 @@ def _run(args) -> int:
     hours = args.idle_hours
     if hours is None:
         hours = PRESSURE_HOURS if args.if_above is not None else _idle_default()
-    every = not (named or paths)
-    chosen = [_look(path) for path in folders if every or os.path.basename(path) in named]
-    chosen += [_look(path, loose=True) for path in paths]
-    rest = [path for path in folders if not every and os.path.basename(path) not in named and not os.path.islink(path)]
-    # who borrows objects is asked of the whole work root, two levels below the home folder and beside each --path
-    near = [path for parent in [home] + [os.path.dirname(path) for path in paths]
-            for first in _dirs(parent) for path in [first] + _dirs(first)]
-    borrowed = _borrowed([repo for look in chosen for repo in look.get("checkouts", ())] + near
-                         + [repo for path in rest for repo in _survey(os.path.realpath(path))["checkouts"]])
-    table, things, run = _processes(), _docker_list(chosen), _Run(args.apply)
-    own = workdir.safe_name(_session()) if _session() else None
-    if args.if_above is not None:
-        chosen.sort(key=lambda look: look.get("last") or 0)   # oldest first
-    for look in chosen:
-        if args.apply and args.if_above is not None and (_disk_used(root) or 0) <= args.if_above - PRESSURE_DROP:
-            print("the disk is now %d points under %g%%: stopping" % (PRESSURE_DROP, args.if_above))
-            break
-        why = _why_not(look, hours, own, named, table)
+    every, claims, cache = not (named or paths), _claims(root), {}
+    looks = [_look(path, claims=claims) for path in folders if every or os.path.basename(path) in named]
+    looks += [_look(path, loose=True) for path in paths]
+
+    def once(key, make):   # the costly facts are asked only when something is eligible, and then only once
+        if key not in cache:
+            cache[key] = make()
+        return cache[key]
+
+    def borrowed():   # who borrows objects: every folder of the work root, two levels below home, beside each --path
+        near = [path for parent in [home] + [os.path.dirname(path) for path in paths]
+                for first in _dirs(parent) for path in [first] + _dirs(first)]
+        done = {look["real"]: look["checkouts"] for look in looks if "checkouts" in look}
+        reals = [os.path.realpath(path) for path in folders if not os.path.islink(path)] + paths
+        return _borrowed([repo for real in reals for repo in (done[real] if real in done
+                                                              else _survey(real)["checkouts"])] + near)
+
+    run, own = _Run(args.apply), workdir.safe_name(_session()) if _session() else None
+    ready = []
+    for look in looks:
+        why = _why_not(look, hours, own, named, lambda: once("table", _processes))
         if why:
             run.note("left", "folder", look["path"], look, why)
         else:
-            run.reduce(look, borrowed, things)
+            ready.append(look)
+    if args.if_above is not None:
+        ready.sort(key=lambda look: look["last"])   # oldest first
+    for look in ready:
+        if args.apply and args.if_above is not None and (_disk_used(root) or 0) <= args.if_above - PRESSURE_DROP:
+            print("the disk is now %d points under %g%%: stopping" % (PRESSURE_DROP, args.if_above))
+            break
+        look.update(_survey(look["real"]))
+        if look["problem"]:
+            run.note("left", "folder", look["path"], look, look["problem"])
+            continue
+        run.reduce(look, once("borrowed", borrowed) if look["checkouts"] else {},
+                   once("docker", lambda: _docker_list(looks)))
+    if every:
+        _leftovers(run, root, hours, claims, lambda: once("table", _processes), lambda: once("borrowed", borrowed))
     print("freed %s" % _human(run.freed) if args.apply else "nothing was changed: this was a dry run (--apply does it)")
     return 1 if run.failed else 0
 
 
 def _scan(args) -> int:
     root = os.path.realpath(str(workdir.work_root()))
-    looks = [_look(path) for path in _dirs(root, links=True)]
+    claims = _claims(root)
+    looks = [_full(_look(path, claims=claims)) for path in _dirs(root, links=True)]
     table, things, hours, now = _processes(), _docker_list(looks), _idle_default(), time.time()
     own = workdir.safe_name(_session()) if _session() else None
 
@@ -565,7 +709,8 @@ def _scan(args) -> int:
         inner = [first] if os.path.lexists(os.path.join(first, ".git")) else _dirs(first)
         loose += [path for path in inner if os.path.lexists(os.path.join(path, ".git")) and not _inside(path, root)]
     report = {"work_root": root, "disk_used_percent": _disk_used(root), "folders": looks, "loose": checkouts(loose),
-              "docker_unlabelled": None if things is None else [thing for thing in things if not thing["folder"]]}
+              "docker_unlabelled": None if things is None else [thing for thing in things if not thing["folder"]],
+              "rescue": _rescue()}
     if args.json:
         print(json.dumps(report, indent=1, sort_keys=True))
         return 0
@@ -587,7 +732,28 @@ def _scan(args) -> int:
     print("docker did not answer: containers and volumes are not listed\n" * (things is None), end="")
     for item in report["docker_unlabelled"] or ():
         print("unlabelled %s %s  %s (report only)" % (item["kind"], item["name"], item["state"] or ""))
+    saved = report["rescue"]
+    print("saved copies in %s (never removed automatically): %d bundles (%s), %d held files (%s)" % (
+        git_save._home("rescue"), saved["bundles"], _human(saved["bundle_bytes"]), saved["held_files"],
+        _human(saved["held_bytes"])))
     return 0
+
+
+def _rescue() -> dict:
+    """Count and size of the bundles and held files under ~/.agent-harness/rescue. Read only."""
+    base = git_save._home("rescue")
+    held, found = os.path.join(base, "held"), dict.fromkeys(("bundles", "bundle_bytes", "held_files", "held_bytes"), 0)
+    for folder, _dirs_in, names in os.walk(base):
+        for name in names:
+            try:
+                size = os.lstat(os.path.join(folder, name)).st_size
+            except OSError:
+                continue
+            kind = "held" if _inside(folder, held) else "bundle" if name.endswith(".bundle") else None
+            if kind:
+                found["held_files" if kind == "held" else "bundles"] += 1
+                found[kind + "_bytes"] += size
+    return found
 
 
 def main(argv=None) -> int:

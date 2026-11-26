@@ -17,8 +17,8 @@ does about it. No part of it blocks or delays a tool call, and none of it reads 
 
 | When | What | By |
 |---|---|---|
-| A session starts | The session folder is made. Shell commands get `AH_SESSION`, `AH_WORK` (the folder) and `TMPDIR` (`~/.agent-harness/tmp/<first 8 characters of the session id>`, so test fixtures land in a place the session owns). The agent is told in one line where its files belong. | `session_env.py` |
-| A turn, a sub-agent or the session ends | Every git checkout in the session folder is saved: unpushed commits, tags, stashes, a detached HEAD and a snapshot of uncommitted and untracked files. An unchanged checkout costs no network call. | `autosave.py` |
+| A session starts | The session folder is made. Shell commands get `AH_SESSION`, `AH_WORK` (the folder) and `TMPDIR` (`~/.agent-harness/tmp/<key>`, so test fixtures land in a place the session owns). The key is the first 8 characters of the folder name when that is a lowercase UUID, else the first 8 hex characters of its SHA-256; `ah reap` uses the same key. The agent is told in one line where its files belong. | `session_env.py` |
+| A turn, a sub-agent or the session ends | Every git checkout in the session folder is saved: unpushed commits, tags, stashes, a detached HEAD and a snapshot of uncommitted and untracked files. An unchanged checkout costs no network call. On Stop and SubagentStop it runs in the background (`"async": true`), so a turn never waits for it; SessionEnd waits for it. If the session's temp directory has gone, it is made again. | `autosave.py` |
 | A session starts and its folder was last measured over the quota | One more line names the three largest directories. Nothing is refused. | `session_env.py` |
 
 Nothing is deleted by these hooks. Deleting is `ah reap run --apply`, which you run or schedule yourself (below).
@@ -27,14 +27,9 @@ On Codex the same two hooks run at SessionStart and Stop. Codex has no env file,
 `TMPDIR` are not set there (the line of context gives `ah co` with `AH_SESSION=<id>` in front); the folder, the line
 and the save work the same. Codex asks you to review new hooks in `/hooks`.
 
-Limits worth knowing:
-
-- The save hook is synchronous: the end of a turn waits for it, at most 20 seconds when many checkouts changed.
-- It looks at 20 checkouts per run and only inside the session folder. A checkout made elsewhere (the home folder,
-  another directory) is not saved by the hook; see `--path` and `--loose` below.
-- The save at session end is best effort. The reaper saves again, freshly, before it deletes anything.
-- The command guard still refuses a typed `rm` of a `*.jsonl` file under `~/.agent-harness/tmp`. Other files in the
-  session's own temp directory are the session's to delete.
+The save hook looks at 20 checkouts per run, within 20 seconds, and only inside the session folder; a checkout made
+elsewhere (the home folder, another directory) is not saved by it (see `--path` and `--loose` below). The save at
+session end is best effort: the reaper saves again, freshly, before it deletes anything.
 
 ## Where saved work goes
 
@@ -52,8 +47,10 @@ with `/` written as `-` (`top` when the session folder is itself the checkout); 
 checkouts of the same name apart. For a `--path` directory `<session>` is `loose` and `<name>` is the directory's name.
 
 Files that never go into a snapshot are copied to `~/.agent-harness/rescue/held/<host>/<session>/<name>-<8 hex>/`
-(directories 0700, files 0600): secret-shaped names such as `.env`, `*.pem` and `*.key`, files over 20 MB, and ignored
-files that are not rebuildable output. If they total more than 200 MB the checkout is kept, not deleted.
+(directories 0700, files 0600) and never pushed: secret-shaped names such as `.env`, `*.pem` and `*.key`, files whose
+content has a secret shape (a token in a `.log`, a key in `config.py`; binary files are read too, with the shapes of
+`redact.py`), files over 20 MB, and ignored files that are not rebuildable output. A tracked file held back keeps its
+committed version in the snapshot. If held files total more than 200 MB the checkout is kept, not deleted.
 
 ## Commands
 
@@ -79,7 +76,12 @@ depends on no other checkout and "is this pushed?" always has an answer. Prefer 
 `ah reap scan` also lists docker containers and volumes. Label yours so they can be tied to the session:
 `docker run --label ah.session=$AH_SESSION ...`. `--loose DIR` adds checkouts at most two levels below `DIR`, and
 `--check-remote` asks each remote what it holds (without it the remote-tracking refs answer, and a local-path origin
-shows as unknown). A scan never deletes. On a work root of 200 GB it takes minutes.
+shows as unknown). A scan never deletes. On a work root of 200 GB it takes minutes. It also reports how many bundles
+and held files `~/.agent-harness/rescue` holds, and their size.
+
+`run` is cheap when nothing is eligible: with `--if-above` it reads the disk use first and stops at once below the
+threshold, and it decides eligibility (own folder, `.keep`, idle time, in use) before it measures a folder or asks git
+anything about it. A walk for the idle time stops at the first recent change.
 
 Exit codes of `ah reap`: 0 done or nothing to do (a kept item is not a failure), 1 a deletion, a docker removal or
 the log write failed, 3 refused (bad arguments, unsafe platform).
@@ -94,14 +96,20 @@ For an eligible folder, in this order:
 
 1. Rebuildable directories go first, wherever they are: `node_modules`, `.venv`, `venv`, `__pycache__`,
    `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.next`, `.nuxt`, `.turbo`, `.parcel-cache`, `.gradle`, `.tox`,
-   `target` beside a `Cargo.toml` or `pom.xml`, `dist` and `build` when git ignores them, and the session's temp
-   directory. Inside a checkout such a directory goes only when git tracks nothing in it; a kept checkout loses it too.
+   `target` beside a `Cargo.toml` or `pom.xml`, `dist` and `build` when git ignores them, and the contents of the
+   session's temp directory (the directory stays, mode 0700, so a session that comes back still has its `TMPDIR`).
+   Inside a checkout such a directory goes only when git tracks nothing in it; a kept checkout loses it too.
 2. Every checkout is saved again (children first: a linked worktree before its repository). Only a proven save allows
    its removal. A checkout that a path outside the folder depends on is kept.
 3. The folder is checked once more for use, then the saved checkouts are deleted, read-only trees included. Loose
    files stay, and so does the folder itself unless it is itself a checkout.
 4. Docker containers and volumes tied to that session (label `ah.session`, or a bind mount under the folder) are
    stopped and removed. Images are never pruned.
+
+A run over everything (no `--session`, no `--path`) also removes what the harness itself left behind: directories in
+`~/.agent-harness/tmp` named like a temp key that belong to no folder of the work root, once idle for the same hours
+and unused; state files in `~/.agent-harness/state/git-save` whose checkout or session folder no longer exists; and
+mirrors in `~/.agent-harness/cache/git` that `ah co` has not used for 30 days (a mirror something borrows from stays).
 
 Every deletion is one JSON line in `~/.agent-harness/logs/reap.jsonl`, written before the deletion starts (no row,
 no deletion). An item kept inside an eligible folder is logged with its reason; folders left alone (not idle, `.keep`,
@@ -115,6 +123,7 @@ in use) are printed, not logged. A folder with a kept checkout is tried again on
   and anything costly to recreate there.
 - A folder a live process is using, a folder that is a symlink, and the harness's own protected paths.
 - A checkout whose save could not be proven. Large loose files and unlabelled containers are reported only.
+- Bundles and held files under `~/.agent-harness/rescue`: they can be the only copy. Delete them yourself.
 - Small files left in a reduced folder: those follow the older `python3 ~/.claude/hooks/workdir.py prune` retention.
 
 ## Getting a saved checkout back
@@ -133,6 +142,21 @@ From a bundle: `git clone ~/.agent-harness/rescue/<host>/<session>/<name>-<8 hex
 branch there: the snapshot is `origin/rescue/snapshot`, a stash `origin/rescue/stash/<n>`, a detached HEAD
 `origin/rescue/detached`. The same `git restore --source origin/rescue/snapshot --worktree .` brings the files back.
 Copy held files back by hand from `~/.agent-harness/rescue/held/<host>/<session>/<name>-<8 hex>/`.
+
+## Limits
+
+What this does not cover:
+
+- An ignored file over 20 MB inside a saved checkout is deleted with the checkout, unless it sits in `keep/`.
+- A commit made by an outside process between the save and the deletion is lost with the checkout.
+- A checkout elsewhere on disk that borrows objects through alternates, outside the places searched (the work root,
+  two levels below the home folder, beside each `--path`), breaks when its lender goes.
+- Processes of other users are invisible to the in-use check.
+- `reap.jsonl` stays on this machine unless you ship it with `ah log-push`.
+- Codex sessions get no `TMPDIR` and no `AH_WORK`.
+- A docker container is tied to a session only by the label `ah.session` or a bind mount under the session folder.
+- The command guard still refuses a typed `rm` of a `*.jsonl` file under `~/.agent-harness/tmp`. Other files in the
+  session's own temp directory are the session's to delete.
 
 ## Running it on a timer (your choice)
 

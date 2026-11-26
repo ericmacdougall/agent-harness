@@ -564,6 +564,32 @@ class SaveToRemote(Case):
         self.assertTrue(self.save(repo)["ok"])
         self.assertEqual((held / ".env").read_text(), "COLOUR=green\n")
 
+    def test_a_file_whose_content_is_secret_shaped_is_held_and_never_pushed(self):
+        repo = self.repo()
+        token = "ghp_" + "A1b2C3d4" * 5   # put together at run time: this file holds no token-shaped literal
+        self.commit(repo, "settings.py", "DEBUG = True\n")
+        (repo / "settings.py").write_text("DEBUG = True\napi_key = 'k3y-%s'\n" % token[4:])   # tracked, now secret
+        (repo / "run.log").write_text("starting\nlogged in with %s\n" % token)            # an ordinary .log file
+        (repo / "dump.bin").write_bytes(b"\x00\xff\xfe" + token.encode() + b"\x80\x00")    # binary counts too
+        (repo / "notes.txt").write_text("nothing secret here\n")
+        result = self.save(repo)
+        self.assert_saved_remote(result)
+        self.assertEqual(result["held"], ["dump.bin", "run.log", "settings.py"])
+        commit, held = git_save.snapshot(repo, SESSION)
+        self.assertEqual({item["path"]: item["reason"] for item in held},
+                         dict.fromkeys(("dump.bin", "run.log", "settings.py"), "secret-shaped content"))
+        snapshot = result["refs"][self.ref(result, "/snapshot")]
+        self.assertEqual(snapshot, commit)
+        self.assertEqual(self.tree_files(self.rescue, snapshot), {"README.md", "settings.py", "notes.txt"})
+        self.assertEqual(self.git(self.rescue, "show", snapshot + ":settings.py"), "DEBUG = True")   # HEAD's version
+        pushed = subprocess.run(["git", "-C", str(self.rescue), "cat-file", "--batch-all-objects", "--batch"],
+                                capture_output=True, check=True).stdout
+        self.assertNotIn(token.encode(), pushed)
+        self.assertNotIn(token[4:].encode(), pushed)
+        held_dir = Path(result["held_dir"])
+        self.assertIn(token, (held_dir / "run.log").read_text())   # the only copy is the local, private one
+        self.assertEqual(stat.S_IMODE((held_dir / "run.log").stat().st_mode), 0o600)
+
     def test_held_files_too_large_is_not_ok_but_the_commits_are_still_pushed(self):
         repo = self.repo()
         (repo / ".env").write_text("x" * 600)

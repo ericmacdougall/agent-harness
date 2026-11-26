@@ -192,12 +192,17 @@ def _inside(path: Path, root: Path) -> bool:
 
 def own_roots(payload, home=None) -> list[Path]:
     """Directories every agent may clean without asking: its session's durable work directory, its temp directory
-    (the TMPDIR session_env.py gives it: tmp/<first 8 characters of the session id>) and scratch."""
+    (the TMPDIR session_env.py gives it: tmp/<session_env.tmp_key of its folder name>) and scratch."""
     session = _session(payload)
     if not session or not SESSION_ID.match(session):
         return []
     base = state_dir(home)
-    roots = [base / "work" / session, base / "tmp" / session[:8]]
+    roots = [base / "work" / session]
+    try:   # the one name of a session's temp directory (docs/lifecycle.md); unknown means no temp root
+        import session_env  # noqa: PLC0415
+        roots.append(base / "tmp" / session_env.tmp_key(session_env.workdir.safe_name(session)))
+    except Exception:  # noqa: BLE001
+        pass
     scratch = base / "scratch"
     try:
         roots += [p for p in scratch.glob(f"*/*/{session}") if p.is_dir()]

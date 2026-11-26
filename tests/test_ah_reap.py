@@ -7,6 +7,7 @@ repositories, and `docker` is a script that answers from files and records what 
 The deletion path follows section F of the t2-dev report: each rule there has a test below.
 """
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -612,21 +613,73 @@ class Rebuildable(Case):
         self.assertEqual(out.buffer.getvalue(), b"kept  checkout  /work/caf\\udce9/node_modules  why\n")
         self.assertEqual(self.rows()[-1]["path"], odd)
 
-    def test_the_session_temp_directory_goes_with_the_folder(self):
+    def test_the_session_temp_directory_is_emptied_and_kept_for_a_session_that_may_still_be_alive(self):
         folder = self.folder()
         temp = self.home / ".agent-harness" / "tmp" / SESSION[:8]
         (temp / "fixture-repo").mkdir(parents=True)
         (temp / "fixture-repo" / "file").write_text("x\n")
+        (temp / "loose.txt").write_text("x\n")
+        outside = self.root / "outside.txt"
+        outside.write_text("precious\n")
+        os.symlink(outside, temp / "link")
+        os.chmod(temp / "fixture-repo", 0o500)
+        os.chmod(temp, 0o755)
         code, out = self.apply()
         self.assertEqual(code, 0, out)
-        self.assertFalse(temp.exists())
+        self.assertEqual(list(temp.iterdir()), [])   # the contents go; the directory stays, so TMPDIR still works
+        self.assertEqual(stat.S_IMODE(temp.stat().st_mode), 0o700)
+        self.assertEqual(outside.read_text(), "precious\n")
         self.assertEqual(self.removed("tmp"), [str(temp)])
         self.assertTrue(folder.is_dir())   # the folder and its small files are left to `workdir.py prune`
-        temp.mkdir()
-        twin = self.work / (SESSION[:8] + "-twin")   # two folders could claim that name: then it is nobody's
+        (temp / "again").write_text("x\n")
+        self.age(temp, 100)
+        twin = self.work / (SESSION[:8] + "-0000-4000-8000-000000000000")   # two folders claim it: nobody's
         twin.mkdir()
         self.apply()
-        self.assertTrue(temp.is_dir())
+        self.assertTrue((temp / "again").exists())
+
+    def test_a_folder_name_that_is_not_a_uuid_gets_a_hashed_temp_directory_of_its_own(self):
+        import session_env  # noqa: PLC0415
+        folder = self.folder("codex-run-7")
+        key = hashlib.sha256(folder.name.encode()).hexdigest()[:8]
+        self.assertEqual(session_env.tmp_key(folder.name), key)
+        self.assertEqual(session_env.tmp_key(SESSION), SESSION[:8])
+        self.assertEqual(session_env.tmp_key(SESSION.upper()), hashlib.sha256(SESSION.upper().encode()).hexdigest()[:8])
+        temp = self.home / ".agent-harness" / "tmp" / key
+        (temp / "fixture").mkdir(parents=True)
+        code, out = self.apply()
+        self.assertEqual(code, 0, out)
+        self.assertEqual((self.removed("tmp"), list(temp.iterdir())), ([str(temp)], []))
+
+    def test_temp_directories_of_no_folder_go_once_idle_and_unused(self):
+        self.folder()   # its own temp directory is not an orphan, however idle it looks
+        tmp = self.home / ".agent-harness" / "tmp"
+        made = {}
+        for name in ("deadbeef", "cafef00d", "0badc0de", SESSION[:8], "guard-selftest-x1", "abcdef12.txt"):
+            made[name] = tmp / name
+            if name.endswith(".txt"):
+                made[name].write_text("x\n")
+            else:
+                (made[name] / "fixture").mkdir(parents=True)
+                (made[name] / "fixture" / "file").write_text("x\n")
+        for name in made:
+            if name != "cafef00d":   # used just now
+                self.age(made[name], 50)
+        self.processes.return_value = {os.getpid(): (1, []), 70000002: (1, [str(made["0badc0de"] / "sock")])}
+        code, out = self.reap("run")
+        self.assertEqual(code, 0, out)
+        self.assertIn("would remove  tmp  ", out)
+        self.assertIn(str(made["deadbeef"]), out)
+        self.assertTrue(made["deadbeef"].is_dir())
+        self.assertEqual(self.reap("run", "--apply", "--session", SESSION)[0], 0)   # a run limited to sessions
+        self.assertTrue(made["deadbeef"].is_dir())
+        code, out = self.reap("run", "--apply")
+        self.assertEqual(code, 0, out)
+        self.assertFalse(made["deadbeef"].exists())
+        self.assertEqual(self.removed("tmp"), [str(made["deadbeef"])])
+        self.assertIn("in use by process 70000002", out)
+        for name in ("cafef00d", "0badc0de", SESSION[:8], "guard-selftest-x1", "abcdef12.txt"):
+            self.assertTrue(made[name].exists(), name)
 
     def test_a_process_inside_the_temp_directory_keeps_the_session(self):
         folder = self.folder()
@@ -681,12 +734,13 @@ class Checkouts(Case):
         self.assertEqual(len(hook), 3, hook)   # two heads/main, and a snapshot of the folder's untracked marker
         self.assertTrue(any("/%s/top-" % SESSION in ref for ref in hook), hook)
         temp = session_env.make_tmp(folder.name)
+        (temp / "fixture").write_text("x\n")
         code, out = self.apply()
         self.assertEqual(code, 0, out)
         self.assertFalse(folder.exists())
         self.assertEqual(self.refs(), hook)
         self.assertEqual(self.removed("tmp"), [str(temp)])
-        self.assertFalse(temp.exists())
+        self.assertEqual(list(Path(temp).iterdir()), [])   # emptied, and still there for a session that comes back
 
     def test_an_edit_git_can_only_see_by_reading_the_file_is_saved_too(self):
         """Same size, same timestamp as the index entry and as the index itself: only the content differs. git reads
@@ -994,7 +1048,9 @@ class Checkouts(Case):
         self.assertEqual(code, 0, out)
         for path, logged in seen:
             self.assertIn(path, logged)   # the row was on disk before the deletion began
-        rows = self.rows()
+        state = self.rows("removed", "state")   # the save's record of the deleted checkout goes with it
+        self.assertEqual([(row["session"], row["reason"]) for row in state], [(None, "%s no longer exists" % gone)])
+        rows = [row for row in self.rows() if row["kind"] != "state"]
         self.assertEqual([(row["action"], row["kind"], row["path"]) for row in rows],
                          [("removed", "rebuildable", str(folder / "node_modules")),
                           ("kept", "checkout", str(stays)), ("removed", "checkout", str(gone))])
@@ -1066,6 +1122,97 @@ class Pressure(Case):
         self.assertEqual(self.removed("rebuildable"), [str(made[SESSION] / "node_modules")])
         self.assertTrue((made[OTHER] / "node_modules").is_dir())
         self.assertIn("stopping", out)
+
+
+class Cheap(Case):
+    def test_with_nothing_eligible_no_tree_is_walked_for_size_and_no_git_or_docker_is_asked(self):
+        own, kept, busy = self.folder(SESSION), self.folder(OTHER), self.folder(THIRD)
+        for folder in (own, kept, busy):
+            self.repo(folder / "app")
+            (folder / "node_modules").mkdir()
+        (kept / ".keep").write_text("")
+        self.age(own, 100)
+        self.age(kept, 100)
+        self.age(busy, 100)
+        (busy / "app" / "deep").mkdir()
+        (busy / "app" / "deep" / "new.txt").write_text("written just now\n")
+        os.environ["AH_SESSION"] = SESSION
+        costly = AssertionError("costly work for a folder that is not eligible")
+        self.processes.side_effect = costly
+        with mock.patch.object(ah_reap, "_survey", side_effect=costly), \
+                mock.patch.object(ah_reap, "_size", side_effect=costly), \
+                mock.patch.object(ah_reap, "_docker_list", side_effect=costly), \
+                mock.patch.object(git_save, "facts", side_effect=costly), \
+                mock.patch.object(git_save, "_git", side_effect=costly):
+            code, out = self.reap("run", "--apply")
+        self.assertEqual(code, 0, out)
+        self.assertIn("the calling session's own folder", out)
+        self.assertIn("has a .keep file", out)
+        self.assertIn("used 0.0 hours ago, needs 48 idle hours", out)
+        with mock.patch.object(ah_reap, "_disk_used", return_value=40.0), \
+                mock.patch.object(ah_reap, "_look", side_effect=costly):
+            code, out = self.reap("run", "--apply", "--if-above", "70")
+        self.assertEqual(code, 0, out)
+        self.assertIn("nothing to do", out)
+        self.processes.side_effect = None
+        del os.environ["AH_SESSION"]
+        self.assertEqual(self.apply()[0], 0)   # eligible now: the full work is done for those folders only
+        self.assertEqual([(f / "node_modules").exists() for f in (own, kept, busy)], [False, True, False])
+
+
+class Housekeeping(Case):
+    def test_the_run_removes_its_own_leftovers_and_never_a_saved_copy(self):
+        folder = self.folder()
+        repo = self.repo(folder / "app")
+        state = self.home / ".agent-harness" / "state" / "git-save"
+        state.mkdir(parents=True)
+        files = {"gone": state / ("a" * 64 + ".json"), "here": state / ("b" * 64 + ".json"),
+                 "odd": state / ("c" * 64 + ".json"), "mine": state / ("session-%s.json" % SESSION),
+                 "mine-lock": state / ("session-%s.json.lock" % SESSION),
+                 "ended": state / ("session-%s.json" % OTHER), "ended-lock": state / ("session-%s.json.lock" % OTHER),
+                 "private": state / ("private-%s.json" % ("d" * 16))}
+        for key, path in files.items():
+            path.write_text(json.dumps({"repo": str(self.root / "no-such-checkout"), "at": 1}) if key == "gone"
+                            else json.dumps({"repo": str(repo)}) if key == "here" else "not json" if key == "odd"
+                            else "{}")
+        mirrors = self.home / ".agent-harness" / "cache" / "git" / "acme"
+        for name in ("old", "new", "busy", "lent"):
+            self.git(self.root, "init", "-q", "--bare", str(mirrors / (name + ".git")))
+        borrower = self.repo(self.home / "elsewhere" / "borrower")
+        alternates = borrower / ".git" / "objects" / "info" / "alternates"
+        alternates.write_text(str(mirrors / "lent.git" / "objects") + "\n")
+        for name in ("old", "busy", "lent"):
+            self.age(mirrors / (name + ".git"), 31 * 24)
+        self.age(mirrors / "new.git", 29 * 24)
+        self.processes.return_value = {os.getpid(): (1, []), 70000003: (1, [str(mirrors / "busy.git" / "objects")])}
+        rescue = self.home / ".agent-harness" / "rescue"
+        (rescue / "host" / SESSION).mkdir(parents=True)
+        (rescue / "host" / SESSION / "app-12345678.bundle").write_bytes(b"b" * 3000)
+        (rescue / "host" / SESSION / "app-12345678.json").write_text("{}")
+        (rescue / "held" / "host" / SESSION / "app-12345678").mkdir(parents=True)
+        (rescue / "held" / "host" / SESSION / "app-12345678" / ".env").write_bytes(b"e" * 1000)
+        self.age(rescue, 1000)
+        before = self.listing(self.home / ".agent-harness")
+        code, out = self.reap("run")
+        self.assertEqual(code, 0, out)
+        self.assertIn("would remove  state  ", out)
+        self.assertIn("would remove  mirror  ", out)
+        self.assertEqual(self.listing(self.home / ".agent-harness"), before)
+        code, out = self.reap("run", "--apply")
+        self.assertEqual(code, 0, out)
+        self.assertEqual({key for key, path in files.items() if not path.exists()}, {"gone", "ended", "ended-lock"})
+        self.assertEqual(sorted(p.name for p in mirrors.iterdir()), ["busy.git", "lent.git", "new.git"])
+        self.assertEqual(sorted(self.removed("state")), sorted(str(files[k]) for k in ("gone", "ended", "ended-lock")))
+        self.assertEqual(self.removed("mirror"), [str(mirrors / "old.git")])
+        self.assertIn("borrows its objects", out)
+        self.assertEqual(sorted(str(p) for p in rescue.rglob("*") if p.is_file()), sorted(
+            str(p) for p in [rescue / "host" / SESSION / "app-12345678.bundle", rescue / "host" / SESSION /
+                             "app-12345678.json", rescue / "held" / "host" / SESSION / "app-12345678" / ".env"]))
+        code, out = self.reap("scan")
+        self.assertEqual(code, 0, out)
+        self.assertIn("1 bundles (2.9 KB), 1 held files (1000 B)", out)
+        report = json.loads(self.reap("scan", "--json")[1])
+        self.assertEqual(report["rescue"], {"bundles": 1, "bundle_bytes": 3000, "held_files": 1, "held_bytes": 1000})
 
 
 class PathOption(Case):

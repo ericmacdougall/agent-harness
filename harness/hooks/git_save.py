@@ -29,6 +29,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ah_local  # noqa: E402
 import ah_log_push  # noqa: E402  (the URL without credentials, the GitHub URL shape and the host name live there)
+import redact  # noqa: E402  (the secret shapes: a file whose content matches one is held back like a .env)
 
 GIT = ("git", "--no-pager", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
        "-c", "commit.gpgsign=false")
@@ -234,7 +235,11 @@ def _held_reason(path):
         return "" if stat.S_ISDIR(info.st_mode) else "not a regular file"
     if any(fnmatch.fnmatchcase(os.path.basename(path).lower(), pattern) for pattern in SECRET_NAMES):
         return "secret-shaped name"
-    return "over 20 MB" if info.st_size > MAX_FILE else None
+    if info.st_size > MAX_FILE:
+        return "over 20 MB"
+    with open(path, "rb") as handle:   # an unreadable file raises: the save is not ok and the checkout stays
+        text = handle.read(MAX_FILE).decode("utf-8", "replace")
+    return "secret-shaped content" if redact.has_secret(text) else None
 
 
 def _snapshot(repo, session):

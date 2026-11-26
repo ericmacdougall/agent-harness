@@ -6,6 +6,7 @@ any CLAUDE*, CODEX_*, AH_* or GIT_* variable of the session that runs the tests,
 env file or a real ~/.agent-harness. No test reaches a real host: http goes to a closed local port, ssh is `false`.
 """
 import fcntl
+import hashlib
 import json
 import os
 import stat
@@ -153,6 +154,13 @@ class SessionStart(Case):
                          ["export AH_SESSION", "export AH_WORK"])
         self.assertFalse((self.home / ".agent-harness" / "tmp").exists())
 
+    def test_a_session_id_that_is_not_a_uuid_gets_a_temp_directory_of_its_own(self):
+        done = self.start(session="codex-run-7")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        tmp = self.home / ".agent-harness" / "tmp" / hashlib.sha256(b"codex-run-7").hexdigest()[:8]
+        self.assertIn("export TMPDIR=%s" % tmp, self.env_file.read_text().splitlines())
+        self.assertEqual(stat.S_IMODE(tmp.stat().st_mode), 0o700)
+
     def test_a_temp_path_that_is_a_symlink_is_never_exported(self):
         (self.home / ".agent-harness" / "tmp").mkdir(parents=True)
         (self.home / ".agent-harness" / "tmp" / SESSION[:8]).symlink_to(self.root / "tmp")
@@ -265,6 +273,18 @@ class Save(Case):
         self.assertEqual(files, ["README.md", "notes.txt"], "the secret-shaped file never leaves the machine")
         self.assertEqual(self.git(repo, "status", "--porcelain"), "?? .env\n?? notes.txt", "the checkout is as it was")
         self.assertEqual(self.state()["unsaved"], [])
+
+    def test_a_missing_session_temp_directory_is_made_again_at_the_end_of_a_turn(self):
+        self.start()
+        tmp = self.home / ".agent-harness" / "tmp" / SESSION[:8]
+        tmp.rmdir()   # as if something removed it while the session was still alive
+        done = self.stop()
+        self.assertEqual((done.returncode, done.stdout, done.stderr), (0, "", ""))
+        self.assertEqual(stat.S_IMODE(tmp.stat().st_mode), 0o700)
+        self.configure(rescue_remote=str(self.rescue), session_tmpdir=False)   # session_env would not make it
+        tmp.rmdir()
+        self.assertEqual(self.stop().returncode, 0)
+        self.assertFalse(tmp.exists())
 
     def test_an_unchanged_checkout_costs_no_network_call(self):
         self.checkout()
@@ -409,9 +429,11 @@ class Wiring(Case):
         for event in ("Stop", "SubagentStop", "SessionEnd"):
             saves = [h for name, h in self.scripts(managed[event]) if name == "autosave.py"]
             self.assertEqual(len(saves), 1, event)
-            # synchronous with a 30 second limit, never blocking: the hook's own budget is 20 seconds
-            self.assertEqual({k: v for k, v in saves[0].items() if k != "args"},
-                             {"type": "command", "command": "python3", "timeout": 30}, event)
+            # a turn never waits for the save: Stop and SubagentStop run it in the background ("async", Claude Code
+            # 2.1.332 and later); SessionEnd stays synchronous. 30 seconds either way: the hook's own budget is 20
+            expected = {"type": "command", "command": "python3", "timeout": 30}
+            expected.update({} if event == "SessionEnd" else {"async": True})
+            self.assertEqual({k: v for k, v in saves[0].items() if k != "args"}, expected, event)
             self.assertEqual(saves[0]["args"][:2], [str(claude / "hooks" / "ah_hook.py"), "autosave.py"])
             self.assertLess(autosave.BUDGET_S + autosave.SIZE_SECONDS, saves[0]["timeout"])
         once = install.merged_settings({}, claude)
@@ -452,6 +474,17 @@ class Wiring(Case):
             self.assertEqual(ah.main(["reap", "run", "--if-above", "70"]), 3)
             self.assertEqual(ah.main(["co", "owner/repo", "--name", "x"]), 0)
         self.assertEqual(calls, [("main", ["run", "--if-above", "70"]), ("co_main", ["owner/repo", "--name", "x"])])
+
+    def test_the_role_check_names_the_temp_directory_session_env_makes(self):
+        import ah_roles
+        import workdir
+        tmp = self.home / ".agent-harness" / "tmp"
+        for session in (SESSION, "ABCDEF12-0000-4000-8000-000000000000", "0f8fad5bcafe"):
+            roots = ah_roles.own_roots({"session_id": session}, home=str(self.home))
+            key = session_env.tmp_key(workdir.safe_name(session))
+            self.assertIn(tmp / key, roots, session)
+            if key != session[:8]:   # never another session's: 0f8fad5bcafe is not SESSION
+                self.assertNotIn(tmp / session[:8], roots, session)
 
     def test_a_session_may_clean_its_own_temp_directory_and_not_another_sessions(self):
         import command_guard as cg

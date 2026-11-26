@@ -8,7 +8,8 @@ a verified bundle, which is what lets `ah reap` remove the folder later without 
 It prints nothing when everything is saved and one line on stderr when something is not. It always exits 0 and
 writes nothing to stdout, so it never blocks a turn from ending. No command text is read. About every ten minutes it
 also measures the folder (at most 2 seconds) and records the size in the session's state file
-(session_env.state_file), which session_env.py reads at the next session start. Standard library only.
+(session_env.state_file), which session_env.py reads at the next session start. When the session's temp directory
+(its TMPDIR) has gone, it is made again. Standard library only.
 """
 from __future__ import annotations
 
@@ -23,6 +24,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 try:
+    import ah_local  # noqa: E402
     import ah_log_push  # noqa: E402  (shown_url: a reason never carries a credential)
     import git_save  # noqa: E402
     import safe_input  # noqa: E402
@@ -96,6 +98,8 @@ def run(session) -> str:
     folder = workdir.work_root() / workdir.safe_name(session)
     if folder.is_symlink() or not folder.is_dir():
         return ""
+    if ah_local.get("session_tmpdir") is not False and not os.path.isdir(session_env.tmp_dir(folder.name)):
+        session_env.make_tmp(folder.name)   # its contents may be reaped; a live session's TMPDIR must still exist
     started, state_path = time.monotonic(), str(session_env.state_file(folder.name))
     git_save._mkdirs(os.path.dirname(state_path))
     with open(state_path + ".lock", "a") as lock:

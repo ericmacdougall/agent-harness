@@ -3,13 +3,14 @@
 
 The path is the owner: what a session makes belongs under ~/.agent-harness/work/<session>/. This hook makes that
 folder. When Claude Code names an env file (CLAUDE_ENV_FILE) it adds AH_SESSION, AH_WORK and, unless local.json
-`session_tmpdir` is false, TMPDIR = ~/.agent-harness/tmp/<first 8 characters of the folder name> (0700; short,
-because a unix socket path holds about 104 characters). It prints one line that tells the agent where its files
-belong, and a second line when autosave.py measured the folder over local.json `session_quota_gb` (default 10).
+`session_tmpdir` is false, TMPDIR = ~/.agent-harness/tmp/<tmp_key> (0700; 8 characters, because a unix socket path
+holds about 104 characters). It prints one line that tells the agent where its files belong, and a second line when
+autosave.py measured the folder over local.json `session_quota_gb` (default 10).
 Nothing is refused or delayed: no tool call is read, and every failure is silence and exit 0. Standard library only.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -33,9 +34,19 @@ GB = 1024 ** 3
 SMALL = 256 * 1024
 
 
+def tmp_key(name) -> str:
+    """The temp directory's name for the session folder `name`, shared by this hook and `ah reap`: the first 8
+    characters when the name is a lowercase UUID, else the first 8 hex characters of the SHA-256 of the name."""
+    name = str(name)
+    if workdir.SESSION_UUID.fullmatch(name):
+        return name[:8]
+    return hashlib.sha256(name.encode("utf-8", "surrogateescape")).hexdigest()[:8]
+
+
 def tmp_dir(name) -> Path:
-    """The temp directory of the session whose folder is called `name`. `ah reap` removes it with the folder."""
-    return Path.home() / ".agent-harness" / "tmp" / str(name)[:8]
+    """The temp directory of the session whose folder is called `name`. `ah reap` empties it with the folder and
+    keeps the directory itself, so a session that comes back still has its TMPDIR."""
+    return Path.home() / ".agent-harness" / "tmp" / tmp_key(name)
 
 
 def state_file(name) -> Path:
