@@ -31,7 +31,7 @@ import review_diagnostics as diagnostics
 from process import CleanupIncomplete, OutputLimitExceeded, run as run_process, signal_group
 from git_safety import git_environment as safe_git_environment, require_safe_source
 from report_file import ReportTarget
-import escalation as ladder
+import ah_repo
 import model_tiers as tiers
 from usage_guard import GuardError, PoolUnavailable, UsageStore, capture_subject, invocation_identity
 
@@ -202,7 +202,7 @@ def hoist_verdict(stage, text):
     - the preamble is at most HOIST_MAX_LINES lines and HOIST_MAX_CHARS characters.
     Lines AFTER the marker may hold fences, quotes and code: reviewers put code in findings, and nothing after the
     marker can contain it. A marker repeated after it still counts as a second marker, so it is never hoisted.
-    The text is returned verdict first, the preamble moved below with a note, so the pass marker, the ticket parser
+    The text is returned verdict first, the preamble moved below with a note, so the pass marker
     and stage_report still see a first-line verdict."""
     if not isinstance(text, str) or verdict_match(stage, text):
         return text
@@ -576,7 +576,7 @@ def classify_provider(provider, code, stdout, stderr='', last_message='', reques
         text.encode('utf-8')
     except UnicodeError:
         return invalid
-    text = hoist_verdict(requested_stage, text)
+    text = hoist_verdict(requested_stage, ticketed_as_block(requested_stage, text))
     verdict = verdict_match(requested_stage, text)
     if not verdict:
         return invalid
@@ -639,14 +639,9 @@ def domain_section(repo: Path, base, changed_paths=None):
         paths = changed_paths or []
         distrust = (not base or len(paths) >= 5000 or any(
             unicodedata.normalize('NFC', p).casefold().startswith('.harness/') for p in paths))  # case-insensitive volumes
-        try:
-            import spec_flow
-            policy = spec_flow.load_spec_policy()
-        except (ImportError, OSError, ValueError) as error:
-            policy, distrust = None, True  # unknown policy: never let the repo file switch the checklist off
-            if not isinstance(error, ImportError):
-                print(f'Warning: spec_policy.json could not be loaded ({type(error).__name__}); domain gates fall back '
-                      'to warn mode, so enforce refusals are OFF until it is fixed', file=sys.stderr)
+        # 2026-11-25: the spec flow and its policy file are gone; the checklist is advisory review guidance, so there
+        # is no installed policy to read (HARNESS_DOMAIN_GATES and the repo opt-out file still apply).
+        policy = None
         state = domain_gates.settings(repo, policy, ignore_repo_file=distrust)
         enforcing = state['mode'] == 'enforce'
         if state['warning']:
@@ -850,6 +845,8 @@ _CHILD_PATH_ROOTS: list[str] = []  # reviewed repo roots, set where discovery co
 
 def run(cmd: list[str], prompt: str, cwd: Path, timeout=720, on_spawn=None) -> tuple[int, str, str]:
     environment = git_environment(snapshot=True)
+    # The reviewer is launched as role reviewer (docs/roles.md): the launch, not the model, sets the role.
+    environment['AH_ROLE'], environment['AH_ROLE_SOURCE'] = REVIEWER_ROLE, 'peer_review:reviewer'
     # The reviewer's own interpreter lookup (`#!/usr/bin/env node`) must not reach reviewed files.
     environment['PATH'] = diagnostics.child_path(
         environment.get('PATH', ''), [*_CHILD_PATH_ROOTS, *diagnostics.untrusted_roots(snapshot=cwd)])
@@ -952,113 +949,6 @@ def read_packet(path: Path) -> PacketEvidence:
     except (OSError, ValueError):
         os.close(fd)
         raise ValueError('packet invalid or changed while being read') from None
-
-
-AHC_RELEASE = 'harness/hooks/ahc_release.json'
-AHC_RELEASE_FILE = re.compile(r'ahc_[a-z0-9_]{1,60}\.py')
-AHC_RELEASE_HELPER = re.compile(r'[a-z][a-z0-9_]{0,40}')  # a helper name in ahc_guard.HELPER_SCRIPTS
-AHC_RELEASE_SHA = re.compile(r'[0-9a-f]{64}')
-AHC_RELEASE_FIX = ('run `python3 scripts/ahc_release_hashes.py --write` and commit harness/hooks/ahc_release.json in '
-                   'the same change')
-
-
-def _hook_tree(snapshot: Path, rev: str) -> dict[str, str]:
-    """{basename: git mode} for the entries directly under harness/hooks/ at rev, read from the snapshot's objects."""
-    tree = {}
-    for entry in git(snapshot, 'ls-tree', '-z', rev, '--', 'harness/hooks/', snapshot=True).split('\0'):
-        meta, tab, path = entry.partition('\t')
-        if tab:
-            tree[path.rsplit('/', 1)[-1]] = meta.split(' ', 1)[0]
-    return tree
-
-
-def _release_parts(text: str, where: str) -> tuple[dict, dict]:
-    try:
-        data = json.loads(text)
-    except ValueError:
-        raise ValueError(f'{AHC_RELEASE} at {where} is not JSON') from None
-    parts = []
-    for part, names in (('files', AHC_RELEASE_FILE), ('helpers', AHC_RELEASE_HELPER)):
-        value = data.get(part) if isinstance(data, dict) else None
-        if not isinstance(value, dict) or not all(
-                isinstance(k, str) and names.fullmatch(k) and isinstance(v, str) and AHC_RELEASE_SHA.fullmatch(v)
-                for k, v in value.items()):
-            raise ValueError(f'{AHC_RELEASE} at {where} has a malformed "{part}" map')
-        parts.append(value)
-    return parts[0], parts[1]
-
-
-def _declared(snapshot: Path, rel: str, name: str, kind: type):
-    """The literal value HEAD assigns to `name` at module level in `rel`: parsed with ast.literal_eval, never run."""
-    import ast  # noqa: PLC0415
-    path = snapshot / rel
-    try:
-        tree = ast.parse(path.read_bytes(), filename=rel)
-    except (OSError, SyntaxError, ValueError):
-        raise ValueError(f'{rel} cannot be parsed at HEAD') from None
-    values = [node.value for node in tree.body if isinstance(node, ast.Assign)
-              and any(isinstance(target, ast.Name) and target.id == name for target in node.targets)]
-    if len(values) != 1:
-        raise ValueError(f'{rel} {name} must be assigned exactly once at module level')
-    try:
-        value = ast.literal_eval(values[0])
-    except ValueError:
-        raise ValueError(f'{rel} {name} is not a literal') from None
-    if not isinstance(value, kind):
-        raise ValueError(f'{rel} {name} is not a {kind.__name__}')
-    return value
-
-
-def ahc_release_problem(snapshot: Path, head: str, base: str | None) -> tuple[str | None, str | None]:
-    """The PR-stage gate for the ahc release list (goodqa#16049, PR 247 F4): (problem, manifest sha256).
-
-    agent-harness runs no GitHub CI, so a merge needs this review's authorization or an audited waiver; checking
-    here is what makes a stale list block a merge. It applies the predicate of scripts/ahc_release_hashes.py --check
-    without running any of the reviewed commit's code: the expected names are HEAD's own declarations, read as
-    literals (install.py HOOKS: its ahc_*.py modules; harness/hooks/ahc_guard.py HELPER_SCRIPTS: helper name to
-    script). The list's "files" and "helpers" must name exactly those, each a regular file at HEAD (no symlink or
-    submodule) whose sha256 matches. A repository with no list at HEAD or at the base is not checked (other
-    repositories use this review too); deleting the base's list is a problem.
-    """
-    head_tree = _hook_tree(snapshot, head)
-    base_tree = _hook_tree(snapshot, base) if base else {}
-    if 'ahc_release.json' not in head_tree:
-        if 'ahc_release.json' in base_tree:
-            return f'{AHC_RELEASE} exists at the base but not at HEAD; the ahc daemon refuses every entry point', None
-        return None, None
-    stale = []
-    try:
-        if head_tree['ahc_release.json'] not in {'100644', '100755'}:
-            raise ValueError(f'{AHC_RELEASE} is not a regular file at HEAD')
-        raw = (snapshot / AHC_RELEASE).read_bytes()
-        files, helpers = _release_parts(raw.decode('utf-8'), 'HEAD')
-        shipped = _declared(snapshot, 'install.py', 'HOOKS', tuple)
-        declared = _declared(snapshot, 'harness/hooks/ahc_guard.py', 'HELPER_SCRIPTS', dict)
-        if not all(isinstance(n, str) for n in shipped) or not all(
-                isinstance(k, str) and AHC_RELEASE_HELPER.fullmatch(k) and isinstance(v, str)
-                and re.fullmatch(r'[a-z][a-z0-9_]{0,60}\.py', v) for k, v in declared.items()):
-            raise ValueError('install.py HOOKS or ahc_guard.HELPER_SCRIPTS holds a name that is not a plain file name')
-        modules = {n for n in shipped if AHC_RELEASE_FILE.fullmatch(n)}
-        stale += [f'files {n} (shipped by install.py, not listed)' for n in sorted(modules - set(files))]
-        stale += [f'files {n} (listed, but install.py does not ship it)' for n in sorted(set(files) - modules)]
-        stale += [f'helpers {n} (declared by ahc_guard.HELPER_SCRIPTS, not listed)'
-                  for n in sorted(set(declared) - set(helpers))]
-        stale += [f'helpers {n} (listed, but ahc_guard.HELPER_SCRIPTS does not declare it)'
-                  for n in sorted(set(helpers) - set(declared))]
-        for part, entries, script in (('files', files, lambda n: n), ('helpers', helpers, declared.get)):
-            for name, digest in sorted(entries.items()):
-                if script(name) is None:
-                    continue
-                if head_tree.get(script(name)) not in {'100644', '100755'}:
-                    stale.append(f'{part} {name} (no regular file at HEAD)')
-                elif hashlib.sha256((snapshot / 'harness' / 'hooks' / script(name)).read_bytes()).hexdigest() != digest:
-                    stale.append(f'{part} {name} (sha256 differs)')
-    except (ValueError, UnicodeDecodeError) as error:
-        return f'{AHC_RELEASE} cannot be checked: {error}; {AHC_RELEASE_FIX}', None
-    if stale:
-        return (f'{AHC_RELEASE} is stale at HEAD: ' + '; '.join(stale[:12]) + '. The ahc daemon refuses these until '
-                f'the list matches: {AHC_RELEASE_FIX}'), None
-    return None, hashlib.sha256(raw).hexdigest()
 
 
 def repo_state(repo: Path, *, snapshot: bool = False) -> tuple[str, str]:
@@ -1245,7 +1135,7 @@ KIMI_VERDICT = re.compile(r'^KIMI_ADVISORY: (ACCEPT|BLOCK)\b')
 
 
 class AdvisoryOnly(Exception):
-    """Kimi answered. Its packet-only opinion is advisory: no pass marker, no exit 0, no ladder record."""
+    """Kimi answered. Its packet-only opinion is advisory: no pass marker, no exit 0, no review status."""
     def __init__(self, text, source, failure):
         super().__init__('advisory opinion from ' + source)
         self.text, self.source, self.failure = text, source, failure
@@ -1329,7 +1219,8 @@ def verdict_instruction(stage):
     (goodqa#15723), and a PASS after a preface is never accepted (a quoted PASS looks the same), so the prompt asks
     for the verdict as the very first line and says a later PASS is ignored."""
     if stage == 'pr':
-        marker, ok, tail = 'VERDICT', 'PASS', ''
+        marker, ok, tail = 'VERDICT', 'PASS', (' There are only these two verdicts: a finding you would defer to a '
+                                               'ticket is still a BLOCK, and the owner decides.')
     else:
         marker, ok, tail = ('PLAN' if stage == 'plan' else 'CODE_INSPECTION') + '_RESULT', 'ACCEPT', ' This is not PR signoff.'
     return ("Begin exactly %s: %s or %s: BLOCK.%s The first line of your reply must be exactly that line and nothing "
@@ -1422,12 +1313,13 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                         last = Path(temp) / 'last.txt'
                         if provider == 'codex':
                             cmd = [resolution['path'], 'exec', '--ephemeral', '--json', '--model', codex_model,
-                                   '-c', 'model_reasoning_effort=' + effort, '--sandbox', 'read-only',
+                                   '-c', 'model_reasoning_effort=' + effort, *codex_sandbox_args(),
                                    '--cd', str(snapshot), '--output-last-message', str(last), '-']
                         else:
                             cmd = [resolution['path'], '--print', '--safe-mode', '--restricted', '--model', claude_model,
                                    '--effort', effort, '--max-budget-usd', str(selection.get('review_budget_usd') or 5),
-                                   '--no-session-persistence', '--output-format', 'json', '--system-prompt', REVIEW_SYSTEM, '-']
+                                   '--no-session-persistence', '--output-format', 'json', *claude_sandbox_args(),
+                                   '--system-prompt', REVIEW_SYSTEM, '-']
                         launched_at = time.monotonic()
                         timeout = min(timeout, deadline - launched_at)
                         if timeout <= 0:
@@ -1543,26 +1435,19 @@ def verify_pr_binding(repository, number, head, *, runner=None):
             or type(number) is not int or number <= 0
             or not isinstance(head, str) or not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', head)):
         raise OSError('PR binding needs owner/repo, a positive PR number and the full lowercase reviewed HEAD')
-    import merge_gate
-    client = merge_gate.Client(runner or merge_gate.SubprocessGh(), time.monotonic() + 12)
     try:
-        value = client.json(['pr', 'view', str(number), '-R', repository, '--json',
-                             'number,url,headRefOid,state'], 'the reviewed pull request')
-    except merge_gate.GateError as error:
+        value = ah_repo.pr_head(repository, number, runner=runner)
+    except ah_repo.GitHubError as error:
+        # pr_head compares the answer's github.com URL, repository (ASCII case-insensitive) and number with the request
+        if str(error).startswith('GitHub answered for a different pull request'):
+            raise OSError('reviewed PR differs from the requested repository, number, HEAD or open state') from None
         raise OSError('could not verify the reviewed PR binding: ' + str(error)) from None
-    if not isinstance(value, dict):
-        raise OSError('reviewed PR binding is unreadable')
-    # Exact github.com host, ASCII names and digits, nothing after the number (fullmatch: no trailing newline).
-    match = re.fullmatch(r'https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/([0-9]+)',
-                         str(value.get('url') or ''))
-    # GitHub owner/repo names are case-insensitive (GoodQA #15565): compare ASCII-folded identities on both sides.
-    expected = merge_gate.repo_key(repository)
-    if (not match or expected is None or merge_gate.repo_key(match.group(1) + '/' + match.group(2)) != expected
-            or int(match.group(3)) != number or type(value.get('number')) is not int
-            or value['number'] != number or value.get('headRefOid') != head
-            or str(value.get('state') or '').upper() != 'OPEN'):
+    except ValueError as error:
+        raise OSError('PR binding needs owner/repo, a positive PR number and the full lowercase reviewed HEAD: '
+                      + str(error)) from None
+    if value['head'] != head or value['state'] != 'OPEN':
         raise OSError('reviewed PR differs from the requested repository, number, HEAD or open state')
-    return {'repo': expected, 'pr': number}
+    return {'repo': value['repo'], 'pr': number}
 
 
 AUTHOR_TRAILER = re.compile(r'^co-authored-by:\s*(.+)$', re.I | re.M)
@@ -1609,267 +1494,105 @@ def pr_base(repo, base):
     return None
 
 
-def top_rung_approval(task):
-    """{"approval": id} when a live `top-rung` record of the approvals store (ah_approvals) names `task`, else None.
-    Guarded import; never raises."""
+def top_rung_approval(task, project=None):
+    """{"approval": id} when a live `top-rung` record of the approvals store (ah_approvals) names `task` (and, when
+    the record names a project, covers `project`, the reviewed repository), else None. Guarded import; never raises."""
     try:
         import ah_approvals  # noqa: PLC0415 - a sibling module; absent on older installs
-        record = ah_approvals.allowed('top-rung', task=task)
+        facts = {'task': task}
+        if project is not None:
+            facts['project'] = str(project)
+        record = ah_approvals.allowed('top-rung', **facts)
     except Exception:  # noqa: BLE001
         return None
     return {'approval': record.get('id'), 'granted_by': record.get('granted_by')} if record else None
 
 
-FOLLOW_UP_LINE = re.compile(r'^follow-up:[ \t]*(.+)$', re.I | re.M)
-REFS_LINE = re.compile(r'^refs:[ \t]*(.+)$', re.I | re.M)
-# #134 red-team P3: these findings are never ticketed away, whatever category the reviewer gives them
-UNTICKETABLE = re.compile(
-    r'data[- ]?loss|los(?:e|es|ing|t) (?:\w+ )?(?:data|rows|records|files|commits|work)|\bdrops? (?:the |a )?\w+ '
-    r'(?:table|column|database)|\bdelet|\bwip(?:e|es|ed)\b|corrupt|secur|\bauth|credential|password|secret|'
-    r'\btoken|privacy|\bpii\b|leak|inject|privilege|permission|bypass|migrat|rollback|roll back|'
-    # B3 (step-1 red-team): wordings the first list missed
-    r'unauth|oauth|authn|authz|\bxss\b|cross[- ]site|csrf|ssrf|\bidor\b|\brce\b|remote code|\bsql\b|'
-    r'truncat|\beras(?:e|es|ed|ing|ure)\b|\bpurg|rm -rf|\btenant|exfiltrat|sandbox escape|\bacl\b|\bjwt\b|'
-    r'sign[- ]?in|log[- ]?in\b|session (?:token|cookie|id|fixation|hijack)', re.I)
+# ---- the reviewer's own boundary (docs/merge-rule.md, docs/sandbox.md) ------------------------------------------
+
+REVIEWER_ROLE = 'reviewer'
+CODEX_REVIEWER_PROFILE = re.compile(r'(?m)^[ \t]*\[[ \t]*permissions[ \t]*\.[ \t]*(?:ah-reviewer|"ah-reviewer")[ \t]*\]')
 
 
-def related_ticket_refs(repo, base):
-    """(follow-up tickets, own tickets) named by the reviewed commits, never by the reviewer or a tracker lookup.
-    Own tickets are those a commit cites in `Refs:`; a follow-up is cited in a `Follow-up:` line and is not own."""
-    if not base:
-        return set(), set()
-    import commit_policy
-    policy = commit_policy.load_policy()
-    messages = git(repo, 'log', '--max-count=500', '--format=%B', base + '..HEAD')
-    own = set(commit_policy.ticket_refs('\n'.join(REFS_LINE.findall(messages)), policy))
-    follow = set(commit_policy.ticket_refs('\n'.join(FOLLOW_UP_LINE.findall(messages)), policy))
-    return follow - own, own
-
-
-def default_ticket_verifier(ref):
-    """Isolated live GoodQA seam; tests replace this function with a fake adapter."""
-    system, project, number = ref
-    if system != 'goodqa':
-        raise OSError('only GoodQA tickets can record ticketed findings')
-    import commit_policy
-    import ticket_adapters
-    config = commit_policy.load_policy()['ticket_systems'][system]
-    adapter = ticket_adapters.adapter_for(config)
-    return adapter.lookup(project, number)
-
-
-TICKETED_LINE = re.compile(
-    r'TICKETED: ((?:F|R)[0-9]+(?:[-_.][A-Za-z0-9]+)*) \| category: ([a-z][a-z0-9-]{0,39})'
-    r' \| ticket: GoodQA ([a-z0-9][a-z0-9-]{0,62})#([1-9]\d{0,9})', re.I)
-TICKETED_FINDING_LINE = re.compile(
-    r'(?:#{1,6}\s+|[-*]\s+)?(?:Finding\s+)?((?:F|R)[0-9]+(?:[-_.][A-Za-z0-9]+)*):[ \t]+(\S(?:.*\S)?)')
-
-
-def parse_ticketed_report(report):
-    """Strict mode: every nonblank body line belongs to one finding/declaration pair."""
-    parsed, findings, errors = {}, [], []
-    lines = report.strip().splitlines()[1:]
-    index = 0
-    while index < len(lines):
-        if not lines[index].strip():
-            index += 1
-            continue
-        finding_match = TICKETED_FINDING_LINE.fullmatch(lines[index].strip())
-        if not finding_match:
-            errors.append('unparsed finding text in ticketed report: ' + lines[index].strip()[:120])
-            break
-        finding = finding_match[1]
-        if finding in parsed:
-            errors.append('duplicate finding block for ' + finding)
-            break
-        index += 1
-        while index < len(lines) and not lines[index].strip():
-            index += 1
-        if index >= len(lines) or not lines[index].lstrip().startswith('TICKETED:'):
-            errors.append(finding + ': finding block needs exactly one TICKETED declaration')
-            break
-        declaration = TICKETED_LINE.fullmatch(lines[index].strip())
-        if not declaration:
-            errors.append('malformed TICKETED declaration')
-            break
-        declared, category, project, number = declaration.groups()
-        if declared != finding:
-            errors.append(finding + ': declaration names a different finding')
-            break
-        parsed[finding] = (category.lower(), project.lower(), int(number), finding_match[2])
-        findings.append(finding)
-        index += 1
-    if len(findings) > 128:
-        errors.append('too many ticketed finding blocks')
-    return parsed, findings, errors
-
-
-def resolve_ticketed_findings(stage, report, *, head, related, verifier=None, own=()):
-    """Return (report, ticketed records, errors); any error preserves the original BLOCK."""
-    lines = report.strip().splitlines()
-    declarations = [line for line in lines if line.lstrip().startswith('TICKETED:')]
-    if not declarations:
-        return report, [], []
-    if stage != 'pr' or not re.match(r'^VERDICT: BLOCK\b', report.strip()) or len(declarations) > 128:
-        # A reviewer cannot turn a declaration into an unconditional acceptance;
-        # every stage fails closed to its own BLOCK marker.
-        marker = {'pr': 'VERDICT', 'plan': 'PLAN_RESULT', 'code-inspection': 'CODE_INSPECTION_RESULT'}.get(stage)
-        blocked = (re.sub(r'^' + marker + r': (?:PASS|ACCEPT|BLOCK)\b', marker + ': BLOCK',
-                          report.strip(), count=1) if marker else report)
-        return blocked, [], ['ticketed declarations require a PR BLOCK with at most 128 findings']
-    parsed, findings, errors = parse_ticketed_report(report)
-    if errors:
-        return report, [], errors
-    verifier = verifier or default_ticket_verifier
-    records = []
-    for finding in findings:
-        category, project, number, text = parsed[finding]
-        ref = ('goodqa', project, number)
-        ticket_label = f'GoodQA {project}#{number}'
-        if UNTICKETABLE.search(text):
-            errors.append(f'{finding}: a data-loss, security, auth or migration finding cannot be ticketed')
-            continue
-        if ref in own:
-            errors.append(f'{finding}: {ticket_label} is this branch\'s own work ticket (Refs:); file a follow-up')
-            continue
-        if category not in __import__('usage_guard').TICKETED_CATEGORIES:
-            errors.append(f'{finding}: category {category} cannot be ticketed')
-            continue
-        if ref not in related:
-            errors.append(f'{finding}: {ticket_label} is not referenced by the reviewed commits')
-            continue
-        try:
-            ticket = verifier(ref)
-            status = str(getattr(ticket, 'status', '') or '').lower().replace('-', '_')
-            if ticket is None:
-                errors.append(f'{finding}: {ticket_label} does not exist')
-            elif (str(getattr(ticket, 'project', '')).lower() != project
-                  or getattr(ticket, 'number', None) != number or not status):
-                errors.append(f'{finding}: tracker answered for a different or malformed ticket')
-            elif (getattr(ticket, 'closed', False) is not False
-                  or status not in {'open', 'backlog', 'triage', 'todo', 'in_progress', 'in_review'}):
-                errors.append(f'{finding}: {ticket_label} is not verified open (status {status or "unknown"})')
-        except Exception as error:  # adapter failures fail closed and never become PASS-with-tickets
-            errors.append(f'{finding}: {ticket_label} could not be verified ({type(error).__name__})')
-            continue
-        if not errors:
-            records.append({'state': 'ticketed', 'finding': finding, 'category': category,
-                            'ticket': ticket_label, 'head': head})
-    if errors:
-        return report, [], errors
-    first = 'VERDICT: PASS-WITH-TICKETS'
-    transformed = first + report.strip()[len('VERDICT: BLOCK'):]
-    return transformed, records, []
-
-
-def commit_policy_gate(repo, base):
-    """PR review spends a paid review only on a branch whose commits and tickets pass policy."""
+def claude_sandbox_args(home=None):
+    """['--settings', <reviewer settings>] when the owner installed the reviewer sandbox file, else []."""
+    home = Path(home) if home is not None else Path.home()
     try:
-        import commit_policy
-        policy = commit_policy.load_policy()
-    except (ImportError, OSError, ValueError):
-        return 2, 'commit policy could not be loaded; refusing PR review'
-    if base is None and not commit_policy.git(repo, 'remote', 'get-url', 'origin', check=False).strip():
-        return 0, ''  # no origin: nothing can be published from here; deliver prepare checks later
-    if base is None:
-        for candidate in ('refs/remotes/origin/HEAD', 'refs/remotes/origin/main', 'refs/remotes/origin/master'):
-            if commit_policy.git(repo, 'rev-parse', '-q', '--verify', candidate + '^{commit}', check=False).strip():
-                base = candidate
-                break
-    if base is None:
-        return 2, 'commit policy: cannot find the PR base (origin/HEAD or origin/main); pass --base'
-    branch = commit_policy.git(repo, 'symbolic-ref', '--quiet', '--short', 'HEAD', check=False).strip() or None
+        import ah_sandbox  # noqa: PLC0415 - W1's module; absent on an older install
+        path = Path(ah_sandbox.installed_path(home, REVIEWER_ROLE))
+    except Exception:  # noqa: BLE001 - absent or broken: the documented location
+        path = home / '.agent-harness' / 'sandbox' / (REVIEWER_ROLE + '.claude.json')
     try:
-        report = commit_policy.check_range(str(repo), base, 'HEAD', policy, branch=branch, verify_tickets=True)
-    except (OSError, subprocess.TimeoutExpired):
-        return 2, 'commit policy: the commit range could not be inspected'
-    if report['status'] == 'PASS':
-        return 0, commit_policy.format_report(report) if report['waivers'] or report.get('warnings') else ''
-    return (6 if report['status'] == 'UNVERIFIED' else 2), commit_policy.format_report(report)
+        return ['--settings', str(path)] if path.is_file() else []
+    except OSError:
+        return []
 
 
-def packet_provenance_gate(content):
-    """Plan packets: AC/NEG/REQ/ASK/DEC lines must cite a verifiable Source (mode in provenance_policy.json)."""
+def codex_sandbox_args(home=None, env=None):
+    """The `ah-reviewer` permission profile when config.toml declares it (profiles and --sandbox do not combine),
+    else Codex's own read-only sandbox."""
+    env = os.environ if env is None else env
+    home = Path(home) if home is not None else Path.home()
+    config = Path(env['CODEX_HOME']) / 'config.toml' if env.get('CODEX_HOME') else home / '.codex' / 'config.toml'
     try:
-        import provenance
-    except ImportError:
-        return 0, ''
-    text = content.decode('utf-8', 'replace') if isinstance(content, bytes) else str(content)
+        declared = CODEX_REVIEWER_PROFILE.search(read_bounded(config, 4 << 20))
+        if declared:
+            import ah_sandbox  # noqa: PLC0415
+            args = list(ah_sandbox.codex_launch_args(REVIEWER_ROLE))
+            if args and all(isinstance(a, str) for a in args):
+                return args
+    except Exception:  # noqa: BLE001 - no config, no profile or no ah_sandbox: the read-only sandbox
+        pass
+    return ['--sandbox', 'read-only']
+
+
+# ---- the harness/review status (docs/merge-rule.md) -------------------------------------------------------------
+
+TICKETED_VERDICT = re.compile(r'VERDICT: PASS-WITH-TICKETS[ \t\r]*')
+TICKETED_NOTE = ('[harness: PASS-WITH-TICKETS is not a verdict; a finding deferred to a ticket still blocks, and the '
+                 'owner decides]')
+
+
+def ticketed_as_block(stage, text):
+    """A reviewer that still writes the retired ticketed verdict gets BLOCK (the owner decides), not invalid output."""
+    if stage not in ('pr', None) or not isinstance(text, str):
+        return text
+    lines = text.split('\n')
+    index = next((i for i, line in enumerate(lines) if line.strip()), None)
+    if index is None or not TICKETED_VERDICT.fullmatch(lines[index]):
+        return text
+    return '\n'.join(['VERDICT: BLOCK', TICKETED_NOTE, *lines[index + 1:]])
+
+
+def has_ticketed_findings(report):
+    return TICKETED_NOTE in report or any(line.lstrip().startswith('TICKETED:') for line in report.splitlines())
+
+
+def review_status(passed, report, reviewer, run_id):
+    """(state, description) for the harness/review status of one settled PR review."""
+    tail = '; receipt %s' % run_id
+    if not passed and has_ticketed_findings(report):
+        return 'failure', 'ticketed findings: owner decides' + tail
+    verdict = 'PASS' if passed else 'BLOCK'
+    room = ah_repo.DESCRIPTION_LIMIT - len(verdict + ' by ' + tail)
+    name = ah_repo.clean(reviewer, max(room, 8))
+    return ('success' if passed else 'failure'), (verdict + ' by ' + name + tail)[:ah_repo.DESCRIPTION_LIMIT]
+
+
+def post_review_result(binding, head, passed, report, reviewer, run_id, runner=None):
+    """Post harness/review for the reviewed head and read it back: 0, or 4 with the one command that finishes it."""
+    state, description = review_status(passed, report, reviewer, run_id)
     try:
-        return provenance.packet_gate(text)
-    except Exception as error:
-        try:
-            enforcing = provenance.load_policy().get('plan_packet') == 'enforce'
-        except Exception:
-            enforcing = False
-        if enforcing:  # a broken gate must not silently pass when the policy says enforce
-            return 2, f'provenance: packet check could not run ({type(error).__name__}); enforce mode stops here'
-        return 0, f'provenance: packet check could not run ({type(error).__name__}); continuing'
-
-
-def plan_ticket_gate(repo, content):
-    """Plan review starts substantive work: in ticket-tracked repos the packet must name its ticket."""
-    try:
-        import spec_flow
-    except ImportError:
-        return 0, ''  # older install without the spec flow; the commit policy still requires Refs
-    text = content.decode('utf-8', 'replace') if isinstance(content, bytes) else str(content)
-    try:
-        return spec_flow.plan_ticket_gate(repo, text)
-    except (OSError, subprocess.TimeoutExpired) as error:
-        return 0, f'spec-flow: plan ticket gate could not run ({error}); continuing'
-
-
-def write_selection_receipt(run_id, args, head, packet_sha256, author_rung, selection):
-    """The selection receipt: what the table chose before launch, bound to task, stage, head and packet."""
-    try:
-        root = ladder.state_root() / 'selections'
-        root.mkdir(mode=0o700, exist_ok=True)
-        path = root / (run_id + '.json')
-        body = json.dumps({'schema': 1, 'run_id': run_id, 'task': args.task, 'stage': args.stage, 'head': head,
-                           'packet_sha256': packet_sha256, 'author_rung': author_rung, 'author_harness': args.author_harness,
-                           'review_routing': review_routing(selection, getattr(args, 'reviewer', 'auto'),
-                                                            getattr(args, 'secondary', 'default')),
-                           'selection': selection, 'at': ladder.now()}, sort_keys=True)
-        path.write_text(body); os.chmod(path, 0o600)
-    except OSError as error:
-        print(f'Selection receipt could not be written: {type(error).__name__}', file=sys.stderr)
-
-
-def record_in_ladder(args, store, reference, head, policy):
-    """Reviews count where they are consumed: the FINAL receipt bytes feed the task ledger."""
-    if not args.task or reference is None:
-        return
-    try:
-        receipt = (store._run_directory(reference['run_id']) / 'final.json').read_bytes()  # input-ok: final receipt just written by usage_guard, capped at write; the ledger bounds it again
-        status = ladder.Ledger(policy=policy).record(args.task, receipt, kind='review', source='peer_review:' + args.stage,
-                                                     head=head, notify=os.environ.get('AGENT_HARNESS_MAIN_WAL'))
-        note = ladder.event_note(status, policy)
-        print('Ladder: task %s rung %s, failures at rung %d%s%s' % (
-            args.task, status['rung'], status['failures_at_rung'],
-            ' (escalated %s -> %s)' % (status['escalation']['from'], status['escalation']['to']) if status.get('escalation') else '',
-            '; ' + note if note else ''),
-            file=sys.stderr)
-        limit = ladder.limit_note(status, policy)
-        if limit:
-            print('Ladder limit: ' + limit, file=sys.stderr)
-    except (OSError, ladder.LedgerError, tiers.TierError, GuardError) as error:
-        print(f'Ladder record failed: {getattr(error, "message", error)}', file=sys.stderr)
-
-
-def plan_resource_gate(content):
-    """Plan review also needs a `## Resource budget` that fits the target host's live headroom."""
-    try:
-        import resource_budget
-        import spec_flow
-        text = content.decode('utf-8', 'replace') if isinstance(content, bytes) else str(content)
-        try:
-            mode = spec_flow.load_spec_policy().get('resource_budget_gate', 'enforce')
-        except (OSError, ValueError):
-            mode = 'enforce'
-        return resource_budget.plan_gate(text, mode)
-    except ImportError:
-        return 0, ''  # older install without the resource gate
+        entry = ah_repo.post_review_status(binding['repo'], head, state, description, runner=runner)
+    except (ah_repo.GitHubError, ValueError) as error:
+        import shlex  # noqa: PLC0415
+        print('The review stands, but harness/review was not confirmed on GitHub: %s\nFinish it with: '
+              'ah review-status post --repo %s --sha %s --state %s --description %s'
+              % (diagnostics.sanitize(error), binding['repo'], head, state, shlex.quote(description)), file=sys.stderr)
+        return 4
+    print('GitHub: harness/review %s on %s in %s (status %s)' % (entry.get('state'), head[:12], binding['repo'],
+                                                                entry.get('id')), flush=True)
+    return 0
 
 
 def main() -> int:
@@ -1902,16 +1625,19 @@ def main() -> int:
                         help="Authorized independent fallback: 'default' is the other harness; 'kimi' is the user's "
                              "Kimi subscription via kimi_review.py (tool-less, egress-gated, packet text only)")
     parser.add_argument('--owner', default='peer-review', help='Safe owner identifier for execution receipts')
-    parser.add_argument('--base', help='PR base for the commit-policy range check (default origin/HEAD or origin/main)')
-    parser.add_argument('--task', help='Ladder task key: the author rung comes from its ledger and the receipt is recorded there')
+    parser.add_argument('--base', help='PR base whose commits prove the author harness (default origin/HEAD or origin/main)')
+    parser.add_argument('--task', help='Task key: a reviewer rung that needs the user\'s permission looks for '
+                                       '`ah approve top-rung --task T`')
     parser.add_argument('--author-rung', help='Author rung override (R0..R6); unknown gets the configured unknown-author reviewer')
     parser.add_argument('--author-harness', choices=('claude', 'openai', 'unknown'), default='unknown',
                         help='Harness that wrote the change; the other harness reviews when available')
-    parser.add_argument('--github-repo', help='Exact owner/repo binding for an optional reviewed GitHub PR')
+    parser.add_argument('--github-repo', help='Exact owner/repo of the reviewed pull request: the binding is read from '
+                                              'GitHub first, and the verdict is posted as the harness/review status '
+                                              'on the reviewed HEAD (docs/merge-rule.md)')
     parser.add_argument('--pr', type=int, help='Exact pull request number; requires --github-repo')
     parser.add_argument('--no-main-stamp', action='store_true',
-                        help='Accepted and ignored (2026-11-24: there is no main-agent stamp any more; the settled '
-                             'receipt is the merge evidence). The ahc daemon still passes it.')
+                        help='Accepted and ignored for one release (there is no main-agent stamp; GitHub reads the '
+                             'harness/review status)')
     args = parser.parse_args()
     if args.reviewer == 'codex-only' and args.secondary != 'default':
         parser.error('--reviewer codex-only cannot be combined with --secondary kimi')
@@ -1998,41 +1724,7 @@ def main() -> int:
         target.close()
         evidence.close()
         return 2
-    if args.stage == 'plan':
-        prov_code, prov_text = packet_provenance_gate(evidence.content)
-        if prov_text:
-            print(prov_text, file=sys.stderr)
-        if prov_code:
-            target.close()
-            evidence.close()
-            print('Plan review not started: every requirement needs a verifiable Source (provenance.py).', file=sys.stderr)
-            return prov_code
-        code, text = plan_ticket_gate(repo, evidence.content)
-        if text:
-            print(text, file=sys.stderr)
-        if code:
-            target.close()
-            evidence.close()
-            print('Plan review not started: name the ticket this work belongs to first.', file=sys.stderr)
-            return code
-        code, text = plan_resource_gate(evidence.content)
-        if text:
-            print(text, file=sys.stderr)
-        if code:
-            target.close()
-            evidence.close()
-            print('Plan review not started: add a `## Resource budget` that fits the target host (resource_budget.py check).',
-                  file=sys.stderr)
-            return code
     if args.stage == 'pr':
-        code, text = commit_policy_gate(repo, args.base)
-        if text:
-            print(text, file=sys.stderr)
-        if code:
-            target.close()
-            evidence.close()
-            print('PR review not started: fix the commit policy findings above first.', file=sys.stderr)
-            return code
         # #134 red-team P1: --author-harness is a claim; the commits are the evidence. A contradiction refuses the
         # review, and commits that prove nothing make the author 'unknown', which can never authorize a merge.
         evidenced = commit_author_harness(repo, pr_base(repo, args.base))
@@ -2068,11 +1760,6 @@ def main() -> int:
         print(f'Review refused: tier table error: {error}', file=sys.stderr)
         return 2
     author_rung = args.author_rung
-    if author_rung is None and args.task:
-        try:
-            author_rung = ladder.Ledger(policy=policy).status(args.task)['rung']
-        except (ladder.LedgerError, tiers.TierError):
-            author_rung = None
     # Availability uses the launch's own trust-checked discovery, so a CLI found only at a policy location counts
     # and a binary inside the reviewed repo does not.
     providers = ('codex',) if args.reviewer == 'codex-only' else diagnostics.PROVIDERS
@@ -2107,15 +1794,10 @@ def main() -> int:
         return 2
     permission = None
     if policy['rungs'][selection['rung']]['needs_user_permission']:
-        # --author-rung is a claim; the ledger permission is the only record of Fable-approved work.
+        # --author-rung is a claim; the approvals store is the only record of the user's permission.
         if args.task:
-            try:
-                permission = ladder.Ledger(policy=policy).status(args.task).get('permission')
-            except (ladder.LedgerError, tiers.TierError):
-                permission = None
-            if not isinstance(permission, dict) or not permission.get('ask_id'):
-                permission = top_rung_approval(args.task)  # the approvals store (`ah approve top-rung --task T`)
-        if not isinstance(permission, dict) or not (permission.get('ask_id') or permission.get('approval')):
+            permission = top_rung_approval(args.task, repo)  # `ah approve top-rung --task T`
+        if not isinstance(permission, dict) or not permission.get('approval'):
             target.close()
             evidence.close()
             print('Review refused: reviewer rung %s needs the user\'s permission for the task: an approve-top ledger '
@@ -2155,14 +1837,6 @@ def main() -> int:
             options['snapshot_deadline'] = args.snapshot_timeout
             options['base'] = base
             options['repo'] = repo
-            if args.stage == 'pr':
-                # Before any provider budget: a stale ahc release list never earns a merge authorization (PR 247 F4).
-                release_problem, options['release_manifest'] = ahc_release_problem(snapshot, before[0], base)
-                if release_problem:
-                    print('Review refused: ' + release_problem, file=sys.stderr)
-                    target.close()
-                    evidence.close()
-                    return 2
             _CHILD_PATH_ROOTS[:] = diagnostics.untrusted_roots(repo=repo, snapshot=snapshot)
             resolutions = {name: diagnostics.discover_executable(
                 name, policy=review_policy(), roots=list(_CHILD_PATH_ROOTS))
@@ -2193,28 +1867,9 @@ def main() -> int:
                                      timeout=2 * provider_seconds, aggregate_timeout=4 * provider_seconds, kind='review',
                                      repeat_reason=args.repeat_reason)
             options.update(store=store, run_record=run_record)
-            write_selection_receipt(run_record.run_id, args, before[0], evidence.sha256, author_rung, selection)
             source, report, failure = review_snapshot(snapshot, before[0], args.stage,
                                                        stage_rules, evidence.content, options)
             report = stage_report(args.stage, report)
-            ticketed = []
-            if 'TICKETED:' in report:
-                related_error = None
-                try:
-                    related, own = related_ticket_refs(repo, base)
-                except (ImportError, OSError, ValueError) as error:
-                    related, own, related_error = set(), set(), error
-                report, ticketed, ticket_errors = resolve_ticketed_findings(
-                    args.stage, report, head=before[0], related=related, own=own)
-                if related_error is not None:
-                    ticket_errors.append('reviewed commit tickets could not be inspected ('
-                                         + type(related_error).__name__ + ')')
-                    # A missing relationship proof can never produce a ticketed PASS.
-                    if re.match(r'^VERDICT: PASS-WITH-TICKETS\b', report):
-                        report = re.sub(r'^VERDICT: PASS-WITH-TICKETS\b', 'VERDICT: BLOCK', report, count=1)
-                        ticketed = []
-                for message in ticket_errors:
-                    print('Ticketed finding refused: ' + message, file=sys.stderr)
             if repo_state(snapshot, snapshot=True) != (before[0], ''):
                 raise OSError('snapshot changed during review')
         # Cleanup must succeed before any report is published.
@@ -2237,7 +1892,6 @@ def main() -> int:
                                                   'provider_attempts': options.get('attempt_summary', []),
                                                   'diagnostic': diagnosis['code'],
                                                   'timing': review_timing(options, run_record)})
-                record_in_ladder(args, store, failed, before[0], policy)
             except (OSError, GuardError):
                 print('Execution receipt could not be finalized; reconciliation is required.', file=sys.stderr)
         target.close()
@@ -2245,7 +1899,7 @@ def main() -> int:
         return 2
     except AdvisoryOnly as advisory:
         # An independent-provider opinion on packet text only: written to the report path with honest headers,
-        # recorded in the receipt as ADVISORY, never a pass marker, never exit 0, never a ladder record.
+        # recorded in the receipt as ADVISORY, never a pass marker, never exit 0, never a review status.
         try:
             if repo_state(repo) != before:
                 raise OSError('repository HEAD or worktree changed during review')
@@ -2288,9 +1942,6 @@ def main() -> int:
                  + hashlib.sha256(options['domain_section'].encode('utf-8')).hexdigest() + "\n")
     elif options.get('domain_disabled'):
         note += f"Domain gates: disabled by {options['domain_disabled']}.\n"
-    if options.get('release_manifest'):
-        note += (f"ahc release list: current at this HEAD ({AHC_RELEASE} SHA-256 "
-                 f"{options['release_manifest']})\n")
     finalized = False
     reference = None
     announced = False
@@ -2318,12 +1969,11 @@ def main() -> int:
         target.verify_current()
         evidence.verify()
         report_sha256 = target.expected_digest.hex()
-        ticketed_success = bool(re.match(r'^VERDICT: PASS-WITH-TICKETS(?:\s|$)', report.lstrip()))
         passed = bool(re.match(r'^(?:VERDICT: PASS|(?:PLAN|CODE_INSPECTION)_RESULT: ACCEPT)\b', report.lstrip()))
         review_metadata = {
             'stage': args.stage.upper().replace('-', '_'),
-            'verdict': 'ACCEPT_WITH_TICKETS' if ticketed_success else 'ACCEPT' if passed else 'BLOCK',
-            'findings': finding_ids(report) if ticketed_success or not passed else []}
+            'verdict': 'ACCEPT' if passed else 'BLOCK',
+            'findings': [] if passed else finding_ids(report)}
         if args.stage == 'pr':
             review_metadata.update(head=before[0], report_sha256=report_sha256,
                                    reviewer=source,
@@ -2332,13 +1982,10 @@ def main() -> int:
             if binding:
                 review_metadata.update(binding)
             if base and base != before[0]:
-                # goodqa#16049 spec ahc-m1-v2g: the snapshot base B_r the reviewer diffed against, so the ahc
-                # binding can require B_r to be an ancestor of (or equal to) the current default-branch tip.
-                # Recorded on every PR review that has a base, explicit or the head^1 default, whatever its
-                # relation to the merge-base. Only a root commit (no base) omits it; ahc treats absence as legacy.
+                # goodqa#16049: the snapshot base the reviewer diffed against, recorded on every PR review that has
+                # a base, explicit or the head^1 default, whatever its relation to the merge-base. Only a root commit
+                # (no base) omits it.
                 review_metadata['snapshot_base'] = base
-        if ticketed_success:
-            review_metadata['ticketed'] = [dict(record, report_sha256=report_sha256) for record in ticketed]
         reference = run_record.finish(execution='COMPLETED', result='CHECK_OK' if passed else 'CHECK_FAILED',
             reason='NONE' if passed else 'CODE_FINDINGS', exit_code=0,
             review=review_metadata,
@@ -2357,7 +2004,6 @@ def main() -> int:
         evidence.verify()
         # FINAL preserves execution history; only settled publication is usable.
         store.settle_review(reference)
-        record_in_ladder(args, store, reference, before[0], policy)
         print(f"{source}: {report.splitlines()[0].strip()} | {output}\n"
               'Usage receipt: ' + json.dumps(reference, sort_keys=True), flush=True)
         announced = True
@@ -2383,7 +2029,12 @@ def main() -> int:
                     store.invalidate_review(reference, reason='Review publication did not complete')
                 except (OSError, GuardError):
                     print('Review settlement could not be invalidated; reconciliation is required.', file=sys.stderr)
-    return 0 if re.match(r'^(?:VERDICT: PASS|(?:PLAN|CODE_INSPECTION)_RESULT: ACCEPT)\b', report.lstrip()) else 3
+    if binding:
+        # The exact HEAD reviewed, after the receipt is settled. A post or readback that fails leaves the review as it
+        # is; the head simply stays unmergeable until the printed command finishes it.
+        if post_review_result(binding, before[0], passed, report, source, reference['run_id']):
+            return 4
+    return 0 if passed else 3
 
 
 if __name__ == "__main__":
