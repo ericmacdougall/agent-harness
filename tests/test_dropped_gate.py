@@ -160,21 +160,6 @@ class GateTests(Base):
         self.assertIn("handoff-unacked", by["dropowner"]["flags"])
         self.assertTrue(by["dropowner"]["decision_required"])
 
-    def test_live_waiting_disposition_acknowledges_handoff_until_it_expires(self):
-        w = self.home / ".claude" / "wals" / SESSION
-        jl(w / "agent-dropowner.jsonl", [
-            {"at": iso(NOW - ah.HANDOFF_ACK_S - 1), "event": "handoff", "note": "to main: blocked on an ask"}])
-        before = {r["agent_id"]: r for r in self.owners()["owners"]}
-        self.assertIn("handoff-unacked", before["dropowner"]["flags"])
-        import caller_identity
-        caller_identity.put_stamp("ack-handoff", ["dropowner"], home=self.home)  # what main's hook writes
-        self.dispose("waiting", "disp-handoff-wait", until=iso(NOW + 3600), ref="wa5b00000001", ack_handoff=True)
-        waiting = {r["agent_id"]: r for r in self.owners()["owners"]}
-        self.assertNotIn("handoff-unacked", waiting["dropowner"]["flags"])
-        self.assertFalse(waiting["dropowner"]["decision_required"])
-        expired = {r["agent_id"]: r for r in self.owners(now=NOW + 3601)["owners"]}
-        self.assertIn("handoff-unacked", expired["dropowner"]["flags"])
-        self.assertTrue(expired["dropowner"]["decision_required"])
 
     def test_a_wait_without_ack_handoff_does_not_acknowledge(self):
         # #134 red-team P4: the owner records its own wait; the unacknowledged handoff must stay visible

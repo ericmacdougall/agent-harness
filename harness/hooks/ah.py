@@ -1242,10 +1242,62 @@ def user_msgs(home: Path, session: str, text=None, recent=None, full=False, limi
 
 # ------------------------------------------------------------------ tickets
 
+# The GoodQA adapter's defaults (until release 1001 the "ticket_systems.goodqa" object of commit_policy.json).
+GOODQA_TICKETS = {
+    "adapter": "goodqa", "endpoint": "https://goodqa.app/v1/mcp", "key_file": "~/.claude/goodqa-hive/member.key",
+    "default_project": "goodqa", "timeout_seconds": 15, "total_deadline_seconds": 90, "attempts": 2,
+    "clock_skew_seconds": 120, "max_comment_pages": 5, "repos": [], "unreachable_projects": [],
+    "unreachable_reason": "",
+    "ref_pattern": r"\bGoodQA\s+(?:(?P<project>[a-z0-9][a-z0-9-]{0,62})\s*)?#(?P<number>[1-9]\d{0,9})\b"}
+# The personal values an owner may set (the org, the key, project routes); the endpoint is never one of them.
+GOODQA_LOCAL_KEYS = ("repos", "org_id", "key_file", "key_secret", "default_project", "projects",
+                     "unreachable_projects", "unreachable_reason")
+
+
+def goodqa_config() -> dict:
+    """GOODQA_TICKETS with the owner's personal values on top: `ticket_systems.goodqa` in ~/.agent-harness/local.json,
+    else the same object in a commit_policy.local.json left beside the hooks by a release before 1001. Keys other
+    than GOODQA_LOCAL_KEYS are ignored, so no local file can point the GoodQA key at another endpoint."""
+    cfg = dict(GOODQA_TICKETS)
+    overlay = None
+    try:
+        import ah_local  # noqa: PLC0415
+        overlay = ((ah_local.get("ticket_systems") or {}).get("goodqa"))
+    except Exception:  # noqa: BLE001 - a broken local.json is the same as none
+        overlay = None
+    if not isinstance(overlay, dict):
+        legacy_path = Path(__file__).with_name("commit_policy.local.json")
+        fixture = os.environ.get("AGENT_HARNESS_POLICY_LOCAL")
+        if fixture and _test_fixture(Path(fixture)):
+            legacy_path = Path(fixture)
+        try:
+            import safe_input  # noqa: PLC0415
+            legacy = safe_input.safe_json_loads(safe_input.read_bounded(legacy_path, 1 << 20))
+            overlay = ((legacy.get("ticket_systems") or {}).get("goodqa")) if isinstance(legacy, dict) else None
+        except Exception:  # noqa: BLE001 - absent or unreadable: the defaults
+            overlay = None
+    if isinstance(overlay, dict):
+        cfg.update({k: v for k, v in overlay.items() if k in GOODQA_LOCAL_KEYS})
+    return cfg
+
+
+def _test_fixture(candidate: Path) -> bool:
+    """True only for a file inside <checkout>/tests/data of a source checkout (harness/hooks/ beside install.py). An
+    installed copy (~/.claude/hooks) has no such directory, so there AGENT_HARNESS_POLICY_LOCAL does nothing."""
+    try:
+        here = Path(__file__).resolve()
+        root = here.parents[2]
+        if not (here.parent.name == "hooks" and here.parents[1].name == "harness" and (root / "install.py").is_file()):
+            return False
+        data = (root / "tests" / "data").resolve()
+        return data.is_dir() and candidate.resolve().is_relative_to(data)
+    except (OSError, ValueError, IndexError):
+        return False
+
+
 def load_adapter(home: Path | None = None, quick: bool = False):
     import ticket_adapters
-    import commit_policy  # overlay-aware: the shipped policy no longer carries the org id (GoodQA #14538)
-    cfg = commit_policy.load_policy(Path(__file__).with_name("commit_policy.json"))["ticket_systems"]["goodqa"]
+    cfg = goodqa_config()
     if os.environ.get("AH_GOODQA_ENDPOINT"):  # loopback endpoints only (tests); the adapter enforces the scheme
         cfg = dict(cfg, endpoint=os.environ["AH_GOODQA_ENDPOINT"])
     if os.environ.get("AH_GOODQA_KEY_FILE"):
@@ -1277,8 +1329,7 @@ def check_ticket_exists(ref: str) -> None:
     """Refuse a ticket GoodQA says is missing or out of scope before anything is queued. Offline: nothing to check."""
     slug, number = ticket_ref(ref)
     try:
-        import commit_policy  # overlay-aware: unreachable projects now live in the local profile (main ebb61fc)
-        policy = commit_policy.load_policy(Path(__file__).with_name("commit_policy.json"))["ticket_systems"]["goodqa"]
+        policy = goodqa_config()
         if slug in (policy.get("unreachable_projects") or []):
             return  # the member key cannot see these projects: nothing to verify (commit policy treats them as warn-only)
         adapter, mod = load_adapter(quick=True)

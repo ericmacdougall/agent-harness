@@ -98,6 +98,23 @@ class NamedThingsExist(unittest.TestCase):
                     self.assertEqual(run.returncode, 0, f"`ah {word} --help`: {run.stderr.decode()[-400:]}")
 
 
+class NoteCommandLeavesTheSandbox(unittest.TestCase):
+    def test_the_claude_note_command_matches_an_excluded_command(self):
+        """~/.claude stays write-protected in the sandbox even where allowWrite names it, so the note command must run
+        outside it: the rule has to spell it the way the worker and supervisor excludedCommands do."""
+        import fnmatch
+        sys.path.insert(0, str(HOOKS))
+        import ah_sandbox
+        named = [span for span in spans("HARNESS.md") if "wal_note.py" in span]
+        self.assertTrue(named)
+        with tempfile.TemporaryDirectory() as home:
+            for role in ("worker", "supervisor"):
+                excluded = ah_sandbox.claude_settings(role, home=Path(home))["sandbox"].get("excludedCommands") or []
+                for span in named:
+                    with self.subTest(role=role, span=span):
+                        self.assertTrue(any(fnmatch.fnmatchcase(span, rule) for rule in excluded), excluded)
+
+
 class SafetyContent(unittest.TestCase):
     """The few rules that must survive any rewrite (they replace the pinned lines of the 3,000-word version)."""
 

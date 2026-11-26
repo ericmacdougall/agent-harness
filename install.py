@@ -36,17 +36,16 @@ ENTRY_POINTS = (
     "gq_browser.py", "installer_scan.py", "git_save.py", "native_admission.py", "native_user_source.py")
 DATA_FILES = ("sandbox_base.json", "review_policy.json", "model_tiers.json", "domain_checklists.json",
               "node_check_reporter.mjs", "dropbox_budget.conf",
-              # read by modules peer_review.py still imports until the gate branch drops them (commit_policy, spec_flow,
-              # provenance, resource_budget); they go with those modules
-              "commit_policy.json", "spec_policy.json", "spec_template.md", "provenance_policy.json", "resource_limits.json")
+              # read by provenance.py, which stays until ah's transcript reader moves out of it
+              "provenance_policy.json")
 HOOKS = ENTRY_POINTS + (
     # imported by the entry points (the closure)
-    "ah_local.py", "ah_roles.py", "caller_identity.py", "domain_gates.py", "git_safety.py", "github_identity.py",
-    "liveness.py", "mc_chat.py", "model_tiers.py", "native_context.py", "native_main.py", "process.py", "redact.py",
+    "ah_local.py", "ah_roles.py", "domain_gates.py", "git_safety.py", "github_identity.py",
+    "liveness.py", "mc_chat.py", "model_tiers.py", "native_context.py", "process.py", "redact.py",
     "report_file.py", "review_diagnostics.py", "safe_input.py", "ticket_adapters.py", "trivy_gate.py", "usage_guard.py",
-    # imported only by peer_review.py, rescue.py or ah.py's transcript reader today; the kill list, kept until the gate
-    # branch (and for provenance, a move of ah's transcript reader) removes the last importer
-    "commit_policy.py", "escalation.py", "merge_gate.py", "provenance.py", "resource_budget.py", "spec_flow.py",
+    # ah.py's transcript reader (user-msg, asks, requirements, note and status) and Mission Control; on the kill
+    # list, kept until that reader moves out of it
+    "provenance.py",
 ) + DATA_FILES
 GIT_HOOK_KEY = "agent-harness-commit-policy"
 MIN_GIT_HOOKS = (2, 54)  # config-based hooks (hook.<name>.event)
@@ -967,7 +966,10 @@ def scratch_status(home: Path, apply: bool, durable_tmp: bool = True, run=None) 
     if len(str(scratch / "cc-socks" / "999999.sock").encode()) > MAX_SOCKET_PATH:
         status += ("; WARNING: socket paths under this root exceed the macOS limit, "
                    "rerun with --no-durable-tmp or set a shorter CLAUDE_CODE_TMPDIR")
-    if sys.platform == "darwin":
+    import pwd  # noqa: PLC0415
+    if sys.platform == "darwin" and run is None and home != Path(pwd.getpwuid(os.getuid()).pw_dir).resolve():
+        status += "; Time Machine exclusion not set (non-default --home)"
+    elif sys.platform == "darwin":
         run = run or subprocess.run
         try:
             result = run(["tmutil", "addexclusion", str(scratch)], capture_output=True, text=True, timeout=10)

@@ -32,7 +32,7 @@ Changes reach a protected branch through a pull request. `peer_review.py pr --gi
 
 ## Notes and handoffs
 
-The session-start line names your note log. Write `wal_note.py --wal <log> --event intent` before substantive edits, and `decision`, `ask` and `handoff` notes at checkpoints. Before a turn ends with work in flight, write a handoff: checkout, HEAD, what is left, how to test it. Build status from `ah status --since <window>`, not memory.
+The session-start line names your note log. Write `python3 ~/.claude/hooks/wal_note.py --wal <log> --event intent` before substantive edits, and `decision`, `ask` and `handoff` notes at checkpoints. Before a turn ends with work in flight, write a handoff: checkout, HEAD, what is left, how to test it. Build status from `ah status --since <window>`, not memory.
 
 ## Standing practice
 

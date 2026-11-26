@@ -322,7 +322,7 @@ def _proc_start(pid):
     """When PID started, as seconds since the epoch (/proc/PID/stat field 22 and the boot time in /proc/stat), or None."""
     try:
         with open('/proc/%s/stat' % pid) as handle:
-            fields = handle.read().rpartition(')')[2].split()
+            fields = handle.read(4096).rpartition(')')[2].split()
         ticks = int(fields[19])  # field 22 overall; the first two (pid, comm) are before the closing parenthesis
         with open('/proc/stat') as handle:
             boot = next(int(line.split()[1]) for line in handle if line.startswith('btime '))

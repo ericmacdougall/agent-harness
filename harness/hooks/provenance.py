@@ -1295,12 +1295,10 @@ def lookup_ticket(project: str, number: int):
     if os.environ.get("HARNESS_PROVENANCE_OFFLINE", "").strip().lower() in ("1", "true", "yes"):  # tightening only
         return "unverified", "offline mode"
     try:
-        import spec_flow
+        import ah  # noqa: PLC0415 - the GoodQA defaults and the owner's overlay (ah.goodqa_config)
         import ticket_adapters as ta
-        spec_policy = spec_flow.load_spec_policy()
-        _, _, config = spec_flow.ticket_config(spec_policy)
-        adapter = spec_flow.make_adapter(config, spec_policy, project, time.monotonic() + TICKET_TIMEOUT)
-        adapter.timeout, adapter.attempts = min(float(adapter.timeout), TICKET_TIMEOUT), 1
+        adapter = ta.adapter_for(dict(ah.goodqa_config(), attempts=1, timeout_seconds=TICKET_TIMEOUT,
+                                      total_deadline_seconds=TICKET_TIMEOUT))
         try:
             with direct_connections():
                 ticket = adapter.lookup(project, number)

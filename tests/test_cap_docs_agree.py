@@ -1,5 +1,6 @@
 """GoodQA #15565: install.py renders CLAUDE.md from HARNESS.md, so a stale number there silently reverted the user's owner cap.
-HARNESS.md and codex/AGENTS.md must state the one owner cap, resource_limits.json max_live_owners."""
+HARNESS.md and codex/AGENTS.md must state the one owner cap, model_tiers.json caps.session_owner_agents (release 1001;
+until then resource_limits.json max_live_owners)."""
 
 import json
 import re
@@ -11,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class CapDocsAgree(unittest.TestCase):
     def cap(self):
-        return json.loads((ROOT / "harness" / "hooks" / "resource_limits.json").read_text())["max_live_owners"]
+        return json.loads((ROOT / "harness" / "hooks" / "model_tiers.json").read_text())["caps"]["session_owner_agents"]
 
     def test_the_users_cap_is_sixteen(self):
         self.assertEqual(self.cap(), 16)  # the user: "up to 16 live owners per session"

@@ -99,16 +99,16 @@ CONTRACT = {
                          'fallback) was used up.',
                          ['Do not loop. Reconcile the usage store, then decide with the main agent whether one repeat with --repeat-reason is justified.',
                           'The Timing line shows the snapshot step and each provider step against its deadline.',
-                          'A timeout is not counted as a ladder failure; it still spends one of the task review '
-                          'launches and the rung review budget.']),
+                          'A timeout is not a verdict: no harness/review status is posted, so the pull request '
+                          'stays unmergeable until a review settles.']),
     'PROVIDER_TIMEOUT': ('TIMEOUT', 'The provider exceeded its per-provider deadline (provider_timeout in '
                          'review_policy.json, by reviewer rung and effort).',
                          ['Reconcile the run in the usage store before any retry; do not loop.',
                           'The Timing line shows the snapshot step and each provider step against its deadline. A '
                           'reviewer that needs longer is a provider_timeout change in review_policy.json (at most '
                           '3600 seconds per provider), not an unchanged rerun.',
-                          'A timeout is not counted as a ladder failure; it still spends one of the task review '
-                          'launches and the rung review budget.']),
+                          'A timeout is not a verdict: no harness/review status is posted, so the pull request '
+                          'stays unmergeable until a review settles.']),
     'PROVIDER_IO_UNKNOWN': ('UNKNOWN', 'The provider process could not be supervised to a known end.',
                             ['Reconcile the unknown run in the usage store before any retry.']),
     'PROVIDER_INVALID_OUTPUT': ('INVALID_OUTPUT', 'The provider produced no valid stage verdict.',
@@ -140,7 +140,7 @@ CONTRACT = {
     'SNAPSHOT_SOURCE_CHANGED': ('TRANSIENT_INFRA', 'The source checkout changed during the review.',
                                 ['Commit or stash changes, keep the worktree untouched while reviewing, rerun.']),
     'WORKTREE_SCAN_LIMIT': ('TRANSIENT_INFRA', 'The bounded worktree metadata scan or Git listing used up its time, entry or depth budget before finishing. It is not evidence of a special file.',
-                            ['Rerun once when the host is less loaded, or run the review from a full clone on the fleet (T2).',
+                            ['Rerun once when the host is less loaded, or run the review from a full clone on the fleet (the worker host).',
                              'Trees over 250000 entries or 64 directory levels are unsupported; the budget is 5 seconds plus 0.5 ms per tracked entry.']),
     'WORKTREE_SPECIAL_ENTRY': ('TRANSIENT_INFRA', 'The worktree holds a FIFO, socket or device file (or, in a review snapshot, a filesystem symlink) that Git status does not show.',
                                ['Find it with `find <repo> -path <repo>/.git -prune -o ! -type f ! -type d -print` and remove it, then rerun.',

@@ -14,7 +14,6 @@ from unittest import mock
 HOOKS = Path(__file__).resolve().parent.parent / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
 import provenance  # noqa: E402
-import spec_flow  # noqa: E402
 
 SID = "11111111-2222-3333-4444-555555555555"
 HUMAN, AGENT, TASK, REMIND, TOOL, COMPACT, PASTE = (str(uuid.UUID(int=i)) for i in range(1, 8))
@@ -368,29 +367,8 @@ class Enforcement(Env):
         text = SPEC.format(s1=s1, s2=s2 if s2 is not None else s1)
         return text.replace("Click-test: required\n", "Click-test: required\n" + header)
 
-    def test_ac1_spec_without_source_warns_and_is_not_refused(self):  # AC-1, warn-only since 2026-11-24
-        problems, warnings = provenance.spec_lint(self.spec("", ""))
-        self.assertEqual(problems, [])
-        self.assertTrue(any("AC-1 has no `Source:`" in w for w in warnings), warnings)
-        self.assertTrue(any("NEG-1 has no `Source:`" in w for w in warnings), warnings)
-        self.assertFalse(any("Source" in p for p in spec_flow.lint(self.spec("", ""))))
-        control = spec_flow.lint(self.spec("", ""), check_provenance=False)
-        self.assertFalse(any("Source" in p for p in control), control)  # failing control: old behaviour passed
 
-    def test_spec_with_sources_passes_and_fabrication_fails(self):
-        good = f"Source: {self.user(HUMAN, QUOTE)}"
-        self.assertEqual([p for p in spec_flow.lint(self.spec(good)) if "Source" in p or "provenance" in p], [])
-        bad = f"Source: {self.user(AGENT, 'need the OpenRouter key from the user')}"
-        self.assertTrue(any("not-user-authored" in w for w in provenance.spec_lint(self.spec(bad))[1]))
 
-    def test_grandfather_needs_human_signoff(self):
-        problems, warnings = provenance.spec_lint(self.spec("", "", header="Provenance: grandfathered (written before provenance existed)\n"))
-        self.assertEqual(problems, [])
-        self.assertTrue(any("only meaningful with `Sign-off: human`" in w for w in warnings), warnings)
-        ok = self.spec("", "", header="Provenance: grandfathered (written before provenance existed)\nSign-off: human\n")
-        self.assertFalse([p for p in spec_flow.lint(ok) if "provenance" in p.lower() or "Source" in p])
-        buried = self.spec("", "").replace("Works.", "Provenance: grandfathered (hidden in a later section)\nSign-off: human")
-        self.assertTrue(any("no `Source:`" in w for w in provenance.spec_lint(buried)[1]))
 
     def test_packet_gate_modes(self):
         packet = "- AC-1: thing. Verify by: x.\n- REQ-2: other. Source: inferred: from nothing\n"
@@ -614,54 +592,6 @@ class RedTeamFixes(Env):
                 got = provenance.lookup_ticket("harness", 1)
                 self.assertEqual(got == ("unverified", "offline mode"), enabled, value)
 
-    def test_n5_real_lookup_ignores_proxy_variables(self):
-        """The real lookup_ticket against a loopback GoodQA, with dead proxy variables set. Failing control: with the
-        direct-connection wiring removed the same call cannot reach the server and reports an outage."""
-        import http.server
-        import threading
-        import spec_flow
-
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def do_POST(self):
-                length = int(self.headers.get("content-length", 0))
-                arguments = json.loads(self.rfile.read(length))["params"]["arguments"]
-                issue = {"issue": {"id": "i-1", "number": arguments["number"], "projectId": "p-1", "title": "Loopback ticket", "status": "todo"}}
-                body = json.dumps({"result": {"content": [{"text": json.dumps(issue)}]}}).encode()
-                self.send_response(200)
-                self.send_header("content-type", "application/json")
-                self.send_header("content-length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def log_message(self, *args):
-                pass
-
-        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        self.addCleanup(server.server_close)  # runs after shutdown: an unclosed listener raises ResourceWarning later
-        self.addCleanup(server.shutdown)
-        key = self.home / "key"
-        key.write_text("k" * 40)
-        key.chmod(0o600)
-        config = {"adapter": "goodqa", "endpoint": f"http://127.0.0.1:{server.server_address[1]}/", "key_file": str(key),
-                  "org_id": "org-1", "timeout_seconds": 3, "attempts": 1}
-        proxies = {name: "http://127.0.0.1:9" for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")}
-        proxies.update({"NO_PROXY": "", "no_proxy": ""})
-
-        def lookup():
-            provenance._OUTAGE["until"] = 0.0
-            with mock.patch.object(spec_flow, "ticket_config", lambda sp: (None, None, config)), \
-                    mock.patch.object(spec_flow, "load_spec_policy", lambda: {}), mock.patch.dict(os.environ, proxies):
-                return provenance.lookup_ticket("harness", 4242)
-
-        import urllib.request
-        self.addCleanup(setattr, urllib.request, "_opener", None)  # urlopen caches the first opener it builds, proxies included
-        self.assertEqual(lookup(), ("found", "Loopback ticket"))  # the wiring works with dead proxies set
-        urllib.request._opener = None
-        with mock.patch.object(provenance, "direct_connections", lambda: __import__("contextlib").nullcontext()):
-            control = lookup()
-        urllib.request._opener = None  # drop the proxy-configured opener the control just made
-        self.assertEqual(control[0], "unreachable", control)  # control: without the wiring the proxy variables break it
 
     def test_n1_skip_window_never_changes_a_verdict(self):
         provenance._TICKET_MEMO.clear()
@@ -681,45 +611,6 @@ class RedTeamFixes(Env):
         with mock.patch.object(provenance, "TICKET_LOOKUP", lambda p, n: calls.append(n) or answers[n]):  # fresh process
             self.assertEqual(provenance.resolve("ticket:GoodQA harness#424242")["problems"][1]["code"], "ticket-missing")
 
-    def test_n1_only_transport_failures_are_outages(self):
-        import spec_flow
-        import ticket_adapters as ta
-
-        class Stub:
-            timeout, attempts = 15, 2
-
-            def __init__(self, error=None, ticket="ok"):
-                self.error, self.ticket = error, ticket
-
-            def lookup(self, project, number):
-                if self.error:
-                    raise self.error
-                return self.ticket
-
-        def state(error=None, ticket="ok"):
-            provenance._OUTAGE["until"] = 0.0
-            with mock.patch.object(spec_flow, "make_adapter", lambda *a, **k: Stub(error, ticket)), \
-                    mock.patch.object(spec_flow, "ticket_config", lambda sp: (None, None, {})), \
-                    mock.patch.object(spec_flow, "load_spec_policy", lambda: {}):
-                return provenance.lookup_ticket("harness", 5)[0]
-
-        self.assertEqual(state(ta.TicketSystemUnavailable("GoodQA unreachable for get_issue_by_number (URLError)")), "unreachable")
-        self.assertEqual(state(ta.TicketSystemUnavailable("GoodQA verification exceeded its total deadline")), "unreachable")
-        for message in ("GoodQA HTTP 500 for get_issue_by_number", "GoodQA HTTP 401 for get_issue_by_number",
-                        "ticket credential file is missing or unreadable: /x", "GoodQA lookup failed (rate_limited)"):
-            self.assertEqual(state(ta.TicketSystemUnavailable(message)), "unverified", message)
-        self.assertEqual(state(ta.TicketOutOfScope("nope")), "out-of-scope")
-        self.assertEqual(state(RuntimeError("boom")), "unverified")
-        self.assertEqual(state(ticket=None), "missing")
-        calls = []
-        provenance._TICKET_MEMO.clear()
-        provenance._OUTAGE["until"] = 0.0
-        outcomes = iter([("unverified", "HTTP 500"), ("missing", None)])
-        with mock.patch.object(provenance, "TICKET_LOOKUP", lambda p, n: calls.append(n) or next(outcomes)):
-            provenance.resolve("ticket:GoodQA harness#1")
-            second = provenance.resolve("ticket:GoodQA harness#2")
-        self.assertEqual(calls, [1, 2])  # a non-transport error does not start the skip window
-        self.assertEqual(second["problems"][1]["code"], "ticket-missing")
 
     def test_n1_proxy_environment_is_ignored_and_offline_switch(self):
         import http.server

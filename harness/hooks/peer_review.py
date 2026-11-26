@@ -1318,7 +1318,8 @@ def review_snapshot(snapshot: Path, head: str, stage: str, stage_rules: str, con
                         else:
                             cmd = [resolution['path'], '--print', '--safe-mode', '--restricted', '--model', claude_model,
                                    '--effort', effort, '--max-budget-usd', str(selection.get('review_budget_usd') or 5),
-                                   '--no-session-persistence', '--output-format', 'json', *claude_sandbox_args(),
+                                   '--no-session-persistence', '--output-format', 'json',
+                                   *claude_sandbox_args(project=snapshot),
                                    '--system-prompt', REVIEW_SYSTEM, '-']
                         launched_at = time.monotonic()
                         timeout = min(timeout, deadline - launched_at)
@@ -1514,18 +1515,32 @@ REVIEWER_ROLE = 'reviewer'
 CODEX_REVIEWER_PROFILE = re.compile(r'(?m)^[ \t]*\[[ \t]*permissions[ \t]*\.[ \t]*(?:ah-reviewer|"ah-reviewer")[ \t]*\]')
 
 
-def claude_sandbox_args(home=None):
-    """['--settings', <reviewer settings>] when the owner installed the reviewer sandbox file, else []."""
+def claude_sandbox_args(home=None, project=None):
+    """['--settings', <reviewer settings>] when the owner installed the reviewer sandbox file, else [].
+
+    With `project` (the checkout the reviewer runs in) the settings are this review's own JSON, with the checkout
+    named in denyWrite: Claude Code does not read `.` in a --settings denyWrite as the working directory, so the
+    generic installed file leaves the checkout writable by the reviewer's Bash (docs/sandbox.md). The installed file
+    stays the switch: no file, no sandbox."""
     home = Path(home) if home is not None else Path.home()
     try:
         import ah_sandbox  # noqa: PLC0415 - W1's module; absent on an older install
         path = Path(ah_sandbox.installed_path(home, REVIEWER_ROLE))
     except Exception:  # noqa: BLE001 - absent or broken: the documented location
+        ah_sandbox = None
         path = home / '.agent-harness' / 'sandbox' / (REVIEWER_ROLE + '.claude.json')
     try:
-        return ['--settings', str(path)] if path.is_file() else []
+        if not path.is_file():
+            return []
     except OSError:
         return []
+    if project is not None and ah_sandbox is not None:
+        try:
+            settings = ah_sandbox.claude_settings(REVIEWER_ROLE, home=home, project=os.path.abspath(str(project)))
+            return ['--settings', json.dumps(settings, sort_keys=True)]
+        except Exception:  # noqa: BLE001 - a broken local.json: the installed file still removes the edit tools
+            pass
+    return ['--settings', str(path)]
 
 
 def codex_sandbox_args(home=None, env=None):

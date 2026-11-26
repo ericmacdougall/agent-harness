@@ -908,8 +908,16 @@ print(json.dumps({{'role': 'assistant', 'content': 'KIMI_ADVISORY: ACCEPT\\nVERD
         self.assertEqual(launched, ['codex', 'kimi'])
         self.assertFalse(self.output.exists())
 
+    def denylisted_home(self):
+        """A HOME whose private leak denylist names 'yates' (the real one lives in the owner's home, not the repo)."""
+        home = self.root / 'denyhome'
+        (home / '.agent-harness').mkdir(parents=True, exist_ok=True)
+        (home / '.agent-harness' / 'leak-denylist.txt').write_text('(?i)\\byates\\b\n')
+        return {'HOME': str(home)}
+
     def test_egress_gate_blocks_the_kimi_fallback_before_launch(self):
-        result, launched = self.kimi_review(packet_text='Scope mentions the yates deployment.\n')
+        result, launched = self.kimi_review(packet_text='Scope mentions the yates deployment.\n',
+                                            env=self.denylisted_home())
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertEqual(launched, ['codex'])  # kimi refused by the gate, never launched
         self.assertFalse(self.output.exists())
@@ -929,7 +937,7 @@ print(json.dumps({{'role': 'assistant', 'content': 'KIMI_ADVISORY: ACCEPT\\nVERD
         self.assertFalse(self.output.exists())
 
     def test_a_refused_kimi_call_is_not_counted_as_a_launch(self):
-        result, _ = self.kimi_review(packet_text='Scope mentions the yates deployment.\n')
+        result, _ = self.kimi_review(packet_text='Scope mentions the yates deployment.\n', env=self.denylisted_home())
         self.assertEqual(result.returncode, 2)
         receipts = list((self.root / 'usage-state').rglob('final.json'))
         self.assertTrue(receipts)
@@ -2513,6 +2521,20 @@ class ReviewerLaunchTests(unittest.TestCase):
         settings.write_text('{}\n')
         self.assertEqual(self.review.claude_sandbox_args(home=self.home), ['--settings', str(settings)])
 
+    def test_claude_reviewer_settings_name_the_checkout(self):
+        checkout = self.home / 'snapshot'
+        checkout.mkdir()
+        self.assertEqual(self.review.claude_sandbox_args(home=self.home, project=checkout), [])  # no file: no sandbox
+        settings = self.home / '.agent-harness' / 'sandbox' / 'reviewer.claude.json'
+        settings.parent.mkdir(parents=True)
+        settings.write_text('{}\n')
+        flag, value = self.review.claude_sandbox_args(home=self.home, project=checkout)
+        self.assertEqual(flag, '--settings')
+        data = json.loads(value)
+        self.assertIn(str(checkout), data['sandbox']['filesystem']['denyWrite'])
+        self.assertEqual(data['env']['AH_ROLE'], 'reviewer')
+        self.assertIn('Edit', data['permissions']['deny'])
+
     def test_codex_uses_the_ah_reviewer_profile_only_when_config_declares_it(self):
         from types import SimpleNamespace
         stub = SimpleNamespace(codex_launch_args=lambda role: ['-c', 'default_permissions="ah-%s"' % role,
@@ -2559,7 +2581,8 @@ class ReviewerLaunchCLITests(unittest.TestCase):
         self.fake('claude', f'''import json, os, sys
 from pathlib import Path
 sys.stdin.read()
-Path({str(self.argv)!r}).write_text(json.dumps({{'argv': sys.argv, 'role': os.environ.get('AH_ROLE')}}))
+Path({str(self.argv)!r}).write_text(json.dumps({{'argv': sys.argv, 'role': os.environ.get('AH_ROLE'),
+                                                 'cwd': os.getcwd()}}))
 print('CODE_INSPECTION_RESULT: ACCEPT\\nReviewed.')
 ''')
         (self.bin / 'codex').unlink()
@@ -2573,7 +2596,11 @@ print('CODE_INSPECTION_RESULT: ACCEPT\\nReviewed.')
         result = self.invoke(stage='code-inspection', env={'HOME': str(self.home)})
         self.assertEqual(result.returncode, 0, result.stderr)
         seen = json.loads(self.argv.read_text())
-        self.assertEqual(seen['argv'][seen['argv'].index('--settings') + 1], str(settings))
+        # This review's own settings, with the checkout it runs in named in denyWrite (docs/sandbox.md)
+        data = json.loads(seen['argv'][seen['argv'].index('--settings') + 1])
+        denied = {os.path.realpath(path) for path in data['sandbox']['filesystem']['denyWrite']}
+        self.assertIn(os.path.realpath(seen['cwd']), denied)
+        self.assertEqual(data['env']['AH_ROLE'], 'reviewer')
         self.assertEqual(seen['role'], 'reviewer')
 
     def test_without_the_file_claude_has_no_settings_flag(self):

@@ -76,8 +76,10 @@ If the post or the readback fails, the review result stands, the exit code is 4,
 A fix pushed after the review is a new commit with no status, so GitHub refuses the merge until the new head is
 reviewed. This replaces the old 150-line allowance. Re-review happens automatically; nobody files a new card for it.
 
-The reviewer runs inside its own boundary when the owner has installed one. Claude gets
-`--settings ~/.agent-harness/sandbox/reviewer.claude.json` when that file exists. Codex gets the `ah-reviewer`
+The reviewer runs inside its own boundary when the owner has installed one. When
+`~/.agent-harness/sandbox/reviewer.claude.json` exists, Claude gets `--settings` with this review's own settings: the
+same reviewer profile with the review checkout named in `denyWrite` (`ah_sandbox.claude_settings("reviewer",
+project=<checkout>)`), because Claude Code does not read `.` there as the working directory. Codex gets the `ah-reviewer`
 permission profile when `config.toml` declares it; otherwise it keeps `--sandbox read-only`. Profiles and
 `--sandbox` do not combine. The child process carries `AH_ROLE=reviewer`.
 

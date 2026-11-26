@@ -54,7 +54,7 @@ class Refused(Exception):
 def base() -> dict:
     """sandbox_base.json (shipped beside this file)."""
     with open(BASE_FILE, "rb") as handle:
-        return json.loads(handle.read().decode("utf-8"))
+        return json.loads(handle.read(1 << 20).decode("utf-8"))  # the shipped data file is a few KB
 
 
 def _home(home=None) -> Path:

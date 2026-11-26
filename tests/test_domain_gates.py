@@ -16,7 +16,6 @@ sys.path.insert(0, str(HOOKS))
 import domain_gates as dg  # noqa: E402
 import peer_review as pr  # noqa: E402
 import provenance  # noqa: E402
-import spec_flow as sf  # noqa: E402
 
 _STUBS = []
 _OFFLINE = None
@@ -252,17 +251,6 @@ class OptOutTests(unittest.TestCase):
         for value in ("off", "OFF", "0", "false"):
             self.assertEqual(dg.active_domains(repo, env={"HARNESS_DOMAIN_GATES": value}), [])
 
-    def test_env_off_cannot_loosen_policy_enforce(self):
-        repo = make_repo({"A.sol": "contract A {}"})
-        enforce = {"domain_gates": {"mode": "enforce"}}
-        self.assertTrue(dg.active_domains(repo, policy=enforce, env={"HARNESS_DOMAIN_GATES": "off"}))
-        self.assertIn("ignored", dg.settings(repo, enforce, {"HARNESS_DOMAIN_GATES": "off"})["warning"])
-        with mock.patch.dict(os.environ, {"HARNESS_DOMAIN_GATES": "off"}):
-            warnings, problems = sf.domain_lint(SPEC, repo, enforce)
-        self.assertTrue(problems)  # still enforcing
-        self.assertTrue(any("HARNESS_DOMAIN_GATES=off ignored" in w for w in warnings))
-        with mock.patch.dict(os.environ, {"HARNESS_DOMAIN_GATES": "off"}):
-            self.assertEqual(sf.domain_lint(SPEC, repo, {"domain_gates": {"mode": "warn"}}), ([], []))  # control: warn still honours env
 
     def test_waiver_needs_three_words_and_neg_ignores_fences_and_comments(self):
         for line in ("Domain-gate: reentrancy waived (abcdef ghijk)",):
@@ -383,49 +371,11 @@ class SpecFlowTests(unittest.TestCase):
         text = SPEC.replace("- Rounding: tested.", "- reentrancy and precision: tested.")
         self.assertIn("reentrancy", dg.missing_items(text, ["evm"]))
 
-    def test_new_appends_block_only_when_detected(self):
-        out = Path(tempfile.mkdtemp()) / "s.md"
-        evm_repo = make_repo({"foundry.toml": "x"})
-        text = sf_template_text()
-        with_block = sf.append_domain_block(text, evm_repo, {})
-        self.assertIn("## Domain checklist", with_block)
-        self.assertTrue(with_block.startswith(text))
-        plain = sf.append_domain_block(text, make_repo({"a.txt": "x"}), {})
-        self.assertEqual(plain, text)
-        off = sf.append_domain_block(text, evm_repo, {"domain_gates": {"disabled": True}})
-        self.assertEqual(off, text)
-        self.assertFalse(out.exists())
 
-    def test_block_does_not_break_lint_of_filled_spec(self):
-        block = dg.render_block(["evm"])
-        filled = full_neg_spec() + "\n" + block
-        self.assertEqual(sf.lint(filled), [])
 
-    def test_lint_warns_not_fails_by_default(self):
-        repo = make_repo({"foundry.toml": "x"})
-        warnings, problems = sf.domain_lint(SPEC, repo, {})
-        self.assertTrue(any("reentrancy" in w for w in warnings))
-        self.assertEqual(problems, [])
 
-    def test_lint_enforce_mode_fails(self):
-        repo = make_repo({"foundry.toml": "x"})
-        warnings, problems = sf.domain_lint(SPEC, repo, {"domain_gates": {"mode": "enforce"}})
-        self.assertTrue(problems)
 
-    def test_lint_clean_spec_and_non_blockchain_repo_silent(self):
-        repo = make_repo({"foundry.toml": "x"})
-        self.assertEqual(sf.domain_lint(full_neg_spec(), repo, {}), ([], []))
-        self.assertEqual(sf.domain_lint(SPEC, make_repo({"a.txt": "x"}), {}), ([], []))
-        quiet = sf.domain_lint(SPEC, make_repo({"a.txt": "x"}), {"domain_gates": {"disabled": True}})
-        self.assertEqual(quiet, ([], []))
-        traced, _ = sf.domain_lint(SPEC, repo, {"domain_gates": {"disabled": True}})
-        self.assertTrue(traced and "disabled by spec_policy.json" in traced[0])  # an opt-out leaves a trace
 
-    def test_spec_block_domains_stay_binding(self):
-        text = SPEC + "\n" + dg.render_block(["solana"])
-        warnings, _ = sf.domain_lint(text, make_repo({"a.txt": "x"}), {})
-        self.assertTrue(warnings)
-        self.assertEqual(set(dg.missing_items(text, [])), {i["id"] for i in dg.checklist("solana")})  # block alone covers nothing
 
     def test_hostile_spec_is_fast(self):
         import time
@@ -453,49 +403,9 @@ class SpecFlowTests(unittest.TestCase):
         (repo / "New.sol").write_text("contract N {}")  # not added
         self.assertIn("evm", names(dg.detect(repo)))
 
-    def test_not_a_git_checkout_warns_instead_of_silent_pass(self):
-        warnings, _ = sf.domain_lint(SPEC, Path(tempfile.mkdtemp()), {})
-        self.assertTrue(any("could not run" in w for w in warnings))
 
-    def test_enforce_fails_closed_when_detection_cannot_run(self):
-        enforce = {"domain_gates": {"mode": "enforce"}}
-        _, problems = sf.domain_lint(SPEC, Path(tempfile.mkdtemp()), enforce)
-        self.assertTrue(problems)
-        repo = make_repo({"foundry.toml": "x"})
-        with mock.patch.object(dg.subprocess, "run", return_value=mock.Mock(returncode=128, stdout=b"")):
-            _, problems = sf.domain_lint(SPEC, repo, enforce)
-            warnings, soft = sf.domain_lint(SPEC, repo, {})
-        self.assertTrue(problems)
-        self.assertTrue(warnings and not soft)
 
-    def test_enforce_ignores_domains_line_when_scan_failed(self):
-        enforce = {"domain_gates": {"mode": "enforce"}}
-        with_line = SPEC + "\n" + dg.render_block(["xrpl"])
-        deep = make_repo({"package.json": "[" * 5000 + "]" * 5000})
-        _, problems = sf.domain_lint(with_line, deep, enforce)
-        self.assertTrue(any("deeply nested" in p for p in problems), problems)
-        repo = make_repo({"foundry.toml": "x"})
-        with mock.patch.object(dg.subprocess, "run", return_value=mock.Mock(returncode=128, stdout=b"")):
-            _, problems = sf.domain_lint(with_line, repo, enforce)
-        self.assertTrue(any("git ls-files failed" in p for p in problems), problems)
 
-    def test_truncated_scan_is_a_failure_reason(self):
-        files = {f"0/balance{i}.txt": "x" for i in range(60)}
-        files["src/T.sol"] = "contract T {}"
-        repo = make_repo(files)
-        found, reason = dg.detect_full(repo, max_files=50)
-        self.assertEqual(found, [])
-        self.assertIn("truncated", reason)
-        _, reason = dg.detect_full(repo, max_files=500)  # positive control: no cap hit, signal found
-        self.assertIsNone(reason)
-        with mock.patch.object(dg, "MAX_FILES", 50):
-            _, problems = sf.domain_lint(SPEC, repo, {"domain_gates": {"mode": "enforce"}})
-        self.assertTrue(any("truncated" in p for p in problems), problems)
-        big = make_repo({"package.json": json.dumps({"dependencies": {"ethers": "6"}, "pad": "x" * (dg.MAX_MANIFEST_BYTES + 5)})})
-        self.assertIn("truncated", dg.detect_full(big)[1])
-        with mock.patch.object(dg, "MAX_MANIFESTS", 1):
-            two = make_repo({"a/package.json": "{}", "b/package.json": "{}"})
-            self.assertIn("truncated", dg.detect_full(two)[1])
 
     def test_irrelevant_caps_do_not_fail_plain_repos(self):
         grpc = make_repo({f"api/s{i}.proto": "message A {}" for i in range(dg.MAX_PROTO_FILES + 5)})
@@ -504,13 +414,6 @@ class SpecFlowTests(unittest.TestCase):
                           "go.mod": "require nats.go v1\n"})
         self.assertIn("proto count", dg.detect_full(nats)[1])  # cap can hide the ledger signal here
 
-    def test_allow_truncated_turns_failure_into_visible_warning(self):
-        repo = make_repo({"0/a.sol": "x", "1/b.sol": "x", "2/c.sol": "x"})
-        policy = {"domain_gates": {"mode": "enforce", "allow_truncated": True}}
-        with mock.patch.object(dg, "MAX_FILES", 2):
-            warnings, problems = sf.domain_lint(SPEC, repo, policy)
-        self.assertTrue(any("truncated" in w for w in warnings))
-        self.assertFalse(any("truncated" in p for p in problems))
 
     def test_symlinked_manifest_is_reported_not_silent(self):
         outside = Path(tempfile.mkdtemp()) / "package.json"
@@ -523,34 +426,8 @@ class SpecFlowTests(unittest.TestCase):
         lb = make_repo({"load_balancer.proto": "message A {}", "go.mod": "require nats.go v1\n"})
         self.assertEqual(dg.detect(lb), [])
 
-    def test_enforce_applies_at_attach(self):
-        spec = Path(tempfile.mkdtemp()) / "s.md"
-        spec.write_text(SPEC)
-        args = mock.Mock(spec=["spec", "repo"])
-        args.spec, args.repo = str(spec), str(make_repo({"foundry.toml": "x"}))
-        with mock.patch.object(sf, "ticket_config", return_value=(None, None, None)):
-            with self.assertRaises(sf.SpecError) as ctx:
-                sf.cmd_attach(args, {"domain_gates": {"mode": "enforce"}})
-        self.assertIn("domain checklist items", str(ctx.exception))
 
-    def test_packet_and_plain_lint_unaffected(self):
-        repo = make_repo({"foundry.toml": "x"})
-        self.assertEqual(sf.lint(SPEC), [])
-        self.assertEqual(sf.lint(SPEC + "\n" + dg.render_block(["evm"])), [])
 
-    def test_cmd_lint_prints_warnings_and_exit_unchanged(self):
-        repo = make_repo({"foundry.toml": "x"})
-        spec = Path(tempfile.mkdtemp()) / "s.md"
-        spec.write_text(SPEC)
-        args = mock.Mock(spec=["spec", "repo"], spec_path=None)
-        args.spec, args.repo = str(spec), str(repo)
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out), mock.patch.object(sf, "ticket_config", return_value=(None, None, None)):
-            code = sf.cmd_lint(args, {"domain_gates": {"mode": "warn"}})
-        data = json.loads(out.getvalue())
-        self.assertEqual(code, 0)
-        self.assertEqual(data["status"], "PASS")
-        self.assertTrue(data["warnings"])
 
 
 def sf_template_text():
@@ -668,15 +545,6 @@ class PeerReviewTests(unittest.TestCase):
         self.assertTrue(dg.active_domains(repo, policy={"domain_gates": {"mode": "enforce"}}, env={}))
         self.assertEqual(dg.active_domains(repo, policy={"domain_gates": {"mode": "warn"}}, env={}), [])
 
-    def test_enforce_fails_closed_on_broken_data(self):
-        repo = make_repo({"foundry.toml": "x"})
-        bad = Path(tempfile.mkdtemp()) / "c.json"
-        bad.write_text("{not json")
-        with mock.patch.object(dg, "CHECKLIST_FILE", bad):
-            warnings, problems = sf.domain_lint(SPEC, repo, {"domain_gates": {"mode": "enforce"}})
-            self.assertTrue(problems)
-            warnings, problems = sf.domain_lint(SPEC, repo, {})
-            self.assertEqual(problems, [])
 
     def test_go_mod_substring_is_not_a_dependency(self):
         self.assertEqual(dg.detect(make_repo({"go.mod": "require example.com/foo/web3stuff v1.0.0\n"})), [])

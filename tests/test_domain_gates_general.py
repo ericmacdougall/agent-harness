@@ -12,7 +12,6 @@ HOOKS = Path(__file__).resolve().parents[1] / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
 import domain_gates as dg  # noqa: E402
 import provenance  # noqa: E402
-import spec_flow as sf  # noqa: E402
 
 NEW = {
     "auth": ["pre-account-hijack", "lookalike-identifier", "request-device-binding", "link-expiry-single-use",
@@ -54,12 +53,6 @@ class Checklists(unittest.TestCase):
 
 
 class Detection(unittest.TestCase):
-    def test_two_auth_paths_detect_auth_and_spec_has_hijack_item(self):
-        root = make_repo(["src/auth/login.ts", "src/auth/session.ts"])
-        self.assertIn("auth", domains(root))
-        text = sf.append_domain_block("# Spec\n", root, {})
-        self.assertIn("## Domain checklist", text)
-        self.assertIn("pre-account-hijack", text)
 
     def test_single_doc_path_detects_nothing(self):
         self.assertEqual(domains(make_repo(["README-release.md"])), set())

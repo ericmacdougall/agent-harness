@@ -88,7 +88,8 @@ ah sandbox show --role reviewer --project /abs/checkout > /tmp/reviewer.json   #
 ```
 
 The generic `~/.agent-harness/sandbox/reviewer.claude.json` still removes the file-editing tools and denies secrets
-and records. On its own, though, its Bash can write the working directory.
+and records. On its own, though, its Bash can write the working directory. `peer_review.py` therefore treats the
+installed file as the switch and passes the per-review JSON, with its snapshot named, to `--settings`.
 
 ## What the e2e settled (Claude Code 2.1.332, macOS)
 

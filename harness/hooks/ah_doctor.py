@@ -507,7 +507,7 @@ def role_probes(ctx, ps, role, mech, prefix, codex_text=None) -> list:
 def codex_probes(ctx, ps, roles) -> list:
     codex_home = Path(ctx.environ.get("CODEX_HOME") or ctx.home / ".codex")
     try:
-        text = (codex_home / "config.toml").read_text(encoding="utf-8")
+        text = (codex_home / "config.toml").read_text(encoding="utf-8")  # input-ok: the owner's own Codex config
     except FileNotFoundError:
         text = ""
     except OSError as error:
@@ -570,7 +570,7 @@ def check_files(ctx, flavor) -> dict:
     for rel, meta in sorted(snap["files"].items()):
         try:
             with open(ctx.home / rel, "rb") as handle:
-                digest = hashlib.sha256(handle.read()).hexdigest()
+                digest = hashlib.sha256(handle.read()).hexdigest()  # input-ok: an installed file the release snapshot names
         except OSError:
             digest = None
         if digest != (meta or {}).get("sha256"):
@@ -608,7 +608,8 @@ def managed_script(handler, hooks_dir: str):
     if i >= len(toks):
         return None
     path = os.path.normpath(os.path.expanduser(toks[i]))
-    if os.path.dirname(path) != os.path.normpath(hooks_dir):
+    # real paths on both sides: the installer writes the resolved home (/private/tmp/... for a home under /tmp)
+    if os.path.realpath(os.path.dirname(path)) != os.path.realpath(hooks_dir):
         return None
     if os.path.basename(path) == ah_switch.LAUNCHER:
         return (toks[i + 1] if i + 1 < len(toks) else "", True)
@@ -656,7 +657,7 @@ def check_wiring(ctx, flavor) -> dict:
     spec = snap.get("settings") if snap else None
     if isinstance(spec, dict) and isinstance(doc, dict):
         current = doc.get("hooks") if isinstance(doc.get("hooks"), dict) else {}
-        if json.dumps(ah_switch.repaired_hooks(current, spec), sort_keys=True) != json.dumps(current, sort_keys=True):
+        if ah_switch.managed_wiring(current, spec) != ah_switch.managed_wiring(spec.get("groups") or {}, spec):
             problems.append(f"live wiring differs from release {snap.get('release')} (install.py --apply restores it)")
     note = f"; {users_on_bash} handler(s) of your own match Bash" if users_on_bash else ""
     if problems:
@@ -738,7 +739,7 @@ def check_codex_trust(ctx) -> dict:
         return result("codex-trust", "SKIPPED", "Codex hooks not installed")
     config = Path(ctx.environ.get("CODEX_HOME") or ctx.home / ".codex") / "config.toml"
     try:
-        trusted = trusted_hashes(config.read_text(encoding="utf-8"))
+        trusted = trusted_hashes(config.read_text(encoding="utf-8"))  # input-ok: the owner's own Codex config
     except FileNotFoundError:
         trusted = {}
     except OSError as error:

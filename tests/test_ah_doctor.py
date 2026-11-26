@@ -217,6 +217,22 @@ class Checks(Base):
         self.write_settings({"Stop": [{"hooks": [{"type": "command", "command": f"python3 {hooks / 'wal.py'}"}]}]})
         self.assertIn("launcher", self.result(self.run_doctor(), "wiring.claude")["summary"])
 
+    def test_a_real_install_reads_as_ten_handlers_and_a_changed_one_differs(self):
+        # The installer's own output, compared with the release snapshot it recorded (ah_switch.managed_wiring).
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        import install  # noqa: PLC0415
+        with mock.patch.object(install, "scratch_status", lambda *a, **k: "durable scratch: skipped (test)"):
+            install.install(self.home, True)
+        r = self.result(self.run_doctor(), "wiring.claude")
+        self.assertEqual((r["status"], r["detail"]["handlers"]), ("OK", 10), r)
+        settings = self.home / ".claude" / "settings.json"
+        doc = json.loads(settings.read_text())
+        doc["hooks"]["Stop"][0]["hooks"][0]["timeout"] = 1
+        settings.write_text(json.dumps(doc))
+        r = self.result(self.run_doctor(), "wiring.claude")
+        self.assertEqual(r["status"], "FAILED")
+        self.assertIn("differs from release", r["summary"])
+
     def test_user_hook_on_bash_is_not_ours(self):
         self.write_settings({"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "mytool"}]}]})
         self.assertEqual(self.result(self.run_doctor(), "wiring.claude")["status"], "OK")

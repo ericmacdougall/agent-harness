@@ -26,18 +26,18 @@ DELETED = (
     "central_decisions", "review_map", "remote_delete", "remote_delete_agent", "ah_install",
     "ahc_clock", "ahc_clone", "ahc_contracts", "ahc_core", "ahc_crash", "ahc_fs", "ahc_guard", "ahc_install",
     "ahc_merge", "ahc_migrate", "ahc_observe", "ahc_packet", "ahc_review", "ahc_runner", "ahc_scan", "ahc_shadow",
-    "ahc_w21",
+    "ahc_w21", "merge_gate", "commit_policy", "escalation", "spec_flow", "resource_budget",
 )
-DELETED_DATA = ("kill_guard_policy.json", "ahd_policy.json", "rules.json", "hooks_manifest.json", "ahc_release.json")
+DELETED_DATA = ("kill_guard_policy.json", "ahd_policy.json", "rules.json", "hooks_manifest.json", "ahc_release.json",
+                "commit_policy.json", "spec_policy.json", "spec_template.md", "resource_limits.json")
 DELETED_TREES = ("cmd", "internal", "console", "plugins/harness-tui", "native/codex", "testdata", "go.mod",
                  "install_tui_plugin.py")
 # Shipped files that still name a deleted file, each with the reason it is not a launch of it. Keep this short.
 KNOWN = {
     "harness/hooks/mc_chat.py": "Mission Control chat prints `mc_inbox.py reply ...` as the way to answer a dashboard "
-                                "message; mc_inbox.py (kill list) is deleted, so that reply path is gone. Not this "
-                                "branch's file: the integrator drops the instruction or keeps mc_inbox as a tool",
-    "harness/hooks/peer_review.py":"the ahc release check (ahc_release_problem) names ahc_*.py; the gate branch (W2) "
-                                    "deletes that check. Drop this entry when it merges",
+                                "message; mc_inbox.py (kill list) is deleted, so that reply path is gone. The "
+                                "dashboard stays as a read-only view (docs/direction.md); removing its chat is its "
+                                "own change",
 }
 # Docs this branch owns; the others are listed for the integrator (they still describe the deleted parts).
 OPERATOR_DOCS = ("README.md", "docs/off-switch.md", "docs/local-config.md", "docs/operations.md",

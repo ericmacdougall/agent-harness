@@ -17,26 +17,22 @@ from pathlib import Path
 HOOKS = Path(__file__).resolve().parent.parent / "harness" / "hooks"
 ALLOW = re.compile(r"#\s*input-ok:\s*\S")
 # file -> number of unannotated unbounded reads that existed before safe_input. Only ever decrease these.
-BASELINE = {"commit_policy.py": 6, "deliver.py": 2, "peer_review.py": 2, "spec_flow.py": 3, "wal.py": 1, "workdir.py": 4}
+BASELINE = {'ah_roles.py': 3, 'deliver.py': 2, 'gq_browser.py': 3, 'installer_scan.py': 1, 'ops_watch.py': 1, 'peer_review.py': 1, 'successor.py': 1, 'trivy_gate.py': 3, 'wal.py': 1, 'workdir.py': 4}
 # Counts are the ratchet; this also pins each baselined call by its source line so swapping an old violation for a
 # new one fails. Delete a line from here when you migrate it (fill with `python3 tests/test_input_lint.py --pins`).
-PINS = {'commit_policy.py': ['policy = json.load(handle)',
-                      'message = normalize(Path(path).read_text(encoding="utf-8", errors="replace"), '
-                      'strip_commen',
-                      'message = Path(args.file).read_text(encoding="utf-8") if args.file else '
-                      'sys.stdin.read()',
-                      'message = Path(args.file).read_text(encoding="utf-8") if args.file else '
-                      'sys.stdin.read()',
-                      'previous = Path(args.previous_file).read_text(encoding="utf-8") if args.previous_file '
-                      'else',
-                      '_HOOK_STATE["raw"] = sys.stdin.buffer.read().decode("utf-8", errors="replace")'],
+PINS = {'ah_roles.py': ['data = json.loads((state_dir(home) / ROLES_NAME).read_text())',
+                 'incoming = json.load(sys.stdin)',
+                 'tail = handle.read()'],
  'deliver.py': ['and (hooks / name).read_bytes() == data for name, data in observed.items())',
                 'observed = {name: (hooks / name).read_bytes() for name in names}'],
- 'peer_review.py': ["last_message = last.read_text(errors='replace') if last.exists() else ''",
-                    'listed = set(boundary.read_text().split() if boundary.exists() else ())'],
- 'spec_flow.py': ['policy = json.load(handle)',
-                  'text = TEMPLATE_FILE.read_text(encoding="utf-8").format(',
-                  'payload = json.load(sys.stdin)'],
+ 'gq_browser.py': ['data = json.load(f)', 'return _remember(f.read().strip())', 'return json.load(f)'],
+ 'installer_scan.py': ['data = path.read_bytes()'],
+ 'ops_watch.py': ['deployed = json.loads(Path(expand(home, svc.get("deployed_file") or "")).read_text(encodin'],
+ 'peer_review.py': ['listed = set(boundary.read_text().split() if boundary.exists() else ())'],
+ 'successor.py': ['head = json.loads(head_path.read_text(encoding="utf-8"))'],
+ 'trivy_gate.py': ['data = Path(exe).read_bytes()  # read once: the bytes hashed are the bytes run',
+                   'data = json.loads(path.read_text(encoding="utf-8"))',
+                   'report = json.loads(output.read_text(encoding="utf-8"))'],
  'wal.py': ['data = json.load(sys.stdin)'],
  'workdir.py': ['config = json.loads(path.read_text())',
                 'lines = handle.read().splitlines()',

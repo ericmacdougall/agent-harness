@@ -68,12 +68,6 @@ class Resolve(Env):
         foreign = good.replace(SESSION, "99999999-2222-4333-8444-555555555555", 1)
         self.assertFalse(provenance.resolve(foreign, {"allow_mc": True})["ok"])
 
-    def test_mc_never_counts_as_a_requirement_user_source(self):
-        import escalation
-        _, source = self.delivered()
-        self.assertEqual(provenance.parse_source(source)["kind"], "mc")
-        with self.assertRaises(escalation.LedgerError):
-            escalation.verify_top_source(source)
 
     def test_every_user_origin_consumer_refuses_mc(self):  # review 2 item 1
         import ah_kill

@@ -261,7 +261,7 @@ class GoodQAAdapter:
         data = self.call("list_orgs", {})
         orgs = data.get("orgs") if isinstance(data, dict) else None
         if not isinstance(orgs, list) or len(orgs) != 1 or not isinstance(orgs[0], dict):
-            raise TicketSystemUnavailable("GoodQA credential reaches zero or several orgs; set org_id in commit_policy.json")
+            raise TicketSystemUnavailable("GoodQA credential reaches zero or several orgs; set ticket_systems.goodqa.org_id in ~/.agent-harness/local.json")
         self._org = orgs[0].get("id")
         return self._org
 

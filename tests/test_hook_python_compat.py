@@ -70,7 +70,7 @@ class HookPythonCompatibilityTests(unittest.TestCase):
                                  capture_output=True, text=True, timeout=30).stdout.strip()
         if version != "True":
             self.skipTest(f"{python} is not older than 3.10")
-        for name in ("peer_review", "deliver", "integrate_local", "commit_policy", "wal_note", "rescue"):
+        for name in ("peer_review", "deliver", "integrate_local", "wal_note", "rescue", "ah_sandbox", "ah_doctor", "ah_repo", "ah_roles"):
             with self.subTest(module=name):
                 result = subprocess.run([python, "-c", f"import {name}"], cwd=HOOKS,
                                         capture_output=True, text=True, timeout=60)
