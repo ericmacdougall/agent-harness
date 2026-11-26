@@ -8,10 +8,13 @@ HTTP request to a closed local port, and replaces ssh with `false`.
 import hashlib
 import json
 import os
+import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -315,9 +318,9 @@ class Snapshot(Case):
                    "nested/dir/auth.json", "Server.KEY"}
         self.assertEqual({path for path, why in reasons.items() if why == "secret-shaped name"}, secrets)
         self.assertEqual(reasons["big.bin"], "over 20 MB")
-        self.assertEqual(reasons["link"], "not a regular file")
+        self.assertNotIn("link", reasons)   # a symlink goes in as a link: git stores the name of its target
         self.assertNotIn("pipe", reasons)   # git never lists a FIFO, and it holds nothing to save
-        self.assertEqual(self.tree_files(repo, commit), {"README.md", ".npmrc", "notes.txt"})
+        self.assertEqual(self.tree_files(repo, commit), {"README.md", ".npmrc", "notes.txt", "link"})
         self.assertEqual(self.git(repo, "show", commit + ":.npmrc"), "registry=https://fixture.invalid")
 
     def test_a_repository_with_no_commit_yet(self):
@@ -403,10 +406,14 @@ class IgnoredKeepers(Case):
             (repo / name).write_text(text)
         subprocess.run(["git", "init", "-q", str(repo / "outer" / "inner-repo")], check=True)
         os.symlink("/etc/hosts", repo / "link.local")
+        big = []
         with mock.patch.object(git_save, "MAX_FILE", 4096):
-            found = git_save.ignored_keepers(repo)
+            found = git_save.ignored_keepers(repo, big)
+            with self.assertRaisesRegex(git_save.SaveError, "huge.bin is over 20 MB"):
+                git_save.ignored_keepers(repo)   # never copied, so never silently left to the deletion
         self.assertEqual(found, [".env", "data/run1/result.json", "dev.sqlite", "settings.local", "src/keep.pyc",
                                  "sub/target/note.txt", "untracked/inner/.env"])
+        self.assertEqual(big, ["huge.bin"])
 
     def test_rebuildable_names(self):
         base = self.root / "r"
@@ -491,7 +498,9 @@ class SaveToRemote(Case):
         detached = self.commit(repo, "d.txt")
         result = self.save(repo)
         there = self.assert_saved_remote(result)
-        base = "refs/rescue/%s/%s/work-%s/" % (HOST, SESSION, hashlib.sha256(str(repo).encode()).hexdigest()[:8])
+        base = self.ref(result, "/heads/main")[:-len("heads/main")]
+        self.assertRegex(base, r"^refs/rescue/%s/%s/work-%s/[0-9]{8}T[0-9]{6}Z-[0-9a-f]{4}/$" % (
+            HOST, SESSION, hashlib.sha256(str(repo).encode()).hexdigest()[:8]))
         self.assertEqual(result["refs"], {
             base + "heads/main": main, base + "heads/feature/x": feature, base + "detached": detached,
             base + "tags/v1": self.git(repo, "rev-parse", "refs/tags/v1"),
@@ -501,7 +510,7 @@ class SaveToRemote(Case):
         restored = self.root / "restored"
         subprocess.run(["git", "init", "-q", str(restored)], check=True)
         self.git(restored, "fetch", "-q", str(self.rescue), "refs/rescue/%s/%s/*:refs/rescue/*" % (HOST, SESSION))
-        stash = self.git(restored, "for-each-ref", "--format=%(refname)", "refs/rescue/*/stash/0")
+        stash = self.git(restored, "for-each-ref", "--format=%(refname)", "refs/rescue/*/*/stash/0")
         self.assertEqual(self.git(restored, "show", stash + ":f.txt"), "stashed")
         self.assertEqual(self.git(restored, "show", stash + "^3:untracked-in-stash.txt"), "u")
 
@@ -546,12 +555,12 @@ class SaveToRemote(Case):
         with mock.patch.object(git_save, "MAX_FILE", 4096):
             result = self.save(repo)
         self.assert_saved_remote(result)
-        self.assertEqual(result["held"], [".env", "big.bin", "conf/deploy.pem", "link"])
+        self.assertEqual(result["held"], [".env", "big.bin", "conf/deploy.pem"])   # the link is in the snapshot
         held = Path(result["held_dir"])
         self.assertEqual(held.relative_to(self.home / ".agent-harness" / "rescue" / "held").parts[:2], (HOST, SESSION))
         self.assertEqual((held / ".env").read_text(), "COLOUR=blue\n")
         self.assertEqual((held / "big.bin").stat().st_size, 5000)
-        self.assertEqual(os.readlink(held / "link"), "conf/deploy.pem")
+        self.assertFalse(os.path.lexists(held / "link"))
         for path in (held / ".env", held / "conf" / "deploy.pem", held / "big.bin"):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600, path)
         folder = held / "conf"
@@ -559,7 +568,7 @@ class SaveToRemote(Case):
             self.assertEqual(stat.S_IMODE(folder.stat().st_mode), 0o700, folder)
             folder = folder.parent
         snapshot = result["refs"][self.ref(result, "/snapshot")]
-        self.assertEqual(self.tree_files(self.rescue, snapshot), {"README.md", ".gitignore"})
+        self.assertEqual(self.tree_files(self.rescue, snapshot), {"README.md", ".gitignore", "link"})
         (repo / ".env").write_text("COLOUR=green\n")
         self.assertTrue(self.save(repo)["ok"])
         self.assertEqual((held / ".env").read_text(), "COLOUR=green\n")
@@ -688,7 +697,7 @@ class SaveToRemote(Case):
         result = git_save.save(repo, "../se ss/..", "my repo@{1}.lock", host="ho st")
         self.assert_saved_remote(result)
         self.assertRegex(self.ref(result, "/heads/main"),
-                         r"^refs/rescue/ho-st/se-ss/my-repo-1-[0-9a-f]{8}/heads/main$")
+                         r"^refs/rescue/ho-st/se-ss/my-repo-1-[0-9a-f]{8}/[0-9]{8}T[0-9]{6}Z-[0-9a-f]{4}/heads/main$")
 
     def test_a_linked_worktree_and_its_parent_in_both_orders(self):
         for order in ("worktree first", "parent first"):
@@ -786,7 +795,8 @@ class Proof(Case):
         self.assertEqual((result["ok"], result["where"], result["url"], result["reason"]),
                          (True, "bundle", None, None))
         bundle = Path(result["bundle"])
-        self.assertEqual(bundle.parent, self.home / ".agent-harness" / "rescue" / HOST / SESSION)
+        self.assertEqual(bundle.parent.parent, self.home / ".agent-harness" / "rescue" / HOST / SESSION)
+        self.assertRegex(bundle.name, r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{4}\.bundle$")
         self.assertFalse(str(bundle).startswith(str(repo) + os.sep))
         self.assertEqual(self.git(repo, "for-each-ref"), refs_before)
         self.verify_alone(bundle)
@@ -930,6 +940,264 @@ class StateAndLimits(Case):
         self.assertEqual(top, ["rescue", "state"])
         self.assertEqual(sorted(path.name for path in self.root.iterdir()), ["bin", "home", "remotes", "tmp", "work"])
         self.assertEqual(list((self.root / "tmp").iterdir()), [])   # scratch indexes and repositories are removed
+
+
+class ReviewFixes(Case):
+    """Each test here failed before the fix it is named for (reviews rt2-data-loss and rt2-friction-security)."""
+
+    def clone(self, url, path):
+        subprocess.run(["git", "clone", "-q", url, str(path)], check=True, capture_output=True)
+        return path
+
+    def test_a_checkout_made_again_at_the_same_path_never_changes_what_the_one_before_saved(self):
+        for mode in ("remote", "bundle"):
+            with self.subTest(mode):
+                self.configure(**({"rescue_remote": str(self.rescue)} if mode == "remote" else {}))
+                self.seeded_remote("app-" + mode)
+                url, path = "https://fixture.invalid/app-%s.git" % mode, self.root / ("co-" + mode)
+                self.clone(url, path)
+                self.git(path, "checkout", "-q", "-b", "fix")
+                day1 = self.commit(path, "fix.txt", "day one\n")
+                (path / "README.md").write_text("day one edit\n")
+                (path / ".env").write_text("DAY1=x\n")
+                first = self.save(path)
+                self.assertEqual((first["ok"], first["where"]), (True, mode), first)
+                shutil.rmtree(path)   # the reaper deleted it; the same session makes it again the next day
+                self.clone(url, path)
+                self.git(path, "checkout", "-q", "-b", "fix")
+                self.commit(path, "fix.txt", "day two\n")
+                (path / "README.md").write_text("day two edit\n")
+                (path / ".env").write_text("DAY2=x\n")
+                second = self.save(path, fresh=True)
+                self.assertTrue(second["ok"], second)
+                if mode == "remote":
+                    self.assertFalse(set(first["refs"]) & set(second["refs"]))
+                    there = self.refs(self.rescue)
+                    for ref, commit in first["refs"].items():
+                        self.assertEqual(there.get(ref), commit, ref)
+                    snapshot = first["refs"][self.ref(first, "/snapshot")]
+                    self.assertEqual(self.git(self.rescue, "show", snapshot + ":README.md"), "day one edit")
+                else:
+                    self.assertNotEqual(first["bundle"], second["bundle"])
+                    heads = self.git(path, "bundle", "list-heads", first["bundle"])
+                    self.assertIn(day1 + " refs/heads/fix", heads)
+                self.assertNotEqual(first["held_dir"], second["held_dir"])
+                self.assertEqual((Path(first["held_dir"]) / ".env").read_text(), "DAY1=x\n")
+                self.assertEqual((Path(second["held_dir"]) / ".env").read_text(), "DAY2=x\n")
+
+    def test_the_same_checkout_brings_its_own_copy_up_to_date_in_place(self):
+        repo = self.repo()
+        (repo / "wip.txt").write_text("one\n")
+        first = self.save(repo)
+        (repo / "wip.txt").write_text("two\n")
+        self.commit(repo, "more.txt")
+        second = self.save(repo)
+        self.assertEqual(set(first["refs"]), set(second["refs"]))   # one copy per checkout's life, not one per turn
+        self.assertEqual(first["held_dir"], second["held_dir"])
+
+    def test_a_checkout_ah_reap_began_to_delete_is_never_saved_over(self):
+        repo = self.repo()
+        (repo / "README.md").write_text("the only copy\n")
+        proven = self.save(repo)
+        self.assertTrue(proven["ok"])
+        (repo / ".git" / git_save.REAPING).write_text("{}")
+        (repo / "README.md").unlink()   # what a deletion that stopped part way leaves
+        again = self.save(repo, fresh=True)
+        self.assertFalse(again["ok"])
+        self.assertIn("stopped part way", again["reason"])
+        snapshot = proven["refs"][self.ref(proven, "/snapshot")]
+        self.assertEqual(self.refs(self.rescue), proven["refs"])
+        self.assertEqual(self.git(self.rescue, "show", snapshot + ":README.md"), "the only copy")
+
+    def test_unchanged_is_true_only_for_exactly_what_was_proven(self):
+        repo = self.repo()
+        (repo / "wip.txt").write_text("wip\n")
+        result = self.save(repo)
+        self.assertTrue(git_save.unchanged(repo, SESSION, result["proof"]))
+        old = time.time() - 5 * 86400
+        moved = self.root / "elsewhere.txt"
+        moved.write_text("moved in\n")
+        os.utime(moved, (old, old))
+        os.rename(moved, repo / "moved.txt")   # keeps its old mtime
+        self.assertFalse(git_save.unchanged(repo, SESSION, result["proof"]))
+        (repo / "moved.txt").unlink()
+        self.commit(repo, "late.txt")          # a commit made after the save
+        self.assertFalse(git_save.unchanged(repo, SESSION, result["proof"]))
+        self.assertFalse(git_save.unchanged(repo, SESSION, None))
+
+    def test_a_repository_that_uses_git_lfs_is_never_ok(self):
+        repo = self.repo()
+        (repo / ".git" / "lfs" / "objects" / "ab").mkdir(parents=True)
+        (repo / "model.bin").write_text("version https://git-lfs.github.com/spec/v1\n")
+        result = self.save(repo)
+        self.assertFalse(result["ok"])
+        self.assertIn("git-lfs", result["reason"])
+        self.assertTrue(result["refs"])   # the commits and the snapshot are saved all the same
+
+    def test_an_ignored_file_over_20_mb_keeps_the_checkout_and_is_named(self):
+        repo = self.repo()
+        (repo / ".gitignore").write_text("*.sqlite\n.env\n")
+        with open(repo / "dev.sqlite", "wb") as handle:
+            handle.truncate(21 * 1024 * 1024)
+        (repo / ".env").write_text("A=1\n")
+        result = self.save(repo)
+        self.assertFalse(result["ok"])
+        self.assertIn("dev.sqlite is over 20 MB", result["reason"])
+        self.assertEqual(result["held"], [".env"])   # what can be held still is
+
+    def test_tool_output_among_ignored_files_is_not_held(self):
+        repo = self.repo()
+        (repo / ".gitignore").write_text("env/\nhtmlcov/\n.cache/\nresults/\n")
+        for rel, text in {"env/pyvenv.cfg": "home = /usr\n", "env/lib/site.py": "x", "htmlcov/.gitignore": "# cov\n*\n",
+                          "htmlcov/index.html": "x", ".cache/CACHEDIR.TAG": "Signature", ".cache/blob": "x",
+                          "results/verdicts.jsonl": "{}\n"}.items():
+            (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+            (repo / rel).write_text(text)
+        self.assertEqual(git_save.ignored_keepers(repo), ["results/verdicts.jsonl"])
+
+    def test_unpushed_commits_and_stashes_with_secret_shaped_files_go_to_the_bundle_not_the_remote(self):
+        token = "ghp_" + "Z9y8X7w6" * 5
+        repo = self.repo()
+        self.git(repo, "checkout", "-q", "-b", "wip")
+        (repo / ".env").write_text("SECRET=one\n")
+        self.git(repo, "add", "-f", ".env")
+        self.git(repo, "commit", "-q", "-m", "oops")
+        (repo / "config.py").write_text("TOKEN = '%s'\n" % token)
+        self.git(repo, "add", "config.py")
+        self.git(repo, "commit", "-q", "-m", "oops again")
+        result = self.save(repo)
+        self.assertEqual((result["ok"], result["where"]), (True, "bundle"), result)
+        self.assertEqual(self.refs(self.rescue), {})
+        manifest = json.loads(Path(result["bundle"][:-len(".bundle")] + ".json").read_text())
+        self.assertTrue(manifest["secret_in_commits"])
+        clean = self.repo("clean")   # the control: a commit without one still goes to the remote
+        (clean / ".env.local").write_text("LOCAL=1\n")
+        self.git(clean, "stash", "push", "-q", "--include-untracked")
+        self.assertEqual(self.save(clean, name="clean")["where"], "bundle")   # the stash holds .env.local
+        plain = self.repo("plain")
+        self.commit(plain, "notes.md", "nothing here\n")
+        self.assertEqual(self.save(plain, name="plain")["where"], "remote")
+        pushed = subprocess.run(["git", "-C", str(self.rescue), "cat-file", "--batch-all-objects", "--batch"],
+                                capture_output=True, check=True).stdout
+        for value in (b"SECRET=one", token.encode(), b"LOCAL=1"):
+            self.assertNotIn(value, pushed)
+
+    def test_more_credential_file_names_are_held(self):
+        for name in (".pgpass", "putty.ppk", "store.jks", "id_ecdsa", "dev-kubeconfig.yaml", ".htpasswd", ".s3cfg",
+                     ".boto", "home/.docker/config.json", ".git-credentials"):
+            self.assertTrue(git_save._secret_name(name), name)
+        for name in ("config.json", "id_card.py", "docker/config.json.example"):
+            self.assertFalse(git_save._secret_name(name), name)
+
+    def test_a_hanging_remote_falls_back_to_a_bundle_in_time_and_leaves_no_process(self):
+        with open(self.home / ".gitconfig", "a") as handle:
+            handle.write('[protocol "ext"]\n\tallow = always\n')
+        pid_file = self.root / "helper.pid"
+        self.configure(rescue_remote="ext::sh -c echo% $$% >" + str(pid_file) + ";% exec% sleep% 60")
+        repo = self.repo()
+        started = time.monotonic()
+        result = self.save(repo, budget_s=6)
+        self.assertLess(time.monotonic() - started, 6)
+        self.assertEqual((result["ok"], result["where"]), (True, "bundle"), result)
+        pid = int(pid_file.read_text())
+        for _ in range(50):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            os.kill(pid, signal.SIGKILL)
+            self.fail("the remote helper %d was left running" % pid)
+
+    def test_the_content_check_reads_small_files_once(self):
+        repo = self.repo()
+        (repo / "small.txt").write_text("plain\n")
+        (repo / "large.csv").write_bytes(b"a,b\n" * (git_save.SCAN_MAX // 4 + 1))
+        real, read = git_save.redact.has_secret, []
+
+        def spy(text):
+            read.append(text[:5])
+            return real(text)
+
+        with mock.patch.object(git_save.redact, "has_secret", side_effect=spy):
+            self.assertTrue(self.save(repo)["ok"])
+            self.assertEqual(read.count("plain"), 1)
+            self.assertEqual(read.count("a,b\na"), 0)   # over SCAN_MAX: judged by its name only
+            self.assertTrue(self.save(repo)["ok"])
+            self.assertTrue(self.save(repo, fresh=True)["ok"])
+        self.assertEqual(read.count("plain"), 1)          # unchanged files are not read again
+
+    def test_a_symlink_in_the_held_folder_is_never_written_through(self):
+        repo = self.repo()
+        (repo / "config").mkdir()
+        (repo / "config" / ".env").write_text("checkout's own\n")
+        first = self.save(repo)
+        self.assertEqual(first["held"], ["config/.env"])
+        outside = self.root / "Documents" / "client-config"
+        outside.mkdir(parents=True)
+        (outside / ".env").write_text("THE USER'S REAL FILE\n")
+        held = Path(first["held_dir"])
+        shutil.rmtree(held / "config")
+        os.symlink(outside, held / "config")   # left there by an older version, or by anyone
+        (repo / "config" / ".env").write_text("checkout's newer\n")
+        second = self.save(repo)
+        self.assertFalse(second["ok"])
+        self.assertIn("not a real directory", second["reason"])
+        self.assertEqual((outside / ".env").read_text(), "THE USER'S REAL FILE\n")
+
+    def test_programs_named_by_the_checkout_own_config_never_run(self):
+        repo = self.repo()
+        marker = self.root / "filter-ran"
+        (repo / ".gitattributes").write_text("* filter=x\n")
+        self.git(repo, "config", "filter.x.clean", "touch '%s'; cat" % marker)
+        (repo / "README.md").write_text("edited\n")
+        facts = git_save.facts(repo)
+        self.assertIn("filter program (filter.x.clean)", facts["errors"][0])
+        result = self.save(repo)
+        self.assertFalse(result["ok"])
+        self.assertFalse(marker.exists())
+
+    def test_the_checkout_own_url_rewrites_do_not_apply_to_the_rescue_remote(self):
+        repo = self.repo()
+        elsewhere = self.bare("elsewhere")
+        self.git(repo, "config", "url.%s.insteadOf" % elsewhere, str(self.rescue))
+        (repo / "wip.txt").write_text("wip\n")
+        result = self.save(repo)
+        self.assert_saved_remote(result)
+        self.assertEqual(self.refs(elsewhere), {})
+
+    def test_a_stash_whose_reflog_was_expired_and_a_broken_ref(self):
+        repo = self.repo()
+        (repo / "README.md").write_text("stashed\n")
+        self.git(repo, "stash", "push", "-q")
+        stash = self.git(repo, "rev-parse", "refs/stash")
+        (repo / ".git" / "logs" / "refs" / "stash").unlink()
+        self.assertEqual(git_save.facts(repo)["tips"]["stash/0"], stash)
+        (repo / ".git" / "refs" / "heads" / "empty").write_text("")
+        self.assertIn("broken ref", " ".join(git_save.facts(repo)["errors"]))
+        self.assertFalse(self.save(repo)["ok"])
+
+    def test_the_bundle_restore_command_works_when_the_bundle_has_prerequisites(self):
+        self.seeded_remote("proj")
+        repo = self.repo(origin="https://fixture.invalid/proj.git")
+        (repo / "README.md").write_text("only here\n")
+        self.configure(rescue_to_origin="never")
+        result = self.save(repo)
+        self.assertEqual(result["where"], "bundle")
+        restore = json.loads(Path(result["bundle"][:-len(".bundle")] + ".json").read_text())["restore"]
+        place = self.root / "restore-here"
+        place.mkdir()
+        subprocess.run(["sh", "-c", restore], cwd=str(place), check=True, capture_output=True)
+        self.assertEqual(self.git(place / "back", "show", "refs/rescued/heads/rescue/snapshot:README.md"), "only here")
+
+    def test_a_public_rescue_remote_on_github_gets_a_bundle(self):
+        self.bare("agent-rescue")
+        self.configure(rescue_remote="https://github.com/acme/agent-rescue.git")
+        self.gh_answer.write_text("false\n")
+        result = self.save(self.repo())
+        self.assertEqual((result["ok"], result["where"]), (True, "bundle"), result)
+        self.assertEqual(self.refs(self.remotes / "agent-rescue.git"), {})
 
 
 if __name__ == "__main__":

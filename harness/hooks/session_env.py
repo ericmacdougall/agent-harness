@@ -4,12 +4,14 @@
 The path is the owner: what a session makes belongs under ~/.agent-harness/work/<session>/. This hook makes that
 folder. When Claude Code names an env file (CLAUDE_ENV_FILE) it adds AH_SESSION, AH_WORK and, unless local.json
 `session_tmpdir` is false, TMPDIR = ~/.agent-harness/tmp/<tmp_key> (0700; 8 characters, because a unix socket path
-holds about 104 characters). It prints one line that tells the agent where its files belong, and a second line when
-autosave.py measured the folder over local.json `session_quota_gb` (default 10).
+holds about 104 characters). It prints one line that tells the agent where its files belong, one more when autosave.py
+measured the folder over local.json `session_quota_gb` (default 10), and one more when, since the last turn end,
+`ah reap` removed checkouts of this folder (they were saved first) or the last save could not save one.
 Nothing is refused or delayed: no tool call is read, and every failure is silence and exit 0. Standard library only.
 """
 from __future__ import annotations
 
+import calendar
 import hashlib
 import json
 import os
@@ -17,6 +19,7 @@ import re
 import shlex
 import stat
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -92,9 +95,9 @@ def context(folder, ah, home, exported=False, session=None) -> str:
         return "~/" + path[len(base):] if path.startswith(base) else path
 
     def line(show, tool):
-        return ("Session folder: %s%s. Put clones, scratch and test fixtures there, not in the home folder or /tmp. "
-                "It is cleaned up after the session ends; unpushed work is saved first. Put anything costly to "
-                "recreate in its keep/ folder. For a checkout: %s co <owner/repo>."
+        return ("Session folder: %s%s. Put clones and test fixtures there, not in the home folder or /tmp. Once "
+                "idle for some hours it may be removed by ah reap; unpushed work is saved first. Put anything costly "
+                "to recreate in its keep/ folder. For a checkout: %s co <owner/repo>."
                 % (show(folder), " ($AH_WORK)" if exported else "", tool))
 
     for text in (line(str, "%spython3 %s" % (env, ah)), line(short, "%spython3 %s" % (env, short(ah))),
@@ -126,6 +129,44 @@ def quota_line(name) -> str:
                                            " Largest: %s." % top if top else ""))
 
 
+def _clean(text, size=80) -> str:
+    return re.sub(r"[\x00-\x1f\x7f]+", " ", str(text))[:size]
+
+
+def notice_line(folder, session) -> str:
+    """One line when, since the last turn end, `ah reap` removed checkouts of this folder (rows of reap.jsonl), or
+    when the last turn-end save could not save a checkout (autosave.py's state file); else ''."""
+    try:
+        state = safe_input.safe_json_loads(safe_input.read_bounded(state_file(folder.name), SMALL))
+    except (safe_input.InputRejected, ValueError):
+        state = {}
+    state = state if isinstance(state, dict) else {}
+    since, removed, parts = _number(state.get("at")) or 0, [], []
+    try:
+        tail = safe_input.read_tail(Path.home() / ".agent-harness" / "logs" / "reap.jsonl", SMALL * 4)
+    except safe_input.InputRejected:
+        tail = b""
+    for line in tail.decode("utf-8", "replace").splitlines():
+        try:
+            row = json.loads(line)
+            at = calendar.timegm(time.strptime(row["time"], "%Y-%m-%dT%H:%M:%SZ"))
+        except (ValueError, TypeError, KeyError, AttributeError):
+            continue
+        if (isinstance(row, dict) and row.get("session") in (session, folder.name) and row.get("kind") == "checkout"
+                and row.get("action") == "removed" and at >= since and isinstance(row.get("path"), str)):
+            base = os.path.realpath(str(folder))
+            removed.append(os.path.relpath(row["path"], base) if row["path"].startswith(base + os.sep) else row["path"])
+    if removed:
+        parts.append("While this session was idle, ah reap removed %d checkout(s) after saving them (%s); the ref or "
+                     "bundle to restore each from is in ~/.agent-harness/logs/reap.jsonl." % (
+                         len(removed), ", ".join(_clean(x) for x in removed[:3])))
+    unsaved = [x for x in state.get("unsaved") or () if isinstance(x, dict)]
+    if unsaved:
+        parts.append("The last save at a turn end could not save %d checkout(s) (%s: %s); ah reap keeps them." % (
+            len(unsaved), _clean(unsaved[0].get("path")), _clean(unsaved[0].get("reason"), 160)))
+    return " ".join(parts)[:2 * MAX_LINE]
+
+
 def main() -> int:
     try:
         data = safe_input.safe_json_loads(safe_input.read_stdin_bounded(SMALL) or b"{}")
@@ -144,9 +185,9 @@ def main() -> int:
             except OSError:
                 pass   # the env file cannot be written: the folder and the context line still stand
         text = context(folder, Path(__file__).resolve().parent / "ah.py", Path.home(), exported, session)
-        extra = quota_line(folder.name)
+        extra = [line for line in (quota_line(folder.name), notice_line(folder, session)) if line]
         print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart",
-                                                 "additionalContext": text + ("\n" + extra if extra else "")}}))
+                                                 "additionalContext": "\n".join([text] + extra)}}))
     except Exception as error:   # noqa: BLE001  this hook never fails a session start
         sys.stderr.write("session_env: skipped (%s)\n" % type(error).__name__)
     return 0

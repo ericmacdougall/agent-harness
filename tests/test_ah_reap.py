@@ -1232,7 +1232,7 @@ class PathOption(Case):
         self.assertTrue((beside / ".git").is_dir())        # only what was named
         self.assertTrue((idle / "node_modules").is_dir())  # and not the work root
         ref, = [ref for ref in self.refs() if ref.endswith("/heads/main")]
-        self.assertRegex(ref, r"^refs/rescue/[^/]+/loose/timbar-pr41-[0-9a-f]{8}/heads/main$")
+        self.assertRegex(ref, r"^refs/rescue/[^/]+/loose/timbar-pr41-[0-9a-f]{8}/[0-9]{8}T[0-9]{6}Z-[0-9a-f]{4}/heads/main$")
         self.assertEqual(self.refs()[ref], work)
         self.assertEqual({row["session"] for row in self.rows()}, {None})
 
@@ -1260,22 +1260,23 @@ class PathOption(Case):
 
 
 class Docker(Case):
-    def things(self, folder):
+    def things(self, folder, state="exited"):
         containers = [
             {"Id": "c0ffee01", "Name": "/pp795-pg", "Config": {"Labels": {"ah.session": SESSION}},
-             "State": {"Status": "running"}, "Mounts": []},
+             "State": {"Status": state}, "Mounts": []},
             {"Id": "c0ffee02", "Name": "/bound", "Config": {"Labels": {}}, "State": {"Status": "exited"},
              "Mounts": [{"Type": "bind", "Source": str(folder / "data")}, {"Type": "volume", "Name": "anon"}]},
             {"Id": "c0ffee03", "Name": "/guard-pin", "Config": {"Labels": None}, "State": {"Status": "exited"},
              "Mounts": [{"Type": "bind", "Source": "/srv/elsewhere"}]},
             {"Id": "c0ffee04", "Name": "/other-session", "Config": {"Labels": {"ah.session": OTHER}},
              "State": {"Status": "running"}, "Mounts": []},
-            {"Id": "--force", "Name": "/odd", "Config": {"Labels": {"ah.session": SESSION}}, "State": {}, "Mounts": []}]
+            {"Id": "--force", "Name": "/odd", "Config": {"Labels": {"ah.session": SESSION}},
+             "State": {"Status": "exited"}, "Mounts": []}]
         volumes = [{"Name": "pgdata-s1", "Labels": {"ah.session": SESSION}}, {"Name": "unowned", "Labels": None},
                    {"Name": "other-vol", "Labels": {"ah.session": OTHER}}]
         self.docker(containers, volumes)
 
-    def test_only_the_idle_sessions_containers_and_volumes_are_stopped_and_removed(self):
+    def test_only_the_idle_sessions_stopped_containers_and_its_volumes_are_removed(self):
         folder, live = self.folder(), self.folder(OTHER)
         self.age(folder, 60)
         self.things(folder)
@@ -1287,14 +1288,30 @@ class Docker(Case):
         self.assertEqual(code, 0, out)
         changes = [call for call in self.docker_calls() if not call.startswith(("ps", "inspect", "volume ls",
                                                                                  "volume inspect"))]
-        self.assertEqual(changes, ["stop c0ffee01", "rm -v c0ffee01", "stop c0ffee02", "rm -v c0ffee02",
-                                   "volume rm pgdata-s1"])
+        self.assertEqual(changes, ["rm -v c0ffee01", "rm -v c0ffee02", "volume rm pgdata-s1"])   # nothing is stopped
         for word in ("prune", "rmi", "image", "system", "guard", "c0ffee03", "c0ffee04", "unowned", "other-vol",
                      "--force"):   # never an image, a prune, an unlabelled thing or a live session's
             self.assertFalse([call for call in changes if word in call], word)
         self.assertEqual([(row["kind"], row["path"]) for row in self.rows("removed")],
                          [("container", "pp795-pg"), ("container", "bound"), ("volume", "pgdata-s1")])
         self.assertTrue(live.is_dir())
+
+    def test_a_running_container_keeps_the_folder_its_checkouts_and_its_volume(self):
+        folder = self.folder()
+        repo = self.repo(folder / "co" / "app")
+        (repo / "wip.txt").write_text("wip\n")
+        self.age(folder, 72)
+        for state in ("running", "paused", "restarting", None):
+            with self.subTest(state):
+                self.things(folder, state)
+                code, out = self.reap("run", "--apply")
+                self.assertEqual(code, 0, out)
+                self.assertIn("kept  folder  %s  container pp795-pg is %s" % (
+                    folder, state or "in an unknown state"), out)
+                self.assertEqual([call for call in self.docker_calls() if call.split()[0] in ("stop", "rm", "volume")
+                                  and not call.startswith(("volume ls", "volume inspect"))], [])
+                self.assertTrue((repo / "wip.txt").exists())
+                self.assertEqual(self.rows("removed"), [])
 
     def test_a_removal_docker_refuses_is_a_failure(self):
         folder = self.folder()
@@ -1445,6 +1462,7 @@ class Checkout(Case):
         self.assertFalse(os.path.exists(os.path.join(path, ".git", "objects", "info", "alternates")))
         mirror = self.home / ".agent-harness" / "cache" / "git" / "acme" / "proj.git"
         self.assertEqual(self.git(mirror, "rev-parse", "--is-bare-repository"), "true")
+        self.assertNotIn("refs/pull/", self.git(mirror, "for-each-ref"))   # branches and tags only
         facts = git_save.facts(path)
         self.assertEqual((facts["real_remote"], facts["alternates"], facts["branch"], facts["errors"]),
                          ("https://github.com/acme/proj.git", [], "main", []))
@@ -1483,6 +1501,190 @@ class Checkout(Case):
         self.assertEqual(code, 1)
         self.assertTrue(err)
         self.assertEqual(sorted(p.name for p in (self.folder() / "co").iterdir()), ["proj"])
+
+
+class ReviewFixes(Case):
+    """Each test here failed before the fix it is named for (reviews rt2-data-loss and rt2-friction-security)."""
+
+    def temp(self, session=SESSION):
+        import session_env  # noqa: PLC0415
+        return Path(os.path.realpath(session_env.make_tmp(self.folder(session).name)))
+
+    def everything(self):
+        """Every object the rescue remote holds, as one blob of bytes."""
+        return subprocess.run(["git", "-C", str(self.rescue), "cat-file", "--batch-all-objects", "--batch"],
+                              capture_output=True, check=True).stdout
+
+    def test_checkouts_and_keep_in_the_session_temp_directory_are_saved_or_kept_first(self):
+        folder, temp = self.folder(), self.temp()
+        main = self.repo(folder / "co" / "app")
+        self.git(main, "worktree", "add", "-q", "-b", "fix-tmp", str(temp / "wt"))
+        (temp / "wt" / "README.md").write_text("UNCOMMITTED WORKTREE EDIT\n")
+        self.git(main, "worktree", "add", "-q", "--detach", str(temp / "detached"))
+        detached = self.commit(temp / "detached", "d.txt", "DETACHED COMMIT\n")
+        clone = self.repo(temp / "clone", origin=main)
+        unpushed = self.commit(clone, "c.txt", "UNPUSHED IN TMP CLONE\n")
+        (temp / "keep").mkdir()
+        (temp / "keep" / "results.json").write_text("{}\n")
+        (temp / "scratch.txt").write_text("disposable\n")
+        code, out = self.apply()
+        self.assertEqual(code, 0, out)
+        objects = self.everything()
+        for text in (b"UNCOMMITTED WORKTREE EDIT", b"DETACHED COMMIT", b"UNPUSHED IN TMP CLONE"):
+            self.assertIn(text, objects)
+        commits = set(self.refs().values())
+        self.assertTrue({detached, unpushed} <= commits, out)
+        self.assertEqual((temp / "keep" / "results.json").read_text(), "{}\n")
+        self.assertFalse((temp / "scratch.txt").exists())
+        removed = self.removed()
+        self.assertLess(removed.index(str(temp / "wt")), removed.index(str(main)))   # a worktree before its repository
+        self.assertIn(str(temp / "clone"), removed)
+
+    def test_a_kept_checkout_in_the_temp_directory_keeps_its_main_repository_and_itself(self):
+        folder, temp = self.folder(), self.temp()
+        main = self.repo(folder / "co" / "app")
+        self.git(main, "worktree", "add", "-q", "-b", "side", str(temp / "wt"))
+        (temp / "wt" / "keep").mkdir()   # a checkout that holds a keep/ is kept whole
+        (temp / "wt" / "keep" / "paid.json").write_text("{}\n")
+        code, out = self.apply()
+        self.assertEqual(code, 0, out)
+        self.assertTrue((temp / "wt" / "keep" / "paid.json").exists())
+        self.assertTrue(main.is_dir(), out)
+
+    def test_a_temp_directory_of_no_folder_that_holds_a_checkout_is_left(self):
+        orphan = self.home / ".agent-harness" / "tmp" / "deadbeef"
+        repo = self.repo(orphan / "clone")
+        self.commit(repo, "x.txt", "only here\n")
+        self.age(orphan, 100)
+        code, out = self.apply()
+        self.assertEqual(code, 0, out)
+        self.assertIn("holds the git checkout %s" % repo, out)
+        self.assertTrue((repo / "x.txt").exists())
+
+    def test_a_deletion_that_stops_part_way_never_lets_a_later_save_replace_the_proof(self):
+        folder = self.folder()
+        repo = self.repo(folder / "co" / "app")
+        (repo / "README.md").write_text("UNCOMMITTED EDIT THAT EXISTS NOWHERE ELSE\n")
+        real = ah_reap._remove
+
+        def stops_part_way(path):
+            if path == str(repo):
+                os.unlink(os.path.join(path, "README.md"))
+                raise PermissionError(1, "Operation not permitted", path)
+            return real(path)
+
+        with mock.patch.object(ah_reap, "_remove", side_effect=stops_part_way):
+            code, out = self.apply()
+        self.assertEqual(code, 1, out)
+        before = self.refs()
+        self.assertTrue((repo / ".git" / git_save.REAPING).exists())
+        self.age(folder, 100)
+        code, out = self.apply()   # another idle period, a real deletion this time
+        self.assertIn("stopped part way", out)
+        self.assertTrue(repo.is_dir())
+        self.assertEqual(self.refs(), before)
+        self.assertIn(b"UNCOMMITTED EDIT THAT EXISTS NOWHERE ELSE", self.everything())
+        import autosave  # noqa: PLC0415  and the save at a turn end does not save over it either
+        self.assertIn("stopped part way", autosave.run(SESSION))
+        self.assertEqual(self.refs(), before)
+
+    def test_the_autosave_lock_is_held_while_a_folder_is_reduced(self):
+        import fcntl  # noqa: PLC0415
+        import session_env  # noqa: PLC0415
+        folder = self.folder()
+        repo = self.repo(folder / "co" / "app")
+        lock_path = str(session_env.state_file(folder.name)) + ".lock"
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        with open(lock_path, "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)   # autosave is saving right now
+            code, out = self.apply()
+        self.assertEqual(code, 0, out)
+        self.assertIn("autosave is saving it right now", out)
+        self.assertTrue(repo.is_dir())
+        seen = []
+        real = git_save.save
+
+        def save_and_probe(*args, **kw):
+            with open(lock_path, "a") as probe:   # while the reaper saves, autosave cannot get in
+                try:
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    seen.append("free")
+                except OSError:
+                    seen.append("held")
+            return real(*args, **kw)
+
+        with mock.patch.object(git_save, "save", side_effect=save_and_probe):
+            code, out = self.apply()
+        self.assertEqual((code, seen), (0, ["held"]), out)
+        self.assertFalse(repo.exists())
+
+    def test_one_run_at_a_time(self):
+        import fcntl  # noqa: PLC0415
+        lock_path = self.home / ".agent-harness" / "state" / "reap.lock"
+        lock_path.parent.mkdir(parents=True)
+        with open(lock_path, "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            code, out = self.apply()
+        self.assertEqual(code, 3, out)
+        self.assertIn("another `ah reap run --apply` is running", out)
+        self.assertEqual(self.reap("run")[0], 0)   # a dry run takes no lock
+
+    def test_a_file_moved_in_after_the_save_keeps_the_checkout(self):
+        folder = self.folder()
+        repo = self.repo(folder / "co" / "app")
+        real = git_save.save
+
+        def save_then_move_in(*args, **kw):
+            result = real(*args, **kw)
+            moved = self.root / "made-elsewhere.txt"
+            moved.write_text("MOVED IN AFTER THE SAVE\n")
+            old = time.time() - 5 * 86400
+            os.utime(moved, (old, old))
+            os.rename(moved, repo / "moved.txt")   # keeps its five-day-old mtime
+            return result
+
+        with mock.patch.object(git_save, "save", side_effect=save_then_move_in):
+            code, out = self.apply()
+        self.assertEqual(code, 0, out)
+        self.assertIn("it changed after its save", out)
+        self.assertTrue((repo / "moved.txt").exists())
+        self.assertFalse((repo / ".git" / git_save.REAPING).exists())
+
+    def test_a_mount_point_keeps_the_folder_and_is_never_crossed(self):
+        folder, temp = self.folder(), self.temp()
+        share = temp / "tmp.M0unt" / "share"
+        share.mkdir(parents=True)
+        (share / "remote-file.txt").write_text("on another machine\n")
+        (folder / "node_modules").mkdir()
+        real = ah_reap._dev
+        with mock.patch.object(ah_reap, "_dev", side_effect=lambda path: real(path) + (
+                1 if str(path).startswith(str(share)) else 0)):
+            code, out = self.apply()
+            self.assertIn("a mount point inside: %s" % share, out)
+            self.assertTrue((share / "remote-file.txt").exists())
+            self.assertTrue((folder / "node_modules").is_dir())
+            with self.assertRaisesRegex(OSError, "another file system"):
+                ah_reap._remove(str(temp / "tmp.M0unt"))
+        self.assertTrue((share / "remote-file.txt").exists())
+
+    def test_a_checkout_inside_or_named_like_a_rebuildable_directory_is_saved_before_it_goes(self):
+        folder = self.folder()
+        app = self.repo(folder / "co" / "app")
+        lib = self.repo(app / ".venv" / "src" / "lib")   # where `pip install -e git+URL` clones
+        patched = self.commit(lib, "f.txt", "PATCHED DEPENDENCY\n")
+        venv = self.repo(folder / "co" / "venv")         # a checkout that happens to be called venv
+        only = self.commit(venv, "v.txt", "ONLY COMMIT\n")
+        (app / ".gitignore").write_text("build/\n.venv/\n")
+        fmt = self.repo(app / "build" / "_deps" / "fmt-src")
+        later = self.commit(fmt, "p.txt", "PATCH 2\n")
+        (app / "node_modules" / "x").mkdir(parents=True)  # plain rebuildable output still goes
+        code, out = self.apply()
+        self.assertEqual(code, 0, out)
+        commits = set(self.refs().values())
+        self.assertTrue({patched, only, later} <= commits, out)
+        self.assertFalse((folder / "co").exists() and any((folder / "co").iterdir()), out)
+        self.assertIn(str(app / "node_modules"), self.removed("rebuildable"))
+        self.assertNotIn(str(app / ".venv"), self.removed("rebuildable"))
 
 
 if __name__ == "__main__":

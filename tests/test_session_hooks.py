@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -173,7 +174,7 @@ class SessionStart(Case):
         text = self.context(self.start())
         self.assertNotIn("\n", text)
         self.assertLess(len(text), 400)
-        for part in ("Session folder: ", SESSION, "($AH_WORK)", "not in the home folder or /tmp", "cleaned up after",
+        for part in ("Session folder: ", SESSION, "($AH_WORK)", "not in the home folder or /tmp", "may be removed by ah reap",
                      "unpushed work is saved first", "keep/", " co <owner/repo>."):
             self.assertIn(part, text)
 
@@ -501,6 +502,48 @@ class Wiring(Case):
         self.assertEqual(verdict(tmp / SESSION[:8] / "fixture"), "allow")
         self.assertEqual(verdict(tmp / OTHER[:8] / "fixture"), "block")
         self.assertEqual(verdict(tmp), "block")
+
+
+class ReviewFixes(Case):
+    """Each test here failed before the fix it is named for (reviews rt2-data-loss and rt2-friction-security)."""
+
+    def test_the_next_start_says_what_ah_reap_removed_and_what_could_not_be_saved(self):
+        self.start()
+        self.stop()   # a turn end: the state file records when
+        log = self.home / ".agent-harness" / "logs" / "reap.jsonl"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        later = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 5))
+        rows = [{"time": later, "session": SESSION, "kind": "checkout", "action": "removed",
+                 "path": os.path.realpath(str(self.work / "co" / "app")), "saved": {"where": "bundle"}},
+                {"time": later, "session": OTHER, "kind": "checkout", "action": "removed", "path": "/x/other"},
+                {"time": "2000-01-01T00:00:00Z", "session": SESSION, "kind": "checkout", "action": "removed",
+                 "path": "/x/long-ago"}]
+        log.write_text("".join(json.dumps(row) + "\n" for row in rows) + "not json\n")
+        state = self.state()
+        state["unsaved"] = [{"path": "co/cov", "reason": "more than 5000 ignored files to hold"}]
+        session_env.state_file(SESSION).write_text(json.dumps(state))
+        lines = self.context(self.start()).split("\n")
+        self.assertEqual(len(lines), 2, lines)
+        self.assertIn("ah reap removed 1 checkout(s) after saving them (co/app)", lines[1])
+        self.assertIn("reap.jsonl", lines[1])
+        self.assertIn("could not save 1 checkout(s) (co/cov: more than 5000 ignored files to hold)", lines[1])
+        self.assertNotIn("other", lines[1])
+        self.assertNotIn("long-ago", lines[1])
+
+    def test_checkouts_in_the_session_temp_directory_are_saved_at_a_turn_end(self):
+        self.start()
+        tmp = self.home / ".agent-harness" / "tmp" / SESSION[:8]
+        clone = tmp / "clone"
+        clone.mkdir()
+        self.git(clone, "init", "-q")
+        (clone / "fix.txt").write_text("only in the temp directory\n")
+        self.git(clone, "add", "fix.txt")
+        self.git(clone, "commit", "-q", "-m", "fix")
+        done = self.stop()
+        self.assertEqual((done.returncode, done.stderr), (0, ""))
+        head = self.git(clone, "rev-parse", "HEAD")
+        self.assertIn(head, self.rescued().values())
+        self.assertTrue([ref for ref in self.rescued() if "/tmp-clone-" in ref])
 
 
 if __name__ == "__main__":

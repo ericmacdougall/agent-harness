@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Stop, SubagentStop and SessionEnd hook: save what the session's checkouts hold nowhere else (docs/lifecycle.md).
 
-For each git checkout under ~/.agent-harness/work/<session>/ (a bounded search, at most 20 checkouts, children first)
-it calls git_save.save, all inside one budget of 20 seconds. An unchanged checkout is answered from git_save's state
+For each git checkout under ~/.agent-harness/work/<session>/ and the session's temp directory (a bounded search, at
+most 20 checkouts each, children first) it calls git_save.save, all inside one budget of 20 seconds. An unchanged checkout is answered from git_save's state
 file and costs no network call. Unpushed commits, stashes and working-tree changes end up on the rescue remote or in
 a verified bundle, which is what lets `ah reap` remove the folder later without losing work.
 It prints nothing when everything is saved and one line on stderr when something is not. It always exits 0 and
@@ -108,9 +108,16 @@ def run(session) -> str:
         except OSError:
             return ""   # another run for this session is saving right now
         found, more = checkouts(folder)
+        named = [(path, os.path.relpath(path, str(folder))) for path in found]
+        tmp = session_env.tmp_dir(folder.name)
+        if os.path.isdir(tmp) and not os.path.islink(tmp):   # the same names `ah reap` saves them under
+            tmp = os.path.realpath(str(tmp))
+            extra, also = checkouts(tmp)
+            named += [(path, "tmp" if path == tmp else "tmp/" + os.path.relpath(path, tmp)) for path in extra]
+            found, more = found + extra, more or also
         unsaved = []
-        for path in found:
-            rel, left = os.path.relpath(path, str(folder)), BUDGET_S - (time.monotonic() - started)
+        for path, rel in named:
+            left = BUDGET_S - (time.monotonic() - started)
             result = (git_save.save(path, folder.name, "top" if rel == "." else rel, budget_s=left) if left >= 1
                       else {"ok": False, "reason": "the %d second budget ran out" % BUDGET_S})
             if not result["ok"]:

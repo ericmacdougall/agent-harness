@@ -8,20 +8,24 @@
 The path is the owner: a folder directly under ~/.agent-harness/work belongs to the session it is named after, and
 `--path` names one other folder exactly. Nothing here reads command text or blocks a tool call, and `run` changes
 nothing without --apply. In a folder idle long enough that no process uses, `run --apply` removes rebuildable
-directories (node_modules, .venv, target, ...), the contents of the session's temp directory (the directory stays,
-so a session that comes back keeps its TMPDIR), every git checkout `git_save.save` proves saved (children first), and
-the docker containers and volumes tied to that session. A run over everything also removes the harness's own
-leftovers: temp directories of no folder, state files of checkouts that are gone, mirrors unused for 30 days. It never
-removes loose files, a folder with a .keep file, a keep/ directory or a checkout that holds one, the calling session's
-own folder, a symlink, a docker image, an unlabelled container or anything under ~/.agent-harness/rescue. Unknown means keep: a git error, an unreadable directory, an
-unproven save or a process inside the folder keeps the data, and the reason is printed. Every deletion is a row in
-~/.agent-harness/logs/reap.jsonl, written before the deletion starts. Exit codes: 0 done or nothing to do,
-1 something failed, 3 refused. Standard library only.
+directories (node_modules, .venv, target, ...; never one that holds a .git entry), every git checkout in the folder or
+its session temp directory that `git_save.save` proves saved (children first), the rest of that temp directory (the
+directory stays, so a session that comes back keeps its TMPDIR), and the stopped docker containers and the volumes
+tied to that session. A run over everything also removes the harness's own leftovers: temp directories of no folder,
+state files of checkouts that are gone, mirrors unused for 30 days. It never removes loose files, a folder with a
+.keep file, a keep/ directory or a checkout that holds one, the calling session's own folder, a symlink, anything on
+another file system, a running container, a docker image, an unlabelled container or anything under
+~/.agent-harness/rescue. Unknown means keep: a git error, an unreadable directory, an unproven save, a checkout that
+changed after its save or a process inside the folder keeps the data, and the reason is printed. Every deletion is a
+row in ~/.agent-harness/logs/reap.jsonl, written before the deletion starts. Exit codes: 0 done or nothing to do,
+1 something failed, 3 refused (bad arguments, unsafe platform, another run going). Standard library only.
 """
 from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -46,6 +50,7 @@ DEFAULT_HOURS, DONE_HOURS = 48, 1
 MIRROR_DAYS = 30               # a mirror in ~/.agent-harness/cache/git that `ah co` has not used for this long goes
 PRESSURE_HOURS, PRESSURE_DROP = 6, 5   # --if-above: the idle hours that are enough, and how far under PCT to stop
 SESSION_ENV = ("AH_SESSION", "CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID")
+STOPPED = ("exited", "created", "dead")   # a container in any other state counts as use of its folder
 
 
 def _inside(path, root) -> bool:
@@ -84,6 +89,11 @@ def _idle_default():
 
 def _session():
     return next((os.environ[key] for key in SESSION_ENV if os.environ.get(key)), None)
+
+
+def _dev(path) -> int:
+    """The device of `path` itself (a symlink is not followed): a directory on another one is a mount point."""
+    return os.lstat(path).st_dev
 
 
 def _dirs(parent, links=False, files=False) -> list:
@@ -167,11 +177,38 @@ def _rebuildable(path, checkout) -> bool:
     return code == 0 and not out
 
 
+def _holds_checkout(path, dev) -> bool:
+    """True when a .git entry or another file system lies anywhere below `path`, or the walk cannot finish. Such a
+    directory is never removed whole as rebuildable (`pip install -e git+...` clones into .venv/src/<name>)."""
+    stack, seen = [path], 0
+    while stack:
+        current = stack.pop()
+        try:
+            if _dev(current) != dev:
+                return True
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    seen += 1
+                    if entry.name == ".git" or seen > WALK_MAX:
+                        return True
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(entry.path)
+        except OSError:
+            return True
+    return False
+
+
 def _survey(folder) -> dict:
     """One walk that never enters .git, keep/ or a rebuildable directory. Read only. `newest` is the latest change
-    of a file (directories do not count: removing a rebuildable directory changes its parent)."""
+    of a file (directories do not count: removing a rebuildable directory changes its parent). A directory on
+    another file system (a mount point) is a problem: nothing there may be removed."""
     found = {"checkouts": [], "rebuildable": [], "keep": [], "big": [], "newest": 0.0, "problem": None}
     stack, seen = [(folder, None)], 0
+    try:
+        dev = _dev(folder)
+    except OSError as error:
+        found["problem"] = "unreadable directory %s (%s)" % (folder, type(error).__name__)
+        return found
     while stack and not found["problem"]:
         current, checkout = stack.pop()
         try:
@@ -189,18 +226,33 @@ def _survey(folder) -> dict:
         for entry in entries:
             try:
                 info = entry.stat(follow_symlinks=False)
+                device = _dev(entry.path) if stat.S_ISDIR(info.st_mode) else dev
             except OSError:
                 continue
             if not stat.S_ISDIR(info.st_mode):
                 found["newest"] = max(found["newest"], info.st_mtime)
                 if checkout is None and stat.S_ISREG(info.st_mode) and info.st_size > BIG_FILE:
                     found["big"].append({"path": entry.path, "bytes": info.st_size})
+            elif device != dev:
+                found["problem"] = "a mount point inside: %s (nothing on another file system is removed)" % entry.path
             elif entry.name == "keep":
                 found["keep"].append(entry.path)
-            elif entry.name != ".git" and _rebuildable(entry.path, checkout):
+            elif entry.name != ".git" and _rebuildable(entry.path, checkout) and not _holds_checkout(entry.path, dev):
                 found["rebuildable"].append(entry.path)
             elif entry.name != ".git":
                 stack.append((entry.path, checkout))
+    return found
+
+
+def _survey_all(look) -> dict:
+    """_survey of the folder and of its session temp directory together, so a checkout or a keep/ in the temp
+    directory is saved or kept like one in the folder."""
+    found = _survey(look["real"])
+    if look.get("tmp"):
+        more = _survey(look["tmp"])
+        for key in ("checkouts", "rebuildable", "keep"):
+            found[key] += more[key]
+        found.update(newest=max(found["newest"], more["newest"]), problem=found["problem"] or more["problem"])
     return found
 
 
@@ -274,7 +326,7 @@ def _activity(look, since=None):
 def _full(look) -> dict:
     """The look with everything a report needs: what the folder holds, its size and when it last changed."""
     if not look["skip"]:
-        look.update(_survey(look["real"]))
+        look.update(_survey_all(look))
         look["last"], look["bytes"], look["complete"] = _activity(look)
     return look
 
@@ -308,7 +360,7 @@ def _recheck(look):
     changes (objects a save writes in .git, the parents of what it removed) does not count as use."""
     if os.path.lexists(os.path.join(look["path"], workdir.KEEP)):
         return "has a .keep file"
-    fresh = _survey(look["real"])
+    fresh = _survey_all(look)
     signs = [Path(look["wal"])] + (workdir._transcripts(look["owner"]) if look["owner"] else [])
     last = max([fresh["newest"]] + [workdir._mtime(sign) for sign in signs])
     if (time.time() - last) / 3600.0 < look["need"]:
@@ -430,9 +482,11 @@ def _remove(path) -> None:
         os.unlink(path)   # a file or a symlink: the link goes, never what it points to
         return
     own = {"follow_symlinks": False} if os.chmod in os.supports_follow_symlinks else {}
-    stack = [path]
+    stack, dev = [path], _dev(os.path.dirname(path))
     while stack:
         current = stack.pop()
+        if _dev(current) != dev:   # checked for the whole tree before anything is deleted
+            raise OSError("%s is on another file system" % current)
         mode = os.lstat(current).st_mode
         if stat.S_ISDIR(mode):
             if stat.S_IMODE(mode) & 0o700 != 0o700:
@@ -478,9 +532,10 @@ class _Run:
             return False
         return True
 
-    def remove(self, look, kind, path, saved=None, reason=None, contents=False) -> bool:
+    def remove(self, look, kind, path, saved=None, reason=None, contents=False, spare=()) -> bool:
         """Log one deletion, then do it. True when the tree is gone. `contents`: empty the directory and keep it
-        (mode 0700), as for a session temp directory, which a live but idle session still has as its TMPDIR."""
+        (mode 0700), as for a session temp directory, which a live but idle session still has as its TMPDIR; an
+        entry that holds a path in `spare` (a kept checkout, a keep/) stays."""
         size = _size(path)
         if not self.note("removed", kind, path, look, reason or look["why"], size, saved) or not self.apply:
             return False
@@ -490,7 +545,8 @@ class _Run:
                     raise OSError("it became a symlink")
                 os.chmod(path, 0o700)
                 for name in sorted(os.listdir(path)):
-                    _remove(os.path.join(path, name))
+                    if not any(_inside(kept, os.path.join(path, name)) for kept in spare):
+                        _remove(os.path.join(path, name))
             else:
                 _remove(path)
         except OSError as error:
@@ -502,13 +558,25 @@ class _Run:
 
     def reduce(self, look, borrowed, things) -> None:
         """Steps 1 to 6 for one eligible folder: rebuildable output, then checkouts (save, check again, delete), then
-        the session's containers and volumes."""
+        the rest of the session temp directory, then the session's stopped containers and its volumes. A running
+        container tied to the folder counts as use. The folder's autosave lock is held throughout."""
+        mine = [thing for thing in things or () if thing["folder"] == look["real"]]
+        running = [thing for thing in mine if thing["kind"] == "container" and thing["state"] not in STOPPED]
+        if running:
+            self.note("kept", "folder", look["real"], look, "container %s is %s" % (
+                running[0]["name"], running[0]["state"] or "in an unknown state"))
+            return
+        with _save_lock(look, self.apply) as free:
+            if free:
+                self._reduce(look, borrowed, mine)
+            else:
+                self.note("kept", "folder", look["real"], look, "autosave is saving it right now")
+
+    def _reduce(self, look, borrowed, mine) -> None:
         top, session = look["real"], "loose" if look["loose"] else look["name"]   # the names autosave.py saves under
         why = _recheck(look) if self.apply else None
         for path in [] if why else sorted(look["rebuildable"]):
             self.remove(look, "rebuildable", path)
-        if not why and look["tmp"] and _dirs(look["tmp"], files=True):   # emptied; the directory itself stays
-            self.remove(look, "tmp", look["tmp"], reason="%s; contents only" % look["why"], contents=True)
         order, facts, before, outside, circle = ([], {}, {}, {}, ()) if why else _order(look["checkouts"], borrowed)
         saved, kept = {}, {}
         for repo in order:
@@ -527,8 +595,7 @@ class _Run:
             elif blocker:
                 kept[repo] = "%s is kept, and it is inside this checkout or depends on it" % blocker
             elif self.apply:
-                name = os.path.relpath(repo, top) if repo != top else look["name"] if look["loose"] else "top"
-                saved[repo] = git_save.save(repo, session, name, fresh=True)   # fresh: proven now, not remembered
+                saved[repo] = git_save.save(repo, session, _name(look, repo), fresh=True)   # proven now
                 if _unproven(saved[repo], top):
                     kept[repo] = _unproven(saved[repo], top)
             else:
@@ -541,23 +608,67 @@ class _Run:
             self.note("kept", "folder", top, look, why)
             return
         for repo in [repo for repo in order if repo in saved and repo not in kept]:
+            blocker = next((other for other in sorted(before[repo]) if other in kept), None)
+            kept[repo] = blocker and "%s is kept, and it is inside this checkout or depends on it" % blocker
+            f, mark = facts[repo], os.path.join(facts[repo]["git_dir"], git_save.REAPING)
             proof = dict({key: saved[repo].get(key) for key in ("where", "url", "refs", "bundle", "held_dir")},
                          held=len(saved[repo].get("held") or ()))
-            f = facts[repo]   # a removed linked worktree leaves an entry in its repository: drop it, as git would
-            if (self.remove(look, "checkout", repo, proof) and f["linked_worktree"]
-                    and os.path.dirname(f["git_dir"]) == os.path.join(f["common_dir"], "worktrees")):
-                shutil.rmtree(f["git_dir"], ignore_errors=True)
-        for thing in sorted((t for t in things or () if t["folder"] == top), key=lambda t: t["kind"]):
+            if not kept[repo]:   # the mark stops any later save from replacing this proof with a half-deleted tree
+                try:
+                    with open(mark, "x") as handle:
+                        json.dump(proof, handle)
+                except OSError as error:
+                    kept[repo] = "it cannot be marked for deletion (%s)" % type(error).__name__
+            if not kept[repo] and not git_save.unchanged(repo, session, saved[repo].get("proof")):
+                os.unlink(mark)
+                kept[repo] = "it changed after its save (a commit, a file moved in, an edit)"
+            if kept[repo]:
+                self.note("kept", "checkout", repo, look, kept[repo])
+                continue
+            del kept[repo]
+            if not self.remove(look, "checkout", repo, proof):
+                kept[repo] = "its deletion stopped part way"   # the mark stays
+            elif f["linked_worktree"] and os.path.dirname(f["git_dir"]) == os.path.join(f["common_dir"], "worktrees"):
+                shutil.rmtree(f["git_dir"], ignore_errors=True)   # git would drop the entry of a removed worktree
+        if look["tmp"] and _dirs(look["tmp"], files=True):   # emptied around what stays; the directory itself stays
+            self.remove(look, "tmp", look["tmp"], reason="%s; contents only" % look["why"], contents=True,
+                        spare=list(kept) + look["keep"])
+        for thing in sorted(mine, key=lambda t: t["kind"]):   # containers first: a volume in use cannot go
             plain = re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", str(thing["id"]))
             if plain and self.note("removed", thing["kind"], thing["name"], look, look["why"]) and self.apply:
-                if thing["kind"] == "container":   # only this session's own: never an image, never a prune
-                    _docker("stop", thing["id"], timeout=60)
+                if thing["kind"] == "container":   # only this session's own stopped ones: never an image, a prune
                     gone = _docker("rm", "-v", thing["id"]) is not None
                 else:
                     gone = _docker("volume", "rm", thing["id"]) is not None
                 if not gone:
                     self.failed = True
                     self.note("failed", thing["kind"], thing["name"], look, "docker did not remove it")
+
+
+def _name(look, repo) -> str:
+    """The name a checkout is saved under, the same in autosave.py: its path in the folder, or tmp/<path> in the
+    session temp directory."""
+    if look["tmp"] and _inside(repo, look["tmp"]):
+        return "tmp" + ("/" + os.path.relpath(repo, look["tmp"]) if repo != look["tmp"] else "")
+    return os.path.relpath(repo, look["real"]) if repo != look["real"] else look["name"] if look["loose"] else "top"
+
+
+@contextlib.contextmanager
+def _save_lock(look, apply):
+    """autosave.py's lock for the folder's session, held while the folder is reduced, so no turn-end save runs
+    between a proof and its deletion. Yields False when autosave holds it now."""
+    if look["loose"] or not apply:
+        yield True
+        return
+    path = str(session_env.state_file(look["name"])) + ".lock"
+    git_save._mkdirs(os.path.dirname(path))
+    with open(path, "a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            free = True
+        except OSError:
+            free = False
+        yield free
 
 
 def _below(*parts) -> list:
@@ -588,10 +699,14 @@ def _leftovers(run, root, hours, claims, table, borrowed) -> None:
         if last > now - need * 3600:
             continue
         users = borrowed().get(os.path.realpath(os.path.join(path, "objects")), []) if kind == "mirror" else []
+        inside = _survey(look["real"]) if kind == "tmp" else {"checkouts": [], "keep": [], "problem": None}
         look["why"] = "%s, unused for %.1f hours" % ("belongs to no session folder" if kind == "tmp" else "a mirror",
                                                     (now - last) / 3600.0)
         why = (None if complete else "too large or unreadable to tell when it was last used") or (
-            "%s borrows its objects" % users[0] if users else None) or _in_use(look, table())
+            "%s borrows its objects" % users[0] if users else None) or inside["problem"] or (
+            "holds the git checkout %s, which is never removed unsaved" % inside["checkouts"][0]
+            if inside["checkouts"] else None) or (
+            "holds %s, which is never removed" % inside["keep"][0] if inside["keep"] else None) or _in_use(look, table())
         if why:
             run.note("left", kind, path, look, why)
         else:
@@ -633,6 +748,9 @@ def _run(args) -> int:
                 or _inside(home, real)):
             refused = ("--path %s must be a real directory, and not the home folder, a folder that holds it, or "
                        "anything under ~/.agent-harness, ~/.claude or ~/.codex (--session names a session)" % given)
+    lock = _run_lock() if args.apply and not refused else True
+    if not lock:
+        refused = "another `ah reap run --apply` is running"
     if refused:
         print("ah reap: " + refused, file=sys.stderr)
         return 3
@@ -675,7 +793,7 @@ def _run(args) -> int:
         if args.apply and args.if_above is not None and (_disk_used(root) or 0) <= args.if_above - PRESSURE_DROP:
             print("the disk is now %d points under %g%%: stopping" % (PRESSURE_DROP, args.if_above))
             break
-        look.update(_survey(look["real"]))
+        look.update(_survey_all(look))
         if look["problem"]:
             run.note("left", "folder", look["path"], look, look["problem"])
             continue
@@ -685,6 +803,22 @@ def _run(args) -> int:
         _leftovers(run, root, hours, claims, lambda: once("table", _processes), lambda: once("borrowed", borrowed))
     print("freed %s" % _human(run.freed) if args.apply else "nothing was changed: this was a dry run (--apply does it)")
     return 1 if run.failed else 0
+
+
+def _run_lock():
+    """An open, locked ~/.agent-harness/state/reap.lock, or None when another run holds it. Kept open for the run."""
+    path = git_save._home("state", "reap.lock")
+    try:
+        git_save._mkdirs(os.path.dirname(path))
+        handle = open(path, "a")
+    except OSError:
+        return None
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
 
 
 def _scan(args) -> int:
@@ -809,10 +943,11 @@ def co_main(argv=None) -> int:
     os.makedirs(os.path.dirname(target), exist_ok=True)
     git_save._mkdirs(os.path.dirname(mirror))
     if os.path.isdir(mirror):   # a mirror only saves download time: a failure here never stops the checkout
-        _git(mirror, "fetch", "--quiet", "--prune", "origin", timeout=600)
-    else:
+        _git(mirror, "fetch", "--quiet", "--prune", "origin", "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*",
+             timeout=600)
+    else:   # --bare, not --mirror: branches and tags only, never every pull request head
         part = "%s.%d.tmp" % (mirror, os.getpid())
-        if _git(os.path.dirname(mirror), "clone", "--quiet", "--mirror", "--", url, part, timeout=1800)[0] == 0:
+        if _git(os.path.dirname(mirror), "clone", "--quiet", "--bare", "--", url, part, timeout=1800)[0] == 0:
             try:
                 os.rename(part, mirror)
             except OSError:
