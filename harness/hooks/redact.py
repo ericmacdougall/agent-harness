@@ -140,3 +140,45 @@ def redact_obj(value, depth=0):
 
 def has_secret(text):
     return bool(find(text))
+
+
+EXACT_MIN = 4  # shorter values are not masked: masking a 1-3 byte value would garble ordinary output
+EXACT_MARK = b'[REDACTED:ah-secret]'
+
+
+class ExactMasker:
+    """Streaming replacement of KNOWN secret values (bytes) in output, for `ah secret exec`. feed() returns what is safe
+    to write now; flush() returns the rest. A value split across two chunks is still caught: the last (longest - 1)
+    bytes are held back until the next chunk or flush()."""
+
+    def __init__(self, values, mark=EXACT_MARK):
+        self.values = sorted({v for v in values if isinstance(v, bytes) and len(v) >= EXACT_MIN}, key=len, reverse=True)
+        self.hold = max((len(v) for v in self.values), default=1) - 1
+        self.mark = mark
+        self.buf = b''
+
+    def _mask(self, data):
+        for value in self.values:
+            data = data.replace(value, self.mark)
+        return data
+
+    def feed(self, chunk):
+        self.buf = self._mask(self.buf + chunk)
+        if not self.hold or len(self.buf) <= self.hold:
+            out, self.buf = (self.buf, b'') if not self.hold else (b'', self.buf)
+            return out
+        out, self.buf = self.buf[:-self.hold], self.buf[-self.hold:]
+        return out
+
+    def flush(self):
+        out, self.buf = self._mask(self.buf), b''
+        return out
+
+
+def mask_values(data, values):
+    """`data` (bytes or str) with every exact occurrence of the given values replaced."""
+    as_text = isinstance(data, str)
+    raw = data.encode('utf-8', 'surrogateescape') if as_text else data
+    masker = ExactMasker([v.encode('utf-8', 'surrogateescape') if isinstance(v, str) else v for v in values])
+    out = masker.feed(raw) + masker.flush()
+    return out.decode('utf-8', 'surrogateescape') if as_text else out

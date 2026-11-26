@@ -1,5 +1,7 @@
 {
   "schema": 1,
+  "_mode": "mode warn (default): form problems print at most three warnings and never block; only an empty message or a secret value is refused. mode strict (set it in commit_policy.local.json): every rule blocks. enforcement off: nothing is checked.",
+  "mode": "warn",
   "enforcement": "enforce",
   "enforce_after": "2026-11-04T06:30:00+00:00",
   "remote_tickets_required": true,
@@ -209,5 +211,16 @@
   "waivers": {
     "min_reason_chars": 20,
     "max_age_hours": 72
+  },
+  "merge_gate": {
+    "_comment": "Read by merge_gate.py. A merge into a protected branch needs a PASS PR review receipt for the head, or one for an earlier head plus a change since of at most small_change_lines with no file matching sensitive_paths, or an approval/waiver.",
+    "protected_branches": ["main", "master"],
+    "small_change_lines": 150,
+    "sensitive_paths": [".github/workflows/*", "*migrations/*", "*.sql", "*secret*", "*credential*", "package-lock.json", "*/package-lock.json", "*.lock", "*/auth/*", "auth/*"],
+    "receipt_max_age_days": 30,
+    "require_other_harness": false,
+    "waiver_ttl_hours": 24,
+    "analyser_seconds": 2.0,
+    "lookup_seconds": 20.0
   }
 }

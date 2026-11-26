@@ -17,6 +17,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 HOOKS = ROOT / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
+os.environ["AH_LOCAL_CONFIG"] = str(Path(__file__).resolve().parent / "data" / "local_fixture.json")  # hermetic hosts
 import ah  # noqa: E402
 import ah_install as ai  # noqa: E402
 
@@ -108,7 +109,7 @@ class Base(unittest.TestCase):
 
     def install(self, ref=None, files=("ah.py", "extra.py"), dry_run=False, ticket=TICKET, **kw):
         posted = kw.setdefault("posted", [])
-        return ai.install_files("t2-dev", ref or self.c1, list(files), ticket, dry_run, self.mac, "sess", "agent-x", self.runner,
+        return ai.install_files("worker-1", ref or self.c1, list(files), ticket, dry_run, self.mac, "sess", "agent-x", self.runner,
                                 lambda t, text: posted.append((t, text))) if "posted" not in kw or True else None
 
     def live(self, name):
@@ -125,10 +126,10 @@ class Base(unittest.TestCase):
 
 class Inputs(Base):
     def test_every_bad_input_refuses_before_any_ssh_call(self):  # AC-1, NEG-1
-        good = dict(host="t2-dev", ref=self.c1, files=["ah.py"], ticket=TICKET, dry_run=False, resume=None, rollback=None, force_files=())
+        good = dict(host="worker-1", ref=self.c1, files=["ah.py"], ticket=TICKET, dry_run=False, resume=None, rollback=None, force_files=())
         ai.check_inputs(**good)
         cases = {
-            "host outside": dict(host="dev2"), "host metachar": dict(host="t2-dev;ls"), "host dash": dict(host="-oProxyCommand=x"),
+            "host outside": dict(host="other-host"), "host metachar": dict(host="worker-1;ls"), "host dash": dict(host="-oProxyCommand=x"),
             "branch ref": dict(ref="main"), "short ref": dict(ref=self.c1[:12]), "upper ref": dict(ref=self.c1.upper()),
             "slash name": dict(files=["../x.py"]), "dot name": dict(files=[".hidden"]), "dotdot": dict(files=["a..b"]), "path": dict(files=["harness/hooks/ah.py"]),
             "duplicate": dict(files=["ah.py", "ah.py"]), "too many": dict(files=["f%d.py" % i for i in range(21)]), "empty": dict(files=[]),
@@ -142,11 +143,47 @@ class Inputs(Base):
                     ai.check_inputs(**dict(good, **change))
                 self.assertEqual(caught.exception.exit_code, 2)
         ai.check_inputs(**dict(good, ticket=None, dry_run=True))  # a dry run needs no ticket
+        with mock.patch.object(ai, "CANONICAL_URL", ""), self.assertRaises(ai.InstallError) as caught:
+            ai.check_inputs(**good)  # no canonical_repo_url in local.json: refused, naming the config
+        self.assertIn("canonical_repo_url", str(caught.exception))
         self.assertEqual(self.calls, [])
 
     def test_a_name_outside_the_installer_list_at_that_commit_refuses_before_ssh(self):  # NEG-1
         self.refused(files=("notlisted.py",))
         self.assertEqual(self.calls, [])
+
+
+class ReleaseFloor(Base):
+    """A ref whose harness/RELEASE is below the host's ~/.agent-harness/floor.json is refused before any write."""
+
+    def set_floor(self, release):
+        floor = self.host_home / ".agent-harness" / "floor.json"
+        floor.parent.mkdir(parents=True, exist_ok=True)
+        floor.write_text(json.dumps({"flavors": {"claude": {"release": release}}}))
+
+    def commit_release(self, release):
+        (self.work / "harness" / "RELEASE").write_text("%d\n" % release)
+        self.write_commit({n: self.base_bytes(n) + b"\n# c2\n" for n in NAMES}, "c2")
+        git(self.work, "push", "-q", str(self.origin), "main")
+        return git(self.work, "rev-parse", "HEAD")
+
+    def test_a_ref_below_the_floor_is_refused_and_nothing_changes(self):
+        self.set_floor(1000)
+        error = self.refused()  # c1 has no harness/RELEASE: release 0
+        self.assertEqual(error.code, "below_floor")
+        self.assertIn("release 1000", str(error))
+        self.assertEqual(self.live("ah.py"), sha(self.base_bytes("ah.py")))
+        self.assertFalse(set(self.counts) & {"lock", "stage", "commit", "selftest"})
+        older = self.commit_release(999)
+        self.assertEqual(self.refused(ref=older).code, "below_floor")
+
+    def test_at_or_above_the_floor_or_with_allow_older_it_proceeds(self):
+        self.set_floor(1000)
+        ref = self.commit_release(1000)
+        self.assertEqual(self.install(ref=ref, dry_run=True, ticket=None)["result"], "dry_run")
+        out = ai.install_files("worker-1", self.c1, ["ah.py"], None, True, self.mac, "s", "a", self.runner,
+                               lambda t, x: None, allow_older=True)
+        self.assertEqual(out["result"], "dry_run")
 
 
 class Listed(Base):
@@ -186,7 +223,7 @@ class Receipt1c(Base):
         self.assertEqual(caught.exception.data["result"], "attempt_refused")
         self.inject = None
         self.assertHostRefuses()
-        self.assertEqual(ai.unfinished_runs(self.mac, "t2-dev"), [run])
+        self.assertEqual(ai.unfinished_runs(self.mac, "worker-1"), [run])
 
     def test_a_resume_refused_by_another_runs_lock_does_not_clear_the_unfinished_run(self):  # F1
         run = self.unknown_install()
@@ -214,9 +251,9 @@ class Receipt1c(Base):
                                 ("unknown", False), ("attempt_refused", False)):
             with self.subTest(result):
                 home = Path(self.tmp, "audit-" + result)
-                ai.audit(home, {"event": "start", "kind": "install", "run": "ins-000000000001", "host": "t2-dev"})
-                ai.audit(home, {"event": "result", "kind": "install", "run": "ins-000000000001", "host": "t2-dev", "result": result})
-                self.assertEqual(ai.unfinished_runs(home, "t2-dev") == [], cleared)
+                ai.audit(home, {"event": "start", "kind": "install", "run": "ins-000000000001", "host": "worker-1"})
+                ai.audit(home, {"event": "result", "kind": "install", "run": "ins-000000000001", "host": "worker-1", "result": result})
+                self.assertEqual(ai.unfinished_runs(home, "worker-1") == [], cleared)
 
     def test_a_guard_that_hangs_forever_after_the_install_is_rolled_back_not_left_live(self):  # F2
         side = Path(self.tmp, "hang")
@@ -278,11 +315,11 @@ class Hardening(Base):
         self.assertEqual(error.code, "older_ref")
         self.assertIn("DOWNGRADE", str(error))
         self.assertEqual(self.calls, [])
-        out = ai.install_files("t2-dev", self.c1, ["ah.py"], TICKET, False, self.mac, "s", "a", self.runner, lambda t, x: None, allow_older=True)
+        out = ai.install_files("worker-1", self.c1, ["ah.py"], TICKET, False, self.mac, "s", "a", self.runner, lambda t, x: None, allow_older=True)
         self.assertEqual(out["result"], "installed")
         self.assertTrue(self.rows("start")[0]["allow_older"])
         # a file with no newer merged version is unaffected
-        self.assertEqual(ai.install_files("t2-dev", self.c1, ["extra.py"], TICKET, False, self.mac, "s", "a", self.runner, lambda t, x: None)["result"], "installed")
+        self.assertEqual(ai.install_files("worker-1", self.c1, ["extra.py"], TICKET, False, self.mac, "s", "a", self.runner, lambda t, x: None)["result"], "installed")
 
     def test_a_hooks_directory_that_is_a_symlink_or_owned_by_another_user_refuses(self):  # M4
         real = self.host_home / ".claude" / "hooks-real"
@@ -310,7 +347,7 @@ class Hardening(Base):
                 self.fail("Installer let the injected commit-reply error escape instead of reporting uncertainty")
         self.assertEqual(caught.exception.exit_code, 5)
         self.assertEqual(caught.exception.data["result"], "unknown")
-        self.assertIn("check t2-dev", str(caught.exception.data["reason"]))
+        self.assertIn("check worker-1", str(caught.exception.data["reason"]))
 
     def test_a_non_literal_hooks_tuple_is_a_refusal_not_a_traceback(self):  # L5
         side = Path(self.tmp, "side-nonliteral")
@@ -336,7 +373,7 @@ class Hardening(Base):
             d.mkdir()
             os.utime(d, (1000 + i, 1000 + i))
         (backups / "not-a-run").mkdir()
-        argv = ai.ssh_argv("t2-dev", "prune", {})
+        argv = ai.ssh_argv("worker-1", "prune", {})
         self.assertEqual(subprocess.run(["sh", "-c", argv[-1]], capture_output=True, env=self.env()).returncode, 0)
         names = sorted(p.name for p in backups.iterdir())
         self.assertEqual(len([n for n in names if n.startswith("ins-")]), 10)
@@ -509,8 +546,8 @@ class Install(Base):
         self.assertEqual([r["kind"] for r in self.rows("result")], ["dry_run"])
 
     def test_the_remote_command_string_reaches_python_unchanged_through_a_shell(self):  # AC-6
-        argv = ai.ssh_argv("t2-dev", "probe", {"names": ["a b'c\"d.py"]})
-        self.assertEqual(argv[argv.index("--") + 1], "t2-dev")
+        argv = ai.ssh_argv("worker-1", "probe", {"names": ["a b'c\"d.py"]})
+        self.assertEqual(argv[argv.index("--") + 1], "worker-1")
         self.assertIn("ClearAllForwardings=yes", argv)
         done = subprocess.run(["sh", "-c", "printf '%s' " + "\"$0\"", argv[-1]], capture_output=True, text=True)
         self.assertEqual(done.stdout, argv[-1])
@@ -602,7 +639,7 @@ class SelfTest(Base):
            "status": "installed", "rules": []}
 
     def test_a_manifest_that_only_adds_an_unregistered_hook_installs_and_says_so(self):  # goodqa#15754 AC-10
-        """t2-dev 2026-11-12, run ins-d882276cc2a3: the new manifest declared three status-truth rows, settings.json does
+        """worker-1 2026-11-12, run ins-d882276cc2a3: the new manifest declared three status-truth rows, settings.json does
         not register them (install-files never edits settings), doctor called them MISSING and the run rolled back.
         On main 6e318911 this test fails with "new failing doctor checks: newhook:stop"."""
         ref = self.manifest_commit([self.ROW])
@@ -710,7 +747,7 @@ class Audit(Base):
             self.install()
         self.assertEqual(caught.exception.exit_code, 5)
         self.assertEqual(caught.exception.data["result"], "unknown")
-        self.assertIn("t2-dev", str(caught.exception))
+        self.assertIn("worker-1", str(caught.exception))
         self.inject = None
         error = self.refused()
         self.assertEqual(error.code, "unfinished_run")
@@ -734,7 +771,7 @@ class Audit(Base):
         self.assertIn(out["result"], ("installed", "already_current"))
         self.assertEqual(seen.get("called"), 1)  # only the after-test: the baseline came from the start row
         self.assertEqual(self.rows("start")[-1]["baseline"], baseline)
-        self.assertEqual(ai.unfinished_runs(self.mac, "t2-dev"), [])
+        self.assertEqual(ai.unfinished_runs(self.mac, "worker-1"), [])
 
     def test_an_automatic_rollback_that_loses_its_connection_is_unknown_rollback_incomplete(self):  # AC-5, NEG-6
         ref = SelfTest.broken_commit(self, b"import sys\nprint('{\"verdict\": \"allow\", \"message\": \"\"}')\n")
@@ -796,18 +833,18 @@ class Lock(Base):
         (lock / "run").write_text(run)
         old = __import__("time").time() - 100
         os.utime(lock, (old, old))
-        argv = ai.ssh_argv("t2-dev", "lock", {"run": run})
+        argv = ai.ssh_argv("worker-1", "lock", {"run": run})
         done = subprocess.run(["sh", "-c", argv[-1]], capture_output=True, text=True, env=self.env())
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertGreater(lock.stat().st_mtime, old + 50)  # touched, and taken back although fresh
-        other = ai.ssh_argv("t2-dev", "lock", {"run": "ins-dddddddddddd"})
+        other = ai.ssh_argv("worker-1", "lock", {"run": "ins-dddddddddddd"})
         self.assertNotEqual(subprocess.run(["sh", "-c", other[-1]], capture_output=True, text=True, env=self.env()).returncode, 0)
 
     def test_the_lock_is_released_only_by_its_own_run_id(self):  # NEG-7
         lock = self.hooks / ".ah-install" / "lock"
         lock.mkdir(parents=True)
         (lock / "run").write_text("ins-bbbbbbbbbbbb")
-        argv = ai.ssh_argv("t2-dev", "unlock", {"run": "ins-cccccccccccc"})
+        argv = ai.ssh_argv("worker-1", "unlock", {"run": "ins-cccccccccccc"})
         done = subprocess.run(["sh", "-c", argv[-1]], capture_output=True, text=True, env=self.env())
         self.assertEqual(json.loads(done.stdout)["released"], False)
         self.assertTrue(lock.exists())
@@ -859,7 +896,7 @@ class Rollback(Base):
         with self.assertRaises(ai.InstallError):
             ai.rollback(run2, TICKET, (), self.mac, "s", "a", self.runner, lambda t, x: None)
         self.assertEqual(self.live("ah.py"), sha(self.base_bytes("ah.py") + b"\n# c1\n"))
-        self.assertEqual(ai.unfinished_runs(self.mac, "t2-dev"), [])  # r1c H1: a refusal before any write must not wedge the host
+        self.assertEqual(ai.unfinished_runs(self.mac, "worker-1"), [])  # r1c H1: a refusal before any write must not wedge the host
 
     def test_unknown_run_other_hosts_run_and_another_unfinished_run_refuse(self):  # AC-8, NEG-9
         with self.assertRaises(ai.InstallError):
@@ -868,8 +905,8 @@ class Rollback(Base):
         with self.assertRaises(ai.InstallError):
             self.install()
         other = ai.new_run_id()
-        ai.audit(self.mac, {"event": "start", "kind": "install", "run": other, "host": "t2-dev", "files": {}, "ref": self.c1})
-        ai.audit(self.mac, {"event": "result", "run": other, "host": "t2-dev", "result": "installed"})
+        ai.audit(self.mac, {"event": "start", "kind": "install", "run": other, "host": "worker-1", "files": {}, "ref": self.c1})
+        ai.audit(self.mac, {"event": "result", "run": other, "host": "worker-1", "result": "installed"})
         self.inject = None
         with self.assertRaises(ai.InstallError) as caught:
             ai.rollback(other, TICKET, (), self.mac, "s", "a", self.runner, lambda t, x: None)
@@ -914,16 +951,16 @@ class Wiring(Base):
         text = (ROOT / "install.py").read_text() + (ROOT / "install_codex.py").read_text()
         self.assertIn("ah_install.py", text)
         with mock.patch.object(ai, "install_files", return_value={"ok": True, "result": "dry_run"}) as run:
-            code, text = self.cli("--host", "t2-dev", "--from-ref", self.c1, "--file", "ah.py", "--dry-run")
+            code, text = self.cli("--host", "worker-1", "--from-ref", self.c1, "--file", "ah.py", "--dry-run")
         self.assertEqual(code, 0)
         self.assertTrue(run.call_args[0][4])
 
     def test_bad_input_exits_2_and_a_non_success_result_keeps_its_exit_code(self):  # AC-5
-        code, text = self.cli("--host", "dev2", "--from-ref", self.c1, "--file", "ah.py", "--ticket", TICKET)
+        code, text = self.cli("--host", "worker-2", "--from-ref", self.c1, "--file", "ah.py", "--ticket", TICKET)
         self.assertEqual(code, 2)
-        err = ai.InstallError("unknown", "unknown on t2-dev", 5, {"ok": False, "result": "unknown"})
+        err = ai.InstallError("unknown", "unknown on worker-1", 5, {"ok": False, "result": "unknown"})
         with mock.patch.object(ai, "install_files", side_effect=err):
-            code, text = self.cli("--host", "t2-dev", "--from-ref", self.c1, "--file", "ah.py", "--ticket", TICKET)
+            code, text = self.cli("--host", "worker-1", "--from-ref", self.c1, "--file", "ah.py", "--ticket", TICKET)
         self.assertEqual(code, 5)
         self.assertIn('"result": "unknown"', text)
 

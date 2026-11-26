@@ -72,7 +72,7 @@ class FakeLedger:
 
 
 class Host:
-    """One host's decision store (the Mac or t2-dev) under a temp home."""
+    """One host's decision store (the Mac or a worker host) under a temp home."""
 
     def __init__(self, base, name):
         self.store = cd.Store(Path(base) / name)
@@ -150,12 +150,12 @@ class Base(unittest.TestCase):
 
 class PublishAndVerify(Base):
     def test_published_decision_verifies_on_the_other_host_for_exactly_its_task(self):
-        self.grant_local('t2scan-audit-5db5032d0c554f08e7e50c90f47ebc85')
-        out = self.publish('t2scan-audit-5db5032d0c554f08e7e50c90f47ebc85')
+        self.grant_local('batch-audit-5db5032d0c554f08e7e50c90f47ebc85')
+        out = self.publish('batch-audit-5db5032d0c554f08e7e50c90f47ebc85')
         self.assertEqual(out['families'], ['fable'])
         self.assertEqual(len(self.fake.items), 1)
         self.assertTrue(self.fake.items[0]['body'].startswith(cd.DECISION_PREFIX))
-        found = self.verify('t2scan-audit-5db5032d0c554f08e7e50c90f47ebc85')
+        found = self.verify('batch-audit-5db5032d0c554f08e7e50c90f47ebc85')
         self.assertEqual(found['sentence'], WORDS)
         self.assertEqual(found['session'], SESSION)
         # the signing key never appears in the posted record
@@ -170,7 +170,7 @@ class PublishAndVerify(Base):
                     self.verify(other)
 
     def test_wildcard_and_malformed_task_keys_never_publish(self):  # NEG-5
-        for task in ('*', 't2scan-*', 'k?', '[a]', '', 'k1\n', 'a b'):
+        for task in ('*', 'batch-*', 'k?', '[a]', '', 'k1\n', 'a b'):
             with self.subTest(task=repr(task)):
                 with self.assertRaises(cd.Denied) as caught:
                     self.publish(task)
@@ -462,7 +462,7 @@ class PromptHookRevokes(Base):
         # the Mac denies at once through its tombstone even though the ledger post failed
         with self.assertRaises(cd.Denied):
             cd.verify('k1', 'fable', store=self.mac.store, client=self.fake)
-        self.verify('k1')  # t2-dev still accepts until the queued post lands (the documented gap)
+        self.verify('k1')  # the worker still accepts until the queued post lands (the documented gap)
         self.fake.fail_post = False
         note = cd.on_user_prompt(SESSION, 'thanks', store=self.mac.store, client=self.fake)
         self.assertIn('posted 1 queued', note)
@@ -510,7 +510,7 @@ class WithdrawalPredicate(unittest.TestCase):
 
 class EveryWithdrawalChannelRevokes(Base):
     """PR 14 round-2 class A: a worker host has no transcript, so it sees a withdrawal only as a ledger revocation.
-    Every channel the T2Scan local path honours (a typed turn, a question answer, a queued mid-turn message) must
+    Every channel the local path honours (a typed turn, a question answer, a queued mid-turn message) must
     therefore produce one from the Mac's hooks. The other host (t2) has no transcript and no tombstone here."""
 
     ASK_USE = 'toolu_01AskUserQuestionFixture'
@@ -996,11 +996,6 @@ class PinReadsStdin(Base):
         with self.assertRaises(cd.Denied):  # nothing was pinned
             cd.load_trusted_keys(self.fresh)
         self.assertEqual(self.run_pin(b'')[0], 2)
-
-    def test_installer_pins_the_worker_through_dash_not_dev_stdin(self):
-        text = (HERE.parent / 'scripts' / 'trust-central-decisions.sh').read_text()
-        self.assertIn('decision pin --pubkey-file -', text)
-        self.assertNotIn('/dev/stdin', text)
 
 
 if __name__ == '__main__':

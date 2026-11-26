@@ -1878,7 +1878,8 @@ else:
         import model_tiers as tiers
         refused = self.run_review('--author-rung', 'R5', '--author-harness', 'claude')
         self.assertEqual(refused.returncode, 2, refused.stderr)
-        self.assertIn('needs user permission', refused.stderr)
+        self.assertIn("needs the user's permission", refused.stderr)
+        self.assertIn('ah approve top-rung --task', refused.stderr)
         self.assertFalse(self.argv_file.exists()); self.assertFalse((self.ladder / 'selections').exists())
         wals = self.root / 'wals'; (wals / 's').mkdir(parents=True)
         wal = wals / 's' / 'main.jsonl'
@@ -1895,6 +1896,19 @@ else:
         argv = json.loads(self.argv_file.read_text())
         # Claude author, Codex present: the cross-harness reviewer is Astra high, launched only with the record.
         self.assertIn('gpt-6-astra', argv); self.assertIn('Permission: w9\n', self.output.read_text())
+
+    def test_permission_rung_reviewer_accepts_a_top_rung_approval(self):
+        # 2026-11-24 integration: `ah approve top-rung --task T` (the approvals store) is the user's permission too
+        import ah_approvals
+        store_home = self.root / 'approvals-home'
+        os.environ['AH_HOME'] = str(store_home); self.addCleanup(lambda: os.environ.pop('AH_HOME', None))
+        self.assertEqual(self.run_review('--task', 'lad-6', '--author-rung', 'R5', '--author-harness', 'claude').returncode, 2)
+        record = ah_approvals.grant('top-rung', {'task': 'lad-6'}, 'user', 'fable review of lad-6', home=str(store_home))
+        allowed = self.run_review('--task', 'lad-6', '--author-rung', 'R5', '--author-harness', 'claude')
+        self.assertEqual(allowed.returncode, 3, allowed.stderr)
+        self.assertIn('Permission: approval %s\n' % record['id'], self.output.read_text())
+        other = self.run_review('--task', 'lad-7', '--author-rung', 'R5', '--author-harness', 'claude')
+        self.assertEqual(other.returncode, 2, other.stderr)  # one task only
 
     def test_claude_fallback_carries_effort_and_budget_when_codex_is_absent(self):
         result = self.run_review('--task', 'lad-2', '--author-rung', 'R1', '--author-harness', 'claude', remove=('codex',))

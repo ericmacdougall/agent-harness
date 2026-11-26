@@ -8,7 +8,7 @@ This proposal operationalizes the November 7–8 reset. It does not weaken secur
 
 ## 1. Work-in-progress limit
 
-- At most **three product streams** are active. The reset order is GoodQA browser + lead gen, ParentProof 1.0.11, then Lessons. Agent Fabric is the single named migration exception while the approved Kimi-derived slices land. Everything else is paused with a ticket and next checkpoint.
+- At most **three product streams** are active. The owner names them and their order, and may name one migration exception. Everything else is paused with a ticket and next checkpoint.
 - A stream is active from pickup until it is merged, deployed where applicable, independently live-checked, cleaned up, and its owner ledger is closed. Opening a PR does not free a slot.
 - Do not create a new owner because a new message arrived. Resume the existing owner for related work. Before spawning, inspect the owner ledger, branches, worktrees, active agents, and existing PRs.
 - Each stream has exactly one accountable owner, one branch, one integration target, and one next observable checkpoint. Competing implementations of the same problem are cancelled or compared once by main; they are not developed in parallel indefinitely.
@@ -85,7 +85,7 @@ For UI/service work, use the owned real browser/staging path when available. If 
 Before launching owners or heavy checks:
 
 - Check disk, memory, load, active alerts, provider availability, and existing dev servers/emulators. Use current readings, not cached wallet/quota/disk claims.
-- Keep the reset targets visible: Mac free-space target at least 60 GB, t2-dev cleanup target about 98 GB, active alerts below 20 actionable items, and a login-shell-independent release environment on the mini.
+- Keep the reset targets visible: Mac free-space target at least 60 GB, worker-host cleanup target, active alerts below 20 actionable items, and a login-shell-independent release environment.
 - Do not start a heavy build on a host below its configured floor. Clean owned artifacts first or move the job to the designated healthy host. Never delete unpushed or unique work to satisfy a disk target.
 - Bind development servers to localhost by default. Track every spawned process with its owner, PID/start token, worktree, and stop command.
 - On quota/auth failure, checkpoint durable state and stop the affected launch wave. Do not resume a dozen agents automatically after login; reconcile the three active streams first.
@@ -147,7 +147,7 @@ The incident review also identified features that need their own threat and evid
 - `ah status --since` and a single ready-and-merge command with exact-head, concurrency and deployment semantics;
 - auth/delete/money/device/release domain checklists with precise triggers and overrides, signed task relays, and reliable wakeup-versus-human transcript classification.
 
-GoodQA token self-grant, real-browser lead generation, ticket-filer throttles, ParentProof release floors/self-update/artifact retention, exposed-token rotation, and host cleanup belong to their product or operational owners. Track them there rather than hiding them in a harness PR.
+GoodQA token self-grant, real-browser lead generation, ticket-filer throttles, product release floors/self-update/artifact retention, exposed-token rotation, and host cleanup belong to their product or operational owners. Track them there rather than hiding them in a harness PR.
 
 ## Immediate operating loop
 

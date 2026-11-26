@@ -1,7 +1,7 @@
 """`ah install-files`: install MERGED hook files on a remote host through one audited command (goodqa#15742).
 
-The 2026-11-11 t2-dev install of command_guard.py was blocked as a remote `cp` and then done with `scp`, a second route
-around a guard. This command is the sanctioned route:
+An install of command_guard.py on a worker host was once blocked as a remote `cp` and then done with `scp`, a second
+route around a guard. This command is the sanctioned route:
 
   * the bytes come only from a commit proven to be an ancestor of the canonical harness repository's main, fetched into a
     FRESH repository this tool owns (never one the caller names); the commit, the trees on the path and the blob are
@@ -32,8 +32,26 @@ import time
 import uuid
 from pathlib import Path
 
-HOSTS = ("t2-dev", "ah-mac-mini")
-CANONICAL_URL = "https://github.com/ericmacdougall/agent-harness.git"
+
+
+def _local():
+    try:
+        import sys  # noqa: PLC0415
+        here = str(Path(__file__).resolve().parent)
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        import ah_local  # noqa: PLC0415
+        return ah_local
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# The non-Windows hosts of ~/.agent-harness/local.json, and its `canonical_repo_url` (the harness repository whose
+# main proves a commit merged). Both are empty by default: install-files then refuses with a pointer to the config.
+_LOCAL = _local()
+HOSTS = tuple(h for h in (_LOCAL.host_names() if _LOCAL else ())
+              if h not in (_LOCAL.host_names(os_name="windows") if _LOCAL else ()))
+CANONICAL_URL = (_LOCAL.get("canonical_repo_url", "") if _LOCAL else "") or ""
 ALLOW_FILE = False  # tests only: lets the fetch read a local bare repository standing in for the canonical URL
 REMOTE_PREFIX = ""  # tests only: a `HOME=... ` assignment so a real ssh-to-localhost run uses a disposable home
 MAX_FILES = 20
@@ -144,7 +162,7 @@ def selftest():
     deadline = time.time() + TOTAL_DEADLINE
     probes = {"allow": "ls -la",
               "deny_wal": "rm -rf ~/.claude/wals",
-              "deny_hooks_copy": 'ssh t2-dev "cp x ~/.claude/hooks/command_guard.py"'}
+              "deny_hooks_copy": 'ssh worker "cp x ~/.claude/hooks/command_guard.py"'}
     for key, cmd in probes.items():
         if deadline - time.time() <= 0.5:
             res["guard"][key] = {"exit": None, "verdict": "error:deadline", "rule": ""}
@@ -209,6 +227,11 @@ if op == "probe":
                        "mode": stat.S_IMODE(os.lstat(p).st_mode) if k == "file" else None,
                        "temp": kind(temp(name))}
     out["files"] = items
+    try:  # the host's release floor (ah_switch.py, docs/off-switch.md); absent on a host that predates it
+        with open(os.path.expanduser("~/.agent-harness/floor.json")) as f:
+            out["floor"] = int(json.load(f)["flavors"]["claude"]["release"])
+    except Exception:
+        out["floor"] = None
     out["lock"] = kind(LOCK)
     out["list"] = sorted((n, os.lstat(os.path.join(HOOKS, n)).st_size, os.lstat(os.path.join(HOOKS, n)).st_mtime_ns,
                           os.lstat(os.path.join(HOOKS, n)).st_ino) for n in os.listdir(HOOKS)) if args.get("list") else None
@@ -388,8 +411,10 @@ class Remote:
 
 # ----------------------------------------------------------------------------- input and source proof
 def check_inputs(host, ref, files, ticket, dry_run, resume, rollback, force_files, allow_older=False):
+    if not CANONICAL_URL:
+        refuse("set canonical_repo_url in ~/.agent-harness/local.json (docs/local-config.md)")
     if host not in HOSTS:
-        refuse("--host must be one of %s" % ", ".join(HOSTS))
+        refuse("--host must be one of %s (hosts in ~/.agent-harness/local.json)" % (", ".join(HOSTS) or "none configured"))
     if resume and rollback:
         refuse("--resume and --rollback cannot be combined")
     for label, run in (("--resume", resume), ("--rollback", rollback)):
@@ -512,6 +537,10 @@ def fetch_source(ref, names, home, allow_older=False):
                 refuse("%s is not a regular file in the commit (mode %s)" % (path, mode))
             return verified_object(repo, home, "blob", oid), oid, mode
 
+        try:  # harness/RELEASE at the ref (one integer); a ref without it predates the floor: release 0
+            release = int(blob_at("harness/RELEASE")[0].decode().strip())
+        except (InstallError, ValueError, UnicodeDecodeError):
+            release = 0
         install_py = blob_at("install.py")[0]
         listed = None
         for stmt in ast.parse(install_py.decode()).body:
@@ -535,7 +564,7 @@ def fetch_source(ref, names, home, allow_older=False):
             if len(data) > MAX_BLOB:
                 refuse("%s is larger than %d bytes" % (name, MAX_BLOB))
             out[name] = (data, oid, mode)
-        return out, listed, main
+        return out, listed, main, release
     finally:
         shutil.rmtree(repo, ignore_errors=True)
 
@@ -751,7 +780,7 @@ def _plan_for(names, sources, state, run):
 
 
 def _run(host, ref, files, ticket, dry_run, home, session, agent, runner, poster, resume_of, baseline, kind_, allow_older=False):
-    sources, listed, main = fetch_source(ref, files, home, allow_older or bool(resume_of))
+    sources, listed, main, release = fetch_source(ref, files, home, allow_older or bool(resume_of))
     remote = Remote(host, runner)
     run = resume_of or new_run_id()
     names = order(files)
@@ -761,6 +790,10 @@ def _run(host, ref, files, ticket, dry_run, home, session, agent, runner, poster
             refuse("host %s has an unfinished run (%s): resume it with --resume or undo it with --rollback first" % (host, busy[0]), "unfinished_run")
     probe = remote.call("probe", {"names": names, "list": dry_run})
     state = probe["files"]
+    floor = probe.get("floor")
+    if isinstance(floor, int) and release < floor and not (allow_older or resume_of):
+        refuse("refusing to install from a ref at release %d: %s is at release %d (its floor); use a newer --from-ref, or "
+               "--allow-older (audited) to downgrade on purpose" % (release, host, floor), "below_floor")
     for name, item in state.items():
         if item["kind"] not in ("absent", "file"):
             refuse("the live target %s on %s is a %s" % (name, host, item["kind"]))

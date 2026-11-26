@@ -3,11 +3,14 @@
 
 Agent, Task and Workflow spawns must match the task's computed rung: lower only with a recorded
 reason, review-only rungs never for writing, the top writing rung only with the user's recorded
-permission. When the rung cannot be determined the spawn is allowed at the lowest rung (model and
-effort rewritten through updatedInput) and a reset record is written. Bash lines that launch
-claude or codex are checked the same way (advisory in warn mode). SubagentStart/Stop keep a
-per-session live-agent count under a cap. Everything is a pure function of the hook input, the
-tier table and the ledger; no model judgement.
+permission (the task's ledger record, a signed central decision, or a top-rung approval in the one
+approvals store, ah_approvals.py). When the rung cannot be determined the spawn is allowed at the lowest
+rung (model and effort rewritten through updatedInput) and a reset record is written. Bash lines that
+launch claude or codex are checked the same way (advisory in warn mode). Helper types that do not write
+code (click-testers, Explore, Plan, guides) are outside the ladder: only the top-rung permission applies to
+them. SubagentStart/Stop keep a per-session live map that live_owner_ids reads; the owner cap itself is
+agent_gate.py. Everything is a pure function of the hook input, the tier table, the ledger and the
+approvals store; no model judgement.
 """
 
 from __future__ import annotations
@@ -30,7 +33,6 @@ SPAWN_TOOLS = {'Agent', 'Task', 'Workflow'}
 REVIEWER_TYPES = {'red-team', 'click-tester', 'reviewer'}
 DOWNGRADE = re.compile(r'\[rung-below:([^\]]{3,200})\]')
 REVIEW_MARK = re.compile(r'\[review:[^\]]+\]')
-LIVE_CAP_DEFAULT = 12
 
 
 def hook_result(decision, reason=None, updated=None, context=None):
@@ -73,6 +75,30 @@ def central_permission(task, family, facts):
     return {'central': True, 'decision_id': found['decision_id'], 'task': task, 'expires_at': found['expires_at']}
 
 
+def approved_top(task, cwd, facts):
+    """A live top-rung approval for this exact task in the one approvals store (ah_approvals.py): the owner's, or a
+    supervisor's inside the project it supervises (`ah approve top-rung --task T --project P`). None on any error."""
+    if not isinstance(task, str) or not esc.SAFE_KEY.fullmatch(task):
+        return None
+    try:
+        import ah_approvals  # noqa: PLC0415
+        found = ah_approvals.allowed('top-rung', task=task, project=cwd if isinstance(cwd, str) and cwd else None)
+    except Exception:  # noqa: BLE001  no store, no approval
+        return None
+    if found:
+        facts['approval'] = found.get('id')
+    return found
+
+
+# Helper types that do not write code: the ladder (which rung writes) does not apply to them; only the top-rung
+# permission does. fixer writes code and red-team/reviewer follow the reviewer rung, so they stay on the ladder.
+LADDER_TYPES = {'fixer', 'red-team', 'reviewer'}
+
+
+def ladder_free(subagent_type, policy):
+    return subagent_type in helper_types(policy) and subagent_type not in LADDER_TYPES
+
+
 def family_of_model(model):
     return 'astra' if 'astra' in str(model or '').lower() else 'fable'
 
@@ -106,6 +132,21 @@ def decide_spawn(data, policy, ledger, *, session_id=None):
         if not ledger.path(task).exists():
             resets.append(('missing_task_key', 'spawn carried no [task:<key>] token; generated ' + task))
     facts['task'] = task
+    if ladder_free(subagent_type, policy):
+        # A click-tester, Explore, Plan or guide: no rung to match, no warning. Only a top-rung model needs permission.
+        requested = requested_spec(tool_input, policy)
+        facts['requested'], facts['ladder_free'] = requested, True
+        if requested and policy['rungs'][requested['rung']]['needs_user_permission']:
+            recorded = None
+            try:
+                recorded = ledger.status(task).get('permission') if not generated else None
+            except (esc.LedgerError, tiers.TierError):
+                pass
+            if not (recorded or approved_top(None if generated else task, data.get('cwd'), facts)
+                    or central_permission(None if generated else task, family_of_model(requested['model']), facts)):
+                return 'deny', ('rung %s needs the user permission for task %s. Fix: %s (then add [task:%s] to the Agent '
+                                'description)' % (requested['rung'], task, esc.approve_fix(task), task)), None, facts
+        return 'allow', 'helper type %s: the ladder does not apply' % subagent_type, None, facts
     status = None
     try:
         status = ledger.status(task)
@@ -153,6 +194,8 @@ def decide_spawn(data, policy, ledger, *, session_id=None):
         inherits a permission the user gave for another task."""
         if (status or {}).get('permission'):
             return True
+        if not generated and approved_top(task, data.get('cwd'), facts):
+            return True
         if 'value' not in central:
             central['value'] = central_permission(task if not generated else None, 'fable', facts)
         return bool(central['value'])
@@ -197,6 +240,9 @@ def decide_spawn(data, policy, ledger, *, session_id=None):
         return 'deny', 'task %s is at rung %s; %s %s is below it (add [rung-below:<reason>] to go lower)' % (task, target_rung, requested['model'], requested['effort']), None, facts
     # Above the computed rung: writers are downgraded deterministically, but an explicit reviewer request must not
     # silently become a weaker review. Name both rungs so the caller can retry at the effective target deliberately.
+    if is_reviewer and req_entry['needs_user_permission']:
+        # permitted() passed above: the user (or a supervisor) granted this reviewer for the task; that is the rule
+        return 'allow', 'reviewer at %s granted for task %s' % (req_rung, task), None, facts
     if is_reviewer:
         return 'deny', ('reviewer request %s %s is rung %s, above the effective target rung %s; explicit above-target '
                         'reviewer model/effort is denied, not downgraded' % (
@@ -399,7 +445,8 @@ def decide_bash(data, policy, ledger, depth=0, env_model=None):
         if assignment:
             env_model = _unquote(assignment.group(1))
         if LAUNCH.search(segment):
-            results.append(_decide_launch(segment, policy, ledger, env_model=env_model, session_id=data.get('session_id')))
+            results.append(_decide_launch(segment, policy, ledger, env_model=env_model, session_id=data.get('session_id'),
+                                          cwd=data.get('cwd')))
         if depth < MAX_NESTING:
             items = nested_items(segment)
             if number and seps[number] == '|' and reads_stdin_as_script(segment):
@@ -408,7 +455,7 @@ def decide_bash(data, policy, ledger, depth=0, env_model=None):
                 except ValueError: producer = []
                 items += [(word, True) for word in producer[1:] if LAUNCH.search(word)]
             for inner, inherits in items:
-                results.append(decide_bash({'tool_input': {'command': inner}, 'session_id': data.get('session_id')}, policy, ledger, depth + 1,
+                results.append(decide_bash({'tool_input': {'command': inner}, 'session_id': data.get('session_id'), 'cwd': data.get('cwd')}, policy, ledger, depth + 1,
                                            env_model=env_model if inherits else None))
     if not results:
         return 'allow', None, None, {'segments': 0}
@@ -419,7 +466,7 @@ def decide_bash(data, policy, ledger, depth=0, env_model=None):
     return 'allow', ('; '.join(reasons) or None), None, dict(results[0][3], segments=len(results))
 
 
-def _decide_launch(command, policy, ledger, env_model=None, session_id=None):
+def _decide_launch(command, policy, ledger, env_model=None, session_id=None, cwd=None):
     """One launch segment: same rule as a spawn, reported as context or deny."""
     try:
         words = shlex.split(command)
@@ -473,7 +520,10 @@ def _decide_launch(command, policy, ledger, env_model=None, session_id=None):
                     permission = ledger.status(task).get('permission')
                 except (esc.LedgerError, tiers.TierError) as error:
                     facts['ladder_error'] = getattr(error, 'code', 'error')
-            # Central decisions do not apply to reviewers: peer_review.py itself honours only the local permission.
+            # Central decisions do not apply to reviewers: peer_review.py itself honours only the local permission
+            # (and, once it reads it, the approvals store).
+            if not permission and task is not None:
+                permission = approved_top(task, cwd, facts)
             if not permission:
                 return 'deny', 'review at %s needs recorded user permission for task %s' % (selection['rung'], task or '(none)'), None, facts
     if model is None:
@@ -491,7 +541,7 @@ def _decide_launch(command, policy, ledger, env_model=None, session_id=None):
     # Permission and review-only checks come first: no task means no recorded permission (no session grant).
     granted = bool((status or {}).get('permission'))
     if not granted and task is not None and (entry['needs_user_permission'] or (status or {}).get('needs_user_permission')):
-        granted = bool(central_permission(task, family_of_model(model), facts))
+        granted = bool(approved_top(task, cwd, facts)) or bool(central_permission(task, family_of_model(model), facts))
     if entry['needs_user_permission'] and not granted:
         return 'deny', 'launch at %s needs the user permission for task %s. Fix: %s' % (
             requested['rung'], task or '(none)', esc.approve_fix(task)), None, facts
@@ -638,7 +688,7 @@ def _slot_freed(row):
     if not isinstance(disp, dict) or row.get('decision_required') is True:
         return False
     kind = disp.get('kind')
-    if kind in ('closed', 'superseded', 'wontdo', 'legacy'):
+    if kind in ('closed', 'superseded', 'wontdo', 'legacy', 'finished'):
         return True
     # a reassignment or a wait frees the slot only while its holder is live (`live` is ah's own verdict); this is checked
     # here, not left to liveness.row_disposed, which accepted any reassignment until never-drop 16.1 lands (red-team ad4294 B1)
@@ -676,23 +726,6 @@ def live_owner_ids(session_id, policy):
         return []
     return sorted(key for key, value in live.items()
                   if counts_as_owner(value.get('type', '') if isinstance(value, dict) else '', policy))
-
-
-def owner_cap_decision(session_id, tool_input, policy):
-    """Deny an owner-type spawn once the session's live owners reach caps.session_owner_agents (scenario B3.17:
-    memory says at most 4 active owners; 12 ran). Helpers (reviewers, click-testers, fixers, Explore, Plan) are
-    not owners and pass. Returns (reason, owner_ids) or (None, owner_ids)."""
-    cap = policy.get('caps', {}).get('session_owner_agents')
-    sub_type = str((tool_input or {}).get('subagent_type') or '')
-    if not cap or not counts_as_owner(sub_type, policy):
-        return None, []
-    owners = live_owner_ids(session_id, policy)
-    if len(owners) < int(cap):
-        return None, owners
-    return ('owner cap %d reached for this session: live owners %s. Fix: finish or hand off one of them (python3 %s owners), '
-            'route this work to the owner that already holds its stream, or spawn a helper type (red-team, click-tester, '
-            'fixer, Explore), which does not count' % (int(cap), ', '.join(o[:12] for o in owners),
-                                                      Path(__file__).resolve().parent / 'ah.py')), owners
 
 
 ACTIONS = ('hook', 'start', 'stop', 'dispatch')
@@ -755,7 +788,7 @@ def open_spawn_dispatch(data, tool, command, decision, updated, facts, policy, m
     if tool in SPAWN_TOOLS:
         prompt, description = str(tool_input.get('prompt') or ''), str(tool_input.get('description') or '')
         task = facts.get('task')
-        if not task:  # the owner-cap and live-cap paths skip decide_spawn: same key rule, no ledger.status
+        if not task:  # a decision that never computed the key: same key rule, no ledger.status
             task = esc.task_key_from(prompt, description) or esc.generated_key(session_id or '', description or prompt[:200])
         subagent_type = str(tool_input.get('subagent_type') or '')
         requested = _spec_from(facts.get('requested')) if 'requested' in facts else _spec_from(requested_spec(tool_input, policy))
@@ -927,21 +960,9 @@ def _main(action, data, tool, command, applies):
         except BaseException as error:  # noqa: BLE001  fail-open: start/stop never fail on dispatch bookkeeping
             _gate_log({'at': esc.now(), 'decision': 'dispatch_%s_failed' % action,
                        'error': '%s: %s' % (type(error).__name__, str(error)[:120])})
-        cap = int(policy.get('caps', {}).get('session_live_agents', LIVE_CAP_DEFAULT))
-        if action == 'start' and count > cap:
-            print(json.dumps({'hookSpecificOutput': {'hookEventName': 'SubagentStart',
-                              'additionalContext': 'live agents %d exceed the cap %d; stop some before spawning more' % (count, cap)}}))
-        return 0
+        return 0  # the live map feeds live_owner_ids; the owner cap itself is agent_gate.py (resource_budget.owner_cap)
     if tool in SPAWN_TOOLS:
-        cap = int(policy.get('caps', {}).get('session_live_agents', LIVE_CAP_DEFAULT))
-        tool_input = data.get('tool_input') if isinstance(data.get('tool_input'), dict) else {}
-        cap_reason, owners = owner_cap_decision(session_id, tool_input, policy)
-        if live_count(session_id) >= cap:
-            decision, reason, updated, facts = 'deny', 'live agents at the cap %d for this session' % cap, None, {}
-        elif cap_reason:
-            decision, reason, updated, facts = 'deny', cap_reason, None, {'owner_cap': owners}
-        else:
-            decision, reason, updated, facts = decide_spawn(data, policy, ledger, session_id=session_id)
+        decision, reason, updated, facts = decide_spawn(data, policy, ledger, session_id=session_id)
     elif tool == 'Bash':
         decision, reason, updated, facts = decide_bash(data, policy, ledger)
     else:

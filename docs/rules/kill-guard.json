@@ -3,8 +3,8 @@
   "rules": [
     {
       "id": "kill-guard",
-      "rule": "No agent runs pkill, killall, fuser -k, taskkill, Stop-Process, a pgrep-fed kill (xargs, command substitution, loops), interpreter code that signals processes, or a plain kill of a PID it cannot prove it owns (cwd or program inside its own git worktree, or a spawn-ledger entry). Kills inside ssh, mosh, docker exec and kubectl exec are blocked except `netwatch orphans --kill --pid N`. kill -0, kill -l and process listing stay allowed. Every block is one line naming `netwatch orphans --kill --pid <pid>`.",
-      "mechanism": "PreToolUse hook harness/hooks/kill_guard.py (Claude Code: Bash and PowerShell, onFailure block; Codex: PreToolUse, no matcher). Runs the analysis in a child process and fails closed for kill-looking input. Policy in kill_guard_policy.json (mode enforce). Audit log and spawn ledger under ~/.agent-harness/state/kill-guard/.",
+      "rule": "No agent stops a process that is not its own: its agent process tree, pids it started with `kill_guard.py spawn`, or processes whose cwd or program is in its work dir, scratch or worktree. A supervisor may also stop processes of projects it supervises; Fable/Astra any process except the protected list (harness daemons, log backup, staging/live). Broad kills (pkill, killall, kill -1 ...) resolve against the process table. A live `ah approve kill` record lifts a role refusal; init, the agent session and system processes are never stopped. Reads, --help, prose and quoted text are never refused; when unsure the command is allowed with one audit line.",
+      "mechanism": "PreToolUse hook harness/hooks/kill_guard.py through ah_hook.py (Claude Code: Bash and PowerShell; Codex: PreToolUse, no matcher). Fails open: a crash or an unreadable command allows. Policy in kill_guard_policy.json. Audit log and spawn ledger under ~/.agent-harness/state/kill-guard/.",
       "enforcement": "ENFORCED",
       "test": "Corpus.test_positive_rows_blocked",
       "test_file": "tests/test_kill_guard.py",

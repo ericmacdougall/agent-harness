@@ -5,6 +5,7 @@ Schema+FileDrop AC-13/NEG-13."""
 import http.client
 import json
 import os
+os.environ["AH_LOCAL_CONFIG"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "local_fixture.json")  # a worker host to probe
 import re
 import socket
 import stat
@@ -258,7 +259,7 @@ class Deploys(WalTail):
         path = self.wals / "sess1" / "agent-d.jsonl"
         path.write_text("")
         self.tailer.run(time.time())
-        self.append(path, {"event": "result", "note": "DEPLOYED 0e2084b on t2-dev via deploy-live.sh"})
+        self.append(path, {"event": "result", "note": "DEPLOYED 0e2084b on worker-1 via deploy-live.sh"})
         self.tailer.run(time.time())
         self.assertEqual(self.kinds(), ["wal", "deploy"])
 
@@ -683,6 +684,17 @@ class Security(ServerHarness):
         self.assertEqual(json.loads(data)["error"], "owner-route-unavailable")
         self.assertEqual(mc_chat.inbox(), [])
 
+    def test_the_dashboard_reply_to_reaches_the_inbox_record(self):
+        # 2026-11-24: an answer typed under an agent's reply or an ask carries what it answers
+        cookie, csrf = self.login()
+        mc_chat.register_target("sess-1", os.getpid())
+        body = {"to": "claude", "session": "sess-1", "text": "yes, go ahead", "client_key": "reply-to-key-01",
+                "reply_to": "ask:w0123456789a"}
+        resp, data = self.post(cookie, csrf, body)
+        self.assertIn(resp.status, (200, 201), data)
+        record = mc_chat.load(json.loads(data)["id"])
+        self.assertEqual(record.get("reply_to"), "ask:w0123456789a")
+
     def test_launch_code_is_single_use_and_expires(self):
         code = mcs.mint_code(mc_chat.secret())
         first, _ = self.request("GET", "/launch?c=" + code)
@@ -836,7 +848,7 @@ class Budget(ServerHarness):
         self.assertGreaterEqual(intervals["owners"], 60)
         self.assertGreaterEqual(intervals["github"], 60)
         self.assertGreaterEqual(intervals["goodqa"], 10)
-        self.assertGreaterEqual(intervals["t2-dev"], 60)
+        self.assertGreaterEqual(intervals["remote"], 60)
 
     def test_hub_rate_limit_summarises_bursts(self):
         hub = ev.Hub(max_rate=20)

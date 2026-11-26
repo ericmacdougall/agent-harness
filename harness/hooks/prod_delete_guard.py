@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
 r"""PreToolUse hook: refuse destructive SQL aimed at a PRODUCTION database unless a recorded,
-user-sourced, signed grant names that exact database (goodqa#14908, ported from Hawkeye's
-hawkeye-prod-delete-guard.py).
+user-sourced, signed grant names that exact database (goodqa#14908).
 
-Why: on 2026-09-12 an agent deleted rows from a live D1 database after announcing the intent in
-chat, with no recorded approval. Hawkeye made that a hard gate on dev2; T2 and the Mac had none.
-This port keeps Hawkeye's detection (its H-1, H-1b, H-1c and F6 fixes) and widens it for the
-bypasses a native review found (2026-11-06, native-reviews/hk-wave1-07d89d59.md F3). It replaces
-Hawkeye's hawk_ask grant store with a signed harness grant file.
+Why: an agent once deleted rows from a live database after announcing the intent in chat, with no
+recorded approval.
 
 What counts as destructive (after `/* ... */` comments and shell quote characters are removed, so
 `DEL""ETE` and `DELETE/**/FROM` still match): DELETE FROM, DROP TABLE|DATABASE|INDEX|SCHEMA,
@@ -24,6 +20,8 @@ What counts as a production TARGET (each yields the exact target value a grant m
   - ssh <prod-host> running a DB client or wrangler        -> the host
   - docker exec <prod-container> running a DB client        -> the container
   - mcp__*__d1_database_query / hyperdrive_* (production by construction) -> the database id field
+  - any extra tool named in ~/.agent-harness/local.json `db_tool_patterns` ([{"tool": "<name regex>",
+    "fields": [...]}]) has those input fields read as a command
 The SQL is read from the command and, with a DB client in it, from --file / psql -f files (also -1f,
 -Xf, --fi=), `< file`, `$(< file)`, every `cat` argument anywhere in the command (a pipe into ssh, docker
 exec, sudo or env, `$(cat ...)`, backticks), psql
@@ -40,7 +38,7 @@ read-only prod command that also cats a file it writes or a missing file is deni
 client is then a target. Scans are bounded (512 characters, 256 words after a client, 64 clients), and a
 command too long to judge its database is denied when it carries a destructive statement.
 Prose that merely mentions these words does not count; a heredoc that runs psql against a prod host
-does (Hawkeye's accepted over-refusal, H-2). Out of scope, disclosed: SQL built at run time
+does (an accepted over-refusal). Out of scope, disclosed: SQL built at run time
 (`base64 -d | psql`, variables holding the statement, scripts run by name), unnamed targets
 (a default PGHOST that is not in the hook's environment, PGSERVICE), non-SQL deletes (API calls, rm on a
 data directory), statements DESTRUCTIVE does not cover (MySQL multi-table `DELETE t FROM t`, mongosh
@@ -169,14 +167,38 @@ RESERVED_TARGETS = {"prod", "production", "delete", "drop", "truncate", "update"
 
 TOOL_COMMAND_FIELDS = (
     (re.compile(r"^Bash$"), ("command",)),
-    (re.compile(r"^mcp__hawkeye__run$"), ("payload", "command", "cmd", "script", "shell", "code")),
     (re.compile(r"(?i)d1_database_query$"), ("sql", "query")),
     (re.compile(r"(?i)^mcp__.*__(execute_sql|run_sql|query|sql)$"), ("sql", "query", "statement")),
 )
 TOOL_IS_PRODUCTION_BY_CONSTRUCTION = re.compile(r"(?i)^mcp__.*__(d1_database_query|hyperdrive_.*)$")
 TOOL_DB_FIELDS = ("database_id", "databaseId", "database", "database_name", "databaseName", "id")
-# The matcher install.py registers; tests pin that it covers every TOOL_COMMAND_FIELDS shape.
-MATCHER = r"Bash|mcp__hawkeye__run|.*d1_database_query|mcp__.*__(execute_sql|run_sql|query|sql)|mcp__.*__hyperdrive_.*"
+# The built-in matcher; install.py registers matcher(), which adds the local db_tool_patterns.
+MATCHER = r"Bash|.*d1_database_query|mcp__.*__(execute_sql|run_sql|query|sql)|mcp__.*__hyperdrive_.*"
+LOCAL_DEFAULT_FIELDS = ("command", "cmd", "script", "sql", "query", "payload")
+
+
+def local_tool_fields() -> tuple:
+    """(compiled full-name regex, fields) for each valid ~/.agent-harness/local.json `db_tool_patterns` entry."""
+    out = []
+    try:
+        import ah_local  # noqa: PLC0415
+        for entry in ah_local.get("db_tool_patterns", []):
+            if not isinstance(entry, dict) or not isinstance(entry.get("tool"), str) or not entry["tool"]:
+                continue
+            try:
+                pattern = re.compile("^(?:%s)$" % entry["tool"])
+            except re.error:
+                continue
+            fields = tuple(f for f in (entry.get("fields") or LOCAL_DEFAULT_FIELDS) if isinstance(f, str) and f)
+            out.append((pattern, fields or LOCAL_DEFAULT_FIELDS, entry["tool"]))
+    except Exception:  # noqa: BLE001 - a broken local file adds nothing
+        return ()
+    return tuple(out)
+
+
+def matcher() -> str:
+    """MATCHER plus every local db tool pattern: the matcher install.py registers."""
+    return "|".join([MATCHER] + [raw for _, _, raw in local_tool_fields()])
 
 FILE_READ_LIMIT = 200000
 GRANTS_NAME = "prod-delete-grants.json"
@@ -492,7 +514,7 @@ def command_text_for_event(ev: dict) -> str:
     ti = ev.get("tool_input")
     if not tool or not isinstance(ti, dict):
         return ""
-    for pat, keys in TOOL_COMMAND_FIELDS:
+    for pat, keys in TOOL_COMMAND_FIELDS + tuple((p, f) for p, f, _ in local_tool_fields()):
         if pat.search(tool):
             return "\n".join(v for v in (_as_text(ti.get(k)) for k in keys) if v.strip())
     return ""

@@ -38,9 +38,6 @@ from usage_guard import GuardError, PoolUnavailable, UsageStore, capture_subject
 
 PACKET_LIMIT = 150_000
 PACKET_WARNING = 32 * 1024
-# goodqa#16811: merge_gate mints the review-auth stamp as this process launches and main() takes it first thing, so a
-# stamp older than this was left by a run that never started or ended early; it is never honoured.
-REVIEW_STAMP_TTL_SECONDS = 120
 # Verdict-bearing provider output (stderr, the last-message file and every stdout record, except the exempt Codex
 # command_execution output below) is bounded at 1 MB, as before goodqa#16170.
 PROVIDER_LIMIT = 1_000_000
@@ -840,7 +837,7 @@ def make_snapshot(repo: Path, snapshot: Path, head: str, *, base: str | None = N
         raise OSError('reviewed paths differ only by case or Unicode form on a case-insensitive filesystem: '
                       + ', '.join(sorted(str(c) for c in clashes)[:5])[:300]
                       + '. This Mac clone cannot hold both files, so the clean-worktree check cannot pass here; run the '
-                      'review from a case-sensitive worktree (a Linux checkout such as dev2, or a case-sensitive APFS '
+                      'review from a case-sensitive worktree (a Linux checkout, or a case-sensitive APFS '
                       'volume), or rename one path in a commit first')
     slow_git(snapshot, 'checkout', '--quiet', '--detach', head)
     if repo_state(snapshot, snapshot=True) != (head, ''):
@@ -1612,14 +1609,15 @@ def pr_base(repo, base):
     return None
 
 
-def review_merge_eligible(args, binding, report, selection):
-    """Only a pure PR PASS with a known different-harness reviewer may auto-authorize."""
-    return bool(args.stage == 'pr' and binding and getattr(args, 'main_stamp', None)
-                and args.author_harness in {'claude', 'openai'}
-                and selection.get('harness') in {'claude', 'openai'}
-                and selection['harness'] != args.author_harness
-                and re.match(r'^VERDICT: PASS(?:\s|$)', report.strip())
-                and finding_ids(report) == ['UNSPECIFIED'] and 'TICKETED:' not in report)
+def top_rung_approval(task):
+    """{"approval": id} when a live `top-rung` record of the approvals store (ah_approvals) names `task`, else None.
+    Guarded import; never raises."""
+    try:
+        import ah_approvals  # noqa: PLC0415 - a sibling module; absent on older installs
+        record = ah_approvals.allowed('top-rung', task=task)
+    except Exception:  # noqa: BLE001
+        return None
+    return {'approval': record.get('id'), 'granted_by': record.get('granted_by')} if record else None
 
 
 FOLLOW_UP_LINE = re.compile(r'^follow-up:[ \t]*(.+)$', re.I | re.M)
@@ -1874,35 +1872,6 @@ def plan_resource_gate(content):
         return 0, ''  # older install without the resource gate
 
 
-def _burn_review_stamp(argv) -> None:
-    """goodqa#16811: a run that argparse refuses (an unknown option, a bad value, --help) still consumes main's
-    review-auth stamp, so the stamp cannot outlive the run it was minted for. merge_gate mints one only for a single
-    plain command naming each binding flag once, so reading `--flag value` and `--flag=value` here finds the pair it
-    minted. Best effort: nothing here can change how the run ends."""
-    argv = [str(word) for word in argv]
-    if '--no-main-stamp' in argv:
-        return
-    found = {}
-    for index, word in enumerate(argv):
-        for flag in ('--github-repo', '--pr'):
-            if word == flag and index + 1 < len(argv):
-                found.setdefault(flag, argv[index + 1])
-            elif word.startswith(flag + '='):
-                found.setdefault(flag, word[len(flag) + 1:])
-    try:
-        _take_review_stamp(found['--github-repo'], int(found['--pr']))
-    except Exception:
-        return
-
-
-def _take_review_stamp(repo, number):
-    """Main's review-auth stamp for this repo and PR (consumed), or None. The one take both call sites use
-    (goodqa#16811 round 2, F2): the stamp must be bound to main's tool call that is still running (a call another
-    hook denied, the user rejected or that failed to launch is over) and at most REVIEW_STAMP_TTL_SECONDS old."""
-    import caller_identity
-    return caller_identity.take_stamp('review-auth', [repo, number], ttl=REVIEW_STAMP_TTL_SECONDS, bound=True)
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("stage", choices=("plan", "code-inspection", "pr"))
@@ -1941,20 +1910,9 @@ def main() -> int:
     parser.add_argument('--github-repo', help='Exact owner/repo binding for an optional reviewed GitHub PR')
     parser.add_argument('--pr', type=int, help='Exact pull request number; requires --github-repo')
     parser.add_argument('--no-main-stamp', action='store_true',
-                        help='Never look for or consume a main-agent review-auth stamp: the run can bind to a PR '
-                             'but can never mint a merge authorization (the ahc daemon always passes this)')
-    try:
-        args = parser.parse_args()
-    except SystemExit:
-        _burn_review_stamp(sys.argv[1:])  # argparse refused the run (or printed help) before the take below
-        raise
-    # goodqa#16811: take main's review-auth stamp before anything else can end the run, so a run that exits early (a
-    # usage error, a HEAD mismatch, a dirty worktree) leaves no stamp for a later process to take; a stamp older than
-    # REVIEW_STAMP_TTL_SECONDS (the hook mints it as this very process launches) is never honoured, and neither is one
-    # whose tool call in main's transcript is already over (_take_review_stamp).
-    args.main_stamp = None
-    if args.github_repo is not None and args.pr is not None and not args.no_main_stamp:
-        args.main_stamp = _take_review_stamp(args.github_repo, args.pr)
+                        help='Accepted and ignored (2026-11-24: there is no main-agent stamp any more; the settled '
+                             'receipt is the merge evidence). The ahc daemon still passes it.')
+    args = parser.parse_args()
     if args.reviewer == 'codex-only' and args.secondary != 'default':
         parser.error('--reviewer codex-only cannot be combined with --secondary kimi')
     if (args.github_repo is None) != (args.pr is None):
@@ -2030,24 +1988,6 @@ def main() -> int:
             target.close()
             evidence.close()
             parser.error(str(error))
-        # #134 red-team B2: only a run the main agent's hook saw may mint a merge authorization; the stamp was taken
-        # right after argument parsing. goodqa#16049: a caller that is never the authority (the ahc daemon) opts out
-        # with --no-main-stamp, so a run on a host where main has stamps can neither take nor burn main's stamp.
-        if args.main_stamp is None:
-            # goodqa#16811: the hook that decides names its reason in the agent's context; this note lists every cause
-            # instead of implying the caller is not main.
-            print('Note: no main-agent stamp for this --github-repo/--pr run; this review cannot authorize a merge. '
-                  + ('--no-main-stamp was given. ' if args.no_main_stamp else
-                     "The merge-gate hook's own note gives the reason when it minted none: not the proven main agent, "
-                     'not the Bash tool, not one plain python3 .../peer_review.py command (an unquoted ; & | < > or #, '
-                     'a newline, a backslash, or a $ or backtick even inside double quotes), or a missing or repeated '
-                     '--github-repo/--pr, or a call without a tool_use_id or transcript to bind the stamp to. A '
-                     'stamp is also single use, is honoured only within %d s of the launch, and only while the '
-                     "main agent's call that launched this run is still running (another hook denied it, the "
-                     'permission prompt was rejected or the launch failed: the call is over). '
-                     % REVIEW_STAMP_TTL_SECONDS)
-                  + 'Fix the cause and rerun once with --repeat-reason in single quotes, with no apostrophe inside.',
-                  file=sys.stderr)
     if before[1]:
         target.close()
         evidence.close()
@@ -2173,11 +2113,14 @@ def main() -> int:
                 permission = ladder.Ledger(policy=policy).status(args.task).get('permission')
             except (ladder.LedgerError, tiers.TierError):
                 permission = None
-        if not isinstance(permission, dict) or not permission.get('ask_id'):
+            if not isinstance(permission, dict) or not permission.get('ask_id'):
+                permission = top_rung_approval(args.task)  # the approvals store (`ah approve top-rung --task T`)
+        if not isinstance(permission, dict) or not (permission.get('ask_id') or permission.get('approval')):
             target.close()
             evidence.close()
-            print('Review refused: reviewer rung %s needs user permission recorded for the task by approve-top '
-                  '(--task with a ledger permission); --author-rung alone is not a record' % selection['rung'], file=sys.stderr)
+            print('Review refused: reviewer rung %s needs the user\'s permission for the task: an approve-top ledger '
+                  'record or an approval (`ah approve top-rung --task %s --reason "<why>"`, run by the user); '
+                  '--author-rung alone is not a record' % (selection['rung'], args.task or '<task>'), file=sys.stderr)
             return 2
     # goodqa#16947: the per-provider deadline for this reviewer rung and effort. --timeout can only lower it; a value
     # above it is refused before any reservation, as a value above 720 always was.
@@ -2367,7 +2310,7 @@ def main() -> int:
                           f"Reviewer-Route: {args.reviewer}; attempts {','.join(options['review_routing']['attempt_order'])}; "
                           f"fallback {options['review_routing']['effective_fallback'] or 'none'}\n"
                           f"Reviewer-Actual: {options.get('actual_reviewer', 'unknown')}\n"
-                          f"{'Permission: ' + str(permission['ask_id']) + chr(10) if permission else ''}"
+                          f"{'Permission: ' + str(permission.get('ask_id') or 'approval ' + str(permission.get('approval'))) + chr(10) if permission else ''}"
                           f"Review input: isolated committed snapshot (depth 1"
                           f"{', base ' + base if base and base != before[0] else ''})\n"
                           f"Worktree status: {'clean' if not before[1] else 'dirty'}\n{note}\n{report.strip()}\n",
@@ -2418,8 +2361,6 @@ def main() -> int:
         print(f"{source}: {report.splitlines()[0].strip()} | {output}\n"
               'Usage receipt: ' + json.dumps(reference, sort_keys=True), flush=True)
         announced = True
-        actual_selection = dict(selection, harness=options.get('reviewer_harness', 'unknown'))
-        authorize_review = review_merge_eligible(args, binding, report, actual_selection)
     except (OSError, subprocess.TimeoutExpired, GuardError) as error:
         if run_record is not None and not finalized:
             try:
@@ -2442,18 +2383,6 @@ def main() -> int:
                     store.invalidate_review(reference, reason='Review publication did not complete')
                 except (OSError, GuardError):
                     print('Review settlement could not be invalidated; reconciliation is required.', file=sys.stderr)
-    if announced and authorize_review:
-        import merge_gate
-        try:
-            # The PR may have moved or closed while the provider ran; only a
-            # still-current exact binding can receive the one-shot waiver.
-            verify_pr_binding(binding['repo'], binding['pr'], before[0])
-            waiver = merge_gate.add_review_waiver(
-                merge_gate.default_state_dir(), reference, store=store)
-            print('Merge authorization: ' + waiver['id'], flush=True)
-        except (OSError, ValueError, merge_gate.Corrupt, GuardError) as error:
-            print('Warning: review passed, but merge authorization could not be created: '
-                  + diagnostics.sanitize(error), file=sys.stderr)
     return 0 if re.match(r'^(?:VERDICT: PASS|(?:PLAN|CODE_INSPECTION)_RESULT: ACCEPT)\b', report.lstrip()) else 3
 
 

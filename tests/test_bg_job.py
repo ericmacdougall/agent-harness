@@ -516,7 +516,7 @@ class Wiring(unittest.TestCase):
         claude = Path("/nonexistent-claude-home/.claude")
         self.assertIn(str(claude / "hooks" / "bg_lint.py"), install.managed_scripts(claude))
         bash_groups = [g for g in install.managed_hooks(claude)["PreToolUse"] if g.get("matcher") == "Bash"]
-        lints = [h for g in bash_groups for h in g["hooks"] if h.get("args", [""])[0].endswith("bg_lint.py")]
+        lints = [h for g in bash_groups for h in g["hooks"] if (install.hook_argv(h) or [""])[0].endswith("bg_lint.py")]
         self.assertEqual(len(lints), 1)
         self.assertNotEqual(lints[0].get("onFailure"), "block")  # advisory: a lint failure must not block
         self.assertTrue((HOOKS / "bg_job.py").is_file() and (HOOKS / "bg_lint.py").is_file())

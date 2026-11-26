@@ -66,9 +66,6 @@ class RoutingBoundary(unittest.TestCase):
     def test_auto_route_and_real_authority_rules_are_preserved(self):
         self.options.update(reviewer='auto', selection=review.tiers.reviewer_for(self.policy, 'R0', 'openai'))
         self.invoke(); self.assertEqual(self.calls, ['claude'])
-        for author, stamp in (('unknown', {'purpose': 'fixture'}), ('openai', {'purpose': 'fixture'}), ('claude', None)):
-            args = SimpleNamespace(stage='pr', author_harness=author, main_stamp=stamp)
-            self.assertFalse(review.review_merge_eligible(args, {'repo': 'o/r', 'pr': 1}, 'VERDICT: PASS', {'harness': 'openai'}))
 
     def test_codex_block_is_one_validated_attempt(self):
         self.failure = (0, '\n'.join(json.dumps(r) for r in (

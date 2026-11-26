@@ -5,6 +5,12 @@ audit intent rows (fail closed: no audit row, no signal) -> SIGTERM (children fi
 period SIGKILL whatever is left -> write one result row per pid. Before every signal the pid identity (start time and
 command) is probed again, so a reused pid is never hit.
 
+Who may stop what (redesign 2026-11-24; roles from ah_roles via the CLI's session and agent ids): the caller's own
+tree, worktree and session spawns with no flag; a supervisor also its supervised projects; a top-rung caller anything
+with --foreign and no ask record, except harness daemons (a harness maintainer may) and staging/live services; anyone
+else's --foreign needs --approved-by <ask> whose human answer names the pid. Never: pid 1, the caller's own session
+chain, root, another user, system processes. kill_guard no longer judges `ah kill`; this file is the check.
+
 Audit: ~/.agent-harness/kill-audit.jsonl (append-only, 0600) and the caller's WAL (best effort, reported).
 """
 from __future__ import annotations
@@ -25,16 +31,33 @@ import time
 import uuid
 from pathlib import Path
 
-HOSTS = ("dev2", "t2-dev", "ah-mac-mini")
+
+def _local():
+    """harness/hooks/ah_local.py (the owner's ~/.agent-harness/local.json), or None."""
+    try:
+        import sys  # noqa: PLC0415
+        here = str(Path(__file__).resolve().parent)
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        import ah_local  # noqa: PLC0415
+        return ah_local
+    except Exception:  # noqa: BLE001
+        return None
+
+
+_LOCAL = _local()
+# ssh hosts `ah kill --host` serves: the hosts of ~/.agent-harness/local.json (none by default).
+HOSTS = tuple(h for h in (_LOCAL.host_names() if _LOCAL else ())
+              if h not in (_LOCAL.host_names(os_name="windows") if _LOCAL else ()))
 # Windows OpenSSH hosts (goodqa#15275): ah.py is not installed there, so ah kill reads and stops the process itself
 # over ssh with PowerShell. Windows OpenSSH does not end a session's processes when the client disconnects, so
 # orphaned remote PowerShell children need this audited path.
-WINDOWS_HOSTS = ("ah-spectre",)
+WINDOWS_HOSTS = _LOCAL.host_names(os_name="windows") if _LOCAL else ()
 # Delta red-team D-F4: a Windows stop is an allowlist, not a deny list. It may stop only an orphaned shell (its parent
 # is gone, or the parent pid now belongs to a newer process) that the ssh login user owns and that is not part of the
 # ssh session running the check. That is exactly the orphaned PowerShell children it exists for. "The login user" is
-# GetOwner of the checking shell itself: on the Spectre $env:USERDOMAIN is WORKGROUP while GetOwner says the machine
-# name (found live, goodqa#15275). Anything else
+# GetOwner of the checking shell itself: on a workgroup machine $env:USERDOMAIN is WORKGROUP while GetOwner says the
+# machine name (found live, goodqa#15275). Anything else
 # (claude, codex, node, adb, sshd-session, WSL, Defender, ...) is refused.
 WINDOWS_ALLOWED = {"powershell", "pwsh", "cmd"}
 WIN_SENTINEL = "AHK1 "  # D-F5: the answer is the last line with this prefix; profile or CLIXML noise is ignored
@@ -231,9 +254,9 @@ def interactive_shell(info, base) -> bool:
     return not any(not w.startswith("-") for w in words)  # no script or -c program: it reads the terminal
 
 
-def refusal(info, my_uid: int, protected: set, probe=None, table=None, skip_approvable=False):
-    """Reason string when this process may never be signalled, else None. No flag reaches this function, except
-    skip_approvable: with a verified --approved-by, the APPROVABLE reasons are skipped and every other one applies."""
+def refusal(info, my_uid: int, protected: set, probe=None, table=None):
+    """Reason string when this process is not signalled by default, else None. role_refusal decides which reasons a
+    role or the owner's approval lifts (HARD ones never)."""
     pid = info["pid"]
     if pid <= 1:
         return "pid 1 and below are never signalled"
@@ -250,9 +273,9 @@ def refusal(info, my_uid: int, protected: set, probe=None, table=None, skip_appr
     base = os.path.basename(comm).lower()
     if os.path.basename(first).lower() in {"sshd", "launchd"}:
         return "protected process (%s)" % base
-    if base in PROTECTED_COMM and not (skip_approvable and base in APPROVABLE_COMM):
+    if base in PROTECTED_COMM:
         return "protected process (%s)" % base
-    if is_session_process(info) and not skip_approvable:
+    if is_session_process(info):
         return "claude/codex session process"
     if interactive_shell(info, base):
         return "interactive shell"
@@ -261,9 +284,10 @@ def refusal(info, my_uid: int, protected: set, probe=None, table=None, skip_appr
     words = [comm] + (info.get("command") or "").split()[:8]
     for w in words:
         name = re.sub(r"\.(py|sh)$", "", os.path.basename(w).lower())
-        if (name in DAEMON_NAMES or name.startswith(DAEMON_PREFIXES)) and not (
-                skip_approvable and name.startswith("harness-console")):
+        if name in DAEMON_NAMES or name.startswith(DAEMON_PREFIXES):
             return "harness daemon or backup job (%s)" % name
+    if any(p.search(info.get("command") or "") for p in _live_patterns()):
+        return LIVE
     if probe is not None and table is not None and MCP_WORD.search(info.get("command") or ""):
         owner = session_ancestor(probe, table, pid)
         if owner is not None:  # stopping one breaks that session's tools, mine included
@@ -273,12 +297,7 @@ def refusal(info, my_uid: int, protected: set, probe=None, table=None, skip_appr
 
 # ---- --approved-by (goodqa#15253): a stop of a stale protected process that the user approved
 
-APPROVABLE_COMM = {"claude", "codex"}
-# Only the harness console daemon: backups (rclone, log_backup), netwatch, hookd and ahd stay unstoppable here.
-APPROVABLE = re.compile(r"^(?:harness daemon or backup job \(harness-console[\w.-]*\)$|claude/codex session process$|"
-                        r"protected process \((?:claude|codex)\)$)")
 APPROVAL_MAX_AGE_S = 24 * 3600
-APPROVED_IDLE_S = 24 * 3600
 ASK_ID = re.compile(r"[A-Za-z0-9_-]{4,40}")
 
 
@@ -294,13 +313,6 @@ def _epoch_iso(value):
     try:
         return dt.datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
     except (TypeError, ValueError):
-        return None
-
-
-def _epoch_lstart(value):
-    try:
-        return time.mktime(time.strptime(" ".join(str(value).split()), "%a %b %d %H:%M:%S %Y"))
-    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -361,27 +373,85 @@ def _named(text, pid, root, info):
 
 
 def approval_problem(probe, info, pid, root, scope):
-    """None when the verified approval in scope covers this process, else the reason it does not."""
-    approval = scope["approval"]
-    if not _named(approval["text"], pid, root, info):
+    """None when the verified approval in scope covers this process (the owner's answer lists its pid, or its --tree
+    root's, and negates nothing), else the reason it does not."""
+    if not _named(scope["approval"]["text"], pid, root, info):
         return "the approving answer does not list pid %d (\"pid %d\") or it contains a negation" % (pid, pid)
-    started = _epoch_lstart(info.get("start"))
-    if started is None:
-        return "its start time cannot be read"
-    if scope["now"] - started < APPROVED_IDLE_S:
-        return "it started less than %d h ago" % (APPROVED_IDLE_S // 3600)
-    if scope.get("session_start") is None or started >= scope["session_start"]:
-        return "it did not start before the current session"
-    if not (info.get("stat") or "").startswith(("S", "I")):
-        return "it is not sleeping"
-    cpu = getattr(probe, "cpu", None)
-    try:
-        used = cpu(pid) if cpu else None
-    except Exception:  # noqa: BLE001
-        used = None
-    if used is None or used > 0.0:
-        return "it is using CPU or its CPU use cannot be read"
     return None
+
+
+# ---- roles (ah_roles is the one place that knows them)
+
+HARD = re.compile(r"^(?:pid 1 and below|the caller's own process|root-owned|owned by another user|system process|"
+                  r"protected process \((?:sshd|launchd|init|systemd)\))")
+DAEMON = re.compile(r"^harness daemon or backup job")
+LIVE = "staging/live service (kill_guard_policy.json staging_live)"
+
+
+def caller_roles(home, session, agent=""):
+    """{"top", "maintainer", "supervised": [real paths]} for the caller."""
+    try:
+        import ah_roles  # noqa: PLC0415
+        payload = ah_roles.cli_payload(home=home, session=session or "", agent=agent)
+        top = ah_roles.is_top_rung(payload)
+        fn = getattr(ah_roles, "may_edit_harness", None)
+        maintainer = bool(fn(payload) if fn else (top and ah_roles.is_supervisor(payload, home)))
+        return {"top": top, "maintainer": maintainer,
+                "supervised": [os.path.realpath(str(p)) for p in ah_roles.supervised_roots(payload, home)]}
+    except Exception:  # noqa: BLE001
+        return {"top": False, "maintainer": False, "supervised": []}
+
+
+def _live_patterns():
+    try:
+        # input-ok: the shipped policy file beside this script
+        policy = json.loads(Path(__file__).resolve().with_name("kill_guard_policy.json").read_text())
+        return [re.compile(p) for p in policy.get("staging_live") or [] if isinstance(p, str)]
+    except (OSError, ValueError, re.error):
+        return []
+
+
+def role_refusal(why, info, roles, approval_ok):
+    """What is left of a refusal once the caller's role or the owner's approval is counted. Hard refusals stay for
+    everyone; staging/live stays unless the owner approved; a harness daemon stays unless approved or the caller is a
+    harness maintainer; everything else is lifted for a top-rung caller or by an approval."""
+    if not why or HARD.match(why):
+        return why
+    if why == LIVE:
+        return None if approval_ok else why
+    if DAEMON.match(why):
+        return None if approval_ok or roles.get("maintainer") else why
+    return None if approval_ok or roles.get("top") else why
+
+
+def store_approval(pid, cwd, owner_only=False):
+    """A live `kill` record of the approvals store (ah_approvals) covering this pid (and its cwd as the project), or
+    None. owner_only: only a record the owner granted (staging/live services). Never raises."""
+    try:
+        import ah_approvals  # noqa: PLC0415 - a sibling module; absent on older installs
+        facts = {"pids": [int(pid)]}
+        if cwd:
+            facts["project"] = cwd
+        record = ah_approvals.allowed("kill", **facts)
+    except Exception:  # noqa: BLE001
+        return None
+    if record and owner_only and record.get("granted_by") != "user":
+        return None
+    return record
+
+
+def approve_hint(pid) -> str:
+    """The `ah approve kill ...` line a refusal names (ah_approvals.command_hint), or a fixed fallback."""
+    try:
+        import ah_approvals  # noqa: PLC0415
+        return ah_approvals.command_hint("kill", pids=[int(pid)])
+    except Exception:  # noqa: BLE001
+        return 'ah approve kill --pids %d --reason "<why>"' % int(pid)
+
+
+def in_supervised(info, cwd, roles):
+    paths = [p for p in [cwd] + (info.get("command") or "").split()[:4] if p and p.startswith("/")]
+    return any(_inside(p, r) for p in paths for r in roles.get("supervised") or [])
 
 
 def session_ancestor(probe, table, pid):
@@ -562,40 +632,61 @@ def snapshot(probe, pid, my_uid, protected, root=None, role="target", scope=None
     rec = {"pid": pid, "role": role, "root": root, "ppid": info["ppid"], "user": probe.user(info["uid"]),
            "uid": info["uid"], "start": info["start"], "cmd": _clip(info["command"]), "cwd": probe.cwd(pid),
            "id": fingerprint(info), "_info": info}
-    table = scope["table"] if scope else None
-    why = refusal(info, my_uid, protected, probe if scope else None, table)
-    approval = scope.get("approval") if scope else None
-    if approval and not info["stat"].startswith("Z") and (
-            (why and APPROVABLE.match(why)) or (not why and not in_own_scope(
-                probe, table, pid, rec["cwd"], scope["roots"], scope["worktree"]))):
-        rest = refusal(info, my_uid, protected, probe, table, skip_approvable=True)
-        bound = rest or approval_problem(probe, info, pid, root, scope)
-        if bound is None:
-            rec["scope"], rec["approved"], rec["approved_by"] = "approved", True, approval["ask"]
-            rec["lifted"] = why  # the refusal the user's approval lifted (None: it was only outside the caller's tree)
-            return rec
-        if why:
-            why = "%s; --approved-by %s does not cover it: %s" % (why, approval["ask"], bound)
+    scope = scope or {}
+    table, roles = scope.get("table"), scope.get("roles") or {}
+    approval = scope.get("approval")
+    approved = bool(approval) and approval_problem(probe, info, pid, root, scope) is None
+    first = refusal(info, my_uid, protected, probe if scope else None, table)
+    stored = None  # an `ah approve kill` record covering this pid (never for a HARD refusal)
+    if first and not HARD.match(first) and not approved:
+        stored = store_approval(pid, rec["cwd"], owner_only=(first == LIVE))
+    why = role_refusal(first, info, roles, approved or bool(stored))
     if why:
+        if approval and not approved and not HARD.match(why):
+            why += "; --approved-by %s does not cover it: %s" % (approval["ask"], approval_problem(probe, info, pid, root, scope))
+        if not HARD.match(why):
+            why += "; the owner approves it with: " + approve_hint(pid)
         rec["status"], rec["detail"] = "refused", why
-    elif info["stat"].startswith("Z"):
+        return rec
+    if stored:
+        rec["approved_by"] = stored.get("id")
+    if first:
+        rec["lifted"] = first  # the refusal a role or the owner's approval lifted
+    if info["stat"].startswith("Z"):
         rec["status"], rec["detail"] = "gone", "already a zombie"
-    elif scope and scope.get("session_spawns") and not in_own_scope(
-            probe, table, pid, rec["cwd"], scope["roots"], scope["worktree"]) and (
-            pid, spawn_start(probe, pid)) in scope["session_spawns"]:
-        rec["scope"] = "session-spawn"  # spawned by a worktree in main's session work dir: audited, no notice
-    elif scope and not in_own_scope(probe, table, pid, rec["cwd"], scope["roots"], scope["worktree"]):
-        rec["scope"] = "foreign"
-        if not scope["foreign"]:
-            rec["status"] = "refused"
-            rec["detail"] = ("foreign: outside your worktree and process tree; pass --foreign to stop it "
-                             "(audited, and main is notified)")
-        else:
-            owner = session_ancestor(probe, table, pid)
-            rec["foreign"] = True
-            rec["target_worktree"] = probe.git_top(rec["cwd"])
-            rec["owner_pid"] = owner
-            rec["owner_session"] = probe.session_env(owner) if owner else None
+        return rec
+    if not scope or in_own_scope(probe, table, pid, rec["cwd"], scope["roots"], scope["worktree"]):
+        return rec
+    if scope.get("session_spawns") and (pid, spawn_start(probe, pid)) in scope["session_spawns"]:
+        rec["scope"] = "session-spawn"  # spawned by a worktree in this session's work dir
+        return rec
+    if in_supervised(info, rec["cwd"], roles):
+        rec["scope"] = "supervised"  # a project the caller supervises: its own to stop
+        return rec
+    rec["scope"] = "foreign"
+    if approved:
+        rec["scope"], rec["approved"], rec["approved_by"] = "approved", True, approval["ask"]
+        return rec  # the owner's approval: one info notice for approved stops, not a foreign page
+    stored = stored or store_approval(pid, rec["cwd"])
+    if stored:
+        rec["scope"], rec["approved"], rec["approved_by"] = "approved", True, stored.get("id")
+        return rec  # an `ah approve kill` record covers it
+    if not scope["foreign"]:
+        rec["status"] = "refused"
+        rec["detail"] = ("foreign: outside your worktree, process tree and supervised projects; "
+                         + ("pass --foreign (audited, main is notified)" if roles.get("top") else
+                            "the owner approves it with: " + approve_hint(pid)))
+        return rec
+    elif not roles.get("top"):
+        rec["status"] = "refused"
+        rec["detail"] = ("foreign: --foreign needs the owner's approval for this pid (or a supervisor or top-rung "
+                         "caller); the owner approves it with: " + approve_hint(pid))
+        return rec
+    owner = session_ancestor(probe, table, pid)
+    rec["foreign"] = True
+    rec["target_worktree"] = probe.git_top(rec["cwd"])
+    rec["owner_pid"] = owner
+    rec["owner_session"] = probe.session_env(owner) if owner else None
     return rec
 
 
@@ -618,7 +709,7 @@ def alive(probe, rec) -> bool:
 def kill_local(pids, reason, tree=False, grace=DEFAULT_GRACE, home=None, probe=None, sleep=time.sleep,
                clock=time.monotonic, session="", agent="", wal_path=None, via=None, own_pid=None, foreign=False,
                worktree="auto", notify=None, session_scope=False, approved_by=None, approval_resolver=None,
-               now=None):
+               now=None, roles=None):
     reason = (reason or "").strip()
     if not reason:
         raise KillError("reason_required", "--reason is mandatory and must not be empty")
@@ -645,14 +736,13 @@ def kill_local(pids, reason, tree=False, grace=DEFAULT_GRACE, home=None, probe=N
     roots = {own_pid}
     if worktree == "auto":
         worktree = probe.git_top(os.getcwd())
-    scope = {"table": table, "roots": roots, "worktree": worktree, "foreign": foreign,
+    if roles is None:
+        roles = caller_roles(home, session, agent)
+    caller["roles"] = {k: v for k, v in roles.items() if k != "supervised"}
+    scope = {"table": table, "roots": roots, "worktree": worktree, "foreign": foreign, "roles": roles,
              "session_spawns": session_spawns(home, session_dir) if session_dir else set()}
     if approved_by:
         scope["approval"] = (approval_resolver or resolve_approval)(approved_by, session, home)
-        scope["now"] = time.time() if now is None else now
-        owner = session_ancestor(probe, table, own_pid)
-        owner_info = probe.info(owner) if owner else None
-        scope["session_start"] = _epoch_lstart(owner_info["start"]) if owner_info else None
     plan, seen = [], set()
     for root in pids:
         batch = []
@@ -673,13 +763,15 @@ def kill_local(pids, reason, tree=False, grace=DEFAULT_GRACE, home=None, probe=N
     for rec in plan:
         audit.row({"event": "intent" if rec in live else "refused", "run": run_id, "reason": reason,
                    "tree": tree, "grace": grace, **_public(rec)})
-    approved_live = [r for r in live if r.get("approved")]
+    approved_live = [r for r in live if r.get("approved") or (r.get("lifted") and scope.get("approval"))]
     if approved_live:
-        approval = scope["approval"]
+        # --approved-by <ask>, or an `ah approve kill` record of the approvals store (rec["approved_by"] is its id)
+        approval = scope.get("approval") or {"ask": ",".join(sorted({str(r.get("approved_by")) for r in approved_live})),
+                                             "source": "ah approvals"}
         # A verified user approval is a record, not a page: info, one aggregated row per caller session (fleet round item 3).
         event = {"host": _host(), "source": "ops-watch", "event": "raise", "severity": "info", "check": "ah-kill",
                  "key": "ah-kill:approved:" + _who(session, agent),
-                 "message": "ah kill --approved-by %s stopped/will stop %d user-approved stale process(es): %s (reason: %s)" % (
+                 "message": "ah kill approved by %s stopped/will stop %d user-approved stale process(es): %s (reason: %s)" % (
                      approval["ask"], len(approved_live), ", ".join(str(r["pid"]) for r in approved_live), _clip(reason, 120)),
                  "detail": {"run": run_id, "caller": caller, "reason": _clip(reason, 200), "ask": approval["ask"],
                             "source": approval["source"], "targets": [

@@ -285,7 +285,7 @@ class Negatives(Fixture):
         data = {'tool_name': 'Agent', 'tool_input': {'prompt': prompt}, 'tool_use_id': 'h3',
                 'tool_response': {'status': 'async_launched', 'agentId': 'a9', 'resolvedModel': SONNET}}
         with mock.patch.object(gate, 'decide_spawn', side_effect=AssertionError('decide_spawn ran')), \
-                mock.patch.object(gate, 'owner_cap_decision', side_effect=AssertionError('owner scan ran')), \
+                mock.patch.object(gate, 'live_owner_ids', side_effect=AssertionError('owner scan ran')), \
                 mock.patch.object(gate.safe_input, 'read_stdin_bounded', return_value=json.dumps(data).encode()), \
                 mock.patch('sys.stdout', io.StringIO()) as out:
             self.assertEqual(gate.main(['dispatch']), 0)
@@ -373,29 +373,7 @@ class Negatives(Fixture):
         policy.setdefault('caps', {})['session_owner_agents'] = 1
         return policy
 
-    def test_pretool_does_not_wait_on_lock(self):
-        data = {'tool_name': 'Agent', 'tool_input': {'prompt': 'x [task:kc]', 'subagent_type': 'task-owner'},
-                'session_id': 's', 'tool_use_id': 'c1'}
-        import fcntl
-        fd = os.open(self.root / 'kc.lock', os.O_RDWR | os.O_CREAT, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        try:
-            buffer = io.StringIO()
-            started = time.monotonic()
-            with mock.patch.object(gate.safe_input, 'read_stdin_bounded', return_value=json.dumps(data).encode()), \
-                    mock.patch.object(tiers, 'load_policy', return_value=self._cap_policy()), \
-                    mock.patch.object(gate, 'live_owner_ids', return_value=['other-owner']), \
-                    mock.patch.object(esc.Ledger, 'status', side_effect=AssertionError('ledger.status on cap path')), \
-                    mock.patch('sys.stdout', buffer):
-                self.assertEqual(gate.main(['hook']), 0)
-            self.assertLess(time.monotonic() - started, 1.0)
-        finally:
-            os.close(fd)
-        self.assertIn('owner cap', buffer.getvalue())
-        lines = (self.root / 'kc.dispatch-open.jsonl').read_text().splitlines()
-        self.assertEqual(json.loads(lines[0])['tool_use_id'], 'c1')
-
-    def test_warn_cap_deny_opens_dispatch(self):
+    def test_owner_count_never_blocks_a_spawn_and_the_dispatch_opens(self):
         self.climb_to('kcap', 'R2')
         data = {'tool_name': 'Agent', 'tool_input': {'prompt': 'w [task:kcap]', 'subagent_type': 'task-owner',
                                                      'model': 'opus', 'effort': 'high'},

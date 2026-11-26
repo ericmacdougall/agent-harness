@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from install import (END, START, ROOT, durable_tmp_choice, install, merged_instructions,
+from install import (END, START, ROOT, durable_tmp_choice, hook_argv, install, merged_instructions,
                      save_durable_tmp_choice, scratch_status)
 
 
@@ -43,7 +43,7 @@ class InstallerTests(unittest.TestCase):
         hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
         for event, action in (("SubagentStart", "subagent"), ("SubagentStop", "subagent_stop")):
             groups = [g for g in hooks[event]
-                      if any(os.path.basename(str((h.get("args") or [""])[0])) == "wal.py" for h in g.get("hooks", []))]
+                      if any(os.path.basename(str((hook_argv(h) or [""])[0])) == "wal.py" for h in g.get("hooks", []))]
             self.assertEqual(len(groups), 1, event)
             matcher = groups[0].get("matcher")
             self.assertIn(matcher, (None, ".*", "*"), (event, matcher))  # every type, not a list of named types
@@ -51,8 +51,8 @@ class InstallerTests(unittest.TestCase):
             for agent_type in ("general-purpose", "claude", "Explore", "Plan", "task-owner", "red-team", "fixer",
                                "click-tester", "statusline-setup", "any-new-type-123"):
                 self.assertTrue(re.fullmatch(matcher if matcher != "*" else ".*", agent_type), (event, matcher, agent_type))
-            hook = [h for h in groups[0]["hooks"] if os.path.basename(str(h["args"][0])) == "wal.py"][0]
-            self.assertEqual(hook["args"][1], action)
+            hook = [h for h in groups[0]["hooks"] if os.path.basename(str(hook_argv(h)[0])) == "wal.py"][0]
+            self.assertEqual(hook_argv(hook)[1], action)
             result = subprocess.run([sys.executable, *[str(a) for a in hook["args"]]],
                                     input=json.dumps({"session_id": "s-gp", "agent_id": "owner-gp", "agent_type": "general-purpose"}),
                                     text=True, capture_output=True, timeout=30, env={**os.environ, "HOME": str(self.home)})
@@ -166,7 +166,7 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual((self.claude / "hooks" / name).read_bytes(), (ROOT / "harness/hooks" / name).read_bytes(), name)
         self.assertIn("run_probe.py", (self.claude / "agents" / "red-team.md").read_text())
         settings = json.loads((self.claude / "settings.json").read_text())
-        groups = {tuple(group["hooks"][0].get("args", [""])[:1]): group for group in settings["hooks"]["PreToolUse"]}
+        groups = {tuple((hook_argv(group["hooks"][0]) or [""])[:1]): group for group in settings["hooks"]["PreToolUse"]}
         heavy = groups[(str(self.claude / "hooks" / "heavy_job_guard.py"),)]
         gate = groups[(str(self.claude / "hooks" / "agent_gate.py"),)]
         self.assertEqual(heavy["matcher"], "Bash")
@@ -174,12 +174,12 @@ class InstallerTests(unittest.TestCase):
         for group in (heavy, gate):  # fail-open: a guard bug must never block every Bash or Agent call
             self.assertNotIn("onFailure", group["hooks"][0])
         limits = json.loads((self.claude / "hooks" / "resource_limits.json").read_text())
-        self.assertEqual((limits["warn_agents"], limits["max_agents"]), (12, 20))
+        self.assertEqual((limits["max_live_owners"], limits["enforce"]), (16, False))  # the one owner cap
         before = (self.claude / "settings.json").read_bytes()
         hook_bytes = {n: (self.claude / "hooks" / n).read_bytes() for n in ("heavy_job_guard.py", "agent_gate.py")}
         install(self.home, apply=True)  # second run changes nothing
         self.assertEqual((self.claude / "settings.json").read_bytes(), before)
-        self.assertEqual(sum(1 for g in json.loads(before)["hooks"]["PreToolUse"] if g["hooks"][0].get("args", [""])[0].endswith("heavy_job_guard.py")), 1)
+        self.assertEqual(sum(1 for g in json.loads(before)["hooks"]["PreToolUse"] if (hook_argv(g["hooks"][0]) or [""])[0].endswith("heavy_job_guard.py")), 1)
         self.assertEqual(hook_bytes, {n: (self.claude / "hooks" / n).read_bytes() for n in hook_bytes})
 
     def test_reinstall_keeps_exactly_one_of_each_group_from_both_feature_sets(self):
@@ -190,7 +190,7 @@ class InstallerTests(unittest.TestCase):
         for event, groups in hooks.items():
             for group in groups:
                 for hook in group.get("hooks", []):
-                    args = hook.get("args") or []
+                    args = hook_argv(hook)
                     if args and str(args[0]).startswith(str(self.claude / "hooks")):
                         key = (event, group.get("matcher"), os.path.basename(args[0]), tuple(args[1:]))
                         counts[key] = counts.get(key, 0) + 1
@@ -214,8 +214,8 @@ class InstallerTests(unittest.TestCase):
         for event, groups in settings.get("hooks", {}).items():
             for group in groups:
                 for hook in group.get("hooks", []):
-                    if script in (hook.get("args") or []):
-                        found.append((event, group.get("matcher"), hook["args"][1]))
+                    if script in hook_argv(hook):
+                        found.append((event, group.get("matcher"), hook_argv(hook)[1]))
         return sorted(found, key=str)
 
     def test_ledger_reminder_hook_is_registered_failopen_once_and_preserves_foreign_hooks(self):
@@ -227,11 +227,14 @@ class InstallerTests(unittest.TestCase):
         def entries():
             hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
             return {event: [h for g in hooks.get(event, []) for h in g["hooks"]
-                            if (h.get("args") or [""])[0].endswith("ledger_reminder.py")]
+                            if (hook_argv(h) or [""])[0].endswith("ledger_reminder.py")]
                     for event in ("SessionStart", "UserPromptSubmit")}
 
         found = entries()
+        self.assertEqual(found["UserPromptSubmit"], [])  # SessionStart only since 2026-11-24
         for event, hooks in found.items():
+            if event == "UserPromptSubmit":
+                continue
             self.assertEqual(len(hooks), 1, event)  # registered once, not duplicated by a reinstall
             self.assertNotIn("onFailure", hooks[0])
             self.assertLessEqual(hooks[0]["timeout"], 3)
@@ -264,10 +267,7 @@ class InstallerTests(unittest.TestCase):
         install(self.home, apply=True)
         self.assertEqual([e for e in self.provenance_entries() if e[0] == "Stop"], [("Stop", None, "stop-lint")])
         stop = json.loads((self.claude / "settings.json").read_text())["hooks"]["Stop"]
-        self.assertEqual([h["timeout"] for g in stop for h in g["hooks"]], [10, 15, 15, 15, 10, 30, 20, 5, 5])  # managed stop-lint replaced the manual one; dropped-owner gate, mission gate, idle guard (goodqa#15943), status truth, WAL cadence, worktree hygiene, Mission Control inbox follow
-        self.assertEqual([h["args"] for g in stop for h in g["hooks"]
-                          if h.get("args", [None])[0] == str(self.claude / "hooks" / "owner_inbox.py")],
-                         [[str(self.claude / "hooks" / "owner_inbox.py"), "hook"]])
+        self.assertEqual([h["timeout"] for g in stop for h in g["hooks"]], [10, 15, 15, 15, 30, 20, 30])  # managed stop-lint replaced the manual one; dropped-owner gate, mission gate, idle guard (goodqa#15943), WAL cadence, worktree hygiene and the save hook (autosave.py, docs/lifecycle.md) follow
 
     def test_foreign_hook_sharing_a_group_and_users_empty_event_list_survive(self):
         script = str(self.claude / "hooks" / "provenance_hooks.py")
@@ -277,17 +277,37 @@ class InstallerTests(unittest.TestCase):
         (self.claude / "settings.json").write_text(json.dumps(mixed))
         install(self.home, apply=True, provenance=False)
         hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
-        self.assertEqual([h["command"] for g in hooks["Stop"] for h in g["hooks"]], ["other-stop", "python3", "python3", "python3", "python3", "python3", "python3", "python3", "python3"])  # foreign kept; dropped gate, mission gate, idle guard (goodqa#15943), status truth (goodqa#15754), WAL cadence, worktree hygiene, Mission Control inbox are not provenance hooks
+        self.assertEqual([h["command"] for g in hooks["Stop"] for h in g["hooks"]], ["other-stop", "python3", "python3", "python3", "python3", "python3", "python3"])  # foreign kept; dropped gate, mission gate, idle guard (goodqa#15943), WAL cadence, worktree hygiene and the save hook (autosave.py) are not provenance hooks
         self.assertTrue(any("dropped_gate.py" in str(h.get("args")) for g in hooks["Stop"] for h in g["hooks"]))
-        self.assertEqual([h["args"] for g in hooks["Stop"] for h in g["hooks"]
-                          if h.get("args", [None])[0] == str(self.claude / "hooks" / "owner_inbox.py")],
-                         [[str(self.claude / "hooks" / "owner_inbox.py"), "hook"]])
         self.assertEqual(hooks["Notification"], [])  # untouched, not ours
+
+    def test_an_upgrade_removes_the_retired_registrations(self):
+        # 2026-11-24: these four no longer do anything; an existing settings.json loses them on reinstall
+        hooks_dir = self.claude / "hooks"
+        old = {"Stop": [{"hooks": [{"type": "command", "command": "python3", "args": [str(hooks_dir / name), *rest]}]}
+                        for name, rest in (("status_truth.py", ["stop"]), ("mc_inbox.py", ["hook"]),
+                                           ("owner_inbox.py", ["hook"]))],
+               "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python3",
+                                                "args": [str(hooks_dir / "ledger_reminder.py")]}]},
+                                    {"hooks": [{"type": "command", "command": "other-prompt"}]}]}
+        (self.claude / "settings.json").write_text(json.dumps({"hooks": old}))
+        install(self.home, apply=True)
+        hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
+
+        def scripts(event):
+            return [os.path.basename(hook_argv(h)[0]) for g in hooks.get(event, []) for h in g["hooks"] if hook_argv(h)]
+        for name in ("status_truth.py", "mc_inbox.py", "owner_inbox.py"):
+            self.assertNotIn(name, scripts("Stop"))
+        self.assertNotIn("ledger_reminder.py", scripts("UserPromptSubmit"))
+        self.assertIn("ledger_reminder.py", scripts("SessionStart"))
+        for name in ("status_truth.py", "mc_inbox.py", "owner_inbox.py"):
+            self.assertIn(name, scripts("UserPromptSubmit"))  # their other registrations stay
+        self.assertTrue(any(h.get("command") == "other-prompt" for g in hooks["UserPromptSubmit"] for h in g["hooks"]))
 
     def test_idle_guard_registrations_survive_reinstall_once_each(self):  # goodqa#15943 (receipt r6 F2)
         def idle_entries():
             hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
-            return sorted((event, h["args"][1], h["timeout"]) for event, groups in hooks.items() for g in groups
+            return sorted((event, hook_argv(h)[1], h["timeout"]) for event, groups in hooks.items() for g in groups
                           for h in g["hooks"] if "idle_guard.py" in str(h.get("args")))
         expected = [("PermissionDenied", "reject", 5), ("PostToolUseFailure", "reject", 5), ("Stop", "stop", 15),
                     ("UserPromptSubmit", "reject", 5)]

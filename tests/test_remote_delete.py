@@ -18,6 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 HOOKS = Path(os.environ.get('CG_HOOKS_DIR') or ROOT / 'harness/hooks')
 sys.path.insert(0, str(HOOKS))
+os.environ["AH_LOCAL_CONFIG"] = str(Path(__file__).resolve().parent / "data" / "local_fixture.json")  # hermetic hosts
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import command_guard as cg  # noqa: E402
@@ -51,9 +52,9 @@ elif op == "copyto":
 else:
     sys.exit(9)
 '''
-ARCHIVE_DIR = 'dropbox:Backups/t2-dev/worktree-archives'
-QUESTION = ("[ask:w1] t2-dev's disk is critical. Each one is already backed up to Dropbox, both the files and its "
-            "git history. Remove these 2 from t2-dev: ~/wt/alpha, ~/wt/beta?")
+ARCHIVE_DIR = 'dropbox:Backups/worker-1/worktree-archives'
+QUESTION = ("[ask:w1] worker-1's disk is critical. Each one is already backed up to Dropbox, both the files and its "
+            "git history. Remove these 2 from worker-1: ~/wt/alpha, ~/wt/beta?")
 ANSWER = 'Yes, remove all 2 (Recommended)'
 
 
@@ -62,7 +63,7 @@ class RemoteCase(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory(prefix='rdel-')
         base = Path(os.path.realpath(self._tmp.name))
         self.home, self.rhome, self.box = base / 'mac', base / 'remote', base / 'box'
-        for d in (self.home, self.rhome / 'wt', self.box / 'Backups/t2-dev/worktree-archives', base / 'bin'):
+        for d in (self.home, self.rhome / 'wt', self.box / 'Backups/worker-1/worktree-archives', base / 'bin'):
             d.mkdir(parents=True)
         self.rclone = base / 'bin/rclone'
         self.rclone.write_text(FAKE_RCLONE)
@@ -97,7 +98,7 @@ class RemoteCase(unittest.TestCase):
 
     def archive(self, name, corrupt=False, bundle_of=None):
         """Archive ~/wt/<name> the way t2_archive_one.sh does, into the fake Dropbox."""
-        out = self.box / 'Backups/t2-dev/worktree-archives'
+        out = self.box / 'Backups/worker-1/worktree-archives'
         tar = out / (name + '.tar.gz')
         run('tar', '-czf', str(tar), '-C', str(self.rhome / 'wt'), name)
         digest = hashlib.sha256(tar.read_bytes()).hexdigest()
@@ -139,7 +140,7 @@ class RemoteCase(unittest.TestCase):
         return dict(self.turn, kind='answer', session='sess-1', uid=source.rsplit('/', 1)[-1].lower(),
                     at=time.time() - 60)
 
-    def delete(self, tree, host='t2-dev', source=SOURCE, wal=None):
+    def delete(self, tree, host='worker-1', source=SOURCE, wal=None):
         return rd.remote_delete(host, str(tree), ARCHIVE_DIR, source, wal or self.wal, home=str(self.home),
                                 resolver=self.resolver, runner=self.runner, policy=self.policy)
 
@@ -201,12 +202,12 @@ class Refused(RemoteCase):
 
     def test_question_without_the_host(self):
         tree = self.plain_tree('alpha')
-        self.turn['question'] = QUESTION.replace('t2-dev', 'the server')
-        self.refused(tree, 'does not name the host t2-dev')
+        self.turn['question'] = QUESTION.replace('worker-1', 'the server')
+        self.refused(tree, 'does not name the host worker-1')
 
     def test_question_without_backup_wording(self):
         tree = self.plain_tree('alpha')
-        self.turn.update(question='Remove ~/wt/alpha from t2-dev?', text='Remove it')
+        self.turn.update(question='Remove ~/wt/alpha from worker-1?', text='Remove it')
         self.refused(tree, 'backed up')
 
     def test_question_naming_another_path(self):
@@ -217,7 +218,7 @@ class Refused(RemoteCase):
 
     def test_host_off_the_allowlist(self):
         tree = self.plain_tree('alpha')
-        self.refused(tree, '--host must be one of', host='ah-spectre')
+        self.refused(tree, '--host must be one of', host='win-1')
 
     def test_wal_of_another_session(self):
         tree = self.plain_tree('alpha')
@@ -332,7 +333,7 @@ class Refused(RemoteCase):
     def test_question_that_also_says_keep(self):
         keep, old = self.plain_tree('active'), self.plain_tree('old')
         self.archive('old')
-        self.turn.update(question="Keep ~/wt/active (an owner is in it). t2-dev: ~/wt/old is backed up. Remove ~/wt/old?",
+        self.turn.update(question="Keep ~/wt/active (an owner is in it). worker-1: ~/wt/old is backed up. Remove ~/wt/old?",
                          text='Yes, remove all 2')
         self.refused(old, 'keep or not remove')
         self.refused(keep, 'keep or not remove')
@@ -340,8 +341,8 @@ class Refused(RemoteCase):
     def test_question_that_spares_a_path(self):
         tree = self.plain_tree('old')
         self.archive('old')
-        for question in ("t2-dev: both are backed up. Spare ~/wt/active; remove ~/wt/old?",
-                         "t2-dev: all backed up. Remove ~/wt/old and ~/wt/x, except ~/wt/active?"):
+        for question in ("worker-1: both are backed up. Spare ~/wt/active; remove ~/wt/old?",
+                         "worker-1: all backed up. Remove ~/wt/old and ~/wt/x, except ~/wt/active?"):
             self.turn.update(question=question, text='Yes, remove all %d' % rd.named_count(question))
             self.refused(tree, 'keep or not remove')
 

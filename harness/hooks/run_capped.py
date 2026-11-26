@@ -24,7 +24,7 @@ host, argv0}) so netwatch can see the declared cap. It is removed on exit.
 Time spent stopped (SIGSTOP by netwatch, or paused by this wrapper) does not count
 toward --timeout-s, so a paused-then-resumed job is not killed for the delay. The
 Bash tool timeout and an external `timeout N` cannot be made pause-aware: a long job
-should go through run_capped (preferably on dev2) rather than rely on those.
+should go through run_capped (preferably on a worker host) rather than rely on those.
 
 Stdlib only, Python 3.9 compatible. Linux and macOS (uses `ps -axo`).
 """

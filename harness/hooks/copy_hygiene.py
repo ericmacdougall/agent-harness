@@ -2,9 +2,8 @@
 """Copy hygiene: one reusable test copy per PR or lane, a disk-low guard, a /dev/shm guard, and an idle-copy reaper
 that is report-only by default.
 
-WHY. On 2026-11-21 t2-dev's root volume reached 0 bytes free: ~/.agent-harness/work held 117 GB, most of it per-round
-click-test copies (work/<session>/tester-1408-r3, tester-1408-r4, tester-1409-r1, ...). Each review round made a new
-full copy and nothing removed the old ones. Sessions also held 50 of the host's 56 GB of /dev/shm (RAM) with scratch.
+WHY. A worker host's disk once filled up with per-round click-test copies (each review round made a new full copy and
+nothing removed the old ones), and sessions filled most of /dev/shm (RAM) with scratch.
 
 WHAT.
   acquire       `copy_hygiene.py acquire --repo <checkout> --key <pr-1408|lane> [--ref <ref>]` returns ONE stable path
@@ -31,9 +30,8 @@ WHAT.
                 ignored changes, no stash, no local commits missing from its remotes, no live or unknown use, and
                 an idle exclusive lease. It uses plain `git worktree remove` (no --force). Legacy copies are report-only.
 
-  protected     Paths a live service depends on are NEVER deleted (2026-11-21: cleanups on t2-dev removed
-                ~/coordinator-v2/rc/agent-harness, claude-rc's WorkingDirectory, plus ~/pp-ci/runner and the ~/pp-ci/nm
-                caches the pp gate runs from). Protected: every absolute path named anywhere in a systemd unit
+  protected     Paths a live service depends on are NEVER deleted (cleanups once removed a service's
+                WorkingDirectory and a CI runner's caches). Protected: every absolute path named anywhere in a systemd unit
                 (system, --user, runtime, transient and generated units and drop-ins; WorkingDirectory=, Exec*=,
                 Environment=, paths inside `bash -c '...'` strings; %h/~ expanded, a path cut at an unresolved
                 specifier such as %i), every path in a launchd plist, the source of a `systemctl link`ed unit, and
@@ -82,6 +80,8 @@ Config (~/.agent-harness/state/copy-hygiene.json; every key optional):
   min_free_gb (25), min_free_pct (10; the floor is the smaller of the two), max_age_hours (24), max_total_gb (60),
   reaper_delete_enabled (false), roots ([~/.agent-harness/work]), name_patterns (["tester-*", "test-copy-*",
   "click-test-*"]), protected_paths ([]).
+min_free_gb comes from resource_budget's limit of the same name (`ah limits set min_free_gb ...`) when that is set
+locally, else from this file, else the shipped default (resource_limits.json).
 Env: HARNESS_COPY_HYGIENE_MIN_FREE_GB overrides min_free_gb; HARNESS_COPY_HYGIENE_HOME relocates the state (tests);
 HARNESS_COPY_HYGIENE_UNIT_DIRS (os.pathsep list) replaces the systemd/launchd directories scanned (tests).
 """
@@ -190,10 +190,23 @@ def load_config() -> dict:
             user = d
     except (OSError, ValueError):
         pass
+    floor = _budget_min_free_gb()
+    if floor is not None and (floor[1] or "min_free_gb" not in user):
+        user = dict(user, min_free_gb=floor[0])  # one disk floor: `ah limits` wins once someone set it there
     env = os.environ.get("HARNESS_COPY_HYGIENE_MIN_FREE_GB")
     if env:
         user = dict(user, min_free_gb=env)
     return normalize(user)
+
+
+def _budget_min_free_gb():
+    """(value, set_locally) of resource_budget's min_free_gb limit, or None when resource_budget is not installed."""
+    try:
+        import resource_budget  # noqa: PLC0415 - a sibling module; older installs lack the limit
+        detail = resource_budget.limit_detail("min_free_gb")
+        return float(detail["value"]), detail["source"] != "repo default"
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _atomic_write(path: str, text: str) -> None:
@@ -1245,7 +1258,7 @@ def _var_value(m, env: dict) -> "list[str] | None":
 
 
 def _expand_vars(s: str, cwd: "str | None", vars_: "dict | None" = None) -> "list[str]":
-    """Expand to a fixpoint, so nested forms such as ${X:-${HOME}/pp-ci} resolve (inner first, then outer)."""
+    """Expand to a fixpoint, so nested forms such as ${X:-${HOME}/ci} resolve (inner first, then outer)."""
     outs = [s]
     for _ in range(6):
         nxt = list(dict.fromkeys(x for o in outs for x in _expand_vars_once(o, cwd, vars_)))[:256]
@@ -1279,7 +1292,7 @@ def _expand_vars_once(s: str, cwd: "str | None", vars_: "dict | None" = None) ->
                 nxt.append((head + rest[:m.end()], rest[m.end():]))
             else:
                 for v in vals:
-                    if v.startswith(_DEFAULT):          # rescan a default value: ${X:-$HOME/pp-ci}
+                    if v.startswith(_DEFAULT):          # rescan a default value: ${X:-$HOME/ci}
                         nxt.append((head + rest[:m.start()], v[len(_DEFAULT):] + rest[m.end():]))
                     else:
                         nxt.append((head + rest[:m.start()] + v, rest[m.end():]))
@@ -1442,7 +1455,7 @@ def _resolve(raw: str, bases: list, vars_: "dict | None" = None,
     """[(path, known, kind)] for a raw argument. `bases` are the possible current directories (None = unknown).
     known=False: a relative path under an unknown directory (matched by tail). kind "pattern": the path holds `*`
     where an unresolved variable or command substitution stood; it is refused only when a protected path or one
-    of its ancestors matches the pattern (`~/pp-ci/$d` matches ~/pp-ci/runner; `out_$n.log` matches nothing).
+    of its ancestors matches the pattern (`~/ci/$d` matches ~/ci/runner; `out_$n.log` matches nothing).
     A wildcard that empties a directory (`dir/*`, `dir/.*`, `dir/**`) also yields the directory itself, resolved
     through symlinks, as does a trailing slash (`rm -rf link/`). Empty words are never targets."""
     out = []
@@ -1864,16 +1877,14 @@ def pretool(event: dict, cfg: "dict | None" = None) -> "tuple[int, str]":
                 alert("protected-delete-denied", {"target": hit[0][:200], "protected": hit[1][:200],
                                                   "source": hit[2][:200]})
                 return 2, (f"PROTECTED PATH: deleting or moving {hit[0]} would remove {hit[1]}, which a service "
-                           f"depends on (named in {hit[2]}). On 2026-11-21 cleanups deleted claude-rc's working folder "
-                           "and the pp gate's runner and caches this way. Leave it. Deleting single files or build "
+                           f"depends on (named in {hit[2]}). Leave it. Deleting single files or build "
                            "output inside it is fine; emptying it is not. If the service is truly retired, the owner "
                            "removes its unit file first. `python3 ~/.claude/hooks/copy_hygiene.py protected --check "
                            "<path>` explains any path.\n")
         if SHM in cmd or cwd.startswith(SHM):
             if writes_into_shm(cmd, cwd):
                 alert("shm-write-denied", {"cwd": cwd[:200]})
-                return 2, ("SCRATCH IN RAM REFUSED: /dev/shm is memory, not disk (2026-11-21: sessions filled 50 of "
-                           "t2-dev's 56 GB). Use disk-backed scratch instead: `export TMPDIR=$(python3 "
+                return 2, ("SCRATCH IN RAM REFUSED: /dev/shm is memory, not disk. Use disk-backed scratch instead: `export TMPDIR=$(python3 "
                            "~/.claude/hooks/copy_hygiene.py scratch --key " + safe_key(str(event.get("session_id") or "session")) +
                            ")` (private, under ~/.agent-harness/scratch/). Reading, copying out of and removing files in /dev/shm stay allowed.\n")
         copying = [w for w in copy_commands(cmd) if is_copy_command(w)]

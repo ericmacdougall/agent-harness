@@ -126,22 +126,25 @@ class Inject(Base):
             self.assertEqual(out["hookSpecificOutput"]["hookEventName"], name)
             self.assertIn(f"body for {name}", out["hookSpecificOutput"]["additionalContext"])
 
-    def test_stop_blocks_once_with_the_note(self):
+    def test_stop_says_one_line_and_leaves_the_note_for_the_next_prompt(self):  # never a block since 2026-11-24
         self.write_decision(body="do non-live work only\n")
         out = self.hook(self.event(name="Stop"))
-        self.assertEqual(out["decision"], "block")
-        self.assertIn("do non-live work only", out["reason"])
-        self.assertIsNone(self.hook(self.event(name="Stop")), "Stop must not loop after the note is marked read")
+        self.assertNotIn("decision", out)
+        self.assertIn("OWNER-DECISION-test.md", out["systemMessage"])
+        self.assertNotIn("do non-live work only", out["systemMessage"])
+        self.assertIsNone(self.hook(self.event(name="Stop")), "the same unread set is named once")
+        self.assertIn("do non-live work only", self.context(self.event()))  # delivered, not lost
 
     def test_overflow_files_wait_for_the_next_turn(self):
         for i in range(owner_inbox.MAX_FILES + 2):
             self.write_decision(name=f"OWNER-DECISION-{i:02d}.md", body=f"note {i}\n")
         text = self.context(self.event())
-        self.assertIn("note 0", text)
+        self.assertIn("OWNER-DECISION-00.md", text)  # too long to inline: one line per note naming its file
         self.assertIn("+2 more unread", text)
+        self.assertLessEqual(len(text), 2000)
         text2 = self.context(self.event())
-        self.assertIn("note 8", text2)
-        self.assertNotIn("note 0", text2)
+        self.assertIn("note 8", text2)  # the last two fit inline
+        self.assertNotIn("OWNER-DECISION-00.md", text2)
 
     def test_cli_fails_open_on_bad_input(self):
         result = subprocess.run([sys.executable, str(HOOKS / "owner_inbox.py"), "hook"],
@@ -179,12 +182,12 @@ class Inject(Base):
         self.assertIn("for the main session only", text)
         self.assertIsNone(self.hook(self.event()))
 
-    def test_stop_hook_active_does_not_block_again(self):
+    def test_stop_hook_active_stays_silent(self):
         self.write_decision(body="do not loop\n")
         self.assertIsNone(self.hook(self.event(name="Stop", stop_hook_active=True)))
         out = self.hook(self.event(name="Stop"))
-        self.assertEqual(out["decision"], "block")
-        self.assertIn("do not loop", out["reason"])
+        self.assertNotIn("decision", out)
+        self.assertIn("1 unread", out["systemMessage"])
 
     def test_failed_mark_does_not_stop_loop_or_eat_posttool(self):
         self.write_decision(body="still unread if mark fails\n")
@@ -223,12 +226,11 @@ class Install(unittest.TestCase):
         self.assertIn(str(Path("/h/.claude") / "hooks" / "owner_inbox.py"),
                       install.managed_scripts(Path("/h/.claude")))
         hooks = install.managed_hooks(Path("/h/.claude"), True)
-        for event, arg in (("UserPromptSubmit", "hook"), ("SessionStart", "hook"),
-                           ("Stop", "hook"), ("PostToolUse", "hook")):
+        for event, arg in (("UserPromptSubmit", "hook"), ("SessionStart", "hook"), ("PostToolUse", "hook")):
             found = [h for g in hooks.get(event, []) for h in g["hooks"]
-                     if (h.get("args") or [""])[0].endswith("owner_inbox.py")]
+                     if (install.hook_argv(h) or [""])[0].endswith("owner_inbox.py")]
             self.assertEqual(len(found), 1, event)
-            self.assertEqual(found[0]["args"][1:], [arg])
+            self.assertEqual(install.hook_argv(found[0])[1:], [arg])
             self.assertNotIn("onFailure", found[0], "the inbox hook fails open")
         merged = install_codex.merge_hooks({}, Path("/h/.codex"))["hooks"]
         for event in ("UserPromptSubmit", "SessionStart"):
@@ -245,11 +247,42 @@ class Install(unittest.TestCase):
             self.assertEqual(sum("owner_inbox.py" in c for c in commands), 1, event)
         manifest = json.loads((HOOKS / "hooks_manifest.json").read_text())
         ids = {h["id"]: h for h in manifest["hooks"]}
-        for rid in ("owner_inbox:prompt", "owner_inbox:session-start",
-                    "owner_inbox:stop", "owner_inbox:posttool"):
+        for rid in ("owner_inbox:prompt", "owner_inbox:session-start", "owner_inbox:posttool"):
             self.assertEqual(ids[rid]["status"], "installed", rid)
+        self.assertNotIn("owner_inbox:stop", ids)  # no Stop registration since 2026-11-24
         self.assertIn("codex", ids["owner_inbox:prompt"]["flavors"])
-        self.assertNotIn("codex", ids["owner_inbox:stop"]["flavors"])
+
+class Crossing(Base):
+    """2026-11-24: relayed answers crossed questions. Notes now arrive oldest first, carry an id and what they answer,
+    and a long note arrives as a path within the context cap."""
+
+    def test_oldest_note_first_whatever_its_name(self):
+        newer = self.write_decision(name="OWNER-DECISION-a.md", body="answer B\n")
+        older = self.write_decision(name="OWNER-DECISION-z.md", body="answer A\n")
+        os.utime(older, (1_700_000_000, 1_700_000_000))
+        os.utime(newer, (1_700_000_100, 1_700_000_100))
+        text = self.context(self.event())
+        self.assertLess(text.index("answer A"), text.index("answer B"))
+
+    def test_note_names_the_asks_it_answers_and_how_to_close_them(self):
+        self.write_decision(body="In-Reply-To: [ask:w0123456789a]\nYes.\n")
+        text = self.context(self.event())
+        self.assertIn("in-reply-to: w0123456789a", text)
+        self.assertIn("--event ask_resolved --ref w0123456789a", text)
+        self.assertIn("OWNER-DECISION-test.md@", text)
+
+    def test_an_edited_note_is_marked_updated(self):
+        path = self.write_decision(body="first\n")
+        self.context(self.event())
+        path.write_text("second\n", encoding="utf-8")
+        self.assertIn("UPDATED", self.context(self.event()))
+
+    def test_a_long_note_arrives_as_its_path_within_the_cap(self):
+        path = self.write_decision(body="decision text " * 400)
+        text = self.context(self.event())
+        self.assertIn(str(path), text)
+        self.assertNotIn("decision text decision text", text)
+        self.assertLessEqual(len(text), 700)
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+os.environ["AH_LOCAL_CONFIG"] = str(Path(__file__).resolve().parent / "data" / "local_fixture.json")  # no chat_prefix
 from test_ah_chat import (AH, CONV, DM_SENTINEL, HOOKS, ME, ORG, OTHER, PEER, USER_SENTINEL, SCHEME, Base, ok,  # noqa: E402
                           ok_bare, rpc_error, tool_error)
 
@@ -30,7 +31,7 @@ USER_UUID = "9a9a9a9a-1111-4222-8333-444455556666"
 WORDS = "pat peer runs the staging checks with sam.. communicate with pat via goodqa"
 GOOD_SOURCE = 'user:%s/%s "communicate with pat via goodqa"' % (SESSION, USER_UUID)
 SAM_SOURCE = 'user:%s/%s "staging checks with sam"' % (SESSION, USER_UUID)
-PREFIX = "Claude (Eric's bot). "
+PREFIX = "Claude (bot). "  # the default; ~/.agent-harness/local.json `chat_prefix` replaces it
 SENT = {"message": {"id": "77777777-7777-4777-8777-777777777777", "senderId": ME, "recipientId": PEER},
         "conversationId": CONV, "seq": 9}
 DM_LIST = {"conversations": [{"id": CONV, "kind": "dm", "participants": [{"id": ME, "name": "Me"}, {"id": PEER, "name": "Pat"}]}],
@@ -133,6 +134,13 @@ class MainAgentSends(SendBase):
 
     def test_the_prefix_is_one_constant(self):
         self.assertEqual(ah_chat_send.PREFIX, PREFIX)
+
+    def test_the_prefix_comes_from_the_local_config_when_it_is_one_printable_line(self):
+        import ah_local
+        for value, expected in (("Claude (Sam's bot). ", "Claude (Sam's bot). "), ("x" * 61, PREFIX),
+                                ("two\nlines ", PREFIX), (7, PREFIX)):
+            with mock.patch.object(ah_local, "get", lambda key, default=None, v=value: v if key == "chat_prefix" else default):
+                self.assertEqual(ah_chat_send._chat_prefix(), expected, value)
 
     def test_dry_run_prints_the_exact_body_and_reads_no_token(self):
         self.user_file.chmod(0o644)  # a token read would now be refused: the dry run must not read one

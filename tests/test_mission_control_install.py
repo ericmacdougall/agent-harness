@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import mission_control_install as mci
-from install import install
+from install import hook_argv, install
 
 
 class Recorder:
@@ -36,18 +36,18 @@ class MissionControlInstall(unittest.TestCase):
     def inbox_hooks(self, event):
         hooks = json.loads((self.home / ".claude" / "settings.json").read_text())["hooks"]
         return [h for g in hooks.get(event, []) for h in g["hooks"]
-                if os.path.basename(str((h.get("args") or [""])[0])) == "mc_inbox.py"]
+                if os.path.basename(str((hook_argv(h) or [""])[0])) == "mc_inbox.py"]
 
     def test_mission_inbox_hook_is_registered_once_and_foreign_hooks_survive_two_installs(self):
         settings = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "my-own-stop"}]}]}}
         (self.home / ".claude" / "settings.json").write_text(json.dumps(settings))
         install(self.home, apply=True)
         install(self.home, apply=True)
-        for event in ("Stop", "UserPromptSubmit"):
-            found = self.inbox_hooks(event)
-            self.assertEqual(len(found), 1, event)
-            self.assertEqual(found[0]["args"][1:], ["hook"])
-            self.assertNotIn("onFailure", found[0], "the chat hook fails open")
+        self.assertEqual(self.inbox_hooks("Stop"), [], "no Stop registration since 2026-11-24")
+        found = self.inbox_hooks("UserPromptSubmit")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(hook_argv(found[0])[1:], ["hook"])
+        self.assertNotIn("onFailure", found[0], "the chat hook fails open")
         self.assertEqual(self.inbox_hooks("SubagentStop"), [], "subagents never act on dashboard chat")
         stop = json.loads((self.home / ".claude" / "settings.json").read_text())["hooks"]["Stop"]
         self.assertTrue(any(h.get("command") == "my-own-stop" for g in stop for h in g["hooks"]))

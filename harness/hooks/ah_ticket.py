@@ -1,4 +1,4 @@
-"""ah ticket create: file a GoodQA ticket through the harness's own adapter, with an idempotency key.
+"""ah ticket create | edit: file a GoodQA ticket, or change its title or priority, through the harness's own adapter, with an idempotency key.
 
 A shared path so every agent can file tickets without hand-rolling MCP calls. The key becomes GoodQA's operationId
 (server-side idempotent) and is recorded in a local ledger, so a retry after a lost response, a restart or a
@@ -161,3 +161,39 @@ def create(project, title, body_file, type_="task", priority=None, key=None, hom
         return dict(result, deduplicated=False, key=key)
     finally:
         os.close(lock)
+
+
+def edit(ref, title=None, priority=None, project="goodqa", adapter=None, mod=None, redactor=None):
+    """`ah ticket edit <id> [--title T] [--priority P]`: one update_issue call with only the fields given. Retrying
+    it is safe: setting a title or priority twice leaves the same ticket."""
+    patch = {}
+    if title is not None:
+        title = " ".join(title.split())
+        if not title or len(title) > MAX_TITLE:
+            raise TicketCreateError("bad_request", "--title must be 1 to %d characters" % MAX_TITLE)
+        if redactor is None:
+            import redact
+            redactor = redact.redact
+        patch["title"] = redactor(title)
+    if priority is not None:
+        if priority not in PRIORITIES:
+            raise TicketCreateError("bad_request", "--priority must be one of %s" % ", ".join(PRIORITIES))
+        patch["priority"] = priority
+    if not patch:
+        raise TicketCreateError("bad_request", "give --title and/or --priority")
+    import ah
+    if adapter is None:
+        adapter, mod = ah.load_adapter()
+    project, number = ah.ticket_ref(ref, project)
+    ticket = ah.ticket_issue(adapter, mod, project, number)
+    try:
+        data = adapter.update_fields(ticket, patch)
+    except Exception as error:
+        unavailable = getattr(mod, "TicketSystemUnavailable", ())
+        if unavailable and isinstance(error, unavailable):
+            raise TicketCreateError("ticket_unavailable", "%s; the edit is safe to retry" % str(error)[:200], 3)
+        raise
+    issue = data.get("issue", data) if isinstance(data, dict) else {}
+    return {"ok": True, "ticket": "GoodQA %s#%d" % (project, number), "changed": sorted(patch),
+            "title": (issue.get("title") if isinstance(issue, dict) else None) or patch.get("title"),
+            "priority": (issue.get("priority") if isinstance(issue, dict) else None) or patch.get("priority")}

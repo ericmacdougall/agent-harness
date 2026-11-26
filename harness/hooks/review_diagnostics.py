@@ -134,7 +134,7 @@ CONTRACT = {
     'SNAPSHOT_GRAFTS_ALTERNATES': ('TRANSIENT_INFRA', 'The repository uses grafts or alternate object stores.',
                                    ['Review from a fresh clone made with `git clone --no-local` (no alternates).']),
     'SNAPSHOT_CASE_COLLISION': ('TRANSIENT_INFRA', 'Reviewed paths differ only by case or Unicode form and this filesystem is case-insensitive.',
-                                ['Run the review on a case-sensitive filesystem (for example dev2) or a case-sensitive APFS volume.']),
+                                ['Run the review on a case-sensitive filesystem (for example a Linux worker host) or a case-sensitive APFS volume.']),
     'SNAPSHOT_GITLINK': ('TRANSIENT_INFRA', 'The reviewed tree contains submodule gitlinks or unsupported entries.',
                          ['Review the submodule repositories separately; the packet must list their commits.']),
     'SNAPSHOT_SOURCE_CHANGED': ('TRANSIENT_INFRA', 'The source checkout changed during the review.',

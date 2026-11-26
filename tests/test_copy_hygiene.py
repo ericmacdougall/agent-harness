@@ -1041,6 +1041,32 @@ class Scratch(Base):
         self.assertIn("copy_hygiene.py scratch", err)
 
 
+class OneDiskFloor(unittest.TestCase):
+    """2026-11-24: min_free_gb is read through resource_budget.limit, so `ah limits set min_free_gb` reaches it."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+        env = mock.patch.dict(os.environ, {"HARNESS_COPY_HYGIENE_HOME": str(self.home), "AH_HOME": str(self.home)})
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("HARNESS_COPY_HYGIENE_MIN_FREE_GB", None)
+
+    def write_limit(self, value):
+        state = self.home / ".agent-harness"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "limits.local.json").write_text(json.dumps({"values": {"min_free_gb": {"value": value, "set_by": "user"}}}))
+
+    def test_the_shipped_default_and_a_local_limit_reach_copy_hygiene(self):
+        import resource_budget
+        self.assertEqual(tc.load_config()["min_free_gb"], float(resource_budget.limit("min_free_gb")))
+        self.write_limit(40)
+        self.assertEqual(tc.load_config()["min_free_gb"], 40.0)
+        os.environ["HARNESS_COPY_HYGIENE_MIN_FREE_GB"] = "3"  # the test override still wins
+        self.assertEqual(tc.load_config()["min_free_gb"], 3.0)
+
+
 class Install(unittest.TestCase):
     def test_installer_ships_and_wires_the_guard(self):
         sys.path.insert(0, str(ROOT))

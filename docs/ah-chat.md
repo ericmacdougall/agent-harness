@@ -43,11 +43,11 @@ GoodQA's `send_direct_message` (`POST /v1/orgs/:org/dm/:user`) stores each messa
   - **Main's WAL is not write-protected either** (GoodQA goodqa#17008, CRITICAL). On 2026-11-24 command_guard allowed `>>`, `tee -a` and a Python one-liner appending to `~/.claude/wals/<session>/main.jsonl`, and no hook refuses a Write or Edit there (only Claude Code's worktree isolation stops an isolated agent).
   - So an agent that forges both a decision row and a line can still message a person, but only someone the user named in his own words whose GoodQA member name contains that name. A member who sets a matching display name also passes.
 
-### Adding Tisha and replying to her, step by step
+### Adding a person and replying, step by step
 
-1. Find her ids: `ah chat conversations --org ORG` lists the DM, its id and the participant ids.
-2. Find the user's words: `ah user-msg --text-match "tisha"` prints a `queue:` or `user:` source.
-3. In a foreground Bash call of its own: `ah chat allow --with HER_ID --org ORG --name Tisha --source '<that source>'`.
+1. Find their ids: `ah chat conversations --org ORG` lists the DM, its id and the participant ids.
+2. Find the user's words: `ah user-msg --text-match "sam"` prints a `queue:` or `user:` source.
+3. In a foreground Bash call of its own: `ah chat allow --with THEIR_ID --org ORG --name Sam --source '<that source>'`.
 4. Then follow the reply steps below.
 
 ### Replying to a person, step by step

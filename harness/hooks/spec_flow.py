@@ -378,18 +378,20 @@ def lint(text: str, config: dict | None = None, check_provenance: bool = True, s
 
 
 def provenance_problems(text: str) -> list:
-    """Every AC-n and NEG-n needs a resolvable `Source:` (provenance.py). Additive: needs provenance.py installed."""
+    """Every AC-n and NEG-n should carry a `Source:` (provenance.py); what is missing is a warning on stderr, never a
+    problem. Kept as a function so lint() reads the same; it always returns []."""
     try:
         import provenance
     except ImportError:
         return []  # older install: no provenance module, no gate
+    # 2026-11-24: provenance never refuses a spec. Whatever it finds, or a resolver crash, is printed as a warning.
     try:
         problems, warnings = provenance.spec_lint(text)
-    except Exception as error:  # a resolver bug must be visible, not silent
-        return [f"provenance check failed ({type(error).__name__}); fix provenance.py or the spec"]
-    for warning in warnings:
+    except Exception as error:  # noqa: BLE001 - visible, but never a refusal
+        problems, warnings = [], [f"provenance: check skipped ({type(error).__name__})"]
+    for warning in list(warnings) + list(problems):
         print(warning, file=sys.stderr)
-    return problems
+    return []
 
 
 # --------------------------------------------------------------------------- blockchain domain gates

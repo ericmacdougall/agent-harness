@@ -230,8 +230,10 @@ class MustRefuse(CloneCase):
         self.assertRefused(self.verdict('rm -rf %s/*' % self.base))
         self.assertRefused(self.verdict('rm -rf %s/clone/.git' % self.base))
 
-    def test_dynamic_paths_stay_refused(self):
-        self.assertRefused(self.verdict('rm -rf $(echo %s)' % self.clone))
+    def test_dynamic_paths_are_never_exempt(self):
+        # 2026-11-24: a substitution the guard cannot resolve is allowed with a note (never blocked for being unread);
+        # a glob is still judged by role, so neither form earns the reproducible-clone exemption
+        self.assertEqual(self.verdict('rm -rf $(echo %s)' % self.clone)[0], 'warn')
         self.assertRefused(self.verdict('rm -rf %s/cl*' % self.base))
 
     def test_moves_and_truncation_are_not_deletes(self):

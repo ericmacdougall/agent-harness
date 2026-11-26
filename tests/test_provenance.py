@@ -108,7 +108,9 @@ class Env(unittest.TestCase):
     def reject(self, source, code):
         result = provenance.resolve(source)
         self.assertFalse(result["ok"], result)
-        self.assertEqual(result["problems"][0]["code"], code, result)
+        # 2026-11-24: an untraced source is kept as given; its first problem is the verdict "unsourced", the cause after
+        self.assertEqual(result["problems"][0]["code"], "unsourced", result)
+        self.assertEqual(result["problems"][1]["code"], code, result)
         return result
 
 
@@ -252,7 +254,7 @@ class UserSources(Env):
         self.write_transcript([], raw=[deep])
         run = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, env=dict(os.environ, HOME=str(self.home)))
         self.assertEqual(run.returncode, 0, run.stderr[-300:])
-        self.assertEqual(json.loads(run.stdout), [False, ["transcript-malformed"]])
+        self.assertEqual(json.loads(run.stdout), [False, ["unsourced", "transcript-malformed"]])
         with self.assertRaises(ValueError):
             provenance.loads_line(deep)
         self.assertEqual(provenance.loads_line('{"a":[1,{"b":"[[[["}]}'), {"a": [1, {"b": "[[[["}]})  # brackets in strings
@@ -289,7 +291,9 @@ class OtherKinds(Env):
         ok = provenance.resolve("ticket:GoodQA harness#14398 comment abcd1234")
         self.assertTrue(ok["ok"])
         self.assertTrue(ok["deferred"])
-        self.reject("ticket:harness#5", "bad-syntax")
+        loose = provenance.resolve("ticket:harness#5")  # free form since 2026-11-24: normalised, not refused
+        self.assertEqual(loose["normalized"], "ticket:GoodQA harness#5")
+        self.assertTrue(loose["ok"], loose)
         self.reject("agent:main said so", "unknown-kind")
         self.reject("", "no-source")
 
@@ -364,10 +368,12 @@ class Enforcement(Env):
         text = SPEC.format(s1=s1, s2=s2 if s2 is not None else s1)
         return text.replace("Click-test: required\n", "Click-test: required\n" + header)
 
-    def test_ac1_spec_without_source_is_rejected(self):  # AC-1
-        problems = spec_flow.lint(self.spec("", ""))
-        self.assertTrue(any("AC-1 has no `Source:`" in p for p in problems), problems)
-        self.assertTrue(any("NEG-1 has no `Source:`" in p for p in problems), problems)
+    def test_ac1_spec_without_source_warns_and_is_not_refused(self):  # AC-1, warn-only since 2026-11-24
+        problems, warnings = provenance.spec_lint(self.spec("", ""))
+        self.assertEqual(problems, [])
+        self.assertTrue(any("AC-1 has no `Source:`" in w for w in warnings), warnings)
+        self.assertTrue(any("NEG-1 has no `Source:`" in w for w in warnings), warnings)
+        self.assertFalse(any("Source" in p for p in spec_flow.lint(self.spec("", ""))))
         control = spec_flow.lint(self.spec("", ""), check_provenance=False)
         self.assertFalse(any("Source" in p for p in control), control)  # failing control: old behaviour passed
 
@@ -375,15 +381,16 @@ class Enforcement(Env):
         good = f"Source: {self.user(HUMAN, QUOTE)}"
         self.assertEqual([p for p in spec_flow.lint(self.spec(good)) if "Source" in p or "provenance" in p], [])
         bad = f"Source: {self.user(AGENT, 'need the OpenRouter key from the user')}"
-        self.assertTrue(any("not-user-authored" in p for p in spec_flow.lint(self.spec(bad))))
+        self.assertTrue(any("not-user-authored" in w for w in provenance.spec_lint(self.spec(bad))[1]))
 
     def test_grandfather_needs_human_signoff(self):
-        problems = spec_flow.lint(self.spec("", "", header="Provenance: grandfathered (written before provenance existed)\n"))
-        self.assertTrue(any("only valid with `Sign-off: human`" in p for p in problems), problems)
+        problems, warnings = provenance.spec_lint(self.spec("", "", header="Provenance: grandfathered (written before provenance existed)\n"))
+        self.assertEqual(problems, [])
+        self.assertTrue(any("only meaningful with `Sign-off: human`" in w for w in warnings), warnings)
         ok = self.spec("", "", header="Provenance: grandfathered (written before provenance existed)\nSign-off: human\n")
         self.assertFalse([p for p in spec_flow.lint(ok) if "provenance" in p.lower() or "Source" in p])
         buried = self.spec("", "").replace("Works.", "Provenance: grandfathered (hidden in a later section)\nSign-off: human")
-        self.assertTrue(any("no `Source:`" in p for p in spec_flow.lint(buried)))
+        self.assertTrue(any("no `Source:`" in w for w in provenance.spec_lint(buried)[1]))
 
     def test_packet_gate_modes(self):
         packet = "- AC-1: thing. Verify by: x.\n- REQ-2: other. Source: inferred: from nothing\n"
@@ -399,15 +406,16 @@ class Enforcement(Env):
         return subprocess.run([sys.executable, str(HOOKS / "wal_note.py"), "--wal", str(self.wals / "main.jsonl"), *argv],
                               capture_output=True, text=True, env=dict(os.environ, HOME=str(self.home)))
 
-    def test_ac5_wal_note_modes(self):  # AC-5
-        refused = self.run_note("--event", "ask", "--note", "need the OpenRouter key", "--reason", "provider fallback needs it")
-        self.assertEqual(refused.returncode, 2, refused.stderr)
-        self.assertIn("REFUSED", refused.stderr)
-        self.assertFalse((self.wals / "main.jsonl").exists())
+    def test_ac5_wal_note_modes(self):  # AC-5; since 2026-11-24 an unsourced ask or requirement is written and labelled
+        unsourced = self.run_note("--event", "ask", "--note", "need the OpenRouter key", "--reason", "provider fallback needs it")
+        self.assertEqual(unsourced.returncode, 0, unsourced.stderr)
+        self.assertIn("provenance warning", unsourced.stderr)
+        self.assertTrue(json.loads((self.wals / "main.jsonl").read_text().splitlines()[-1])["unsourced"])
         self.assertEqual(self.run_note("--event", "ask", "--note", "n", "--source", self.user(HUMAN, QUOTE)).returncode, 2)  # no reason
-        self.assertEqual(self.run_note("--event", "requirement", "--note", "n").returncode, 2)
+        self.assertEqual(self.run_note("--event", "requirement", "--note", "n").returncode, 0)
         bad = self.run_note("--event", "ask", "--note", "n", "--reason", "because of reasons", "--source", self.user(AGENT, "need the OpenRouter key"))
-        self.assertEqual(bad.returncode, 2)
+        self.assertEqual(bad.returncode, 0, bad.stderr)
+        self.assertTrue(json.loads((self.wals / "main.jsonl").read_text().splitlines()[-1])["unsourced"])
         warn = self.run_note("--event", "blocker", "--note", "stuck")  # existing flow keeps working, with a warning
         self.assertEqual(warn.returncode, 0, warn.stderr)
         self.assertIn("provenance warning", warn.stderr)
@@ -616,7 +624,7 @@ class RedTeamFixes(Env):
         out = subprocess.run([sys.executable, str(sandbox / "wal_note.py"), "--wal", str(self.wals / "main.jsonl"), "--event", "ask", "--note", "n",
                               "--reason", "needed for deploy", "--source", "ticket:GoodQA nonexistent#99999"],
                              capture_output=True, text=True, env=env)
-        self.assertEqual(out.returncode, 2, out.stdout)
+        self.assertEqual(out.returncode, 0, out.stdout)  # written with a warning since 2026-11-24
         self.assertIn("unverified ticket or file line", out.stderr)
         cli = lambda *a: subprocess.run([sys.executable, str(sandbox / "provenance.py"), *a], capture_output=True, text=True, env=env)  # noqa: E731
         self.assertEqual(cli("cache-ticket", "--ref", "GoodQA nonexistent#99999", "--title", "T", "--checked-by", "main").returncode, 0)
@@ -649,13 +657,13 @@ class RedTeamFixes(Env):
         self.assertEqual(calls, [])
         missing = fresh(("missing", None), "ticket:GoodQA harness#99999")  # known missing: refused
         self.assertFalse(missing["ok"])
-        self.assertEqual(missing["problems"][0]["code"], "ticket-missing")
+        self.assertEqual(missing["problems"][1]["code"], "ticket-missing")
         out = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, %r); import provenance as p; "
                               "p.TICKET_LOOKUP = lambda a, b: ('missing', None); import json; "
                               "print(json.dumps(p.spec_lint(open(sys.argv[1]).read())[0]))" % str(HOOKS),
                               str(self.write_spec("ticket:GoodQA harness#99999"))],
                              capture_output=True, text=True, env=dict(os.environ, HOME=str(self.home)))
-        self.assertIn("ticket-missing", out.stdout)  # spec lint (enforce) refuses a missing ticket cite
+        self.assertEqual(out.stdout.strip(), "[]")  # spec lint never refuses; a missing ticket is a warning
         down = fresh(("unreachable", "URLError"), "ticket:GoodQA harness#7")  # outage: still only an unverified citation
         self.assertTrue(down["ok"] and down["weak"] and down["deferred"], down)
         self.assertEqual(down["chain"][0]["status"], "unverified")
@@ -668,13 +676,14 @@ class RedTeamFixes(Env):
         note = subprocess.run([sys.executable, str(HOOKS / "wal_note.py"), "--wal", str(self.wals / "main.jsonl"), "--event", "ask", "--note", "n",
                                "--reason", "needed for the release", "--source", "ticket:GoodQA harness#7"],
                               capture_output=True, text=True, env=dict(os.environ, HOME=str(self.home)))  # real adapter, no credentials
-        self.assertEqual(note.returncode, 2, note.stdout)  # missing credentials are refusable, never a warning
+        self.assertEqual(note.returncode, 0, note.stdout)  # written, and the weak cite is named in a warning
         self.assertIn("add a `user:` or `wal:` source", note.stderr)
         home_less = subprocess.run([sys.executable, str(HOOKS / "wal_note.py"), "--wal", str(self.wals / "main.jsonl"), "--event", "requirement",
                                     "--note", "n", "--source", "ticket:GoodQA harness#424242"],
                                    capture_output=True, text=True,
                                    env=dict(os.environ, HOME=str(self.home), HTTPS_PROXY="http://127.0.0.1:9"))
-        self.assertEqual(home_less.returncode, 2, home_less.stdout)  # a proxy variable cannot turn a lookup into a pass
+        self.assertEqual(home_less.returncode, 0, home_less.stdout)
+        self.assertIn("provenance warning", home_less.stderr)  # a proxy variable cannot turn a lookup into a clean pass
         self.policy_file(ticket_lookup="warn")  # loosening comes from the installed policy file only
         soft = fresh(("missing", None), "ticket:GoodQA harness#99998")
         self.assertTrue(soft["ok"] and soft["weak"])  # warn mode accepts a missing ticket in specs...
@@ -704,9 +713,10 @@ class RedTeamFixes(Env):
         with mock.patch.object(provenance, "POLICY_FILE", enforce), \
                 mock.patch.dict(os.environ, {"HARNESS_PROVENANCE_POLICY": str(loose), "HARNESS_PROVENANCE_TICKET_LOOKUP": "off"}):
             policy = provenance.load_policy()
+            # 2026-11-24: "enforce" reads as "warn" for every advisory key; env "off" still cannot loosen below it
             self.assertEqual((policy["spec"], policy["plan_packet"], policy["ticket_lookup"], policy["wal"]["ask"]),
-                             ("enforce", "enforce", "enforce", "enforce"))  # enforce stays enforce under env off/warn
-            self.assertEqual(policy["wal"]["blocker"], "enforce")  # ...but the env can still tighten (warn -> enforce)
+                             ("warn", "warn", "enforce", "warn"))
+            self.assertEqual(policy["wal"]["blocker"], "warn")
             provenance._TICKET_MEMO.clear()
             provenance._OUTAGE["until"] = 0.0
             with mock.patch.object(provenance, "TICKET_LOOKUP", lambda p, n: ("missing", None)):
@@ -718,12 +728,13 @@ class RedTeamFixes(Env):
         with mock.patch.object(provenance, "POLICY_FILE", warn), \
                 mock.patch.dict(os.environ, {"HARNESS_PROVENANCE_POLICY": str(tight), "HARNESS_PROVENANCE_TICKET_LOOKUP": "enforce"}):
             policy = provenance.load_policy()
-            self.assertEqual((policy["spec"], policy["ticket_lookup"], policy["wal"]["scope"]), ("enforce", "enforce", "enforce"))
+            self.assertEqual((policy["spec"], policy["ticket_lookup"], policy["wal"]["scope"]), ("warn", "enforce", "warn"))
         out = subprocess.run([sys.executable, str(HOOKS / "wal_note.py"), "--wal", str(self.wals / "main.jsonl"), "--event", "ask", "--note", "n",
                               "--reason", "needed for deploy"],
                              capture_output=True, text=True,
                              env=dict(os.environ, HOME=str(self.home), HARNESS_PROVENANCE_POLICY=str(loose)))
-        self.assertEqual(out.returncode, 2, out.stdout)  # the installed policy still enforces the ask despite env off
+        self.assertEqual(out.returncode, 0, out.stdout)
+        self.assertIn("provenance warning", out.stderr)  # env "off" cannot silence the installed warning
 
     def test_n4_offline_switch_cannot_turn_a_refusal_into_a_warning(self):
         only_ticket = f"Source: ticket:GoodQA harness#31337"
@@ -735,7 +746,8 @@ class RedTeamFixes(Env):
                 provenance._OUTAGE["until"] = 0.0
                 with mock.patch.object(provenance, "TICKET_LOOKUP", lambda p, n: provenance.lookup_ticket(p, n) if value else ("unverified", "no tracker")):
                     problems, warnings = provenance.spec_lint(SPEC.format(s1=only_ticket, s2=only_ticket))
-                    self.assertTrue(any("add a `user:` or `wal:` source" in p for p in problems), (value, problems))
+                    self.assertEqual(problems, [])  # warn-only since 2026-11-24; the offline switch changes nothing
+                    self.assertTrue(any("add a `user:` or `wal:` source" in w for w in warnings), (value, warnings))
                     problems, warnings = provenance.spec_lint(SPEC.format(s1=backed, s2=backed))  # verified user source behind it: warns
                     self.assertEqual(problems, [], (value, problems))
                     self.assertTrue(any("also cites an unverified source" in w for w in warnings), (value, warnings))
@@ -810,7 +822,7 @@ class RedTeamFixes(Env):
         provenance._OUTAGE["until"] = 0.0
         provenance._TICKET_MEMO.clear()
         with mock.patch.object(provenance, "TICKET_LOOKUP", lambda p, n: calls.append(n) or answers[n]):  # fresh process
-            self.assertEqual(provenance.resolve("ticket:GoodQA harness#424242")["problems"][0]["code"], "ticket-missing")
+            self.assertEqual(provenance.resolve("ticket:GoodQA harness#424242")["problems"][1]["code"], "ticket-missing")
 
     def test_n1_only_transport_failures_are_outages(self):
         import spec_flow
@@ -850,7 +862,7 @@ class RedTeamFixes(Env):
             provenance.resolve("ticket:GoodQA harness#1")
             second = provenance.resolve("ticket:GoodQA harness#2")
         self.assertEqual(calls, [1, 2])  # a non-transport error does not start the skip window
-        self.assertEqual(second["problems"][0]["code"], "ticket-missing")
+        self.assertEqual(second["problems"][1]["code"], "ticket-missing")
 
     def test_n1_proxy_environment_is_ignored_and_offline_switch(self):
         import http.server
@@ -894,10 +906,9 @@ class RedTeamFixes(Env):
 
     def test_f4_reviews_section_is_not_an_enforcement_exemption(self):
         text = SPEC.format(s1="", s2="") + "\n## Reviews\n\n- adversarial: x\n"
-        problems, _ = provenance.spec_lint(text)
-        self.assertTrue(any("AC-1 has no `Source:`" in p for p in problems), problems)
-        # attach rewrites the Reviews section before linting, so the heading must never exempt a spec
-        self.assertTrue(any("AC-1 has no" in p for p in spec_flow.lint(text)))
+        problems, warnings = provenance.spec_lint(text)
+        self.assertEqual(problems, [])
+        self.assertTrue(any("AC-1 has no `Source:`" in w for w in warnings), warnings)  # the heading exempts nothing
 
     def test_f5_packet_formats(self):
         packet = "1. AC-1: numbered\n| REQ-2 | table row |\n> ASK-3: quoted\n  - DEC-4: nested bullet\n**NEG-5**: bold\n"

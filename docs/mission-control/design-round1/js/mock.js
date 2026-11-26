@@ -27,7 +27,7 @@ export function createSeed() {
     ['wal', 'c-01', 'Mobile composer now clears the keyboard', 'mission', 'harness', 'info'],
     ['push', 'x-04', '3 commits pushed to feat/release-gates', 'release', 'harness', 'info'],
     ['ticket', 'c-03', 'Token rotation needs a coordinator decision', 'auth', 'harness', 'warn'],
-    ['deploy', 'x-04', 'Preview is healthy · all smoke checks passed', 'release', 't2-dev', 'info'],
+    ['deploy', 'x-04', 'Preview is healthy · all smoke checks passed', 'release', 'worker-1', 'info'],
     ['wal', 'x-02', 'Replay cursor held through 40 reconnects', 'stream', 'harness', 'info'],
     ['release', 'c-08', 'WAL collectors v0.8.2 ready for handoff', 'collector', 'collectors', 'info'],
     ['owner', 'x-06', 'Runner dropped · checkpoint preserved', 'runner', 'harness', 'high'],
@@ -39,7 +39,7 @@ export function createSeed() {
     { id: 'codex', name: 'Codex WALs', state: 'ok', checked: iso(12), note: 'Collector is reading local work logs.' },
     { id: 'github', name: 'GitHub', state: 'stale', checked: iso(184), note: 'Polling is delayed. Push events may arrive late.' },
     { id: 'goodqa', name: 'GoodQA tickets', state: 'ok', checked: iso(18), note: 'Ticket snapshot is current.' },
-    { id: 't2', name: 't2-dev', state: 'error', checked: iso(423), note: 'Health endpoint returned 503. Last known deployment evidence is retained.' },
+    { id: 't2', name: 'worker-1', state: 'error', checked: iso(423), note: 'Health endpoint returned 503. Last known deployment evidence is retained.' },
     { id: 'file', name: 'Initiatives file', state: 'ok', checked: iso(5), note: 'Coordinator file parsed successfully.' },
   ];
   const messages = [
@@ -53,7 +53,7 @@ export function createSeed() {
 }
 function eventFrom([kind, agent, summary, initiative, repo, severity = 'info'], owners, ts = stamp()) {
   const owner = owners.find(item => item.agent_id === agent);
-  return { schema: 'mc.event/1', id: crypto.randomUUID(), ts, kind, source: kind === 'wal' ? `${owner?.runtime || 'claude'}-wal` : kind === 'ticket' ? 'goodqa' : kind === 'push' || kind === 'release' ? 'github' : kind === 'deploy' ? 't2-dev' : 'coordinator', actor: { runtime: owner?.runtime || 'claude', session: 'workspace-main', agent }, subject: { repo, branch: kind === 'push' ? 'feat/release-gates' : 'main', ticket: owner?.ticket || null, initiative }, summary, severity };
+  return { schema: 'mc.event/1', id: crypto.randomUUID(), ts, kind, source: kind === 'wal' ? `${owner?.runtime || 'claude'}-wal` : kind === 'ticket' ? 'goodqa' : kind === 'push' || kind === 'release' ? 'github' : kind === 'deploy' ? 'worker' : 'coordinator', actor: { runtime: owner?.runtime || 'claude', session: 'workspace-main', agent }, subject: { repo, branch: kind === 'push' ? 'feat/release-gates' : 'main', ticket: owner?.ticket || null, initiative }, summary, severity };
 }
 export function createMock(adapter, seed) {
   let connection = 'live', failNext = false, eventTimer, healthTimer, serial = 0, running = false;
@@ -65,7 +65,7 @@ export function createMock(adapter, seed) {
     ['push','x-04','Pushed a rollback checkpoint to staging','release','harness'],
     ['wal','x-07','Keyboard focus reaches every panel','mission','harness'],
     ['ticket','c-03','Added evidence to the rotation edge case','auth','harness','warn'],
-    ['deploy','x-04','Preview deployment passed its smoke checks','release','t2-dev'],
+    ['deploy','x-04','Preview deployment passed its smoke checks','release','worker-1'],
     ['owner','x-02','Reviewer checkpoint · reconnect test still running','stream','harness'],
     ['release','x-04','Release candidate v0.9.0-rc.2 assembled','release','harness'],
     ['wal','x-02','Replay cursor verified without duplicate events','stream','harness'],

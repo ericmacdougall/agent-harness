@@ -10,10 +10,11 @@ holds a next step that does not need the user? Whether a stream needs main is ah
 here: an owner is actionable exactly when its row is decision_required or has `attention` (an untaken result or
 handoff, an invalid wait, a wait on a ticket or agent, a silent owner); it is a genuine user wait only when it is not
 actionable and its `wait_on` is an open ask (owners() already checked the ask is its own). Modes (argv[1]):
-  stop    Stop hook: block with the named streams (idle), or when every owner waits on a user ask while another owner
-          holds a returned result nobody took (no idle time needed), or when this turn holds a user rejection and
-          independent work exists. Bounded per problem signature; main only; fails open on any error.
-  reject  PostToolUseFailure / PermissionDenied / UserPromptSubmit: one context line after a user rejection.
+  stop    Stop hook: one advisory line (never a block, 2026-11-24) naming the streams when main is idle, or when every
+          owner waits on a user ask while another owner holds a returned result nobody took, or when this turn holds a
+          user rejection and independent work exists. Only when that problem changed; main only; fails open.
+  reject  PostToolUseFailure / PermissionDenied / UserPromptSubmit: one context line after a user rejection, at most
+          once per 30 min per session.
 ops_watch.check_idle_guard raises the high `idle-guard:<session8>` alert from the same assess().
 
 Progress is: main commit/check/intent/subagent/result/handoff rows, main Agent/Write/Edit pretool rows (a Bash-only
@@ -35,7 +36,6 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 IDLE_MIN_DEFAULT = 30
-MAX_STOP_BLOCKS = 2
 TAIL_BYTES = 1 << 20
 REMINDER = "A rejected question pauses only that question; keep every independent stream moving."
 MAIN_PROGRESS = {"commit", "check", "intent", "subagent", "subagent_stop", "result", "handoff", "deploy"}
@@ -174,30 +174,6 @@ def rejected_this_turn(transcript) -> bool:
     return seen
 
 
-def state_path(session: str) -> Path:
-    return Path(os.environ.get("AH_HOME") or Path.home()) / ".agent-harness" / "state" / "idle-guard" / f"{re.sub(r'[^A-Za-z0-9._-]', '_', session)[:120]}.json"
-
-
-def _count(session: str, sig: str, bump: bool) -> int:
-    path = state_path(session)
-    try:
-        state = json.loads(path.read_text())
-    except (OSError, ValueError):
-        state = {}
-    n = int((state.get("blocks") or {}).get(sig, 0)) if isinstance(state, dict) else 0
-    if bump:
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            tmp = path.with_suffix(".tmp")
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w") as fh:
-                json.dump({"blocks": {sig: n + 1}}, fh)
-            os.replace(tmp, path)
-        except OSError:
-            pass
-    return n
-
-
 def cmd_stop(payload: dict, now: float | None = None) -> dict:
     session = str(payload.get("session_id") or "")
     if not session or "/" in session or session in (".", ".."):
@@ -211,35 +187,54 @@ def cmd_stop(payload: dict, now: float | None = None) -> dict:
     except Exception:  # noqa: BLE001 - no WAL, a partial install or a bug: fail open, never trap the turn
         return {}
     if a["idle"]:
-        head = (f"Main idle {int((a['idle_s'] or 0) // 60)} min with {len(a['streams'])} stream(s) holding a non-user next step "
-                f"(goodqa#15943). Act on them before ending the turn:\n")
+        head = (f"main idle {int((a['idle_s'] or 0) // 60)} min with {len(a['streams'])} stream(s) holding a non-user "
+                "next step")
     elif a["all_waiting_on_user"]:
-        head = ("Every owner waits on a user ask while another owner holds a result nobody took (goodqa#15943). "
-                "A wait on one ask excuses only that owner:\n")
+        head = "every owner waits on a user ask while another owner holds a result nobody took"
     elif rejected and a["streams"]:
-        head = "A tool call was rejected this turn, and independent work exists (goodqa#15943):\n"
+        head = "a tool call was rejected this turn and independent work exists"
     else:
         return {}
-    text = head + lines(a["streams"]) + "\n" + REMINDER
-    sig = hashlib.sha256((",".join(sorted(s["agent"] for s in a["streams"])) + f"|{int(a['last_progress'])}").encode()).hexdigest()[:16]
-    count = _count(session, sig, bump=False)
-    if payload.get("stop_hook_active") or count >= MAX_STOP_BLOCKS:
-        return {"systemMessage": "idle guard: " + text}
-    _count(session, sig, bump=True)
-    return {"decision": "block", "reason": text}
+    names = ", ".join(f"{s['agent']} ({s.get('ticket') or 'no ticket'})" for s in a["streams"][:6])
+    more = f" +{len(a['streams']) - 6} more" if len(a["streams"]) > 6 else ""
+    text = f"idle guard: {head}: {names}{more}. Detail: ah owners. {REMINDER}"
+    # Advisory, never a block (2026-11-24 context budget): one line, and only when the problem changed.
+    sig = hashlib.sha256((head.split(" ", 2)[0] + "|" + ",".join(sorted(s["agent"] for s in a["streams"]))
+                          + f"|{int(a['last_progress'])}").encode()).hexdigest()[:16]
+    if payload.get("stop_hook_active") or not _budget(session, "idle_guard:stop", signature=sig):
+        return {}
+    return {"systemMessage": text[:CONTEXT_CAP]}
+
+
+REJECT_EVERY_S = 30 * 60
 
 
 def cmd_reject(payload: dict) -> dict:
-    """One line of context after a user rejection (PostToolUseFailure, PermissionDenied) or at the next prompt."""
+    """One line of context after a user rejection (PostToolUseFailure, PermissionDenied) or at the next prompt; at
+    most once per REJECT_EVERY_S per session, never for a sub-agent."""
     event = payload.get("hook_event_name") or ""
+    if payload.get("agent_id"):
+        return {}
     if event == "UserPromptSubmit":
         hit = rejected_this_turn(payload.get("transcript_path"))
     else:
         blob = " ".join(str(payload.get(k) or "") for k in ("error", "tool_response", "reason", "message"))
         hit = bool(REJECT_RE.search(blob) or payload.get("is_interrupt") is True or event == "PermissionDenied")
-    if not hit:
+    if not hit or not _budget(str(payload.get("session_id") or ""), "idle_guard:reject", every_s=REJECT_EVERY_S):
         return {}
     return {"hookSpecificOutput": {"hookEventName": event or "PostToolUseFailure", "additionalContext": REMINDER}}
+
+
+CONTEXT_CAP = 600
+
+
+def _budget(session: str, name: str, **kw) -> bool:
+    """wal.budget_once (the shared per-session context state); True when wal.py is not beside this file."""
+    try:
+        import wal  # noqa: PLC0415
+        return wal.budget_once(session, name, home=os.environ.get("AH_HOME") or None, **kw)
+    except Exception:  # noqa: BLE001
+        return True
 
 
 def main(argv=None) -> int:

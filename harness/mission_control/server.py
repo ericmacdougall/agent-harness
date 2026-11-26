@@ -473,7 +473,8 @@ class App:
             self.health.off("codex-owners", "OpenAI supervised owners are not configured on this instance", truth="current")
         self.github = col.GitHub(self.hub, self.health, self.runner)
         self.tickets = col.Tickets(self.hub, self.health, self.runner, self.tracked_tickets)
-        self.remote = col.Remote(self.hub, self.health, self.runner, enabled=remote, fabric=bool(fabric_bin),
+        self.remote = col.Remote(self.hub, self.health, self.runner,
+                                 enabled=remote and bool(getattr(self.runner, "remote_host", True)), fabric=bool(fabric_bin),
                                  drop_dir=root / "sources")
         self.drop = col.FileDrop(self.hub, self.health, self.reader, root / "sources")
         self.asks = col.Asks(self.hub, self.health, self.runner, lambda: self.owners.session, root=root,
@@ -697,7 +698,7 @@ class App:
         try:
             record, created = mc_chat.new_message(to, body.get("text"), client_key=body.get("client_key"),
                                                   session=body.get("session"), thread=body.get("thread"),
-                                                  root=self.root)
+                                                  reply_to=body.get("reply_to"), root=self.root)
         except mc_chat.ChatError as exc:
             status = 409 if exc.code in ("no-target", "key-conflict") else 400
             return status, {"error": exc.code, "message": str(exc)}

@@ -79,7 +79,7 @@ Requirements of earlier sessions (only main's current session is read), the owne
 
 The default port is 47615. To use another one, pass `--port P` to `serve`, `url`, `open`, `status` and `install-launchd`.
 
-A disposable instance for testing does not touch your real chat data or launchd. In it, Codex is never run and t2-dev is never contacted:
+A disposable instance for testing does not touch your real chat data or launchd. In it, Codex is never run and the worker host is never contacted:
 
 ```sh
 MC_HOME=$(mktemp -d) python3 harness/mission_control/server.py serve --port 47699 --no-remote --no-codex
@@ -99,7 +99,7 @@ Every source has a fixed interval. A failing source is never retried faster, and
 | Owners | `python3 ~/.claude/hooks/ah.py owners` | Every 60 s |
 | GitHub | Your pushes and releases, from `gh api` events | One request every 60 s |
 | GoodQA tickets | Checkpoint comments on tickets that initiatives reference | One ticket read every 10 s, round robin, at most 12 tickets |
-| t2-dev | One fixed WAL probe over ssh | At most one ssh connection every 60 s |
+| remote | One fixed WAL probe over ssh to local.json `heavy_job_host` (off when unset) | At most one ssh connection every 60 s |
 | Event drops | `~/.agent-harness/mission-control/sources/*.jsonl`, written by external sources such as Fabric | Every 5 s |
 | Ledger | `ah goals`, `ah requirements`, `ah status` (see Ledger source) | 60 s attached, 300 s idle |
 
@@ -120,7 +120,7 @@ The server stays under 100 MB RSS.
 The two expensive sources are subprocesses: `provenance.py asks` (about 5 CPU seconds a run on a busy session) and `ah owners` (about 6). Neither is a blind poll any more.
 
 - The asks ledger is read when a WAL line registers or resolves an ask (debounced by 5 s), when you click Approve or Deny, and at every sweep (5 minutes). It is not read every minute.
-- `ah owners`, GitHub, the GoodQA ticket reader and the t2-dev probe run at their normal interval while a page is attached, and at their idle interval (5 minutes; tickets 2 minutes) while none is. Attaching a page refreshes them at once.
+- `ah owners`, GitHub, the GoodQA ticket reader and the remote probe run at their normal interval while a page is attached, and at their idle interval (5 minutes; tickets 2 minutes) while none is. Attaching a page refreshes them at once.
 - Scripts, styles and the three.js bundle are served gzipped with an ETag and `Cache-Control: no-cache, private`, so an unchanged file costs a 304. The page shell and every API response stay `no-store`.
 
 ### The read envelope and the gate
@@ -264,7 +264,7 @@ Sending is idempotent:
 
 | Runtime | How chat reaches it | Limits |
 | --- | --- | --- |
-| Claude Code CLI (main) | Main runs `python3 ~/.claude/hooks/mc_inbox.py wait --session <session-id>` as a background task. It wakes when a message arrives, prints the framed message and exits; main answers with `mc_inbox.py reply <id>` (text on stdin) and re-arms the waiter. The installed `mc_inbox.py hook` on Stop and UserPromptSubmit points the registered session at a message it missed, and once per 30 minutes tells a session whose waiter is not running to re-arm it. A session stays the chat target for 12 hours after its last `wait` heartbeat. | Only the session you pick in the dashboard receives a Claude message. The Stop hook blocks at most once per message (a message main ignored never hides a newer one), with a 120 s cooldown and at most 6 blocks an hour, and its text is a fixed pointer. The hook reads only its own session's target file, so an unregistered session pays one failed file open per prompt. Subagents never act on chat. With no registered session, the page says "no main attached" and does not accept Claude messages. |
+| Claude Code CLI (main) | Main runs `python3 ~/.claude/hooks/mc_inbox.py wait --session <session-id>` as a background task. It wakes when a message arrives, prints the framed message and exits; main answers with `mc_inbox.py reply <id>` (text on stdin) and re-arms the waiter. The installed `mc_inbox.py hook` on UserPromptSubmit points the registered session at a message it missed, and once per 30 minutes tells a session whose waiter is not running to re-arm it. A session stays the chat target for 12 hours after its last `wait` heartbeat. | Only the session you pick in the dashboard receives a Claude message. There is no Stop registration (2026-11-24); the prompt hook's text is a fixed pointer. The hook reads only its own session's target file, so an unregistered session pays one failed file open per prompt. Subagents never act on chat. With no registered session, the page says "no main attached" and does not accept Claude messages. |
 | Codex CLI | The dashboard's Codex switch runs `codex exec --json` read-only on your ChatGPT subscription and streams the reply. The installer also ships `~/.codex/agent-harness/mc_inbox.py`, so a Codex session can list waiting Codex message ids (`pending --to codex`) by hand. The responder claims each message atomically, so it is answered once. | There is no Codex hook and no API-key fallback. When Codex is busy, rate-limited or not signed in, the page shows why and when it resets. Codex keys hook trust by position, so the installer adds no Codex hook. |
 | Claude desktop | Ask the app to "check the dashboard". Its harness-tui plugin calls `mc_pending`, which attaches the app as the chat target `claude-desktop` and lists its unread ids (queued, or read but not yet answered) with their status. Pick `claude-desktop` in the dashboard's session picker to send to it. `mc_read` returns one verified, framed message and `mc_reply` answers it. | The desktop app has no Stop hook, so it never wakes on its own: a message waits until you ask the app to check. The tools never see messages for a terminal session. |
 | ChatGPT / Codex desktop | There is no hook point and no supported MCP path from this harness. Use the dashboard's Codex switch, which runs the Codex CLI. | Messages are not delivered into the desktop app. |
@@ -342,7 +342,7 @@ The demo feed also writes two tool-call records each pulse (seen with "Show tool
 ## Not yet
 
 - **Remote access over Tailscale.** It would need a second listener on the tailnet address, with the same launch-code and cookie model plus an allowlist of tailnet identities. It is off until it has its own review.
-- **Fabric events.** Fabric will write events through the event-drop directory, or through the t2-dev probe once `fabric control export` ships. The format is fixed in [mission-control-events.md](mission-control-events.md).
+- **Fabric events.** Fabric will write events through the event-drop directory, or through the remote probe once `fabric control export` ships. The format is fixed in [mission-control-events.md](mission-control-events.md).
 
 ### Named OpenAI owners
 

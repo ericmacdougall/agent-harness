@@ -7,7 +7,10 @@ lock writes log-backup.last-skip instead, which this tool never treats as succes
 
   check          exit 0 fresh, 1 stale, 2 missing or invalid (a future timestamp is invalid), 3 transcripts fresh but
                  the bulk marker is stale, missing or invalid
-  session-start  SessionStart hook: prints an alert only when the backup is not fresh; always exits 0
+  session-start  SessionStart hook: one alert line when the backup is not fresh, at most once per 24 h per machine
+                 and never while an ack holds; always exits 0
+  ack            --hours N --reason TEXT: silence that alert for N hours (the owner at a terminal, a supervisor
+                 session or the top rung, as ah_roles says)
   status         last success, last run, last skip and lock holder
   restore        copy one backed-up source from the remote into an empty scratch directory and compare it
 
@@ -207,24 +210,176 @@ def cmd_check(args) -> int:
     return 3 if bulk["state"] in ("stale", "missing", "invalid") else 0
 
 
+ALERT_STATE = "log-backup-alert.json"   # under ~/.agent-harness/state: when the alert was last shown, and any ack
+ALERT_EVERY_SECONDS = 24 * 3600
+ACK_MAX_HOURS = 24 * 30
+STATUS_CMD = "python3 ~/.claude/hooks/log_backup.py status"
+ACK_CMD = "python3 ~/.claude/hooks/log_backup.py ack --hours 24 --reason '<why>'"
+REASON_LINE = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ (.+)$")
+REASON_WORDS = ("budget", "rate limit", "failed", "no primary", "stopped", "refused", "cannot", "skipped")
+LOG_TAIL_BYTES = 64 * 1024
+
+
+def alert_state_path(home: Path) -> Path:
+    return home / ".agent-harness" / "state" / ALERT_STATE
+
+
+def load_alert_state(home: Path) -> dict:
+    text = None
+    try:
+        fd = os.open(alert_state_path(home), os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+        try:
+            import stat
+            if stat.S_ISREG(os.fstat(fd).st_mode):
+                text = os.read(fd, 16384).decode("utf-8", "replace")
+        finally:
+            os.close(fd)
+        data = json.loads(text) if text else {}
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_alert_state(home: Path, data: dict) -> bool:
+    path = alert_state_path(home)
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        tmp = path.with_name(f".{ALERT_STATE}.{os.getpid()}.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, sort_keys=True)
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        return False
+
+
+def last_reason(home: Path) -> str:
+    """The most recent line of the backup's own log that says why a run did not finish (its budget, the rate
+    limit, a failed copy), shortened; '' when the log says nothing useful."""
+    try:
+        fd = os.open(logs_dir(home) / "log-backup.log", os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+        try:
+            import stat
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return ""
+            size = os.fstat(fd).st_size
+            tail = os.pread(fd, LOG_TAIL_BYTES, max(0, size - LOG_TAIL_BYTES)).decode("utf-8", "replace")
+        finally:
+            os.close(fd)
+    except OSError:
+        return ""
+    for line in reversed(tail.splitlines()):
+        m = REASON_LINE.match(line.strip())
+        if m and any(word in m.group(1) for word in REASON_WORDS):
+            return printable(m.group(1))[:110]
+    return ""
+
+
+def alert_line(home: Path, max_age: int = MAX_AGE_SECONDS) -> str:
+    """The one-line SessionStart alert, or '' when both tiers are fresh (or the bulk tier is only pending)."""
+    result = classify(home, max_age=max_age)
+    if result["state"] == "fresh":
+        bulk = bulk_classify(home)
+        if bulk["state"] not in ("stale", "missing", "invalid"):
+            return ""
+        what = ("bulk tier has not completed its first full pass yet" if bulk["state"] == "missing" else
+                f"bulk tier last completed {human_age(bulk['age'])} ago" if bulk["state"] == "stale" else
+                "bulk tier marker unreadable")
+    elif result["state"] == "stale":
+        what = f"last successful backup {human_age(result['age'])} ago (limit {max_age // 60} min)"
+    elif result["state"] == "missing":
+        what = "no successful backup has ever completed on this host"
+    else:
+        what = "the success marker is unreadable or dated in the future"
+    why = []
+    if throttle_note(home):
+        why.append("Dropbox write rate limit")
+    reason = last_reason(home)
+    if reason:
+        why.append(reason)
+    lock = logs_dir(home) / LOCK_DIR
+    if lock_holder(home).startswith("held"):
+        try:
+            why.append(f"a run has held the lock for {human_age(max(0, time.time() - lock.stat().st_mtime))}")
+        except OSError:
+            pass
+    prefix = ("LOG BACKUP ALERT (DISABLED BY CHOICE; re-enable with install.py --apply --log-backup): "
+              if disabled_by_choice(home) else "LOG BACKUP ALERT: ")
+    return (f"{prefix}{what}" + (f"; {'; '.join(why)}" if why else "")
+            + f". Do not prune agent logs. Acknowledge: {ACK_CMD}")
+
+
 def cmd_session_start(args) -> int:
+    """At most one line per session start, and at most once per ALERT_EVERY_SECONDS per machine; silent while an
+    ack holds. The hook payload is drained, never needed."""
     try:
         try:
-            sys.stdin.read(65536)  # the hook payload is not needed; drain a bounded amount
+            sys.stdin.read(65536)
         except (OSError, ValueError):
             pass
-        result = classify(args.home, max_age=args.max_age)
-        bulk = bulk_classify(args.home)
-        text = ""
-        if result["state"] != "fresh":
-            text = choice_note(args.home, alert_text(result, args.max_age)) + run_note(args.home) + throttle_note(args.home)
-        elif bulk["state"] in ("stale", "missing", "invalid"):
-            text = choice_note(args.home, bulk_alert_text(bulk)) + run_note(args.home)
-        if text:
-            print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text},
-                              "systemMessage": text}))
+        text = alert_line(args.home, args.max_age)
+        if not text:
+            return 0
+        now = time.time()
+        state = load_alert_state(args.home)
+        until = state.get("ack_until")
+        if isinstance(until, (int, float)) and now < until:
+            return 0
+        last = state.get("last_shown")
+        if isinstance(last, (int, float)) and 0 <= now - last < ALERT_EVERY_SECONDS:
+            return 0
+        state["last_shown"] = now
+        if not save_alert_state(args.home, state):
+            return 0  # an alert that cannot be rate-limited would repeat at every session start
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text},
+                          "systemMessage": text}))
     except Exception:  # noqa: BLE001 - a status hook must never break a session
         pass
+    return 0
+
+
+def ack_allowed(environ=None) -> tuple[bool, str]:
+    """(allowed, who). The owner at a terminal (no agent runtime in the environment) may ack; an agent only when
+    ah_roles names its session a supervisor or its model the top rung."""
+    environ = os.environ if environ is None else environ
+    in_agent = bool(environ.get("CLAUDECODE")) or any(k.startswith("CODEX_") for k in environ)
+    if not in_agent:
+        return True, "owner (terminal)"
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import ah_roles  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return False, "roles module unavailable"
+    payload = ah_roles.cli_payload(environ)
+    if ah_roles.is_supervisor(payload):
+        return True, "supervisor " + str(payload.get("session_id", ""))[:8]
+    if ah_roles.is_top_rung(payload):
+        return True, "top rung " + ah_roles.caller_model(payload)
+    return False, "not the owner, a supervisor or the top rung"
+
+
+def cmd_ack(args) -> int:
+    if not 1 <= args.hours <= ACK_MAX_HOURS:
+        print(f"log_backup: --hours must be 1-{ACK_MAX_HOURS}", file=sys.stderr)
+        return 2
+    reason = printable(args.reason or "")[:300]
+    if not reason:
+        print("log_backup: --reason is required", file=sys.stderr)
+        return 2
+    allowed, who = ack_allowed()
+    if not allowed:
+        print(f"log_backup: ack refused ({who}). The owner, a supervisor session or the top rung acks it; "
+              f"`{STATUS_CMD}` shows why the backup is stale.", file=sys.stderr)
+        return 3
+    state = load_alert_state(args.home)
+    now = time.time()
+    state.update({"ack_until": now + args.hours * 3600, "ack_reason": reason, "ack_by": who,
+                  "ack_at": datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
+    if not save_alert_state(args.home, state):
+        print("log_backup: cannot write the alert state", file=sys.stderr)
+        return 1
+    print(f"log backup alert silenced for {args.hours} h ({who}): {reason}")
     return 0
 
 
@@ -491,6 +646,10 @@ def main(argv: list[str] | None = None) -> int:
         if name in ("check", "status"):
             cmd.add_argument("--json", action="store_true")
         cmd.set_defaults(func=handler)
+    ack = sub.add_parser("ack", help="silence the SessionStart alert for N hours (owner, supervisor or top rung)")
+    ack.add_argument("--hours", type=int, required=True)
+    ack.add_argument("--reason", required=True)
+    ack.set_defaults(func=cmd_ack)
     restore = sub.add_parser("restore", help="restore one source from the remote into an empty scratch directory")
     restore.add_argument("--src", required=True, help="source relative to HOME, e.g. .claude/projects")
     restore.add_argument("--into", required=True, help="empty scratch directory (never a live tree)")

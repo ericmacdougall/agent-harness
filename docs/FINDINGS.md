@@ -10,10 +10,10 @@ the fixes merge.
 ## F-001 Command guard was never wired on any host (2026-11-04)
 
 - **Broken:** the harness promised a guard against destructive shell commands, but no
-  PreToolUse hook for it was registered on the Mac or on dev2, and the guard was not yet in
+  PreToolUse hook for it was registered on the Mac or on the worker host, and the guard was not yet in
   this repository. The instructions forbade such commands; nothing enforced it.
-- **Impact:** a builder agent's recursive delete ran on dev2. P0 #14471 (F-006) is the same
-  class of failure. A later probe on dev2 confirmed that no live hook blocked a recursive
+- **Impact:** a builder agent's recursive delete ran on the worker host. P0 #14471 (F-006) is the same
+  class of failure. A later probe on the worker host confirmed that no live hook blocked a recursive
   delete of the agent transcript directory.
 - **Found by:** the incident review and a probe by the rules owner.
 - **Fix:** command guard (`feat/command-guard`), kill guard (`feat/kill-guard-14506`) and
@@ -76,13 +76,13 @@ no guard was installed.
 
 1. A guard owner wrote probe rows and docstrings containing deletion text through Bash
    heredocs. Nothing ran; the protected directories were verified intact afterwards.
-2. An owner put a delete of the null device in a launch command on dev2. Harmless
+2. An owner put a delete of the null device in a launch command on the worker host. Harmless
    (unprivileged).
 3. A click-tester wrote harmless fixtures with heredocs. No hostile text.
 4. A background-job owner ran a name-pattern process kill on the Mac (newest `sleep 300`
    process, output discarded). The exact target is unknown; no other owner's run was found
    affected.
-5. Before the rules existed, an owner ran a broad pattern kill of test runners on dev2 and
+5. Before the rules existed, an owner ran a broad pattern kill of test runners on the worker host and
    removed its own scratch directories.
 
 Sources: the harness-coverage owner's WAL entries and the PR bodies in the tickets.
@@ -135,24 +135,14 @@ Common cause: guards not installed (F-001).
   `CLAUDE.md` only, never `~/.codex`. Deterministic guards (placement, disk floor,
   self-recovery) are in progress under a separate task; SHA to be added.
 - **Side effect on this work:** test runs during the outage gave misleading errors, so
-  they were re-run on dev2 (all passed).
+  they were re-run on the worker host (all passed).
 
 ## F-011 Heavy jobs ran on the Mac because the guard was not installed
 
 - **Broken:** `heavy_job_guard` was merged but not installed, so heavy test suites and
-  browser jobs ran on the Mac instead of dev2.
-- **Fix:** installed on the Mac and dev2 as of 84688d7.
+  browser jobs ran on the Mac instead of the worker host.
+- **Fix:** installed on the Mac and the worker host as of 84688d7.
 - **Common cause with F-001:** a merged guard that is not installed protects nothing.
-
-## F-012 Failing tests on dev2 that are not caused by PR1 (found 2026-11-04)
-
-- **Observed:** on dev2 (Python 3.9) a clean copy of the PR1 base commit already fails
-  `test_report_finalization.test_review_cleanup_races` (5 sub-cases) and two `test_rescue`
-  tests (`test_fallback_when_astra_executable_unavailable_is_blind_and_handed_off`,
-  `test_forged_commit_graph_parent_does_not_accept_sibling`). With PR1 applied the full
-  suite is 1104 tests, 8 skipped, and only those 7 fail.
-- **Cause:** not investigated. They are out of scope for PR1 and are left unchanged.
-- **Follow-up:** needs its own ticket; SHA to be added when fixed.
 
 ## F-013 Personal GoodQA project ids in `spec_policy.json`, found by the first real denylist scan
 

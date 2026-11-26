@@ -335,6 +335,7 @@ class Cli(Case):
         import io
         import ah
         import model_tiers
+        import resource_budget
         import tier_gate
         out = io.StringIO()
         with mock.patch.dict(os.environ, {"AH_HOME": str(self.home)}), mock.patch("sys.stdout", out):
@@ -346,7 +347,8 @@ class Cli(Case):
         with mock.patch.dict(os.environ, {"AH_HOME": str(self.home)}), mock.patch("sys.stdout", out), \
                 mock.patch.object(ah, "owners", lambda home, session, **k: doc()), \
                 mock.patch.object(tier_gate, "live_owner_ids", lambda session, policy: ["o"] * 4), \
-                mock.patch.object(model_tiers, "load_policy", lambda: {"caps": {"session_owner_agents": 4}}), \
+                mock.patch.object(model_tiers, "load_policy", lambda: {"caps": {}}), \
+                mock.patch.object(resource_budget, "owner_cap", lambda: {"max": 4, "enforce": False}), \
                 mock.patch.object(sc, "ring_alert", lambda home: (lambda *a: None)):
             code = ah.main(["task", "succeed", "--agent", AGENT, "--session", SESSION])
         self.assertEqual(code, 3, out.getvalue())

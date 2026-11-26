@@ -94,9 +94,13 @@ def session_directory(session: str):
         yield directory, current_directory
 
 
-def ops_alert_context(event: str) -> str:
-    """Active ops-watch alerts for the Codex side (parity with harness/hooks/wal.py, goodqa#14613 M9). ops_watch is
-    looked up next to this hook, then in the Claude hooks dir, then in a repo checkout. Never raises."""
+def ops_alert_context(event: str, session: str = "") -> str:
+    """Ops-watch alerts for the Codex side (parity with harness/hooks/wal.py, goodqa#14613 M9): one summary line at
+    SessionStart (ops_watch.session_summary: counts, at most a few about this machine or session, the status command)
+    and nothing on a prompt or a sub-agent start (2026-11-24: no per-prompt repetition). ops_watch is looked up next
+    to this hook, then in the Claude hooks dir, then in a repo checkout. Never raises."""
+    if event != "SessionStart":
+        return ""
     try:
         import importlib.util
         here = Path(__file__).resolve().parent
@@ -109,7 +113,8 @@ def ops_alert_context(event: str) -> str:
                 spec = importlib.util.spec_from_file_location("ops_watch_codex", candidate)
                 module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)
-                return module.injection_text(Path.home(), max_chars=400 if event == "UserPromptSubmit" else 700)
+                text = module.session_summary(Path.home(), session)[0]
+                return (" " + text) if text else ""
     except Exception:  # an alert line must never block a prompt or a session start
         pass
     return ""
@@ -484,7 +489,7 @@ def hook() -> None:
             append(main_wal, record)
         except OSError as error:
             note = degraded_note(error)
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": checkpoint_context(session, f"Session WAL: {main_wal}. Add redacted intent before edits, then decisions, checks, commits and handoffs. Hook metadata is not a semantic work log.") + note + ops_alert_context(event)}}))
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": checkpoint_context(session, f"Session WAL: {main_wal}. Add redacted intent before edits, then decisions, checks, commits and handoffs. Hook metadata is not a semantic work log.") + note + ops_alert_context(event, session)}}))
     elif event == "UserPromptSubmit":
         prompt = str(data.get("prompt", ""))
         record["prompt_chars"] = len(prompt)

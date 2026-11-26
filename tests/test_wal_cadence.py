@@ -73,22 +73,36 @@ class Case(unittest.TestCase):
             fh.write(json.dumps(row) + "\n")
 
     def assertNudged(self, r, *needles):
-        self.assertEqual(r.returncode, 2, r.stderr)
-        self.assertIn("NO DURABLE RECORD", r.stderr)
+        # advisory since 2026-11-24: exit 0 and one systemMessage line, never a block
+        self.assertEqual(r.returncode, 0, r.stderr)
+        text = json.loads(r.stdout)["systemMessage"]
+        self.assertIn("NO DURABLE RECORD", text)
+        self.assertNotIn("\n", text)
+        self.assertLessEqual(len(text), 600)
         for needle in needles:
-            self.assertIn(needle, r.stderr)
+            self.assertIn(needle, text)
 
     def assertQuiet(self, r):
-        self.assertEqual((r.returncode, r.stderr), (0, ""), r.stderr)
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (0, "", ""), r.stderr)
+
+    def forget_rate(self):
+        """The 30-minute per-agent limit, aged out: the next nudge is judged on its diff alone."""
+        for path in (self.home / ".agent-harness").rglob("*.json"):
+            if "wal-cadence" in str(path) or "wal_cadence" in str(path):
+                data = json.loads(path.read_text())
+                data["asked"] = {k: v - 3600 for k, v in (data.get("asked") or {}).items()}
+                path.write_text(json.dumps(data))
 
 
 class StopInWorktree(Case):
     def test_big_untracked_diff_without_wal_note_nudges_once(self):
         self.work()
         self.assertNudged(self.hook(), "feature.py", str(self.wals / "main.jsonl"), "wal_note.py")
-        self.assertQuiet(self.hook())  # bounded: the same diff never blocks twice
+        self.assertQuiet(self.hook())  # bounded: the same diff is never repeated
         self.work(lines=60)
-        self.assertNudged(self.hook())  # a new diff earns one new nudge
+        self.assertQuiet(self.hook())  # a new diff within 30 minutes stays quiet too
+        self.forget_rate()
+        self.assertNudged(self.hook())  # later, a new diff earns one new nudge
 
     def test_tracked_change_counts(self):
         (self.wt / "app.py").write_text("".join("y%d = 0\n" % i for i in range(45)))
@@ -107,7 +121,7 @@ class StopInWorktree(Case):
     def test_stale_human_note_nudges(self):
         self.work()
         self.note(seconds_ago=30 * 60)
-        self.assertNudged(self.hook(), "30 minutes old")
+        self.assertNudged(self.hook(), "30 min ago")
 
     def test_small_or_journal_only_diffs_are_quiet(self):
         self.work(lines=39)
@@ -154,7 +168,7 @@ class SubagentStop(Case):
         self.assertQuiet(self.hook("SubagentStop", agent_id=AGENT))
         self.assertQuiet(self.hook("SubagentStop", cwd=self.primary, agent_id=AGENT))
         self.assertNudged(self.hook("Stop"))  # the tree is still main's to account for
-        self.work(self.agent_wt)
+        self.work(self.agent_wt)  # the agent's own limit is separate from main's
         self.assertNudged(self.hook("SubagentStop", agent_id=AGENT), str(self.agent_wt))
 
     def test_subagent_without_id_is_quiet(self):
@@ -170,7 +184,7 @@ class Install(unittest.TestCase):
         hooks = install.managed_hooks(claude)
         script = str(claude / "hooks" / "wal_cadence.py")
         for event in ("Stop", "SubagentStop"):
-            handlers = [h for g in hooks[event] for h in g["hooks"] if script in (h.get("args") or [])]
+            handlers = [h for g in hooks[event] for h in g["hooks"] if script in install.hook_argv(h)]
             self.assertEqual(len(handlers), 1, event)
             self.assertNotIn("onFailure", handlers[0])
         self.assertIn("wal_cadence.py", install.HOOKS)

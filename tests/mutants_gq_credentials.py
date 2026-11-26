@@ -179,14 +179,7 @@ MUTANTS = {
     "files0-from list not judged": ("            listed = self._files0_hit(args, pl, idx)", "            listed = None"),
     "files0-from stdin not judged": ("            if value.text in ('-', '/dev/stdin', '/dev/fd/0'):", "            if False:"),
     "files0-from value is not a producer": ("_find_cred_roots(rargs, []) + _find_files0_values(rargs) if real", "_find_cred_roots(rargs, []) if real"),
-    # receipt r7 fail closed
-    "raw fallback ignores credential locations": ("if PROTECTED_TEXT.search(t) or SECRET_TEXT.search(t) or raw_credential(t):",
-                                                  "if PROTECTED_TEXT.search(t) or SECRET_TEXT.search(t):"),
-    "raw fallback ignores quoted forms": ("    return bool(CRED_TEXT.search(text) or CRED_TEXT.search(re.sub(r'[\\'\"\\\\]', '', text)))",
-                                          "    return bool(CRED_TEXT.search(text))"),
-    "launcher fallback ignores credential locations": ("command_guard_hook.py",
-                                                       "    if CRED_TEXT.search(t) or CRED_TEXT.search(re.sub(r'[\\'\"\\\\]', '', t)):\n        return True",
-                                                       "    if False:\n        return True"),
+    # receipt r7 fail closed: removed with the raw secret probe (redesign 2026-11-24: unsure means allow)
     "brace sequences not expanded": ("        seq = _BRACE_SEQ.fullmatch(text[i + 1:j - 1]) if depth == 0 else None", "        seq = None"),
     "lexer skips sequence-only braces": ("        if '{' in raw and (',' in raw or '..' in raw):", "        if '{' in raw and ',' in raw:"),
     "overflow not judged as a glob": ("            return self.alts[:32] + [_overflow_glob(self.overflow)]", "            return self.alts[:32]"),
@@ -217,8 +210,6 @@ MUTANTS = {
                                                "'unanalysable'"),
     "hook alarm refusal names another rule": ("Finding(SECRET_DUMP if verdict == 'block' else PARSE, 'unanalysable',",
                                               "Finding(PARSE, 'unanalysable',"),
-    "launcher reason omits credential locations": ("command_guard_hook.py", "'harness location, a credential location, a secret source",
-                                                   "'harness location, a secret source"),
 }
 
 

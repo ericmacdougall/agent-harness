@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
-"""Requirement provenance: every requirement, ask, blocker, AC-n, NEG-n and decision names its origin.
+"""Requirement provenance: requirements, asks, blockers, AC-n, NEG-n and decisions record where they came from.
 
-A `Source:` is one of
-  user:<session-id>/<message-uuid> "excerpt"        a real user-authored turn that contains the excerpt
-  ticket:GoodQA <project>#<n> [comment <id>]         a ticket (offline: syntax checked, marked deferred)
-  wal:<path>#<entry-id>                              another WAL entry; its own source is followed
-  file:<repo-path>:<line>@<sha> ["excerpt"]          a line of a committed file
-  inferred: from <source> ; <source> -- <rationale>  an assumption, never a user requirement
+Exact forms (checked against the transcript, WAL, ticket or git):
+  user:<session-id>/<message-uuid> "excerpt"        (uuid:, answer:, queue:, pasted: likewise; see docs/provenance.md)
+  ticket:GoodQA <project>#<n> [comment <id>]
+  wal:<path>#<entry-id>
+  file:<repo-path>:<line>@<sha> ["excerpt"]
+  inferred: from <source> ; <source> -- <rationale>
 
-Subcommands: check, check-spec, check-packet, trace, find-user, asks.
-Exit codes: 0 ok, 2 rejected or untraceable, 3 usage.
+Free form is accepted too: `user said "..."`, `user: "..."`, `the user, <date>: ...`, a bare quoted sentence (looked
+up in the session's user messages and normalised to user:<session>/<uuid> when found), a ticket number, a URL or a
+file path. A source that cannot be traced is kept as given and labelled UNSOURCED; nothing is refused or quarantined
+for its form. Listings show the newest record first and mark one that a later record on the same subject supersedes.
 
-Fail safe: malformed or oversized transcript lines, missing files and internal errors become rejection
-statuses, never tracebacks. Messages carry at most 60 characters of any excerpt. No network access:
-ticket sources are syntax-checked and flagged `deferred` unless a local cache already lists them.
+Subcommands: check, check-spec, check-packet, trace, find-user, asks, decisions.
+Exit codes: check, check-spec, check-packet and trace: 0 traced, 2 unsourced or unreadable; asks and decisions:
+0 (they are listings); 3 usage.
 """
 
 from __future__ import annotations
@@ -226,14 +228,18 @@ EXCERPT_MIN, EXCERPT_MAX, EXCERPT_SEGMENTS = 12, 300, 3
 RATIONALE_MIN = 10
 MODES = ("off", "warn", "enforce")
 DEFAULT_POLICY = {
-    "schema": 1, "spec": "enforce", "plan_packet": "warn", "ask_user_question": "enforce", "stop_lint": "warn", "ticket_lookup": "enforce", "status_lint": "warn",
-    "wal": {"requirement": "enforce", "ask": "enforce", "blocker": "warn", "scope": "warn", "decision": "warn"},
+    "schema": 1, "spec": "warn", "plan_packet": "warn", "ask_user_question": "warn", "stop_lint": "warn", "ticket_lookup": "enforce", "status_lint": "warn",
+    "wal": {"requirement": "warn", "ask": "warn", "blocker": "warn", "scope": "warn", "decision": "warn"},
 }
+# Provenance records and warns; it never refuses for a source (harness redesign 2026-11-24). An old policy file or an
+# environment overlay that still says "enforce" for these keys is read as "warn". ticket_lookup is not a gate: it only
+# decides whether a ticket the tracker reports missing counts as traced.
+ADVISORY_KEYS = ("spec", "plan_packet", "ask_user_question", "stop_lint", "status_lint")
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{4,40}$")
 SESSION_RE = re.compile(r"^[A-Za-z0-9._-]{1,120}$")
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
-LABELS = {"user": "USER", "pasted": "PASTED", "ticket": "TICKET", "file": "FILE", "dashboard": "DASHBOARD"}
+LABELS = {"user": "USER", "pasted": "PASTED", "ticket": "TICKET", "file": "FILE", "dashboard": "DASHBOARD", "link": "LINK"}
 
 
 class Problem(Exception):
@@ -332,6 +338,12 @@ def load_policy(path=None) -> dict:
         except (Problem, OSError, ValueError) as error:
             policy["policy_error"] = clip(getattr(error, "message", error), 120)
     policy["ticket_lookup"] = stricter(policy["ticket_lookup"], os.environ.get("HARNESS_PROVENANCE_TICKET_LOOKUP"))
+    for key in ADVISORY_KEYS:
+        if policy.get(key) == "enforce":
+            policy[key] = "warn"
+    for event, mode in list(policy["wal"].items()):
+        if mode == "enforce":
+            policy["wal"][event] = "warn"
     return policy
 
 
@@ -1116,15 +1128,128 @@ def resolve(source: str, ctx=None, depth: int = 0, seen=()) -> dict:
     try:
         if ctx["_resolves"] > MAX_RESOLVES:
             raise Problem("too-many-sources", f"more than {MAX_RESOLVES} sources resolved for one claim")
-        _resolve(source, ctx, depth, seen, result)
+        try:
+            parse_source(source)
+        except Problem as form:
+            _resolve_free(source, ctx, depth, seen, result, form)
+        else:
+            _resolve(source, ctx, depth, seen, result)
     except Problem as problem:
         result["problems"].append({"code": problem.code, "message": problem.message})
         result["ok"] = False
-    except Exception as error:  # a resolver bug is a rejection, never a crash of the calling hook
+    except Exception as error:  # a resolver bug is an unsourced result, never a crash of the calling hook
         result["problems"].append({"code": "internal", "message": f"resolver error {type(error).__name__}"})
         result["ok"] = False
+    if not result["ok"]:
+        result["unsourced"] = True
+        if depth == 0:  # one verdict code first, the detail after it (callers print problems[0])
+            first = result["problems"][0] if result["problems"] else {"code": "no-source", "message": "no source"}
+            result["problems"].insert(0, {"code": "unsourced", "message": clip(
+                f"kept as given, not traced ({first['code']}): {first['message']}", 300)})
     result["label"] = label_of(result)
     return result
+
+
+# --------------------------------------------------------------------------- free-form sources
+
+_FREE_QUOTE = re.compile(r'"((?:[^"\\]|\\.){4,})"|\u201c([^\u201d]{4,})\u201d')
+_FREE_SAID = re.compile(r"(?is)^\s*(?:the\s+)?(?:user|owner)\b(?:[^:\"\u201c]{0,80}:|\s+(?:said|says|wrote|asked(?:\s+for)?)\b)\s*(.+?)\s*$")
+_FREE_TICKET = re.compile(r"(?i)^\s*(?:ticket\s*:?\s*)?(?:goodqa\s+)?([a-z][a-z0-9_.-]{0,79})?\s*#\s*(\d{1,9})\s*$")
+_FREE_URL = re.compile(r"(?i)^\s*(https?://\S+)\s*$")
+_FREE_PATH = re.compile(r"^\s*((?:~|\.{1,2})?/?(?:[\w.@+-]+/)+[\w.@+-]+(?::\d+(?:-\d+)?)?|[\w.@+-]+\.[A-Za-z0-9]{1,8}(?::\d+(?:-\d+)?)?)\s*$")
+
+
+def free_excerpts(text: str) -> list:
+    """Candidate excerpts of the owner's words in a free-form source: quoted parts, else the words after
+    `user said` / `the user, <date>:`."""
+    quoted = [(a or b).replace('\\"', '"').strip() for a, b in _FREE_QUOTE.findall(text)]
+    if not quoted:
+        said = _FREE_SAID.match(text)
+        if said:
+            quoted = [said.group(1).strip().strip('"\u201c\u201d').strip()]
+    out = []
+    for excerpt in quoted:
+        excerpt = re.sub(r"\s+", " ", excerpt)
+        if len(excerpt) > EXCERPT_MAX:
+            excerpt = excerpt[:EXCERPT_MAX].rsplit(" ", 1)[0]
+        if len(excerpt) >= EXCERPT_MIN and excerpt not in out:
+            out.append(excerpt)
+    return out
+
+
+def _session_of(ctx) -> str:
+    session = ctx.get("session") or os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CLAUDE_SESSION_ID") or ""
+    return session if SESSION_RE.match(session) and session not in (".", "..") else ""
+
+
+def user_candidates(excerpt: str, ctx) -> list:
+    """Exact user: (or answer:/queue:) sources for the owner message that holds `excerpt`, newest first: the
+    `ah user-msg` lookup, then this module's own transcript search. Empty when no session is known."""
+    session = _session_of(ctx)
+    if not session:
+        return []
+    quoted = excerpt.replace('"', '\\"')
+    out = []
+    try:
+        import ah  # noqa: PLC0415 - the same index `ah user-msg` prints
+        rows = ah.user_msgs(claude_home(ctx.get("home")).parent, session, text=excerpt, limit=5)["matches"]
+        for row in reversed(rows):
+            ident = str(row.get("id") or "").replace("uuid:", "user:", 1)
+            if ident:
+                out.append(f'{ident} "{quoted}"')
+            if row.get("source"):
+                out.append(row["source"])
+    except Exception:  # noqa: BLE001 - lookup unavailable: fall back to the search below
+        pass
+    try:
+        for hit in reversed(find_user(session, excerpt, ctx.get("home"))):
+            if hit.get("kind") == "user" and hit.get("uuid"):
+                out.append(f'user:{session}/{hit["uuid"]} "{quoted}"')
+    except Exception:  # noqa: BLE001
+        pass
+    return list(dict.fromkeys(out))
+
+
+def _resolve_free(source, ctx, depth, seen, result, form: Problem):
+    """A source not in the exact grammar: normalise what can be normalised, keep the rest as given."""
+    text = (source or "").strip()
+    if not text:
+        raise form
+    ticket = _FREE_TICKET.match(text)
+    if ticket:
+        exact = f"ticket:GoodQA {(ticket.group(1) or 'goodqa').lower()}#{int(ticket.group(2))}"
+        result["given_as"], result["normalized"] = "ticket", exact
+        _resolve(exact, ctx, depth, seen, result)
+        return
+    link = _FREE_URL.match(text)
+    if link:
+        result.update(given_as="link", kind="link", origin="link", ok=True, weak=True, weak_reasons=["as-given"])
+        result["chain"].append({"kind": "link", "ref": clip(link.group(1), 300), "status": "as-given"})
+        return
+    path = _FREE_PATH.match(text)
+    if path:
+        result.update(given_as="path", kind="path", origin="file", ok=True, weak=True, weak_reasons=["as-given"])
+        result["chain"].append({"kind": "file", "ref": clip(path.group(1), 300), "status": "as-given"})
+        return
+    excerpts = free_excerpts(text)
+    if not excerpts:
+        raise Problem(form.code, "no quote, ticket, link or path to trace (" + form.message + ")")
+    for excerpt in excerpts:
+        for candidate in user_candidates(excerpt, ctx):
+            sub = resolve(candidate, ctx, depth + 1, seen)
+            if sub["ok"]:
+                for key in ("kind", "ok", "origin", "assumption", "deferred", "weak", "weak_reasons", "backed", "chain",
+                            "inputs"):
+                    result[key] = sub[key]
+                result["given_as"], result["normalized"] = "quote", candidate
+                return
+    if re.match(r"(?i)^\s*(?:user|uuid|answer|queue|pasted|ticket|wal|file|inferred|mc)\s*:", text) and \
+            not re.match(r"(?i)^\s*user\s*:\s*[\"\u201c]", text):
+        raise form  # a near-miss of an exact form: its own message says what to fix
+    if not _session_of(ctx):
+        raise Problem("excerpt-not-found", "no session known to look the quoted words up in (set --session or run "
+                                           "inside the session)")
+    raise Problem("excerpt-not-found", "the quoted words are not in this session's user messages")
 
 
 def weak_problem(result: dict):
@@ -1244,6 +1369,8 @@ def check_ticket(project: str, number: int):
 
 
 def label_of(result: dict) -> str:
+    if not result.get("ok"):
+        return "UNSOURCED"
     if result.get("assumption"):
         return "ASSUMPTION"
     return LABELS.get(result.get("origin") or "", "UNTRACEABLE")
@@ -1348,7 +1475,7 @@ def _resolve(source, ctx, depth, seen, result):
         node = {"kind": "wal", "ref": f"{path.parent.name}/{path.name}#{parsed['entry']}", "event": record.get("event"),
                 "at": record.get("at"), "note": clip(record.get("note", ""), 300), "status": "verified"}
         result["chain"].append(node)
-        upstream = record.get("source")
+        upstream = record.get("source_normalized") or record.get("source")  # wal_note stores both (2026-11-24)
         if not upstream:
             # B3.9: an unsourced (legacy or grandfathered) entry no longer refuses the whole citation; it resolves as an
             # assumption, labelled so, which cannot ground a user requirement, a permission or a completion claim.
@@ -1407,8 +1534,10 @@ def _resolve(source, ctx, depth, seen, result):
 
 def render(result: dict, indent: str = "  ") -> list:
     lines = []
-    head = f"[{result['label']}]" + ("" if result["ok"] else " REJECTED")
+    head = f"[{result['label']}]" + ("" if result["ok"] else " (kept as given)")
     lines.append(f"{indent}{head} {clip(result['source'], 120)}")
+    if result.get("normalized"):
+        lines.append(f"{indent}  normalised to: {clip(result['normalized'], 160)}")
     for problem in result["problems"]:
         lines.append(f"{indent}  ! {problem['code']}: {problem['message']}")
     for node in result["chain"]:
@@ -1434,14 +1563,16 @@ def render(result: dict, indent: str = "  ") -> list:
             lines.append(f"{indent}  wal {node['ref']} ({node.get('event')}, {node.get('at')}): {node.get('note')}")
         elif kind == "ticket":
             lines.append(f"{indent}  ticket {node['ref']} [{node['status']}]" + (f" {node['title']}" if node.get("title") else ""))
+        elif kind == "link":
+            lines.append(f"{indent}  link {node['ref']} (as given, not fetched)")
         elif kind == "file":
-            lines.append(f"{indent}  file {node['ref']}")
+            lines.append(f"{indent}  file {node['ref']}" + (" (as given)" if node.get("status") == "as-given" else ""))
             if node.get("text"):
                 lines.extend(f"{indent}    | {line}" for line in node["text"].split("\n")[:20])
         elif kind == "inferred":
             lines.append(f"{indent}  ASSUMPTION (not a user requirement): {node['rationale']}")
     if result.get("ok") and result.get("weak"):
-        lines.append(f"{indent}  note: UNVERIFIED citation (pasted text, offline ticket or file line without an excerpt)")
+        lines.append(f"{indent}  note: UNVERIFIED citation (pasted text, offline ticket, link, path or file line without an excerpt)")
     for sub in result["inputs"]:
         lines.append(f"{indent}  input:")
         lines.extend(render(sub, indent + "    "))
@@ -1466,7 +1597,7 @@ def context_of(text, excerpt: str) -> str:
 
 def status_word(result: dict) -> str:
     if not result["ok"]:
-        return "UNTRACEABLE"
+        return "UNSOURCED"
     return "ASSUMPTION" if result["assumption"] else f"{result['label']}-SOURCED"
 
 
@@ -1516,28 +1647,28 @@ def check_items(items: list, ctx=None) -> list:
 
 
 def spec_lint(text: str, mode=None, ctx=None):
-    """(problems, warnings) for spec_flow.lint. Specs carry Source on every AC-n and NEG-n."""
-    mode = mode or load_policy()["spec"]
-    if mode == "off":
-        return [], []
-    if GRANDFATHERED_RE_SEARCH(text):
-        head = text.split("\n## ", 1)[0]
-        if not re.search(r"(?m)^Sign-off:\s*human\s*$", head):
-            return ["provenance: `Provenance: grandfathered` is only valid with `Sign-off: human`"], []
-        return [], ["provenance: GRANDFATHERED spec, origins not verified: " + clip(GRANDFATHER_RE.search(text).group(1), 80)]
-    items = extract_items(text, sections={"Acceptance criteria", "Negative cases"})
-    results = check_items(items, ctx)
-    problems = [p for _, _, _, p in results if p]
-    # An AC or NEG whose only cite is unverified (ticket not confirmed, outage or not; file line without excerpt) is
-    # refused in enforce mode, as for asks; it only warns when a verified user, wal or file source also backs it.
-    refused = [f"{i} {weak_problem(r)}" for i, _, r, p in results if r and not p and weak_problem(r)]
-    backed = [f"provenance: {i} also cites an unverified source (ticket not confirmed or file line without excerpt)"
-              for i, _, r, p in results if r and not p and r.get("weak") and not weak_problem(r)]
-    if not items:
-        return [], []
-    if mode == "enforce":
-        return problems + refused, backed
-    return [], backed + ["provenance (warn mode): " + p for p in problems + refused]
+    """(problems, warnings) for spec_flow.lint. Every AC-n and NEG-n should carry a Source; a missing or untraced one is
+    a warning, never a problem (2026-11-24: provenance never refuses). Never raises."""
+    try:
+        mode = mode or load_policy()["spec"]
+        if mode == "off":
+            return [], []
+        if GRANDFATHERED_RE_SEARCH(text):
+            head = text.split("\n## ", 1)[0]
+            if not re.search(r"(?m)^Sign-off:\s*human\s*$", head):
+                return [], ["provenance: `Provenance: grandfathered` is only meaningful with `Sign-off: human`"]
+            return [], ["provenance: GRANDFATHERED spec, origins not verified: " + clip(GRANDFATHER_RE.search(text).group(1), 80)]
+        items = extract_items(text, sections={"Acceptance criteria", "Negative cases"})
+        if not items:
+            return [], []
+        results = check_items(items, ctx)
+        problems = [p for _, _, _, p in results if p]
+        weak = [f"{i} {weak_problem(r)}" for i, _, r, p in results if r and not p and weak_problem(r)]
+        backed = [f"provenance: {i} also cites an unverified source (ticket not confirmed or file line without excerpt)"
+                  for i, _, r, p in results if r and not p and r.get("weak") and not weak_problem(r)]
+        return [], backed + ["provenance: " + p for p in problems + weak]
+    except Exception as error:  # noqa: BLE001 - a resolver bug is a warning, never a refused spec
+        return [], [f"provenance: spec check skipped ({type(error).__name__})"]
 
 
 def GRANDFATHERED_RE_SEARCH(text: str):
@@ -1668,14 +1799,14 @@ def ledger_read(session: str, home=None) -> tuple:
 def classify_asks(session: str, home=None, ctx=None, entries=None) -> tuple:
     """Open asks split by how well their source resolves: (traced, assumptions, unverified, blocked, closed count)."""
     entries = ledger(session, home) if entries is None else entries
-    ctx = dict(ctx or {}, home=home, want_text=True)
+    ctx = dict(ctx or {}, home=home, want_text=True, session=session)
     traced, assumptions, blocked, unverified, closed = [], [], [], [], 0
     for record in entries:
         if record.get("_closed"):
             closed += 1
             continue
         source = record.get("source") or ""
-        result = resolve(source, dict(ctx)) if source else None
+        result = resolve(source, dict(ctx)) if source else None  # a fresh ctx: the resolve budget is per record
         row = (record, result)
         if result is None or not result["ok"]:
             blocked.append(row)
@@ -1691,7 +1822,8 @@ def classify_asks(session: str, home=None, ctx=None, entries=None) -> tuple:
 def ask_items(session: str, home=None, ctx=None) -> dict:
     """The open asks a person may be shown, as data (Mission Control's "Needs you" list).
 
-    Blocked asks (no resolvable source) are left out, exactly as the text ledger says not to present them."""
+    Unsourced asks (no traceable source) are listed apart under `blocked` (the key Mission Control reads), each with
+    the reason, so a reader shows them labelled instead of as traced asks."""
     entries, read = ledger_read(session, home)
     traced, assumptions, unverified, blocked, closed = classify_asks(session, home, ctx, entries)
     items = []
@@ -1711,7 +1843,7 @@ def ask_items(session: str, home=None, ctx=None) -> dict:
                         "reason": str(record.get("reason", ""))[:2000], "owner": record["_wal"].stem,
                         "problem": f"{problem['code']}: {clip(problem['message'], 200)}"})
     return {"counts": {"traced": len(traced), "unverified": len(unverified), "assumptions": len(assumptions),
-                       "blocked": len(blocked), "closed": closed}, "items": items, "blocked": flagged,
+                       "blocked": len(blocked), "unsourced": len(blocked), "closed": closed}, "items": items, "blocked": flagged,
             "resolved": resolved_items(session, home, entries=entries), "read": read}
 
 
@@ -1740,15 +1872,15 @@ def resolved_items(session: str, home=None, days: float = 7.0, limit: int = 100,
 
 def render_asks(session: str, home=None, ctx=None) -> tuple:
     traced, assumptions, unverified, blocked, closed = classify_asks(session, home, ctx)
-    lines = [f"Asks ledger for session {session}: {len(traced)} traceable, {len(assumptions)} assumptions, {len(unverified)} unverified citations, "
-             f"{len(blocked)} blocked, {closed} resolved"]
+    lines = [f"Asks ledger for session {session} (newest first): {len(traced)} traceable, {len(assumptions)} assumptions, "
+             f"{len(unverified)} unverified citations, {len(blocked)} unsourced, {closed} resolved"]
 
     def block(title, rows, mark):
         if not rows:
             return
         lines.append("")
         lines.append(title)
-        for record, result in rows:
+        for record, result in sorted(rows, key=lambda row: str(row[0].get("at") or ""), reverse=True):
             lines.append(f"  {mark} {record['id']}  {clip(record.get('note', ''), 200)}")
             lines.append(f"      why: {clip(record.get('reason', '(no reason recorded)'), 200)}")
             lines.append(f"      owner: {record['_wal'].stem}")
@@ -1767,8 +1899,95 @@ def render_asks(session: str, home=None, ctx=None) -> tuple:
     block("ASKS (each traces to a real source)", traced, "*")
     block("UNVERIFIED CITATIONS (pasted text, offline ticket or repo-file origin; check before relying, never a user requirement)", unverified, "~")
     block("ASSUMPTIONS TO CONFIRM (agent inference, not a user requirement)", assumptions, "?")
-    block("BLOCKED: untraceable, do NOT present these to the user until a source is added", blocked, "!")
-    return "\n".join(lines), {"traced": len(traced), "unverified": len(unverified), "assumptions": len(assumptions), "blocked": len(blocked), "closed": closed}
+    block("UNSOURCED (recorded and usable; no traceable source, so say so if you show one to the user)", blocked, "!")
+    return "\n".join(lines), {"traced": len(traced), "unverified": len(unverified), "assumptions": len(assumptions),
+                              "blocked": len(blocked), "unsourced": len(blocked), "closed": closed}
+
+
+# --------------------------------------------------------------------------- decisions listing (later words govern)
+
+DECISION_EVENTS = ("requirement", "scope", "decision", "ask", "blocker")
+DECISION_SCAN_BYTES = 64 << 20
+
+
+def subject_keys(record: dict) -> list:
+    """What a record is about, for supersession: its goal and its ticket, per event kind."""
+    keys = []
+    for field in ("goal", "ticket"):
+        value = record.get(field)
+        if isinstance(value, str) and value.strip():
+            keys.append((record.get("event"), field, value.strip().lower()))
+    return keys
+
+
+def decision_records(session: str, home=None, limit: int = 200) -> tuple:
+    """(records newest first, read block). Each record carries `status` (sourced | unsourced), the source `label`
+    and `superseded_by`: the id of a LATER record that names it (`supersedes` or `recites`) or has the same event kind
+    and the same goal or ticket. A later record governs an earlier, narrower one: nothing here holds work on the
+    earlier record. A row flagged `unsourced` by an older wal_note (the former quarantine) reads as unsourced unless
+    its source now traces."""
+    paths, unread = session_wals_read(session, home)
+    rows, skipped, read_ok = [], 0, 0
+    for path in paths:
+        try:
+            for _, raw in safe_input.iter_jsonl_lines(path, MAX_LINE, max_total_bytes=DECISION_SCAN_BYTES,
+                                                      max_seconds=SCAN_SECONDS):
+                if raw is None:
+                    skipped += 1
+                    continue
+                if not any(f'"{event}"'.encode() in raw for event in DECISION_EVENTS):
+                    continue
+                try:
+                    record = loads_line(raw)
+                except ValueError:
+                    skipped += 1
+                    continue
+                if isinstance(record, dict) and record.get("event") in DECISION_EVENTS and isinstance(record.get("id"), str):
+                    record["_wal"] = path.stem
+                    rows.append(record)
+            read_ok += 1
+        except Exception as error:  # noqa: BLE001 - one unreadable WAL is named, never taken for an empty one
+            unread.append({"source": path.name, "reason": f"file-unreadable: {type(error).__name__}"})
+    rows.sort(key=lambda r: str(r.get("at") or ""), reverse=True)
+    rows = rows[:max(1, int(limit))]
+    newer_by_key, named, out = {}, {}, []
+    for record in rows:  # newest first: anything already seen is later than this record
+        ident = record["id"]
+        superseded = named.get(ident)
+        for key in subject_keys(record):
+            superseded = superseded or newer_by_key.get(key)
+        for key in subject_keys(record):
+            newer_by_key.setdefault(key, ident)
+        for field in ("supersedes", "recites"):
+            target = record.get(field)
+            if isinstance(target, str) and target:
+                named.setdefault(target, ident)
+        source = record.get("source") or ""
+        result = resolve(source, {"home": home, "session": session}) if source else None
+        traced = bool(result and result["ok"])
+        out.append({"id": ident, "at": str(record.get("at") or "")[:40], "event": record.get("event"),
+                    "note": clip(record.get("note") or "", 300), "owner": record["_wal"],
+                    "status": "sourced" if traced else "unsourced", "label": result["label"] if traced else "UNSOURCED",
+                    "source": clip(source, 200), **({"normalized": result["normalized"]} if traced and result.get("normalized") else {}),
+                    "superseded_by": superseded})
+    if any(u["source"] in ("main.jsonl", "session WAL folder") for u in unread):
+        read_ok = 0
+    return out, read_block(read_ok, unread, skipped)
+
+
+def render_decisions(session: str, records: list, read: dict) -> str:
+    lines = [f"Decisions, requirements, scopes, asks and blockers for session {session}, newest first "
+             f"({len(records)} shown; read {read['state']}). A later record on the same subject governs an earlier one."]
+    for row in records:
+        mark = "  " if row["superseded_by"] else "* "
+        lines.append(f"{mark}{row['id']}  {row['at'][:19]}  {row['event']:<11} [{row['label']}] {row['note']}")
+        if row.get("normalized"):
+            lines.append(f"      source normalised to: {clip(row['normalized'], 160)}")
+        elif row["source"] and row["status"] == "unsourced":
+            lines.append(f"      source as given: {row['source']}")
+        if row["superseded_by"]:
+            lines.append(f"      superseded by {row['superseded_by']} (later words govern)")
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- CLI
@@ -1827,6 +2046,11 @@ def build_parser():
     asks.add_argument("--session", required=True)
     asks.add_argument("--json", action="store_true")
     asks.add_argument("--items", action="store_true", help="with --json: also list the presentable open asks")
+    dec = sub.add_parser("decisions", help="requirements, scopes, decisions, asks and blockers, newest first, with "
+                                           "their source label and superseded marks")
+    dec.add_argument("--session", required=True)
+    dec.add_argument("--json", action="store_true")
+    dec.add_argument("--limit", type=int, default=200)
     return parser
 
 
@@ -1851,9 +2075,9 @@ def main(argv=None) -> int:
         if args.command == "check-spec":
             text = read_text_arg(args.spec)
             if GRANDFATHERED_RE_SEARCH(text):
-                problems, warnings = spec_lint(text, mode="enforce")
+                problems, warnings = spec_lint(text, mode="warn")
                 print("\n".join(problems + warnings))
-                return 2 if problems else 0
+                return 2 if any("only meaningful" in w for w in warnings) else 0  # a check: exit 2 when unsourced
             rows = check_items(extract_items(text, sections={"Acceptance criteria", "Negative cases"}))
             for ident, number, result, problem in rows:
                 print(f"{ident} line {number}: " + (problem or f"{status_word(result)}" + (" (deferred ticket check)" if result["deferred"] else "")))
@@ -1881,6 +2105,8 @@ def main(argv=None) -> int:
                 source = args.source
             elif args.item:
                 source = _find_wal_entry(args.item, args.session)
+            if args.session:
+                ctx["session"] = args.session
             else:
                 raise Problem("bad-syntax", "give an item, --source or --spec with an item id")
             result = resolve(source, ctx)
@@ -1904,11 +2130,16 @@ def main(argv=None) -> int:
         if args.command == "asks" and args.json and args.items:
             data = ask_items(args.session)
             print(json.dumps(data))
-            return 2 if data["counts"]["blocked"] else 0
+            return 0
         if args.command == "asks":
             text, counts = render_asks(args.session)
             print(json.dumps(counts) if args.json else text)
-            return 2 if counts["blocked"] else 0
+            return 0
+        if args.command == "decisions":
+            records, read = decision_records(args.session, limit=args.limit)
+            print(json.dumps({"session": args.session, "records": records, "read": read}) if args.json
+                  else render_decisions(args.session, records, read))
+            return 0
     except Problem as problem:
         print(f"provenance: {problem.code}: {problem.message}", file=sys.stderr)
         return 2

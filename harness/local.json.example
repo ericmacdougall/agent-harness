@@ -1,0 +1,25 @@
+{
+  "_doc": "Copy to ~/.agent-harness/local.json and edit. Every key is optional; see docs/local-config.md.",
+  "hosts": {
+    "worker-1": {"role": "worker", "os": "linux",
+                 "limits": {"processes": 64, "browser_pages": 16, "test_workers": 32, "jobs": 16, "mem_fraction": 0.7}},
+    "build-mac": {"role": "build", "os": "macos"},
+    "win-box": {"role": "desktop", "os": "windows"}
+  },
+  "heavy_job_host": "worker-1",
+  "remote_worktree_hosts": ["worker-1"],
+  "trusted_git_hosts": ["worker-1"],
+  "backup_remotes": {"b2": ["my-b2-archive"]},
+  "launchd_label_prefix": "com.example.",
+  "protected_label_prefixes": ["com.example."],
+  "canonical_repo_url": "https://github.com/OWNER/agent-harness.git",
+  "chat_prefix": "Claude (bot). ",
+  "ticket_base_url": "https://goodqa.app/v1",
+  "db_tool_patterns": [{"tool": "mcp__mydb__run", "fields": ["command", "sql"]}],
+  "review_forbidden_topics": [{"pattern": "secret[\\W_]?project", "label": "forbidden project"}],
+  "rescue_remote": "https://github.com/OWNER/agent-rescue.git",
+  "rescue_to_origin": "private",
+  "reap_idle_hours": 48,
+  "session_tmpdir": true,
+  "session_quota_gb": 10
+}

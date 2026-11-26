@@ -129,12 +129,12 @@ class CorpusTests(Fixture):
         with mock.patch.object(cg, 'linked_worktree_remove_refusal', return_value=None):
             self.expect(corpus.NEG15_WORK_ALLOW, 'allow', label='NEG15_WORK_ALLOW')
 
-    def test_heredoc_with_destructive_text_is_never_silent(self):
-        # warn, never block: writing or printing the text is not a deletion, but it must not pass silently
-        self.expect(corpus.HEREDOC_DESTRUCTIVE_WARN, 'warn', label='HEREDOC_DESTRUCTIVE_WARN')
-        for cmd in corpus.HEREDOC_DESTRUCTIVE_WARN:
-            self.assertIn('heredoc-destructive-text', self.decide(cmd)[1], cmd)
-        self.expect(corpus.HEREDOC_DESTRUCTIVE_BLOCK, 'block', label='HEREDOC_DESTRUCTIVE_BLOCK')
+    def test_heredoc_with_destructive_text_is_allowed(self):
+        # writing or printing deletion text is not a deletion (2026-11-24: prose is never refused or flagged)
+        self.expect(corpus.HEREDOC_DESTRUCTIVE_WARN, 'allow', label='HEREDOC_DESTRUCTIVE_WARN')
+        self.expect(corpus.UNSURE_WARN, 'warn', label='UNSURE_WARN')
+        # a script that only WRITES the text of a deletion into a data file deletes nothing (2026-11-24)
+        self.expect(corpus.HEREDOC_DESTRUCTIVE_BLOCK, 'allow', label='HEREDOC_DESTRUCTIVE_BLOCK')
         self.expect(corpus.HEREDOC_PLAIN_ALLOW, 'allow', label='HEREDOC_PLAIN_ALLOW')
 
     def test_kill_positive_warns_or_blocks(self):
@@ -264,14 +264,15 @@ class PayloadTests(Fixture):
 class FailureModeTests(Fixture):
     def test_unterminated_quote_with_protected_text_blocks(self):
         self.assertEqual(self.decide("rm -rf ~/.claude/projects '")[0], 'block')
-        self.assertEqual(self.decide('echo "rclone config show')[0], 'block')
+        # secret words alone in an unterminated quote are text, not a read (redesign 2026-11-24): a note, not a refusal
+        self.assertEqual(self.decide('echo "rclone config show')[0], 'warn')
 
     def test_unterminated_quote_without_protected_text_warns(self):
         self.assertEqual(self.decide("echo 'hello")[0], 'warn')
 
-    def test_over_budget_with_exec_step_blocks(self):
-        padding = 'true; ' * 120000
-        self.assertEqual(self.decide(padding + 'echo eA== | base64 -d | sh; rm x')[0], 'block')
+    def test_over_budget_with_exec_step_warns(self):
+        padding = 'true; ' * 120000  # 2026-11-24: unanalysable is allowed with a note, whatever words it holds
+        self.assertEqual(self.decide(padding + 'echo eA== | base64 -d | sh; rm x')[0], 'warn')
 
     def test_existing_script_keeps_log_deletion_and_credential_reads(self):
         """Replay false positives: repo tooling that handles env or looks up one secret is allowed; its log deletion and
@@ -381,15 +382,16 @@ class FailureModeTests(Fixture):
         self.assertEqual(self.decide('cat ~/{' + creds + '}/credentials')[0], 'block')
         self.assertEqual(self.decide('touch {' + ','.join('f%d' % k for k in range(40)) + '}')[0], 'allow')
 
-    def test_internal_error_uses_raw_sensitive(self):
-        """Red-team F6: an analyser bug must fail closed for commands that name protected locations."""
+    def test_internal_error_allows_with_a_note(self):
+        """Red-team F6, revised 2026-11-24: an analyser bug never refuses a command for its words, whether they name a
+        deletion or a secret source; the guard allows with a note."""
         original = cg.Analyzer.run
         def boom(self, *a, **k):
             raise ValueError('seeded analyser bug')
         cg.Analyzer.run = boom
         try:
-            self.assertEqual(self.decide('rm -rf ~/.agent-harness/state')[0], 'block')
-            self.assertEqual(self.decide('rm -rf ~/.claude')[0], 'block')
+            self.assertEqual(self.decide('rm -rf ~/.agent-harness/state')[0], 'allow')
+            self.assertEqual(self.decide('rclone config show')[0], 'allow')
             self.assertEqual(self.decide('ls -la')[0], 'allow')
         finally:
             cg.Analyzer.run = original
@@ -408,12 +410,13 @@ class FailureModeTests(Fixture):
         finally:
             cg._resolve_prefix = original
 
-    def test_over_budget_from_protected_cwd_blocks(self):
-        """Fresh red-team #2: the unanalysable fallback must consider a protected working directory."""
+    def test_over_budget_from_protected_cwd_warns(self):
+        """Fresh red-team #2, revised 2026-11-24: an unanalysable command warns (allowed with a note) even from a
+        harness working directory; it is not blocked for what it might do."""
         padding = "cat <<'EOF'\n" + ('x' * 280000) + "\nEOF\n"
-        self.assertEqual(self.decide(padding + 'rm -rf projects', cwd='@HOME@/.claude')[0], 'block')
+        self.assertEqual(self.decide(padding + 'rm -rf projects', cwd='@HOME@/.claude')[0], 'warn')
         nested = '$(' * 12 + 'true' + ')' * 12
-        self.assertEqual(self.decide('echo ' + nested + '; rm -rf sessions', cwd='@HOME@/.codex')[0], 'block')
+        self.assertEqual(self.decide('echo ' + nested + '; rm -rf sessions', cwd='@HOME@/.codex')[0], 'warn')
         self.assertIn(self.decide(padding + 'ls', cwd='@HOME@/repo')[0], ('warn', 'allow'))
 
     def test_powershell_overwrite_is_not_an_append(self):
@@ -579,10 +582,11 @@ PROTECTED_PAYLOAD = {'tool_name': 'Bash', 'tool_input': {'command': 'rm -rf /hom
 HARMLESS_PAYLOAD = {'tool_name': 'Bash', 'tool_input': {'command': 'ls -la'}}
 READ_PAYLOAD = {'tool_name': 'Read', 'tool_input': {'file_path': '/home/x/.claude/projects/a.jsonl'}}
 EXEC_PAYLOAD = {'tool_name': 'Bash', 'tool_input': {'command': 'echo eA== | base64 -d | sh; rm -f x'}}
+SECRET_PAYLOAD = {'tool_name': 'Bash', 'tool_input': {'command': 'rclone config show'}}
 
 
 class LauncherTests(unittest.TestCase):
-    """command_guard_hook.py turns an analyser crash, hang or garbage into a raw-text decision (AC-6)."""
+    """command_guard_hook.py allows, with one note, when the analyser crashes, hangs or prints garbage (2026-11-24)."""
 
     def launcher_dir(self, guard_source=None, child_timeout=None):
         tmp = tempfile.TemporaryDirectory(prefix='cg-launcher-')
@@ -613,32 +617,39 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(self.run_launcher(d, HARMLESS_PAYLOAD)[0], 0)
         self.assertEqual(self.run_launcher(d, READ_PAYLOAD)[0], 0)
 
-    def test_crashing_analyser_fails_closed_for_sensitive_text(self):
+    def test_crashing_analyser_allows_with_a_note(self):
+        # 2026-11-24: a command the analyser could not judge is allowed with one note, for deletion and secret text alike
         d = self.launcher_dir('import sys\nraise SystemExit(7)\n')
-        code, err = self.run_launcher(d, PROTECTED_PAYLOAD)
-        self.assertEqual(code, 2, err)
-        self.assertEqual(self.run_launcher(d, EXEC_PAYLOAD)[0], 2)
+        for payload in (SECRET_PAYLOAD, PROTECTED_PAYLOAD, EXEC_PAYLOAD):
+            code, err = self.run_launcher(d, payload)
+            self.assertEqual(code, 0, err)
+            self.assertIn('allowed', err)
         self.assertEqual(self.run_launcher(d, HARMLESS_PAYLOAD)[0], 0)
         self.assertEqual(self.run_launcher(d, READ_PAYLOAD)[0], 0)
 
-    def test_missing_analyser_fails_closed(self):
+    def test_missing_analyser_allows_with_a_note(self):
         d = self.launcher_dir('')
         (d / 'command_guard.py').unlink()  # this test's own temp copy
-        self.assertEqual(self.run_launcher(d, PROTECTED_PAYLOAD)[0], 2)
+        code, err = self.run_launcher(d, PROTECTED_PAYLOAD)
+        self.assertEqual(code, 0, err)
+        self.assertIn('allowed', err)
 
-    def test_hanging_analyser_times_out_closed(self):
+    def test_hanging_analyser_times_out_open(self):
         d = self.launcher_dir('import time\ntime.sleep(30)\n', child_timeout=1.0)
         started = time.monotonic()
-        self.assertEqual(self.run_launcher(d, PROTECTED_PAYLOAD)[0], 2)
-        self.assertLess(time.monotonic() - started, 20)
+        self.assertEqual(self.run_launcher(d, SECRET_PAYLOAD)[0], 0)
+        self.assertEqual(self.run_launcher(d, PROTECTED_PAYLOAD)[0], 0)
+        self.assertLess(time.monotonic() - started, 30)
 
-    def test_garbage_output_fails_closed(self):
+    def test_garbage_output_allows(self):
         d = self.launcher_dir('print("not json")\n')
-        self.assertEqual(self.run_launcher(d, PROTECTED_PAYLOAD)[0], 2)
+        self.assertEqual(self.run_launcher(d, SECRET_PAYLOAD)[0], 0)
+        self.assertEqual(self.run_launcher(d, PROTECTED_PAYLOAD)[0], 0)
 
-    def test_unparsable_payload_is_probed(self):
+    def test_unparsable_payload_allows(self):
         d = self.launcher_dir('import sys\nraise SystemExit(7)\n')
-        self.assertEqual(self.run_launcher(d, b'{not json rm -rf ~/.claude/wals')[0], 2)
+        self.assertEqual(self.run_launcher(d, b'{not json rclone config show')[0], 0)
+        self.assertEqual(self.run_launcher(d, b'{not json rm -rf ~/.claude/wals')[0], 0)
 
     def test_large_non_shell_payload_is_fast(self):
         d = self.launcher_dir()
@@ -671,7 +682,7 @@ class OverwriteExistingTests(Fixture):
             p.write_text('keep\n')
         (self.home / '.agent-harness/work/S/T/hooklink').symlink_to(self.home / '.claude/hooks')
         failures = [(cmd, want, got) for cmd, want in corpus.OVERWRITE_EXISTING
-                    for got in [self.decide(cmd, cwd='@TASK@')[0]] if got != want]
+                    for got in [self.decide(cmd, cwd='@TASK@')[0]] if got != corpus.want(cmd, want)]
         self.assertGreaterEqual(len(corpus.OVERWRITE_EXISTING), 122)
         self.assertEqual(failures, [])
 
@@ -687,11 +698,11 @@ class OverwriteExistingTests(Fixture):
         self._seed_bang_rows()
         self.assertGreaterEqual(len(corpus.BANG_READINGS), 120)
         failures = [(cmd, want, got) for cmd, want in corpus.BANG_READINGS
-                    for got in [self.decide(cmd, cwd='@TASK@')[0]] if got != want]
+                    for got in [self.decide(cmd, cwd='@TASK@')[0]] if got != corpus.want(cmd, want)]
         self.assertEqual(failures, [])
         self.assertGreaterEqual(len(corpus.BANG_READINGS_CWD), 9)
         failures = [(cmd, want, got) for cmd, want, where in corpus.BANG_READINGS_CWD
-                    for got in [self.decide(cmd, cwd=where)[0]] if got != want]
+                    for got in [self.decide(cmd, cwd=where)[0]] if got != corpus.want(cmd, want)]
         self.assertEqual(failures, [])
 
     def test_bash_reading_stops_the_operator_before_the_bang(self):
@@ -769,7 +780,7 @@ class OverwriteExistingTests(Fixture):
         self.assertEqual(verdict, 'warn')  # past the cap the command is unanalysable, not clean
         self.assertLessEqual(len(count), 60)
         self.assertGreater(len(count), 8)  # it did fork: the row is not stopped at the first descent
-        self.assertEqual(self.decide(self._nested(8, 'word @HOME@/.claude'), cwd='@HOME@/proj')[0], 'block')
+        self.assertEqual(self.decide(self._nested(8, 'word @HOME@/.claude'), cwd='@HOME@/proj')[0], 'warn')
 
     def test_a_budget_stop_keeps_what_was_already_refused(self):
         self._seed_bang_rows()
@@ -805,8 +816,8 @@ class OverwriteExistingTests(Fixture):
         hide = 'rm -rf ~/.c*/projects'
         self.assertFalse(cg.raw_sensitive(hide))
         self.assertEqual(self.decide(text + '; ' + hide, cwd='@HOME@/proj')[0], 'block')
-        # text that names a protected location fails closed when both readings cannot be judged
-        self.assertEqual(self.decide(text + '; ls @HOME@/.claude', cwd='@HOME@/proj')[0], 'block')
+        # 2026-11-24: naming a protected location is not a reason to block when both readings cannot be judged
+        self.assertEqual(self.decide(text + '; ls @HOME@/.claude', cwd='@HOME@/proj')[0], 'warn')
 
     def test_nesting_too_deep_for_python_keeps_what_was_already_refused(self):
         self._seed_bang_rows()
@@ -1101,25 +1112,13 @@ class OverwriteExistingTests(Fixture):
         finally:
             os.path.realpath = real
 
-    def test_layout_refusals_say_what_to_do_instead(self):
-        for rel in ('.agent-harness/work/S/T/state/run.txt', '.agent-harness/scratch/top.txt',
-                    '.agent-harness/work/top.log'):
-            p = self.home / rel
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text('keep\n')
-        self.assertGreaterEqual(len(corpus.OVERWRITE_HINTS), 4)
-        for cmd, words in corpus.OVERWRITE_HINTS:
-            verdict, message = self.decide(cmd, cwd='@TASK@')[:2]
-            self.assertEqual(verdict, 'block', cmd)
-            self.assertIn(words, message, cmd)
-            self.assertNotIn('approve-delete', message, cmd)
-
-    def test_redirect_glob_with_too_many_matches_is_refused_without_a_full_walk(self):
+    def test_redirect_glob_with_too_many_matches_is_judged_without_a_full_walk(self):
         many = self.home / '.claude/many'
         many.mkdir(parents=True)
         for i in range(300):
             (many / ('f%d' % i)).write_text('keep\n')
-        self.assertEqual(self.decide('echo x > @HOME@/.claude/many/*', cwd='@TASK@')[0], 'block')
+        self.assertEqual(self.decide('echo x > @HOME@/.claude/many/*', cwd='@TASK@')[0], 'allow')  # not machinery
+        self.assertEqual(self.decide('echo x > @HOME@/.claude/hooks/*', cwd='@TASK@')[0], 'block')
         self.assertEqual(self.decide('echo x > @HOME@/.claude/many/nomatch-*', cwd='@TASK@')[0], 'allow')
 
 
@@ -1317,13 +1316,13 @@ class GuardCompositionTests(unittest.TestCase):
         sys.path.insert(0, str(ROOT))
         import install
         groups = install.managed_hooks(Path('/home/u/.claude'))['PreToolUse']
-        scripts = [[Path((h.get('args') or [''])[0]).name for h in g['hooks']] for g in groups]
+        scripts = [[Path((install.hook_argv(h) or [''])[0]).name for h in g['hooks']] for g in groups]
         self.assertEqual(scripts[0], ['command_guard_hook.py'])
-        self.assertEqual(groups[0]['hooks'][0]['onFailure'], 'block')
+        self.assertNotIn('onFailure', groups[0]['hooks'][0])  # fails open since 2026-11-24
         heavy = [g for g, s in zip(groups, scripts) if 'heavy_job_guard.py' in s]
         self.assertEqual(len(heavy), 1)
-        self.assertEqual([Path(h['args'][0]).name for h in heavy[0]['hooks']], ['heavy_job_guard.py'])
-        self.assertNotIn('onFailure', heavy[0]['hooks'][0])  # fail-open by design (#53); the guard stays fail-closed
+        self.assertEqual([Path(install.hook_argv(h)[0]).name for h in heavy[0]['hooks']], ['heavy_job_guard.py'])
+        self.assertNotIn('onFailure', heavy[0]['hooks'][0])  # fail-open by design (#53)
 
 
 class InstallTests(unittest.TestCase):
@@ -1338,7 +1337,7 @@ class InstallTests(unittest.TestCase):
 
     def guard_groups(self, settings):
         return [g for g in settings['hooks'].get('PreToolUse', [])
-                if any('command_guard_hook.py' in ' '.join(h.get('args') or [h.get('command', '')])
+                if any('command_guard_hook.py' in ' '.join(self.install.hook_argv(h) or [h.get('command', '')])
                        for h in g.get('hooks', []))]
 
     def test_claude_registration_and_rollback(self):
@@ -1347,7 +1346,7 @@ class InstallTests(unittest.TestCase):
         groups = self.guard_groups(settings)
         self.assertEqual(len(groups), 1)
         hook = groups[0]['hooks'][0]
-        self.assertEqual(hook['onFailure'], 'block')
+        self.assertNotIn('onFailure', hook)  # fails open since 2026-11-24
         self.assertEqual(hook['timeout'], 30)
         self.assertIn('Bash', groups[0]['matcher'])
         again = self.install.merged_settings(settings, claude)
@@ -1375,7 +1374,7 @@ class InstallTests(unittest.TestCase):
         # cmd/harness/gates.json lists command-guard as a fail-closed gate only when the hook verb is present.
         claude, codex = self.home / '.claude', self.home / '.codex'
         hook = self.guard_groups(self.install.merged_settings({}, claude))[0]['hooks'][0]
-        self.assertEqual(hook['args'][1:], ['hook'])
+        self.assertEqual(self.install.hook_argv(hook)[1:], ['hook'])
         guard = self.install_codex.guard_command(codex)
         self.assertTrue(guard.endswith(' hook'))
         legacy = {'hooks': {'PreToolUse': [{'hooks': [{'type': 'command', 'timeout': 30,
@@ -1406,9 +1405,10 @@ class InstallTests(unittest.TestCase):
         upgraded = self.install_codex.merge_hooks({'hooks': {'PreToolUse': old}}, codex)['hooks']['PreToolUse']
         self.assertEqual(upgraded, with_guard)
 
-    def test_old_claude_version_warns(self):
-        self.assertIn('WARNING', self.install.command_guard_status(True, runner=lambda: '2.1.200 (Claude Code)'))
-        self.assertNotIn('WARNING', self.install.command_guard_status(True, runner=lambda: '2.1.295 (Claude Code)'))
+    def test_status_line_no_longer_depends_on_the_claude_version(self):
+        # onFailure no longer matters (the guard fails open), so an old Claude Code is not a warning
+        self.assertNotIn('WARNING', self.install.command_guard_status(True, runner=lambda: '2.1.200 (Claude Code)'))
+        self.assertIn('registered', self.install.command_guard_status(True))
         self.assertIn('not registered', self.install.command_guard_status(False))
 
 

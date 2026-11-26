@@ -15,6 +15,7 @@ from pathlib import Path
 
 HOOKS = Path(__file__).resolve().parents[1] / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
+os.environ["AH_LOCAL_CONFIG"] = str(Path(__file__).resolve().parent / "data" / "local_fixture.json")  # hermetic hosts
 import ah_kill as ak  # noqa: E402
 import kill_guard as kg  # noqa: E402
 
@@ -78,6 +79,10 @@ class Clock:
         self.t += s
 
 
+ORDINARY = {"top": False, "maintainer": False, "supervised": []}
+TOP = {"top": True, "maintainer": False, "supervised": []}
+
+
 class KillBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -91,6 +96,7 @@ class KillBase(unittest.TestCase):
         kw.setdefault("grace", 5)
         kw.setdefault("worktree", "/work")
         kw.setdefault("notify", lambda home, event: self.notices.append(event))
+        kw.setdefault("roles", dict(ORDINARY))
         return ak.kill_local(pids, reason, home=self.home, probe=probe, sleep=self.clock.sleep, clock=self.clock.now,
                              session="sess-1", agent="agent-x", own_pid=OWN, **kw)
 
@@ -412,10 +418,10 @@ class ReviewFixes(KillBase):
         self.addCleanup(lambda: os.environ.__setitem__("HOME", old))
         runner = lambda argv, **kw: subprocess.CompletedProcess(  # noqa: E731
             argv, 0, stdout='{"ok": true, "run": "k1", "results": []}')
-        ak.kill_remote("t2-dev", [5], "why", False, 5, "sess-1", "a", home=self.home, runner=runner, foreign=True,
+        ak.kill_remote("worker-1", [5], "why", False, 5, "sess-1", "a", home=self.home, runner=runner, foreign=True,
                        notify=lambda h, e: None)
         text = next((self.home / ".claude").rglob("main.jsonl")).read_text()
-        self.assertIn("t2-dev", text)
+        self.assertIn("worker-1", text)
         self.assertIn("result", text)
 
 
@@ -459,18 +465,29 @@ class NarrowedScope(KillBase):
             probe = self.base(proc(3300 + n, 100, cmd=cmd))
             self.assertEqual(self.run_kill(probe, [3300 + n], foreign=True)["results"][0]["status"], "refused", cmd)
 
+    def test_an_approvals_store_record_covers_a_foreign_pid(self):
+        # 2026-11-24: `ah approve kill --pids N` lifts the foreign refusal; a HARD refusal (pid 1) stays
+        import ah_approvals
+        with mock.patch.dict(os.environ, {"AH_HOME": str(self.home)}):
+            ah_approvals.grant("kill", {"pids": [1101]}, "user", "test", home=self.home)
+            probe = self.foreign(1101)
+            out = self.run_kill(probe, [1101])
+            self.assertNotEqual(out["results"][0]["status"], "refused", out)
+            self.assertEqual(out["results"][0].get("scope"), "approved")
+            self.assertEqual(self.run_kill(self.foreign(1102), [1102])["results"][0]["status"], "refused")
+
     def test_foreign_target_without_flag_is_refused(self):
         probe = self.foreign(1100)
         out = self.run_kill(probe, [1100])
         self.assertEqual(out["results"][0]["status"], "refused")
-        self.assertIn("--foreign", out["results"][0]["detail"])
+        self.assertIn("ah approve kill --pids", out["results"][0]["detail"])  # the one command (2026-11-24)
         self.assertEqual(probe.sent, [])
         self.assertEqual(self.notices, [])
         self.assertFalse(out["ok"])
 
     def test_foreign_with_flag_records_owner_and_notifies_main(self):
         probe = self.foreign(1101)
-        out = self.run_kill(probe, [1101], foreign=True, reason="runaway pytest of another owner")
+        out = self.run_kill(probe, [1101], foreign=True, reason="runaway pytest of another owner", roles=TOP)
         self.assertEqual(out["results"][0]["status"], "exited")
         intent = self.audit()[0]
         self.assertTrue(intent["foreign"])
@@ -486,7 +503,7 @@ class NarrowedScope(KillBase):
     def test_repeated_foreign_stops_by_one_session_share_one_aggregated_alert_key(self):
         """Fleet round item 3: every stop raised its own high alert (unique key per run), 40 of them at once."""
         for pid in (1101, 1103):
-            self.run_kill(self.foreign(pid), [pid], foreign=True, reason="runaway pytest of another owner")
+            self.run_kill(self.foreign(pid), [pid], foreign=True, reason="runaway pytest of another owner", roles=TOP)
         self.assertEqual(len(self.notices), 2)
         self.assertEqual(self.notices[0]["key"], self.notices[1]["key"])
         self.assertEqual(self.notices[0]["key"], "ah-kill:foreign:sess-1")
@@ -496,17 +513,17 @@ class NarrowedScope(KillBase):
         probe = self.foreign(1104)
         probe.session_env = lambda pid: "sess-1"
         with mock.patch.object(ak, "session_ancestor", lambda *a, **k: 77):
-            self.run_kill(probe, [1104], foreign=True, reason="stop my own preview server")
+            self.run_kill(probe, [1104], foreign=True, reason="stop my own preview server", roles=TOP)
         self.assertEqual(self.notices[0]["severity"], "info", self.notices[0])
         self.assertEqual(self.notices[0]["key"], "ah-kill:foreign:sess-1:own")
 
     def test_a_later_info_stop_never_overwrites_an_active_high_alert(self):
         """Red-team finding 3: a high and an info row shared one key, so the later info row hid the high one."""
-        self.run_kill(self.foreign(1105), [1105], foreign=True, reason="runaway pytest of another owner")
+        self.run_kill(self.foreign(1105), [1105], foreign=True, reason="runaway pytest of another owner", roles=TOP)
         probe = self.foreign(1106)
         probe.session_env = lambda pid: "sess-1"
         with mock.patch.object(ak, "session_ancestor", lambda *a, **k: 77):
-            self.run_kill(probe, [1106], foreign=True, reason="stop my own preview server")
+            self.run_kill(probe, [1106], foreign=True, reason="stop my own preview server", roles=TOP)
         high, info = self.notices[0], self.notices[1]
         self.assertEqual((high["severity"], info["severity"]), ("high", "info"))
         self.assertNotEqual(high["key"], info["key"])
@@ -522,7 +539,7 @@ class NarrowedScope(KillBase):
         def boom(home, event):
             raise OSError("ring full")
         with self.assertRaises(ak.KillError) as cm:
-            self.run_kill(probe, [1102], foreign=True, notify=boom)
+            self.run_kill(probe, [1102], foreign=True, notify=boom, roles=TOP)
         self.assertEqual(cm.exception.code, "notice_failed")
         self.assertEqual(probe.sent, [])
         self.assertIn("aborted", [r["event"] for r in self.audit()])
@@ -539,7 +556,7 @@ class NarrowedScope(KillBase):
         probe = self.foreign(1120, cwd="/work/nested/sub")
         out = self.run_kill(probe, [1120])
         self.assertEqual(out["results"][0]["status"], "refused")
-        self.assertIn("--foreign", out["results"][0]["detail"])
+        self.assertIn("ah approve kill --pids", out["results"][0]["detail"])  # the one command (2026-11-24)
 
     def test_audit_row_records_the_callers_cwd(self):
         probe = self.foreign(1121, cwd="/work/sub")
@@ -552,10 +569,15 @@ class NarrowedScope(KillBase):
         probe.cwds = {1105: "/elsewhere/x"}
         out = self.run_kill(probe, [1105])
         self.assertEqual(out["results"][0]["status"], "refused")
-        self.assertIn("--foreign", out["results"][0]["detail"])
+        self.assertIn("ah approve kill --pids", out["results"][0]["detail"])  # the one command (2026-11-24)
         probe = self.base(proc(1105, 4000, cmd="sleep 5"))
         probe.cwds = {1105: "/elsewhere/x"}
-        self.assertEqual(self.run_kill(probe, [1105], foreign=True)["results"][0]["status"], "exited")
+        out = self.run_kill(probe, [1105], foreign=True)  # an ordinary caller's --foreign needs the owner's approval
+        self.assertEqual(out["results"][0]["status"], "refused")
+        self.assertIn("ah approve kill --pids", out["results"][0]["detail"])  # the one command (2026-11-24)
+        probe = self.base(proc(1105, 4000, cmd="sleep 5"))
+        probe.cwds = {1105: "/elsewhere/x"}
+        self.assertEqual(self.run_kill(probe, [1105], foreign=True, roles=TOP)["results"][0]["status"], "exited")
         self.assertEqual(len(self.notices), 1)
 
     def test_claude_pid_env_does_not_widen_scope(self):
@@ -569,6 +591,48 @@ class NarrowedScope(KillBase):
         probe = self.base(proc(1106, 1, uid=0, cmd="/usr/bin/x"))
         self.assertEqual(self.run_kill(probe, [1106], foreign=True)["results"][0]["status"], "refused")
         self.assertEqual(self.notices, [])
+
+
+class Roles(KillBase):
+    """Redesign 2026-11-24: roles come from ah_roles; --foreign works for a top-rung caller without an ask record."""
+    foreign = NarrowedScope.foreign
+
+    def test_supervisor_stops_its_projects_without_a_flag_and_nothing_else(self):
+        sup = {"top": False, "maintainer": False, "supervised": ["/elsewhere"]}
+        self.assertEqual(self.run_kill(self.foreign(1401), [1401], roles=sup)["results"][0]["status"], "exited")
+        out = self.run_kill(self.foreign(1402, cwd="/other/place"), [1402], roles=sup, foreign=True)
+        self.assertEqual(out["results"][0]["status"], "refused")
+        self.assertEqual(self.notices, [])
+
+    def test_top_rung_stops_a_session_process_but_not_a_daemon(self):
+        probe = self.base(proc(1410, 1, cmd="/opt/codex/bin/codex app-server", comm="codex"))
+        probe.cwds = {1410: "/elsewhere/x"}
+        self.assertEqual(self.run_kill(probe, [1410], foreign=True, roles=TOP)["results"][0]["status"], "exited")
+        probe = self.base(proc(1411, 1, cmd="python3 /h/ahd.py"))
+        out = self.run_kill(probe, [1411], foreign=True, roles=TOP)
+        self.assertEqual(out["results"][0]["status"], "refused")
+        self.assertIn("daemon", out["results"][0]["detail"])
+        probe = self.base(proc(1412, 1, uid=0, cmd="/usr/bin/x"))
+        self.assertEqual(self.run_kill(probe, [1412], foreign=True, roles=TOP)["results"][0]["status"], "refused")
+
+    def test_harness_maintainer_may_stop_a_harness_daemon(self):
+        probe = self.base(proc(1420, 1, cmd="python3 /h/ahd.py"))
+        maintainer = dict(TOP, maintainer=True)
+        out = self.run_kill(probe, [1420], foreign=True, roles=maintainer)
+        self.assertEqual(out["results"][0]["status"], "exited")
+        intent = [r for r in self.audit() if r.get("event") == "intent"][0]
+        self.assertIn("daemon", intent["lifted"])
+
+    def test_an_ordinary_foreign_stop_proceeds_with_the_owners_approval_of_that_pid(self):
+        resolver = lambda ask, session, home: {"ask": ask, "source": "answer:x", "uuid": "u", "at": "t",  # noqa: E731
+                                               "text": "yes, stop pid 1430"}
+        out = self.run_kill(self.foreign(1430), [1430], foreign=True, approved_by="wa1b2c3d4e5f",
+                            approval_resolver=resolver)
+        self.assertEqual(out["results"][0]["status"], "exited")
+        self.assertEqual(len(self.notices), 1)
+        out = self.run_kill(self.foreign(1431), [1431], foreign=True, approved_by="wa1b2c3d4e5f",
+                            approval_resolver=resolver)
+        self.assertEqual(out["results"][0]["status"], "refused")
 
 
 class ReviewRound3(KillBase):
@@ -596,34 +660,34 @@ class ReviewRound3(KillBase):
         runner = lambda argv, **kw: calls.append(argv) or subprocess.CompletedProcess(  # noqa: E731
             argv, 0, stdout='{"ok": true, "run": "k1", "results": []}')
         with self.assertRaises(ak.KillError) as cm:
-            ak.kill_remote("dev2", [5], "r", False, 5, home=self.home, runner=runner)
+            ak.kill_remote("worker-2", [5], "r", False, 5, home=self.home, runner=runner)
         self.assertEqual(cm.exception.code, "foreign_required")
         self.assertEqual(calls, [])
         notices = []
-        ak.kill_remote("dev2", [5], "r", False, 5, home=self.home, runner=runner, foreign=True,
+        ak.kill_remote("worker-2", [5], "r", False, 5, home=self.home, runner=runner, foreign=True,
                        notify=lambda h, e: notices.append(e))
         self.assertEqual(len(notices), 1)
         self.assertEqual(notices[0]["severity"], "high")
         for pid in (6, 7):
-            ak.kill_remote("dev2", [pid], "r", False, 5, home=self.home, runner=runner, foreign=True,
+            ak.kill_remote("worker-2", [pid], "r", False, 5, home=self.home, runner=runner, foreign=True,
                            notify=lambda h, e: notices.append(e), session="sess-1")
         self.assertEqual(notices[-1]["key"], notices[-2]["key"], "remote stops by one session on one host share one alert")
-        self.assertEqual(notices[-1]["key"], "ah-kill:foreign:remote-dev2-sess-1")
+        self.assertEqual(notices[-1]["key"], "ah-kill:foreign:remote-worker-2-sess-1")
 
         def boom(h, e):
             raise OSError("ring")
         calls.clear()
         with self.assertRaises(ak.KillError) as cm:
-            ak.kill_remote("dev2", [5], "r", False, 5, home=self.home, runner=runner, foreign=True, notify=boom)
+            ak.kill_remote("worker-2", [5], "r", False, 5, home=self.home, runner=runner, foreign=True, notify=boom)
         self.assertEqual(cm.exception.code, "notice_failed")
         self.assertEqual(calls, [], "no notice, no remote stop")
 
     def test_remote_validates_reason_and_answer(self):
         runner = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, stdout="[1]")  # noqa: E731
         with self.assertRaises(ak.KillError):
-            ak.kill_remote("dev2", [5], "  ", False, 5, home=self.home, runner=runner, foreign=True)
+            ak.kill_remote("worker-2", [5], "  ", False, 5, home=self.home, runner=runner, foreign=True)
         with self.assertRaises(ak.KillError) as cm:
-            ak.kill_remote("dev2", [5], "r", False, 5, home=self.home, runner=runner, foreign=True,
+            ak.kill_remote("worker-2", [5], "r", False, 5, home=self.home, runner=runner, foreign=True,
                            notify=lambda h, e: None)
         self.assertEqual(cm.exception.code, "host_unreachable")
 
@@ -635,7 +699,7 @@ class Remote(KillBase):
         def runner(argv, **kw):
             seen["cmd"] = argv[-1]
             return subprocess.CompletedProcess(argv, 0, stdout='{"ok": true, "run": "k1", "results": []}')
-        ak.kill_remote("dev2", [5], "r", False, 5, home=self.home, runner=runner, foreign=True, notify=lambda h, e: None)
+        ak.kill_remote("worker-2", [5], "r", False, 5, home=self.home, runner=runner, foreign=True, notify=lambda h, e: None)
         self.assertIn("--foreign", seen["cmd"])
         self.assertIn("python3 -I ", seen["cmd"])
 
@@ -645,14 +709,14 @@ class Remote(KillBase):
         def runner(argv, **kw):
             seen["argv"] = argv
             return subprocess.CompletedProcess(argv, 0, stdout='{"ok": true, "run": "k1", "results": []}')
-        out = ak.kill_remote("dev2", [5, 6], "it's $(bad); rm", True, 7, "s", "a", home=self.home, runner=runner,
+        out = ak.kill_remote("worker-2", [5, 6], "it's $(bad); rm", True, 7, "s", "a", home=self.home, runner=runner,
                              foreign=True, notify=lambda h, e: None)
-        self.assertEqual(out["host"], "dev2")
+        self.assertEqual(out["host"], "worker-2")
         cmd = seen["argv"][-1]
         self.assertIn("--pid 5,6", cmd)
         self.assertIn("'it'\"'\"'s $(bad); rm'", cmd)
         self.assertIn("--tree", cmd)
-        self.assertEqual(seen["argv"][-3:-1], ["--", "dev2"])
+        self.assertEqual(seen["argv"][-3:-1], ["--", "worker-2"])
         with self.assertRaises(ak.KillError):
             ak.kill_remote("evil;host", [5], "r", False, 5, home=self.home, runner=runner, foreign=True)
         self.assertTrue(any(r["event"] == "remote" for r in self.audit()))
@@ -695,7 +759,7 @@ class FakeWindowsRemote:
 
 
 class WindowsHost(unittest.TestCase):
-    """goodqa#15275: ah kill --host ah-spectre stops one process with Stop-Process over ssh, with the same guards."""
+    """goodqa#15275: ah kill --host win-1 stops one process with Stop-Process over ssh, with the same guards."""
     PS = {"ppid": 900, "name": "powershell.exe", "created": "2026-11-07T21:14:03.1234567Z",
           "cmd": "powershell.exe -NoProfile -File C:\\pp\\pp-lab.ps1 receipt", "owner": "SPECTRE\\lab",
           "mine": True, "self": False, "orphan": True}
@@ -706,7 +770,7 @@ class WindowsHost(unittest.TestCase):
         self.notices = []
 
     def run_kill(self, remote, pids=(4242,), foreign=True, tree=False):
-        return ak.kill_remote("ah-spectre", list(pids), "orphaned after TaskStop", tree, 5, "sess-1", "a1",
+        return ak.kill_remote("win-1", list(pids), "orphaned after TaskStop", tree, 5, "sess-1", "a1",
                               home=self.home, runner=remote, foreign=foreign,
                               notify=lambda h, e: self.notices.append(e))
 
@@ -726,15 +790,15 @@ class WindowsHost(unittest.TestCase):
         self.assertTrue(out["ok"], out)
         self.assertEqual(remote.stopped, [4242])
         self.assertEqual(len(remote.calls), 2)
-        self.assertEqual(remote.calls[0][6], "ah-spectre")
+        self.assertEqual(remote.calls[0][6], "win-1")
         self.assertIn("'2026-11-07T21:14:03.1234567Z'", remote.script)
         ident = [r for r in self.audit() if r.get("event") == "identity"]
         self.assertEqual(len(ident), 1, self.audit())
         self.assertEqual((ident[0]["host"], ident[0]["pid"], ident[0]["created"]),
-                         ("ah-spectre", 4242, "2026-11-07T21:14:03.1234567Z"))
+                         ("win-1", 4242, "2026-11-07T21:14:03.1234567Z"))
         self.assertIn("pp-lab.ps1 receipt", ident[0]["cmd"])
         self.assertEqual(len(self.notices), 1)
-        self.assertIn("ah-spectre", self.notices[0]["message"])
+        self.assertIn("win-1", self.notices[0]["message"])
 
     def test_neg1_a_reused_pid_is_not_stopped(self):
         remote = FakeWindowsRemote({4242: self.PS}, reuse_after_read="2026-11-08T01:00:00.0000000Z")
@@ -791,17 +855,6 @@ class WindowsHost(unittest.TestCase):
         self.assertEqual(out["results"][0]["status"], "gone")
         self.assertEqual(len(remote.calls), 1)
 
-    def test_guard_admits_the_windows_host_for_main_only(self):
-        # delta red-team D-F4: a subagent may not reach the Windows stop
-        cmd = "python3 -I ~/.claude/hooks/ah.py kill --pid 4242 --reason orphaned --host ah-spectre --foreign"
-        with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual(kg.decide(cmd, cwd=tmp, policy=kg.load_policy(), home=tmp, main=True)[0], "allow")
-            self.assertEqual(kg.decide(cmd, cwd=tmp, policy=kg.load_policy(), home=tmp, main=False)[0], "block")
-            self.assertEqual(kg.decide(cmd.replace("ah-spectre", "ah-spectre2"), cwd=tmp, policy=kg.load_policy(),
-                                       home=tmp, main=True)[0], "block")
-            self.assertEqual(kg.decide(cmd.replace("ah-spectre", "dev2"), cwd=tmp, policy=kg.load_policy(),
-                                       home=tmp, main=False)[0], "allow")  # POSIX hosts unchanged
-
     def test_dF4_only_an_owned_orphan_outside_the_session_is_stopped(self):
         for name, change in (("another user", dict(mine=False, owner="NT AUTHORITY\\SYSTEM")),
                              ("own ssh session", {"self": True}),
@@ -818,7 +871,7 @@ class WindowsHost(unittest.TestCase):
                 self.assertEqual(remote.stopped, [])
 
     def test_login_user_is_the_owner_of_the_checking_shell_not_env(self):
-        # live finding on ah-spectre: $env:USERDOMAIN is WORKGROUP, GetOwner says the machine name
+        # live finding on win-1: $env:USERDOMAIN is WORKGROUP, GetOwner says the machine name
         for script in (ak._WIN_READ, ak._WIN_STOP):
             self.assertNotIn("$env:USERDOMAIN", script)
             self.assertIn('-Filter "ProcessId=$PID") -MethodName GetOwner', script)
@@ -829,88 +882,6 @@ class WindowsHost(unittest.TestCase):
         out = self.run_kill(remote)
         self.assertEqual(out["results"][0]["status"], "stopped")
         self.assertTrue(out["ok"])
-
-
-class GuardRule(unittest.TestCase):
-    A = "python3 -I ~/.claude/hooks/ah.py kill "
-
-    def verdict(self, cmd):
-        with tempfile.TemporaryDirectory() as tmp:
-            return kg.decide(cmd, cwd=tmp, policy=kg.load_policy(), home=tmp)[0]
-
-    def test_literal_forms_pass(self):
-        for tail in ("--pid 4242 --reason 'runaway vite'", "--pid 4242,4243 --reason x --tree --foreign --grace 5",
-                     "--pid=4242 --reason=stuck --host dev2", "--pid 12 --reason 'a b c' --agent a1b2 --session s-1"):
-            self.assertEqual(self.verdict(self.A + tail), "allow", tail)
-        self.assertEqual(self.verdict("python3 -I -B " + str(Path.home()) + "/.claude/hooks/ah.py kill --pid 9 --reason r"), "allow")
-
-    def test_everything_else_stays_blocked(self):
-        bad = [
-            self.A + "--pid 1 --reason x", self.A + "--pid 0,5 --reason x", self.A + "--pid 4242",
-            self.A + "--reason x", self.A + "--pid 4242 --reason ''", self.A + "--pid $PID --reason x",
-            self.A + "--pid '$(pgrep x)' --reason x", self.A + "--pid `pgrep x` --reason x",
-            self.A + "--pid 4,$X --reason x", self.A + "--pid 4242 --reason x --host evil",
-            self.A + "--pid 4242 --reason x --wal /etc/passwd", self.A + "--pid 4242 --reason x extra",
-            self.A + "--pid 4242 --pid 4243 --reason x", self.A + "--pid 4242 --reason $R",
-            self.A + "--pid 4242 --reason x --grace $(echo 5)",
-            "python3 -c 'import os; os.kill(4242, 9)'", "python3 /tmp/ah.py kill --pid 4242 --reason x",
-            "python3 -c 'x' ~/.claude/hooks/ah.py kill --pid 4242 --reason x",
-            "python3 ~/.claude/hooks/ah.py kill --pid 4242 --reason x <<EOF\nimport os;os.kill(1,9)\nEOF",
-            "ssh dev2 python3 ~/.claude/hooks/ah.py kill --pid 4242 --reason x",
-            "eval 'python3 ~/.claude/hooks/ah.py kill --pid 4242 --reason x'",
-            "python3 ~/.claude/hooks/ah.py kill --pid 4242 --reason x",  # no -I
-            "python3 -I .claude/hooks/ah.py kill --pid 4242 --reason x",
-            "python3 -I ..claude/hooks/ah.py kill --pid 4242 --reason x",
-            "python3 -I '~/.claude/hooks/ah.py' kill --pid 4242 --reason x",
-            "python3 -I /Users/Shared/.claude/hooks/ah.py kill --pid 4242 --reason x",
-            "python3 -I /Users/../.claude/hooks/ah.py kill --pid 4242 --reason x",
-            "PYTHONPATH=/tmp/x python3 -I ~/.claude/hooks/ah.py kill --pid 4242 --reason x",
-            "env PYTHONPATH=/tmp/x python3 -I ~/.claude/hooks/ah.py kill --pid 4242 --reason x",
-            "bash -c 'pkill -f vite'", "pkill -f vite", "kill 4242",
-        ]
-        for cmd in bad:
-            with self.subTest(cmd=cmd):
-                self.assertEqual(self.verdict(cmd), "block")
-
-    def test_help_is_allowed_but_only_alone(self):
-        """goodqa#14864 P1: `ah.py kill --help` was blocked, so the form could not be discovered."""
-        self.assertEqual(self.verdict(self.A + "--help"), "allow")
-        self.assertEqual(self.verdict(self.A + "-h"), "allow")
-        for cmd in (self.A + "--help --pid 4242", self.A + "--help; pkill x", "python3 ~/.claude/hooks/ah.py kill --help && pkill x"):
-            with self.subTest(cmd=cmd):
-                self.assertEqual(self.verdict(cmd), "block")
-
-    def hook(self, cmd, cwd):
-        payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": cwd, "hook_event_name": "PreToolUse"})
-        return subprocess.run([sys.executable, str(HOOKS / "kill_guard.py"), "hook"], input=payload, capture_output=True,
-                              text=True, cwd=cwd)
-
-    def test_documented_lines_pass_the_real_hook_from_any_cwd(self):
-        lines = [self.A + "--help",
-                 self.A + "--host t2-dev --pid 3821924,3822748 --reason 'stop leftover stubs' --foreign",
-                 self.A + "--pid 4242 --reason 'my own test server'"]
-        with tempfile.TemporaryDirectory() as tmp:
-            sub = Path(tmp, ".claude", "wals", "sess")
-            sub.mkdir(parents=True)
-            for cwd in (tmp, str(sub)):
-                for cmd in lines:
-                    with self.subTest(cwd=cwd, cmd=cmd):
-                        self.assertEqual(self.hook(cmd, cwd).returncode, 0)
-
-    def test_block_message_names_the_audited_form(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            out = self.hook("python3 ~/.claude/hooks/ah.py kill --pid 4242 --reason x", tmp)
-        self.assertEqual(out.returncode, 2)
-        self.assertIn("python3 -I ~/.claude/hooks/ah.py kill", out.stderr)
-        self.assertIn("--host", out.stderr)
-        with tempfile.TemporaryDirectory() as tmp:  # unrelated signalling keeps the generic message
-            other = self.hook("python3 -c 'import os; os.kill(4242, 9)'", tmp)
-        self.assertEqual(other.returncode, 2)
-        self.assertNotIn("audited stop", other.stderr)
-
-    def test_chained_commands_are_each_judged(self):
-        self.assertEqual(self.verdict(self.A + "--pid 4242 --reason x && pkill -f vite"), "block")
-        self.assertEqual(self.verdict(self.A + "--pid 4242 --reason x; kill 99"), "block")
 
 
 class SessionScope(KillBase):
@@ -956,7 +927,7 @@ class SessionScope(KillBase):
         self.spawned(1211, root=other)                                        # another session's worktree
         self.spawned(1212, root=self.sess() + "0/t")                          # work/sess-10: a prefix, not inside
         self.spawned(1213, root=self.sess("..", "sess-2", "t"))              # dot segments out of the session dir
-        self.spawned(1214, root="remote:dev2")                                # a remote ledger root
+        self.spawned(1214, root="remote:worker-2")                                # a remote ledger root
         for pid in (1210, 1211, 1212, 1213, 1214, 1215):                      # 1215: never recorded
             out = self.run_kill(self.probe_for(pid), [pid], session_scope=True)
             self.assertEqual(out["results"][0]["status"], "refused", pid)
@@ -1035,11 +1006,6 @@ class ApprovedBy(KillBase):
             "negation contraction": dict(text="pid 6201 is mine, don't stop it"),
             "bare number": dict(text="the 6201 runs can go"),
             "longer number": dict(text="stop pid 62011"),
-            "too young": dict(start="Sat Nov  7 06:00:00 2026"),
-            "after the session started": dict(start="Fri Nov  6 09:00:00 2026"),
-            "running": dict(stat_="R"),
-            "using cpu": dict(cpu=3.5),
-            "cpu unknown": dict(cpu=None),
         }
         for name, case in cases.items():
             with self.subTest(name=name):
@@ -1057,10 +1023,7 @@ class ApprovedBy(KillBase):
 
     def test_other_refusals_are_never_lifted(self):
         text = "stop pids 6301 6302 6303 6304 6305 6306 rclone netwatch hookd sshd zsh"
-        for pid, kw in ((6301, dict(cmd="rclone sync /a b:", comm="rclone")),
-                        (6302, dict(cmd="/opt/netwatch/netwatch run", comm="netwatch")),
-                        (6303, dict(cmd="python3 /h/hookd.py serve", comm="python3")),
-                        (6304, dict(cmd="/usr/sbin/sshd -D", comm="sshd")),
+        for pid, kw in ((6304, dict(cmd="/usr/sbin/sshd -D", comm="sshd")),
                         (6305, dict(cmd="/opt/codex/bin/codex", comm="codex", uid=ME + 1)),
                         (6306, dict(cmd="/System/Library/x", comm="/System/Library/x"))):
             with self.subTest(pid=pid):
@@ -1073,6 +1036,14 @@ class ApprovedBy(KillBase):
         probe = self.stale()
         out = self.approved(probe, [3000], text="stop pid 3000 claude")  # the caller's own session process
         self.assertEqual(out["results"][0]["status"], "refused")
+
+    def test_the_owners_approval_lifts_a_daemon_refusal(self):
+        # redesign 2026-11-24: a protected process keeps needing the owner's approval, and that approval is enough
+        for pid, kw in ((6301, dict(cmd="rclone sync /a b:", comm="rclone")),
+                        (6302, dict(cmd="/opt/netwatch/netwatch run", comm="netwatch"))):
+            probe = self.base(proc(pid, 1, start=self.STALE, **kw))
+            probe.cwds = {pid: "/elsewhere/c"}
+            self.assertEqual(self.approved(probe, [pid], text="stop pid %d" % pid)["results"][0]["status"], "exited")
 
     def test_no_notice_means_no_signal(self):
         probe = self.stale()
@@ -1156,19 +1127,6 @@ class ApprovalResolution(unittest.TestCase):
 SID_, UID_ = ApprovalResolution.SID, ApprovalResolution.UID
 
 
-class ApprovedByGuard(unittest.TestCase):
-    A = "python3 -I ~/.claude/hooks/ah.py kill --pid 4242 --reason stale --approved-by wa1b2c3d4e5f"
-
-    def verdict(self, cmd, main):
-        with tempfile.TemporaryDirectory() as tmp:
-            return kg.decide(cmd, cwd=tmp, policy=kg.load_policy(), home=tmp, main=main)[0]
-
-    def test_main_only_and_a_plain_id(self):
-        self.assertEqual(self.verdict(self.A, True), "allow")
-        self.assertEqual(self.verdict(self.A, False), "block")
-        self.assertEqual(self.verdict(self.A.replace("wa1b2c3d4e5f", "'x y'"), True), "block")
-
-
 class ApprovedPids(unittest.TestCase):
     """delta red-team D-F3: only an explicit pid list approves."""
 
@@ -1186,16 +1144,6 @@ class SessionBinding(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             return kg.decide(cmd, cwd=tmp, policy=kg.load_policy(), home=tmp, main=True, session=session)[0]
 
-    def test_guard_binds_the_session(self):
-        for flag in ("--session-scope", "--approved-by wa1b2c3d4e5f"):
-            base = "python3 -I ~/.claude/hooks/ah.py kill --pid 4242 --reason stale " + flag
-            with self.subTest(flag=flag):
-                self.assertEqual(self.verdict(base, self.SID), "allow")
-                self.assertEqual(self.verdict(base + " --session " + self.SID, self.SID), "allow")
-                self.assertEqual(self.verdict(base + " --session other-session-0001", self.SID), "block")
-        plain = "python3 -I ~/.claude/hooks/ah.py kill --pid 4242 --reason stale --session other-session-0001"
-        self.assertEqual(self.verdict(plain, self.SID), "allow")  # an ordinary own-tree stop is unchanged
-
     def test_ah_refuses_another_session(self):
         import ah
         with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": self.SID}):
@@ -1208,34 +1156,17 @@ class SessionBinding(unittest.TestCase):
                     self.assertIn("this session only", str(caught.exception))
 
 
-class SessionScopeGuard(unittest.TestCase):
-    """kill_guard admits --session-scope only from main (caller_identity.is_main on the hook payload)."""
-    A = "python3 -I ~/.claude/hooks/ah.py kill --pid 4242 --reason stuck --session-scope"
+class HookAllowsAhKill(unittest.TestCase):
+    """kill_guard does not re-judge `ah kill`: ah kill refuses and audits per pid itself (redesign 2026-11-24)."""
 
-    def verdict(self, cmd, subagent):
+    def test_every_ah_kill_form_passes_the_guard(self):
         with tempfile.TemporaryDirectory() as tmp:
-            return kg.decide(cmd, cwd=tmp, policy=kg.load_policy(), home=tmp, main=not subagent)[0]
-
-    def test_main_may_pass_the_flag(self):
-        self.assertEqual(self.verdict(self.A, subagent=False), "allow")
-
-    def test_a_subagent_may_not(self):
-        self.assertEqual(self.verdict(self.A, subagent=True), "block")
-        self.assertEqual(self.verdict(self.A.replace(" --session-scope", ""), subagent=True), "allow")
-
-    def test_hook_reads_agent_id_from_the_payload(self):
-        # after step 1 (B7) main is proven by caller_identity.is_main: a session id and its own transcript file
-        sid = "11111111-2222-3333-4444-555555555555"
-        with tempfile.TemporaryDirectory() as home:
-            transcript = Path(home) / ".claude" / "projects" / "-x" / (sid + ".jsonl")
-            transcript.parent.mkdir(parents=True)
-            transcript.write_text("{}\n")
-            proof = {"session_id": sid, "transcript_path": str(transcript)}
-            for extra, code in ((proof, 0), (dict(proof, agent_id="a1"), 2), ({}, 2)):
-                body = json.dumps(dict({"tool_name": "Bash", "tool_input": {"command": self.A}, "cwd": home}, **extra))
-                done = subprocess.run([sys.executable, "-I", str(Path(kg.__file__)), "hook"], input=body.encode(),
-                                      capture_output=True, timeout=60, env={"HOME": home, "PATH": "/usr/bin:/bin"})
-                self.assertEqual(done.returncode, code, (extra, done.stderr[-300:]))
+            for cmd in ("python3 -I ~/.claude/hooks/ah.py kill --help",
+                        "python3 ~/.claude/hooks/ah.py kill --pid 4242 --reason x --approved-by wa1b2c3d4e5f",
+                        "ah kill --pid 4242 --reason stuck --session-scope",
+                        "python3 -I ~/.claude/hooks/ah.py kill --pid 4242 --reason orphaned --host win-1 --foreign"):
+                with self.subTest(cmd=cmd):
+                    self.assertEqual(kg.decide(cmd, cwd=tmp, home=tmp)[0], "allow")
 
 
 if __name__ == "__main__":

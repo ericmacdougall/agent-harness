@@ -1,11 +1,14 @@
-"""Dropped-owner gate: a Stop hook that blocks the main agent's turn from ending while any DROPPED owner of the
-session has no live disposition (GoodQA goodqa#14791, NEVER-LOSE.md invariant I1).
+"""Dropped-owner gate: a Stop hook that blocks the main agent's turn from ending, once per set of owners, while a
+DROPPED owner of the session (one that stopped without a handoff) has no live disposition (GoodQA goodqa#14791,
+NEVER-LOSE.md invariant I1). Since 2026-11-24 this is the one blocking Stop case the context budget keeps: a missed
+deadline or an unacknowledged handoff gets one advisory line instead, a set already blocked once stays silent, and
+the SubagentStop side never blocks (one advisory line, and the owner is marked DROPPED at once).
 
 Evidence: on 2026-11-05 21:10Z `ah owners` listed 12 DROPPED owners and the main agent wrote "0 dropped"; the
 half-hourly prompt only advised. This hook is deterministic: it reads `ah.owners` (the shared liveness rule and the
 dispositions recorded through `ah task dispose`) and blocks with the exact lines to run. The block count is bounded
 per problem signature (the sorted set of undisposed agent ids) by MAX_STOP_BLOCKS, so a session cannot be trapped;
-after the bound, and on a repeated Stop (`stop_hook_active`), it lets the turn end but still names the owners.
+after the bound, and on a repeated Stop (`stop_hook_active`), it lets the turn end silently.
 """
 from __future__ import annotations
 
@@ -21,7 +24,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-MAX_STOP_BLOCKS = 3
+MAX_STOP_BLOCKS = 1  # the one Stop block the context budget keeps (2026-11-24): once per set of dead owners
+CONTEXT_CAP = 600
 
 
 def state_path(session: str) -> Path:
@@ -50,34 +54,33 @@ def save_state(session: str, state: dict) -> None:
         pass  # the gate still decides; only the bound counter is lost
 
 
+def _age(r: dict) -> str:
+    idle = r.get("idle_s")
+    return f"{int(idle // 3600)}h{int(idle % 3600 // 60):02d}m" if isinstance(idle, (int, float)) else "?"
+
+
+def is_dead(agent: str, r: dict) -> bool:
+    """An owner that stopped without a handoff (DROPPED), as opposed to a missed deadline or a handoff nobody took."""
+    return not (agent.startswith("dl") and not r) and "handoff-unacked" not in (r.get("flags") or [])
+
+
 def message(undisposed: list, rows: dict) -> str:
-    lines = []
+    """At most CONTEXT_CAP characters: the owners, then the one command (with its kinds) that records a decision."""
+    names = []
     for agent in undisposed:
         r = rows.get(agent) or {}
-        idle = r.get("idle_s")
-        age = f"{int(idle // 3600)}h{int(idle % 3600 // 60):02d}m" if isinstance(idle, (int, float)) else "?"
-        if agent.startswith("dl") and not r:  # a missed deadline (goodqa#14791 G3)
-            lines.append(f"  - deadline {agent} missed: run `ah deadline done --id {agent} --note <what happened>` when it is met, or\n"
-                         f"      ah task dispose --agent {agent} --kind waiting --ref <ask id or GoodQA ticket> --until <ISO>  (it slipped for a named reason)")
-            continue
-        if "handoff-unacked" in (r.get("flags") or []):  # I9: a handoff nobody took
-            lines.append(f"  - {agent} handed off {age} ago and nobody acknowledged it: main (not the owner) records\n"
-                         f"      ah task dispose --agent {agent} --kind resumed      (someone picked it up)\n"
-                         f"      ah task dispose --agent {agent} --kind reassigned --ref <new agent id>\n"
-                         f"      ah task dispose --agent {agent} --kind waiting --ack-handoff --ref <ask id or GoodQA ticket> --until <ISO>\n"
-                         f"      ah task dispose --agent {agent} --kind closed --reason <what you verified> --deployed <deploy WAL id> "
-                     f"--live-test <live REALLY_TESTED id>\n"
-                     f"      ah task dispose --agent {agent} --kind superseded|wontdo --ref <GoodQA ticket> --reason <why>")
-            continue
-        lines.append(f"  - {agent} DROPPED {age} ticket {r.get('ticket') or 'none'}: run one of\n"
-                     f"      ah task dispose --agent {agent} --kind resumed   (after you resume or re-spawn it)\n"
-                     f"      ah task dispose --agent {agent} --kind reassigned --ref <new agent id>\n"
-                     f"      ah task dispose --agent {agent} --kind waiting --ref <ask id or GoodQA ticket> --until <ISO>\n"
-                     f"      ah task dispose --agent {agent} --kind closed --reason <what you verified> --deployed <deploy WAL id> "
-                     f"--live-test <live REALLY_TESTED id>\n"
-                     f"      ah task dispose --agent {agent} --kind superseded|wontdo --ref <GoodQA ticket> --reason <why>")
-    return ("Dropped owners need a decision before this turn ends (goodqa#14791):\n" + "\n".join(lines) +
-            "\nA dropped owner is a defect: resume it, reassign it, name what it waits on, or close it with evidence.")
+        if agent.startswith("dl") and not r:
+            names.append(f"deadline {agent} missed")
+        elif "handoff-unacked" in (r.get("flags") or []):
+            names.append(f"{agent} handed off {_age(r)} ago, unacknowledged")
+        else:
+            names.append(f"{agent} DROPPED {_age(r)} ({r.get('ticket') or 'no ticket'})")
+    shown = "; ".join(names[:6]) + (f"; +{len(names) - 6} more" if len(names) > 6 else "")
+    text = (f"Owner(s) with no recorded decision (goodqa#14791): {shown}. Record one each: `ah task dispose --agent ID "
+            "--kind resumed` (after resuming), or --kind reassigned --ref NEW_ID, --kind waiting --ref ASK_OR_TICKET "
+            "--until ISO, --kind closed --reason R --deployed WAL_ID --live-test TEST_ID, --kind superseded|wontdo --ref "
+            "TICKET --reason R. Detail: ah owners.")
+    return text if len(text) <= CONTEXT_CAP else text[:CONTEXT_CAP - 3] + "..."
 
 
 GRANDFATHER_MAX = 50  # legacy rows one Stop may write
@@ -141,11 +144,14 @@ def cmd_stop(payload: dict, now: float | None = None) -> dict:
     state = load_state(session)
     count = int((state.get("blocks") or {}).get(sig, 0))
     if payload.get("stop_hook_active") or count >= MAX_STOP_BLOCKS:
-        return {"systemMessage": f"dropped-owner gate: {len(undisposed)} owner(s) still undisposed after {count} block(s): "
-                                 + ", ".join(undisposed) + ". " + text}
+        return {"systemMessage": note} if note else {}  # said once for this set of owners; silent until it changes
     state.setdefault("blocks", {})[sig] = count + 1
     state["last"] = now or time.time()
     save_state(session, state)
+    if not any(is_dead(agent, rows.get(agent) or {}) for agent in undisposed):
+        # a missed deadline or an unacknowledged handoff is reported, never a block
+        return {"systemMessage": "dropped-owner gate: " + text}
+    # Kept as the one blocking Stop case: the session holds an owner that died silently.
     return {"decision": "block", "reason": text}
 
 
@@ -217,15 +223,11 @@ def cmd_subagent_stop(payload: dict, now: float | None = None) -> dict:
         return {}
     state = load_state(session)
     seen = state.setdefault("subagent_blocks", {})
-    text = (f"Sub-agent {agent} is ending its turn with pending work ({why}) and no armed waiter (goodqa#14791 I7). "
-            f"Before stopping: write a handoff or result WAL entry, or name the wait with `ah task dispose --agent {agent} "
-            f"--kind waiting --ref <ask id or GoodQA ticket> --until <ISO>`. Waiting on a background command: watch "
-            f"it with the Monitor tool and record that wait with the same dispose command.")
-    if not payload.get("stop_hook_active") and not seen.get(agent):
-        seen[agent] = (now or time.time())
-        save_state(session, state)
-        return {"decision": "block", "reason": text}
-    try:  # second stop: let it end, but the owner is DROPPED now, not after the finishing grace
+    if payload.get("stop_hook_active") or seen.get(agent):
+        return {}
+    seen[agent] = (now or time.time())
+    save_state(session, state)
+    try:  # advisory, never a block (2026-11-24): the owner is DROPPED now, so main's gate asks for its decision
         import ah  # noqa: PLC0415
         import datetime as dt  # noqa: PLC0415
         ts = dt.datetime.fromtimestamp(now or time.time(), dt.timezone.utc).isoformat()  # microseconds, like wal.py
@@ -233,7 +235,10 @@ def cmd_subagent_stop(payload: dict, now: float | None = None) -> dict:
                  f"pending:{session[:16]}:{agent}:{int((now or time.time()) // 600)}")
     except Exception:  # noqa: BLE001 - the marker is best effort; the message still says what happened
         pass
-    return {"systemMessage": "dropped-owner gate: " + text + " It is now DROPPED and needs a disposition."}
+    text = (f"Sub-agent {agent} ended with pending work ({why}) and no handoff; it is now DROPPED. Record the wait "
+            f"with `ah task dispose --agent {agent} --kind waiting --ref <ask id or GoodQA ticket> --until <ISO>`, or "
+            "write a handoff.")
+    return {"systemMessage": "dropped-owner gate: " + text[:CONTEXT_CAP]}
 
 
 ACK_KINDS = ("resumed", "reassigned", "closed", "legacy", "superseded", "wontdo")

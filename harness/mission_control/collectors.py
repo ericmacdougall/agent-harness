@@ -61,7 +61,7 @@ def read_regular(path, limit: int) -> bytes:
     return data
 
 
-POLICY_COUNT_CAPS = ("session_live_agents", "session_owner_agents", "live_ttl_seconds", "top_assent_max_age_seconds")
+POLICY_COUNT_CAPS = ("session_owner_agents", "live_ttl_seconds", "top_assent_max_age_seconds")
 
 
 def policy_caps(data) -> dict:
@@ -299,7 +299,7 @@ FEEDS = {
     # the feed: every collector that publishes an event, and what decides which tickets are polled for comments
     # (the tickets named by initiatives and by the merged owner rows, so everything that feeds those rows)
     "events": ("wals", "owners", "codex-owners", "native-projects", "native-streams", "owner-policy", "initiatives", "github",
-               "goodqa", "t2-dev", "sources"),
+               "goodqa", "remote", "sources"),
     "chat": ("chat", "main-session"),  # the chat snapshot names which session is main's
 }
 # Health rows that feed no dataset, each with the reason (the derivation test accepts no others).
@@ -2263,7 +2263,7 @@ def _fabric_append(path: Path, payload: bytes) -> None:
 class Remote(Collector):
     """At most one ssh to the remote host per minute: a fixed WAL probe, alternating with the Fabric export once
     Fabric ships `control export`."""
-    name = "t2-dev"
+    name = "remote"
     interval = 60.0
     idle_interval = 300.0
 
@@ -2309,8 +2309,8 @@ class Remote(Collector):
             parts = path.rstrip("/").split("/")
             session, agent = (parts[-2] if len(parts) > 1 else ""), re.sub(r"^agent-|\.jsonl$", "", parts[-1])
             note = _note(entry) or str(entry.get("event") or "")
-            self.hub.publish(ev.make("wal", "t2-dev-wal", f"{entry.get('event', '')}: {note}",
-                                     eid=f"t2wal:{session}:{agent}:{abs(hash(newest)) % 10**12}",
+            self.hub.publish(ev.make("wal", "remote-wal", f"{entry.get('event', '')}: {note}",
+                                     eid=f"remotewal:{session}:{agent}:{abs(hash(newest)) % 10**12}",
                                      actor={"runtime": "claude", "session": session, "agent": agent},
                                      historic=first))
             fresh += 1

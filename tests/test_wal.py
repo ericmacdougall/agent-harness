@@ -60,7 +60,7 @@ class WalTests(unittest.TestCase):
                 result = self.invoke(event, {'session_id': 'privacy', 'cwd': str(sensitive),
                                              **fields}, cwd=sensitive)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                if event != 'pretool':
+                if event not in ('pretool', 'prompt'):  # a prompt after the session start adds nothing
                     self.assertEqual(json.loads(result.stdout)['hookSpecificOutput']['hookEventName'],
                                      {'session': 'SessionStart', 'prompt': 'UserPromptSubmit',
                                       'subagent': 'SubagentStart'}[event])
@@ -620,8 +620,9 @@ class DurableWorkDirHookTests(unittest.TestCase):
         self.assertIn("/tmp and the session scratchpad are for disposable output only", text)
         self.assertEqual(stat.S_IMODE(work.stat().st_mode), 0o700)
         self.assertTrue((work / ".agent-harness-session.json").is_file())
-        self.assertIn(f"Durable work dir: {work}/",
-                      self.context(self.invoke("prompt", {"session_id": "durable-1", "prompt": "x"})))
+        # Context budget (2026-11-24): the prompt after a session start repeats none of it.
+        prompt = self.invoke("prompt", {"session_id": "durable-1", "prompt": "x"})
+        self.assertEqual((prompt.returncode, prompt.stdout), (0, ""), prompt.stderr)
         sub = self.context(self.invoke("subagent", {"session_id": "durable-1", "agent_id": "a1",
                                                     "agent_type": "task-owner"}))
         self.assertIn(f"{work}/agent-a1/", sub)

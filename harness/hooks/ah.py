@@ -591,7 +591,7 @@ def _summarize_cached(path: Path, index_dir: Path, cache: dict | None) -> dict:
         cache["dirty"] = True
         cache["misses"] += 1
         # R8 progress save, at most one per OWNERS_CACHE_SAVE_GAP_S: each save writes the whole cache, so a count-only
-        # trigger made a fresh 2,400-agent run write it 7 times (3.5 s of 8.6 s on t2-dev)
+        # trigger made a fresh 2,400-agent run write it 7 times (3.5 s of 8.6 s on a worker host)
         if cache["misses"] % OWNERS_CACHE_SAVE_EVERY == 0 \
                 and time.monotonic() - cache.get("saved_at", cache["started"]) >= OWNERS_CACHE_SAVE_GAP_S:
             _save_owners_cache(cache["path"], cache, prune=False)
@@ -799,7 +799,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         if t is None or agent_id in seen:
             return False
         td = disp.get(agent_id)
-        if td and td.get("kind") in GUARDED_KINDS and not t["state"].startswith(("live", "working", "waiting")):
+        if td and td.get("kind") in GUARDED_KINDS + (FINISHED,) and not t["state"].startswith(("live", "working", "waiting")):
             return False  # checked first: the row loop below relabels such a target (superseded, unverified-legacy)
         if t["state"] not in ("DROPPED", "done", "handoff", "returned") or agent_id in live_parents:
             return True
@@ -817,9 +817,9 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
     for r in rows:
         d = disp.get(r["agent_id"])
         last_wal = parse_ts(r["last_activity"]) or 0.0
-        alive = liveness.disposition_live(d, now, last_activity=last_wal,
-                                          replacement_live=bool(d and d.get("kind") == "reassigned"
-                                                                and covered(d.get("ref"), (r["agent_id"],))))
+        alive = bool(d and d.get("kind") == FINISHED) or liveness.disposition_live(
+            d, now, last_activity=last_wal,
+            replacement_live=bool(d and d.get("kind") == "reassigned" and covered(d.get("ref"), (r["agent_id"],))))
         r["disposition"] = dict(d, live=alive) if d else None
         r["decision_required"] = bool(r["owner"] and r["state"] == "DROPPED" and not alive)
         r["attention"] = []
@@ -848,7 +848,7 @@ def owners(home: Path, session: str, now: float | None = None, comments=None) ->
         if not r["owner"]:
             continue
         d = r.get("disposition") or {}
-        if d.get("kind") in liveness.ENDING_DISPOSITIONS:
+        if d.get("kind") in liveness.ENDING_DISPOSITIONS or d.get("kind") == FINISHED:
             continue  # a terminal disposition stays terminal, whatever the owner's last note says
         ref = str(d.get("ref") or "") if d.get("kind") == "waiting" and d.get("live") else \
             (r["state"][len("waiting-on-"):] if r["state"].startswith("waiting-on-") else "")
@@ -1533,8 +1533,8 @@ def precheck(op: str, args: dict) -> None:
             raise AhError("bad_request", f"{op}: detail must be a JSON object")
     elif op == "task.dispose":
         need("agent", "session", "kind", "at")
-        if args["kind"] not in liveness.DISPOSITIONS:
-            raise AhError("bad_request", f"task.dispose: kind must be one of {', '.join(liveness.DISPOSITIONS)}")
+        if args["kind"] not in DISPOSE_KINDS:
+            raise AhError("bad_request", f"task.dispose: kind must be one of {', '.join(DISPOSE_KINDS)}")
         if not OWNER_ID_RE.match(args["agent"]):
             raise AhError("bad_request", "task.dispose: agent must be an agent id or a task WAL name")
         if parse_ts(args["at"]) is None:
@@ -1936,16 +1936,22 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
     if op == "task.register":
         if _task(ledger, args["task"]):
             raise AhError("task_exists", f"task {args['task']!r} is already registered; ownership is not reassigned silently", 3)
-        import provenance
+        # 2026-11-24: a source that does not trace is a warning, never a refusal; the row is flagged unsourced
+        warning = None
         try:
-            res = provenance.resolve(args["source"])
-        except Exception as e:  # a resolver crash is a rejection, never a silent pass
-            raise AhError("provenance", f"source check failed ({type(e).__name__})", 3)
-        if not res["ok"]:
-            first = res["problems"][0] if res["problems"] else {"code": "rejected", "message": "rejected"}
-            raise AhError("provenance", f"source rejected ({first['code']}): {first['message']}"[:300], 3)
+            import provenance
+            res = provenance.resolve(args["source"], {"session": args.get("session") or ""})
+            if not res["ok"]:
+                first = res["problems"][0] if res["problems"] else {"code": "rejected", "message": "rejected"}
+                warning = f"source not traced ({first['code']}): {first['message']}"[:300]
+        except Exception as e:  # noqa: BLE001 - a resolver crash is reported, never a reason to drop the task
+            warning = f"source check failed ({type(e).__name__})"
         rec = {"at": now, "event": "scope", "id": wid, "source": args["source"][:2000],
                "note": f"task {args['task']} registered: owner {args['owner_agent']}, {args['ticket']}; {args['scope']}"[:3900]}
+        if warning:
+            rec["unsourced"] = True
+            out["unsourced"] = True
+            out["warnings"] = [warning]
         _wal_append(home, _wal_path(home, args["session"], "main"), rec)
         out["wal"] = wid
     elif op == "task.status":
@@ -2029,7 +2035,7 @@ def _apply(home: Path, op: str, args: dict, key: str, ledger: list) -> dict:
             _closing_checks(args, ledger, time.time())
         rec = {"at": now, "event": "disposition", "id": wid, "agent": args["agent"], "kind": args["kind"],
                "note": f"owner {args['agent']} {args['kind']}: {args.get('reason') or args.get('ref') or ''}"[:300]}
-        for k in ("until", "ref", "reason", "deployed", "live_test", "gate_epoch", "owner_last"):
+        for k in ("until", "ref", "reason", "deployed", "live_test", "gate_epoch", "owner_last", "finished_by"):
             if args.get(k):
                 rec[k] = args[k]
         _wal_append(home, main_wal, rec)
@@ -2348,6 +2354,36 @@ NOT_LIVE_WORDS_RE = re.compile(r"\b(?:not|never|isn't|wasn't|aren't|weren't)\s+(
                                r"(?:live|prod|production)\b|\b(?:staging|pre-?prod(?:uction)?|locally|local[- ]only|dry[- ]run)\b",
                                re.I)
 GUARDED_KINDS = ("closed", "superseded", "wontdo", "legacy")
+# `finished` (2026-11-24): a task whose process has ended or which reported its outcome (a reviewer, a fixer) is
+# disposed of without deploy evidence or a ticket; liveness.py does not know the kind yet, so ah.py treats it as a
+# permanent, live disposition itself (see owners()).
+FINISHED = "finished"
+DISPOSE_KINDS = tuple(liveness.DISPOSITIONS) + (() if FINISHED in liveness.DISPOSITIONS else (FINISHED,))
+FINISHED_STATES = ("done", "handoff", "returned", "finishing", "DROPPED")
+
+
+def _finished_check(home: Path, args: dict) -> str:
+    """Who may record `finished` and when: the task must have ended (its process stopped) or reported finished;
+    the caller is the session that registered it, a supervisor or a top-rung caller. Returns who it was."""
+    session, agent = args["session"], args["agent"]
+    rows = owners(home, session)["owners"]
+    row = next((r for r in rows if r.get("agent_id") == agent), None)
+    if row is None:
+        raise AhError("unknown_agent", f"task.dispose finished: {agent} is not an agent or task WAL of session {session}", 3)
+    if row.get("state") not in FINISHED_STATES and not row.get("result_at"):
+        raise AhError("not_finished", f"task.dispose finished: {agent} is {row.get('state')}: its process is still "
+                                      "running and it has not reported finished; wait for it, or use waiting/reassigned", 3)
+    caller = env_session()
+    if not caller or caller == session:  # the registering session's own call (ah's session is the caller's)
+        return "session"
+    import ah_roles  # noqa: PLC0415
+    payload = ah_roles.cli_payload(home=home, session=caller, agent=os.environ.get("AH_AGENT_ID", ""))
+    if ah_roles.is_top_rung(payload):
+        return "top-rung"
+    if ah_roles.is_supervisor(payload, home):
+        return "supervisor"
+    raise AhError("forbidden", f"task.dispose finished: {agent} belongs to session {session}; only that session, a "
+                               "supervisor or a top-rung caller disposes of it", 3)
 GUARD_FIELDS = ("deploy_specific", "live_specific", "gate_epoch", "owner_last", "ref_checked", "deploy_at")
 WAL_SCAN_MAX = 64 * 1024 * 1024  # bytes of a session's WALs searched for one evidence id
 
@@ -2757,6 +2793,8 @@ def write(home: Path, op: str, args: dict, session: str, key: str | None = None)
         if guarded and args.get("kind") in liveness.CLOSING:
             _close_burst(home, args, actor(session), time.time())  # first: a burst is refused whatever its arguments
         precheck(op, args)
+        if op == "task.dispose" and args.get("kind") == FINISHED:
+            args = dict(args, finished_by=_finished_check(home, args))
     except AhError as e:
         if guarded:
             _audit_reject(home, op, key, session, e.code, tag)
@@ -3252,7 +3290,15 @@ def approve_top_cmd(home: Path, args) -> dict:
         status = ledger.approve_top(task, ask_id, str(wal))
     except escalation.LedgerError as e:
         raise AhError(e.code, f"approve-top: {e.message}", 2)
+    approval = None
+    try:  # the same grant in the one approvals store, so `ah approvals` shows it (the ledger stays the record)
+        import ah_approvals  # noqa: PLC0415
+        approval = ah_approvals.grant("top-rung", {"task": task}, "user", "ah approve-top: the user's own words",
+                                      source=source)["id"]
+    except Exception:  # noqa: BLE001 - the ledger permission above is already written and is what the gate reads
+        pass
     return {"ok": True, "task": task, "session": session, "ask": ask_id, "source": source, "ladder": status,
+            "approval": approval,
             "next": f"spawn with [task:{task}] in the Agent description; the permission covers this task only"}
 
 
@@ -3272,7 +3318,7 @@ def note_cmd(home: Path, args) -> dict:
     text = args.note
     if args.id and not ASK_ID_RE.match(args.id):
         raise AhError("bad_request", "note: --id must be a WAL entry id (w + 11 hex)")
-    if args.id:  # re-cite an existing quarantined entry: its event kind is kept; its text unless --note overrides
+    if args.id:  # re-cite an existing unsourced entry: its event kind is kept; its text unless --note overrides
         import safe_input  # noqa: PLC0415
         for raw in (safe_input.read_tail(wal, 4 << 20).splitlines() if wal.is_file() else []):
             try:
@@ -3317,8 +3363,7 @@ def note_cmd(home: Path, args) -> dict:
             plan["refused"] = True
             plan["problem"] = str(refusal.get("problem") or "")[:300]
     elif isinstance(plan.get("written"), dict) and plan["written"].get("warnings"):
-        plan["ok"] = False  # written, but quarantined: the source did not resolve here (M2); say so instead of ok
-        plan["quarantined"] = True
+        plan["unsourced"] = True  # written; the source did not trace here, so the row is flagged unsourced (2026-11-24)
         plan["warnings"] = plan["written"]["warnings"]
     return plan
 
@@ -3638,7 +3683,7 @@ def build_parser():
     ca = chs.add_parser("allow", help="add a person to the send allow-list on the user's own words (main agent only), or --list it")
     ca.add_argument("--with", dest="with_user", help="the person's user id (never a name)")
     ca.add_argument("--org", help="organization id (required): the entry holds for this org only")
-    ca.add_argument("--name", help="the one word the user's quoted words call this person, e.g. Tisha; the member name must contain it")
+    ca.add_argument("--name", help="the one word the user's quoted words call this person, e.g. Sam; the member name must contain it")
     ca.add_argument("--source", help="user:/uuid:, queue: or answer: source whose verbatim excerpt names the person")
     ca.add_argument("--list", dest="list_only", action="store_true", help="print the listed user ids; changes nothing")
     ca.add_argument("--base", help="API base; must be the pinned GoodQA base")
@@ -3676,6 +3721,11 @@ def build_parser():
     cc = ts.add_parser("comment")
     cc.add_argument("ticket", help="GoodQA <project>#N")
     cc.add_argument("--body", required=True)
+    te = ts.add_parser("edit", help="change a ticket's title or priority (GoodQA update_issue)")
+    te.add_argument("number", help="GoodQA <project>#N or N")
+    te.add_argument("--title")
+    te.add_argument("--priority")
+    te.add_argument("--project", default="goodqa")
     tc = ts.add_parser("create", help="file a GoodQA ticket (idempotent on --key)")
     tc.add_argument("--project", required=True)
     tc.add_argument("--title", required=True)
@@ -3715,7 +3765,8 @@ def build_parser():
                     help="WAL id of the deploy, release or install record (done means deployed live and tested)")
     dp = ks.add_parser("dispose", help="record the decision for a DROPPED owner: resumed, reassigned, waiting or closed")
     dp.add_argument("--agent", required=True)
-    dp.add_argument("--kind", required=True, choices=list(liveness.DISPOSITIONS))
+    dp.add_argument("--kind", required=True, choices=list(DISPOSE_KINDS),
+                    help="finished: the task ended or reported finished (a reviewer, a fixer); no evidence needed")
     dp.add_argument("--ref", help="waiting: ask id or ticket; reassigned: replacement agent id")
     dp.add_argument("--until", help="waiting: ISO time when the wait expires")
     dp.add_argument("--ack-handoff", dest="ack_handoff", action="store_true",
@@ -3771,7 +3822,7 @@ def build_parser():
     nt = sub.add_parser("note", help="write a WAL note through wal_note.py; --source auto picks the nearest sourced ancestor")
     nt.add_argument("--wal", required=True)
     nt.add_argument("--event", default="decision")
-    nt.add_argument("--note", help="the note text (omit with --id to re-cite an existing quarantined entry)")
+    nt.add_argument("--note", help="the note text (omit with --id to re-cite an existing unsourced entry)")
     nt.add_argument("--id", help="re-cite an existing unsourced entry of this WAL by id")
     nt.add_argument("--source", default="auto", help="a Source: string, or auto")
     nt.add_argument("--dry-run", action="store_true", help="print the Source that would be written; write nothing")
@@ -3806,27 +3857,30 @@ def build_parser():
     kp.add_argument("--reason", required=True, help="why (mandatory, logged)")
     kp.add_argument("--tree", action="store_true", help="signal children first")
     kp.add_argument("--grace", type=float, default=10.0, help="seconds between SIGTERM and SIGKILL (default 10)")
-    kp.add_argument("--host", help="run on dev2, t2-dev or ah-mac-mini over ssh; ah-spectre (Windows) takes one pid, "
+    kp.add_argument("--host", help="run on a host from ~/.agent-harness/local.json over ssh; a Windows host takes one pid, "
                     "no --tree, and stops it with Stop-Process")
     kp.add_argument("--foreign", action="store_true",
-                    help="allow a process outside your worktree and process tree (audited; raises a high ops-watch notice)")
+                    help="a process outside your worktree, process tree and supervised projects (audited, ops-watch "
+                         "notice): a top-rung caller needs nothing more; anyone else adds --approved-by")
     kp.add_argument("--session-scope", action="store_true",
-                    help="main only (kill_guard enforces it): also treat as own a process that `kill_guard.py spawn` "
-                         "recorded (pid and start time) for a worktree in this session's ~/.agent-harness/work/<session>/ "
-                         "(audited, no --foreign)")
+                    help="also treat as own a process that `kill_guard.py spawn` recorded (pid and start time) for a "
+                         "worktree in this session's ~/.agent-harness/work/<session>/ (audited, no --foreign)")
     kp.add_argument("--approved-by", metavar="ASK_ID",
-                    help="main only, local only: id of a resolved ask whose answer is a real human turn at most 24 h old "
-                         "listing the exact pid (\"pid N\", no negation), in this session only; lifts the harness-console and claude/codex refusals for processes "
-                         "idle (sleeping, 0%% CPU) and started over 24 h ago and before this session (audited, high notice)")
+                    help="local only: id of a resolved ask in this session whose answer is a real human turn at most "
+                         "24 h old listing the exact pid (\"pid N\", no negation); lifts the foreign and protected "
+                         "refusals for that pid (never pid 1, your own session, root, another user or a system process)")
     kp.add_argument("--session")
     kp.add_argument("--agent", help="calling agent id for the audit row")
     kp.add_argument("--wal", help="caller WAL path (default: this session's main WAL)")
     kp.add_argument("--via", help=argparse.SUPPRESS)
-    wp = sub.add_parser("worktree-remove", help="remove ONE verified clean, published linked worktree here or on t2-dev "
-                        "(audited; see ah_worktree.py; no --force exists)")
-    wp.add_argument("--host", required=True, help="local or t2-dev")
+    wp = sub.add_parser("worktree-remove", help="free ONE dead linked worktree here or on a remote host (audited; see "
+                        "ah_worktree.py; --rescue saves commits and changes first)")
+    wp.add_argument("--host", required=True, help="local or a remote_worktree_hosts entry of ~/.agent-harness/local.json")
     wp.add_argument("--path", required=True, help="one literal absolute path")
-    wp.add_argument("--reason", required=True, help="why (mandatory, logged)")
+    wp.add_argument("--reason", help="why (optional, logged)")
+    wp.add_argument("--rescue", action="store_true", help="save commits to refs/rescue/<name> and changes to a patch, "
+                    "then remove (a supervisor of the project or Fable/Astra)")
+    wp.add_argument("--dry-run", dest="dry_run", action="store_true")
     wp.add_argument("--remote-auth", dest="remote_auth", action="store_true",
                     help="private repository: the verifier reads the remote with the TARGET host's own credentials in a "
                          "scrubbed environment (branch refs cannot be supplied by the caller)")
@@ -3834,7 +3888,7 @@ def build_parser():
     wp.add_argument("--agent", help="calling agent id for the audit row")
     ip = sub.add_parser("install-files", help="install MERGED listed hook files on a remote host (audited; see ah_install.py; "
                         "the bytes come only from a commit on the canonical main; main only)")
-    ip.add_argument("--host", required=True, help="t2-dev or ah-mac-mini")
+    ip.add_argument("--host", required=True, help="a host from ~/.agent-harness/local.json")
     ip.add_argument("--from-ref", dest="from_ref", help="a full 40-hex commit sha on the canonical main")
     ip.add_argument("--file", dest="files", action="append", help="a bare hook file name (repeatable)")
     ip.add_argument("--ticket", help="GoodQA project#N (required for a real run, a resume and a rollback)")
@@ -3907,6 +3961,12 @@ def run(args, home: Path) -> dict:
             import ah_ticket
             try:
                 return ah_ticket.create(args.project, args.title, args.body_file, args.type, args.priority, args.key, home)
+            except ah_ticket.TicketCreateError as e:
+                raise AhError(e.code, str(e), e.exit_code)
+        if args.sub == "edit":
+            import ah_ticket
+            try:
+                return ah_ticket.edit(args.number, args.title, args.priority, args.project)
             except ah_ticket.TicketCreateError as e:
                 raise AhError(e.code, str(e), e.exit_code)
         if args.sub == "get":
@@ -4023,7 +4083,7 @@ def run(args, home: Path) -> dict:
         try:
             return ah_worktree.remove(args.host, args.path, args.reason, args.remote_auth,
                                       args.session or env_session() or "", args.agent or os.environ.get("AH_AGENT_ID", ""),
-                                      home)
+                                      home, rescue=args.rescue, dry_run=args.dry_run)
         except ah_worktree.WorktreeError as e:
             raise AhError(e.code, str(e), e.exit_code)
     if cmd == "install-files":
@@ -4082,9 +4142,30 @@ def main(argv=None) -> int:
     if given[:2] in (["task", "kit"], ["task", "succeed"], ["task", "kits"]):  # goodqa#15565: successor kit (successor.py)
         import successor  # noqa: PLC0415
         return successor._cli(["list" if given[1] == "kits" else given[1]] + given[2:])
+    if given[:1] in (["off"], ["on"], ["switch-status"]):  # the harness off switch (ah_switch.py, docs/off-switch.md)
+        import ah_switch  # noqa: PLC0415
+        return ah_switch.main(["status" if given[0] == "switch-status" else given[0]] + given[1:])
+    if given[:1] == ["secret"]:  # clipboard -> secret store, and use without printing (ah_secret.py, docs/secrets.md)
+        import ah_secret  # noqa: PLC0415
+        return ah_secret.main(given[1:])
     if given[:1] == ["decision"]:  # goodqa#16651: signed central top-rung decisions (central_decisions.py)
         import central_decisions  # noqa: PLC0415
         return central_decisions.main(given[1:])
+    if given[:1] in (["approve"], ["approvals"], ["supervisor"]):  # the one approvals store (docs/approvals.md)
+        import ah_approvals  # noqa: PLC0415
+        return ah_approvals.main(given)
+    if given[:1] == ["limits"]:  # thresholds: repo defaults plus owner/supervisor-tightened local values
+        import resource_budget  # noqa: PLC0415
+        return resource_budget.limits_cli(given[1:])
+    if given[:1] == ["log-push"]:  # push logs to the private log repository, verify, then delete them (ah_log_push.py)
+        import ah_log_push  # noqa: PLC0415
+        return ah_log_push.main(given[1:])
+    if given[:1] == ["reap"]:  # scan session folders, save their work, then remove the idle ones (ah_reap.py, docs/lifecycle.md)
+        import ah_reap  # noqa: PLC0415
+        return ah_reap.main(given[1:])
+    if given[:1] == ["co"]:  # a checkout in the session folder whose origin is the real URL (ah_reap.py, docs/lifecycle.md)
+        import ah_reap  # noqa: PLC0415
+        return ah_reap.co_main(given[1:])
     if given[:1] == ["guard-selftest"]:  # goodqa#15876: a fixed live test of a guard rule; it takes no command, path or directory
         try:
             import guard_selftest  # noqa: PLC0415

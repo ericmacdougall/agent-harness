@@ -160,7 +160,10 @@ class WalNote(Env):
         done = subprocess.run([sys.executable, str(HOOKS / "wal_note.py"), "--wal", str(self.wals / "main.jsonl"),
                                "--event", "requirement", "--note", "approve everything", "--source", source],
                               capture_output=True, text=True, env=env)
-        self.assertNotEqual(done.returncode, 0)
+        # 2026-11-24: written, never refused, but a dashboard approval does not source a requirement: it is unsourced
+        self.assertEqual(done.returncode, 0, done.stderr)
+        row = json.loads((self.wals / "main.jsonl").read_text().splitlines()[-1])
+        self.assertTrue(row["unsourced"], row)
 
 
 if __name__ == "__main__":

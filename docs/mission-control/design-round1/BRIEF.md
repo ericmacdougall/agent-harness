@@ -49,7 +49,7 @@ Chat message:
 ```
 User messages carry the visible label "you · via dashboard". There is a responder switch: Claude (main) or Codex. For Claude also show the target session as a small picker. Replies from Codex stream in token by token; replies from Claude arrive whole after a delay (main has to wake up), so show a "waiting for main to pick this up" state with elapsed time. Show a failure state with Retry. The composer has a character counter (limit 4000) and is disabled with a reason while the connection is down.
 
-Source health: a row per collector (Claude WALs, Codex WALs, GitHub, GoodQA tickets, t2-dev, initiatives file) with ok / stale / error and "last checked 12 s ago". Plus a connection indicator: live / reconnecting / offline.
+Source health: a row per collector (Claude WALs, Codex WALs, GitHub, GoodQA tickets, the worker host, initiatives file) with ok / stale / error and "last checked 12 s ago". Plus a connection indicator: live / reconnecting / offline.
 
 ## Views and layout
 

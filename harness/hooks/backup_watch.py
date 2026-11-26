@@ -33,8 +33,19 @@ sys.path.insert(0, str(HERE))
 REPEAT_SECONDS = 3600
 ALERT_LOG = "backup-alert.jsonl"
 STATE = "backup-alert.state"
-LABEL = "com.ericmacdougall.backup-watch"
 UNIT = "backup-watch"
+
+
+def _job_label(name):
+    """launchd label of this job: ~/.agent-harness/local.json `launchd_label_prefix` (ah_local) + name."""
+    try:
+        import ah_local  # noqa: PLC0415
+        return ah_local.label(name)
+    except Exception:  # noqa: BLE001
+        return "com.agent-harness." + name
+
+
+LABEL = _job_label("backup-watch")
 
 
 def _lb():
@@ -186,7 +197,7 @@ def active(home: Path, system: str, run=default_runner, uid: int | None = None) 
 
 
 def linger(run=default_runner) -> bool:
-    """Linux user timers stop at logout unless lingering is on (dev2 is headless)."""
+    """Linux user timers stop at logout unless lingering is on (a headless worker host)."""
     user = os.environ.get("USER", "")
     return bool(user) and run(["loginctl", "show-user", user, "-p", "Linger", "--value"], capture="yes") == "yes"
 

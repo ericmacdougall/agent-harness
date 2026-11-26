@@ -145,7 +145,7 @@ class SystemdRunner:
 
     def grant_output(self, out_dir, uid):
         """Let the unit's dynamic uid write its report directory, and nobody else. Not implemented in this slice
-        (PENDING_REAL_TEST PRT-r3-grant on t2-dev); never a world-writable fallback, because the packet sha and H
+        (PENDING_REAL_TEST PRT-r3-grant on the worker host); never a world-writable fallback, because the packet sha and H
         are not secret and anyone who can write the report could plant a PASS."""
         raise ahc_guard.LaunchRefused("R3: the report directory grant is not implemented (PRT-r3-grant)")
 

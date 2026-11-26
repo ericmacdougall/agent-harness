@@ -1,6 +1,6 @@
 {
  "schema": 1,
- "note": "status installed = required on every listed flavor; pending = owner PR not merged, reported NOT-ENFORCED. tests/test_doctor.py fails when a pending row's script already ships in harness/hooks (promote it and make the installer wire it). known_gap marks a shipped script that one flavor does not wire yet; it names the batch that fixes it.",
+ "note": "status installed = required on every listed flavor; pending = owner PR not merged, reported NOT-ENFORCED. tests/test_doctor.py fails when a pending row's script already ships in harness/hooks (promote it and make the installer wire it). known_gap marks a shipped script that one flavor does not wire yet; it names the batch that fixes it. script is the hook script itself: the installers wire every row through the off-switch launcher (python3 <hooks>/ah_hook.py <script> <arg>), and doctor counts that form as wired.",
  "hooks": [
   {
    "id": "wal:session",
@@ -538,7 +538,6 @@
    "event": "PreToolUse",
    "tools": [
     "Bash",
-    "mcp__hawkeye__run",
     "mcp__cloudflare__d1_database_query",
     "mcp__pg__execute_sql"
    ],
@@ -610,18 +609,6 @@
    "script": "ledger_reminder.py",
    "arg": null,
    "event": "SessionStart",
-   "tools": [],
-   "flavors": [
-    "claude"
-   ],
-   "status": "installed",
-   "rules": []
-  },
-  {
-   "id": "ledger-reminder:UserPromptSubmit",
-   "script": "ledger_reminder.py",
-   "arg": null,
-   "event": "UserPromptSubmit",
    "tools": [],
    "flavors": [
     "claude"
@@ -881,18 +868,6 @@
    ]
   },
   {
-   "id": "mc_inbox:stop",
-   "script": "mc_inbox.py",
-   "arg": "hook",
-   "event": "Stop",
-   "tools": [],
-   "flavors": [
-    "claude"
-   ],
-   "status": "installed",
-   "rules": []
-  },
-  {
    "id": "mc_inbox:prompt",
    "script": "mc_inbox.py",
    "arg": "hook",
@@ -921,18 +896,6 @@
    "script": "status_truth.py",
    "arg": "session-start",
    "event": "SessionStart",
-   "tools": [],
-   "flavors": [
-    "claude"
-   ],
-   "status": "installed",
-   "rules": []
-  },
-  {
-   "id": "status-truth:stop",
-   "script": "status_truth.py",
-   "arg": "stop",
-   "event": "Stop",
    "tools": [],
    "flavors": [
     "claude"
@@ -976,10 +939,10 @@
    "rules": []
   },
   {
-   "id": "owner_inbox:stop",
+   "id": "owner_inbox:posttool",
    "script": "owner_inbox.py",
    "arg": "hook",
-   "event": "Stop",
+   "event": "PostToolUse",
    "tools": [],
    "flavors": [
     "claude"
@@ -988,10 +951,66 @@
    "rules": []
   },
   {
-   "id": "owner_inbox:posttool",
-   "script": "owner_inbox.py",
-   "arg": "hook",
-   "event": "PostToolUse",
+   "id": "session_env:session-start",
+   "script": "session_env.py",
+   "arg": null,
+   "event": "SessionStart",
+   "tools": [],
+   "flavors": [
+    "claude",
+    "codex"
+   ],
+   "status": "installed",
+   "rules": [],
+   "canaries": [
+    {
+     "payload": {
+      "hook_event_name": "SessionStart",
+      "session_id": "doctor-canary"
+     },
+     "expect": "allow"
+    }
+   ]
+  },
+  {
+   "id": "autosave:stop",
+   "script": "autosave.py",
+   "arg": null,
+   "event": "Stop",
+   "tools": [],
+   "flavors": [
+    "claude",
+    "codex"
+   ],
+   "status": "installed",
+   "rules": [],
+   "canaries": [
+    {
+     "payload": {
+      "hook_event_name": "Stop",
+      "session_id": "doctor-canary"
+     },
+     "expect": "allow"
+    }
+   ]
+  },
+  {
+   "id": "autosave:subagent-stop",
+   "script": "autosave.py",
+   "arg": null,
+   "event": "SubagentStop",
+   "tools": [],
+   "flavors": [
+    "claude"
+   ],
+   "status": "installed",
+   "rules": []
+  },
+  {
+   "id": "autosave:session-end",
+   "script": "autosave.py",
+   "arg": null,
+   "event": "SessionEnd",
    "tools": [],
    "flavors": [
     "claude"

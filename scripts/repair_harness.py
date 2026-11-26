@@ -399,7 +399,7 @@ def main():
         return
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ref", required=True, help="exact reviewed canonical main commit")
-    parser.add_argument("--host", default="t2-dev", help="trusted SSH hostname (default: t2-dev)")
+    parser.add_argument("--host", required=True, help="trusted SSH hostname of the worker")
     parser.add_argument("--python", type=Path, help="absolute local Python 3.11+ interpreter")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true", help="preview only (default)")
