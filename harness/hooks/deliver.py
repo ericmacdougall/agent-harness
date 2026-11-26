@@ -1144,48 +1144,9 @@ WAIVER_RECORD_LIMIT = 1_048_576
 
 
 def commit_policy_gate(source, original_branch, branch, head, baseline, title, body, local_only):
-    """Refuse a new generation whose owner commits, PR text, or tickets break the policy.
-
-    The range is the owner's own work: head minus baseline minus the tracked
-    upstream tip, so upstream commits written by others are never judged here.
-    Runs only before a generation is created; re-entry never repeats network checks.
-    """
-    try:
-        import commit_policy
-        policy = commit_policy.load_policy()
-    except (ImportError, OSError, ValueError):
-        raise DeliveryError("BLOCKED_COMMIT_POLICY", "Commit policy could not be loaded; refusing to publish",
-                            code=2) from None
-    tip_ref = f"refs/remotes/origin/{original_branch}"
-    tip = commit_policy.git(source, "rev-parse", "-q", "--verify", tip_ref + "^{commit}", check=False).strip()
-    exclude = [tip] if OID.match(tip) else []
-    try:
-        result = commit_policy.check_range(str(source), baseline, head, policy, branch=branch,
-                                           verify_tickets=True, exclude=exclude)
-    except (OSError, subprocess.TimeoutExpired):
-        raise DeliveryError("BLOCKED_COMMIT_POLICY", "Commit range could not be inspected", code=2) from None
-    # N11: tracked if any remote url/pushurl matches, not only origin's fetch URL.
-    ticket_context = commit_policy.repo_ticket_context(str(source), policy)
-    pr_problems = [] if local_only or policy.get("enforcement") == "off" else commit_policy.validate_pr(
-        title, body.decode("utf-8", "replace"), policy,
-        tickets_required=True if ticket_context is None else ticket_context["tracked"],
-        ledger=commit_policy.ledger_checker(policy, ticket_context, int(time.time() * 1000)))
-    text = commit_policy.format_report(result)
-    if pr_problems and policy.get("enforcement") != "warn":
-        text += "\n  PR title/body (GitHub squash uses them as the final commit message):\n" + "\n".join(
-            "      - " + item for item in pr_problems)
-    warn = policy.get("enforcement") == "warn"
-    if not warn and (result["status"] == "BLOCKED" or pr_problems):
-        raise DeliveryError("BLOCKED_COMMIT_POLICY", "Commit messages, PR text or tickets break the commit policy; "
-                            "fix them and run prepare again", code=2, commit_policy=text)
-    if not warn and result["status"] == "UNVERIFIED":
-        raise DeliveryError("TICKETS_UNVERIFIED", "Referenced tickets could not be verified (ticket system "
-                            "unreachable); retry, or record a tickets waiver for this head", code=6,
-                            commit_policy=text)
-    if result["waivers"] or result.get("warnings") or warn and result["status"] != "PASS":
-        print(text, file=sys.stderr)
-    return {"exclude": exclude, "waivers": result["waivers"], "warnings": result.get("warnings", []),
-            "tickets": [item["ticket"] for item in result["tickets"]]}
+    """Release 1001 checks no commit message, PR text or ticket reference here: independent review before merge is the
+    one gate (docs/direction.md, docs/merge-rule.md). The record keeps its shape, so earlier generations still read."""
+    return {"exclude": [], "waivers": [], "warnings": [], "tickets": []}
 
 
 COMMIT_POLICY_PENDING = "commit-policy-pending.json"
@@ -1243,30 +1204,9 @@ def _ticket_updates(flow, stage, head, pr_url):
         return {"status": "NOT_APPLICABLE", "reason": "generation predates the commit policy"}
     if record.get("generation") != flow.generation or not record.get("tickets"):
         return {"status": "NOT_APPLICABLE", "reason": "no referenced tickets"}
-    import commit_policy
-    policy = commit_policy.load_policy()
-    lines = [f"- Mode: {flow.args.mode}", f"- Delivered head: `{head}`",
-             f"- Source head: `{flow.state['source_head']}` on `{flow.state['source_branch']}`"]
-    if pr_url:
-        lines.append(f"- PR: {pr_url}")
-    for check in flow.args.check:
-        lines.append(f"- Check passed: `{check}`")
-    lines.append("- Deploy: not observed by deliver.py; post deploy evidence with "
-                 "`commit_policy.py notify --stage deployed`")
-    for item in record.get("waivers", []):
-        lines.append(f"- Waiver used: {item['kind']} {item['subject'][:12]} (id {item['id']})")
-    for item in record.get("warnings", []):
-        lines.append(f"- Not verified (project out of the credential's scope): {item['ticket']}")
-    results = commit_policy.notify(str(flow.original), flow.state["baseline"], flow.state["source_head"], policy,
-                                   operation_seed=flow.generation, evidence="\n".join(lines), stage=stage,
-                                   exclude=record.get("exclude", []))
-    pending = [item for item in results if item["status"] not in commit_policy.NOTIFY_DONE]
-    retry = (f"python3 {Path(__file__).with_name('commit_policy.py')} notify --repo {flow.original} "
-             f"--base {flow.state['baseline']} --head {flow.state['source_head']} --seed {flow.generation} "
-             f"--stage {stage} --evidence '<delivery evidence>'"
-             + "".join(f" --exclude {tip}" for tip in record.get("exclude", [])))
-    return {"status": "PENDING" if pending else "UPDATED", "tickets": results,
-            **({"retry": retry} if pending else {})}
+    # A generation prepared before release 1001 may name tickets; posting to them went with commit_policy.py.
+    return {"status": "NOT_APPLICABLE", "reason": "ticket updates were removed in release 1001",
+            "tickets": list(record.get("tickets") or [])}
 
 
 def scan_gate(args, source, head):

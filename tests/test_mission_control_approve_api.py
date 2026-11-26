@@ -13,7 +13,6 @@ sys.path.insert(0, str(REPO / "harness" / "hooks"))
 sys.path.insert(0, str(REPO / "harness" / "mission_control"))
 
 import mc_chat  # noqa: E402
-import mc_inbox  # noqa: E402
 from test_mission_control import ServerHarness  # noqa: E402
 
 SID = "baab765b-d85c-46b4-b7b9-588eb912c770"
@@ -64,19 +63,6 @@ class ApproveHarness(ServerHarness):
 
 
 class Approve(ApproveHarness):
-    def test_approve_creates_one_signed_record_main_receives(self):  # AC-3
-        status, value = self.approve()
-        self.assertEqual(status, 201, value)
-        self.assertEqual((value["decision"], value["ask_id"], value["status"]), ("approve", ASK, "queued"))
-        record = mc_chat.load(value["id"])
-        self.assertEqual(record["session"], SID)
-        self.assertEqual(record["approval"]["digest"], self.shown()["digest"])
-        rows, _ = mc_chat.unread("claude", SID)
-        self.assertEqual([r["record"]["id"] for r in rows], [value["id"]])
-        framed = mc_inbox.deliver(record)
-        self.assertIn("DASHBOARD DECISION APPROVED ask=" + ASK, framed)
-        self.assertEqual(mc_chat.approval_evidence(SID, value["id"])["decision"], "approve")
-
     def test_deny_is_a_signed_deny(self):  # AC-9
         status, value = self.approve("deny")
         self.assertEqual((status, value["decision"]), (201, "deny"))

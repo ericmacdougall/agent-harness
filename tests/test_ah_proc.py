@@ -1,4 +1,4 @@
-"""ah kill (harness/hooks/ah_kill.py) and its kill_guard allow rule: refusals, pid reuse, audit rows, grace, tree."""
+"""ah kill (harness/hooks/ah_kill.py): refusals, pid reuse, audit rows, grace, tree."""
 import json
 import re
 import shutil
@@ -17,7 +17,6 @@ HOOKS = Path(__file__).resolve().parents[1] / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
 os.environ["AH_LOCAL_CONFIG"] = str(Path(__file__).resolve().parent / "data" / "local_fixture.json")  # hermetic hosts
 import ah_kill as ak  # noqa: E402
-import kill_guard as kg  # noqa: E402
 
 ME = os.getuid()
 OWN = 5000
@@ -624,8 +623,7 @@ class Roles(KillBase):
         self.assertIn("daemon", intent["lifted"])
 
     def test_an_ordinary_foreign_stop_proceeds_with_the_owners_approval_of_that_pid(self):
-        resolver = lambda ask, session, home: {"ask": ask, "source": "answer:x", "uuid": "u", "at": "t",  # noqa: E731
-                                               "text": "yes, stop pid 1430"}
+        resolver = lambda ask, session, home: {"ask": ask, "source": "ah approvals", "pids": [1430]}  # noqa: E731
         out = self.run_kill(self.foreign(1430), [1430], foreign=True, approved_by="wa1b2c3d4e5f",
                             approval_resolver=resolver)
         self.assertEqual(out["results"][0]["status"], "exited")
@@ -884,79 +882,6 @@ class WindowsHost(unittest.TestCase):
         self.assertTrue(out["ok"])
 
 
-class SessionScope(KillBase):
-    """goodqa#15253 item 4: main stops what its own owners spawned, without --foreign (no high notice).
-
-    Exact ownership only: the pid and start time must be in an authenticated `kill_guard.py spawn` ledger entry for
-    a worktree inside ~/.agent-harness/work/<session>/. A cwd or a path in argv never counts."""
-    foreign = NarrowedScope.foreign
-    START = "Thu Nov  5 17:00:00 2026"
-
-    def sess(self, *parts):
-        return os.path.join(os.path.realpath(str(self.home)), ".agent-harness", "work", "sess-1", *parts)
-
-    def spawned(self, pid, root=None, start=None):
-        kg.append_ledger(root or self.sess("agent-y", "tree"), pid, start or self.START, home=str(self.home))
-
-    def probe_for(self, pid, cwd="/elsewhere/repo", cmd="/usr/bin/sleep 300", live_start=None):
-        probe = self.base(proc(pid, 1, cmd=cmd))
-        probe.cwds = {pid: cwd}
-        probe.spawn_start = lambda q, _s=live_start or self.START: _s if q == pid else None
-        return probe
-
-    def test_a_process_spawned_in_the_session_needs_no_foreign(self):
-        self.spawned(1201)
-        self.assertEqual(self.run_kill(self.probe_for(1201), [1201])["results"][0]["status"], "refused")  # flag needed
-        out = self.run_kill(self.probe_for(1201), [1201], session_scope=True)
-        self.assertEqual(out["results"][0]["status"], "exited")
-        self.assertEqual(self.notices, [])
-        intents = [r for r in self.audit() if r.get("event") == "intent" and r.get("pid") == 1201]
-        self.assertEqual(intents[0].get("scope"), "session-spawn")
-
-    def test_cwd_or_argv_in_the_session_dir_is_not_ownership(self):
-        # #133 accepted these; review round 1 and main's ruling: never by a shared directory or argv text
-        for pid, cwd, cmd in ((1202, self.sess("agent-y", "tree"), "/usr/bin/sleep 300"),
-                              (1203, "/elsewhere/repo", "/usr/bin/python3 " + self.sess("agent-y", "run.py"))):
-            out = self.run_kill(self.probe_for(pid, cwd=cwd, cmd=cmd), [pid], session_scope=True)
-            self.assertEqual(out["results"][0]["status"], "refused", (cwd, cmd))
-        self.assertEqual(self.notices, [])
-
-    def test_reused_pid_other_session_and_lookalike_roots_stay_foreign(self):
-        other = os.path.join(os.path.realpath(str(self.home)), ".agent-harness", "work", "sess-2", "t")
-        self.spawned(1210, start="Wed Nov  4 09:00:00 2026")                 # recorded start differs: pid reused
-        self.spawned(1211, root=other)                                        # another session's worktree
-        self.spawned(1212, root=self.sess() + "0/t")                          # work/sess-10: a prefix, not inside
-        self.spawned(1213, root=self.sess("..", "sess-2", "t"))              # dot segments out of the session dir
-        self.spawned(1214, root="remote:worker-2")                                # a remote ledger root
-        for pid in (1210, 1211, 1212, 1213, 1214, 1215):                      # 1215: never recorded
-            out = self.run_kill(self.probe_for(pid), [pid], session_scope=True)
-            self.assertEqual(out["results"][0]["status"], "refused", pid)
-        self.assertEqual(self.notices, [])
-
-    def test_a_forged_ledger_line_is_ignored(self):
-        root = self.sess("agent-y", "tree")
-        self.spawned(1299)  # creates the key and the ledger file
-        path = kg.ledger_path(root, str(self.home))
-        with open(path, "a") as handle:
-            handle.write(json.dumps({"pid": 1220, "start": self.START, "ts": 1, "root": root, "mac": "0" * 64}) + "\n")
-        out = self.run_kill(self.probe_for(1220), [1220], session_scope=True)
-        self.assertEqual(out["results"][0]["status"], "refused")
-
-    def test_protected_processes_are_still_refused(self):
-        self.spawned(1230)
-        probe = self.probe_for(1230, cmd="/usr/sbin/cron -f")
-        probe.procs[1230]["comm"] = "/usr/sbin/cron"
-        self.assertEqual(self.run_kill(probe, [1230], session_scope=True)["results"][0]["status"], "refused")
-
-    def test_a_session_id_is_required(self):
-        probe = self.foreign(1240, cwd=self.sess("x"))
-        with self.assertRaises(ak.KillError):
-            ak.kill_local([1240], "why", home=self.home, probe=probe, sleep=self.clock.sleep, clock=self.clock.now,
-                          session="", agent="", own_pid=OWN, worktree="/work", session_scope=True,
-                          notify=lambda h, e: None)
-        self.assertEqual(probe.sent, [])
-
-
 class ApprovedBy(KillBase):
     """goodqa#15253 (11-07): the user asked main to stop a harness-console from 11-04 and its codex app-server child;
     `ah kill` refused both with no path the user could authorize. --approved-by is that path, and it is bounded."""
@@ -965,8 +890,9 @@ class ApprovedBy(KillBase):
     TEXT = "please stop the stale harness-console pid 6101 and its codex child pid 6102, idle for days"
 
     def approval(self, text=None):
-        return lambda ask, session, home: {"ask": ask, "source": "answer:x", "uuid": "u", "at": "t",
-                                           "text": self.TEXT if text is None else text}
+        """What resolve_approval returns for an `ah approve kill --pids ...` record listing the pids in `text`."""
+        pids = [int(n) for n in re.findall(r"pid (\d+)", self.TEXT if text is None else text)]
+        return lambda ask, session, home: {"ask": ask, "source": "ah approvals", "pids": pids}
 
     def stale(self, *extra, cpu=0.0):
         probe = self.base(proc(6101, 1, cmd="/Users/me/.agent-harness/bin/harness-console --port 0",
@@ -996,30 +922,6 @@ class ApprovedBy(KillBase):
         intents = {r["pid"]: r for r in self.audit() if r.get("event") == "intent"}
         self.assertEqual({intents[6101]["scope"], intents[6102]["scope"]}, {"approved"})
         self.assertEqual(intents[6102]["lifted"], "protected process (codex)")
-
-    def test_each_bound_refuses(self):
-        cases = {
-            "not named": dict(text="please stop the stale processes"),
-            # delta red-team D-F3: a program name, a negation or a bare number collision is not an approval
-            "program name only": dict(text="yes, stop the stale codex processes"),
-            "negation": dict(text="do not stop codex pid 6201"),
-            "negation contraction": dict(text="pid 6201 is mine, don't stop it"),
-            "bare number": dict(text="the 6201 runs can go"),
-            "longer number": dict(text="stop pid 62011"),
-        }
-        for name, case in cases.items():
-            with self.subTest(name=name):
-                self.notices.clear()
-                probe = self.base(proc(6201, 1, cmd="/opt/codex/bin/codex app-server", comm="codex",
-                                       start=case.get("start", self.STALE), stat_=case.get("stat_", "S")))
-                probe.cwds = {6201: "/elsewhere/b"}
-                probe.cpu = lambda pid, c=case.get("cpu", 0.0): c
-                text = case.get("text", "stop codex pid 6201 please, it is stale")
-                out = self.approved(probe, [6201], text=text)
-                self.assertEqual(out["results"][0]["status"], "refused")
-                self.assertIn("--approved-by", out["results"][0]["detail"])
-                self.assertEqual(probe.sent, [])
-                self.assertEqual(self.notices, [])
 
     def test_other_refusals_are_never_lifted(self):
         text = "stop pids 6301 6302 6303 6304 6305 6306 rclone netwatch hookd sshd zsh"
@@ -1055,118 +957,37 @@ class ApprovedBy(KillBase):
         self.assertEqual(probe.sent, [])
 
 
-class ApprovalResolution(unittest.TestCase):
-    """resolve_approval reads the real asks ledger and transcript through provenance."""
-    SID = "11111111-2222-3333-4444-555555555555"
-    UID = "00000000-0000-0000-0000-0000000000a1"
-    ASK = "wa1b2c3d4e5f"
+class ApprovalRecord(unittest.TestCase):
+    """Release 1001: --approved-by names a live `ah approve kill --pids N` record; no asks ledger or transcript."""
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.home = Path(self.tmp.name)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+        import ah_approvals  # noqa: PLC0415
+        self.store = ah_approvals
 
-    def world(self, text="please stop the stale harness-console 6101 now", at="2026-11-07T10:00:00Z",
-              source=None, resolved=True, origin="human"):
-        projects = self.home / ".claude" / "projects" / "-x"
-        projects.mkdir(parents=True)
-        record = {"type": "user", "uuid": self.UID, "timestamp": at, "sessionId": self.SID,
-                  "origin": {"kind": origin}, "message": {"role": "user", "content": text}}
-        (projects / (self.SID + ".jsonl")).write_text(json.dumps(record, separators=(",", ":")) + "\n")
-        wals = self.home / ".claude" / "wals" / self.SID
-        wals.mkdir(parents=True)
-        rows = [{"at": "2026-11-07T09:59:00Z", "event": "ask", "id": self.ASK, "note": "stop 6101?", "reason": "user asked"}]
-        if resolved:
-            rows.append({"at": "2026-11-07T10:01:00Z", "event": "ask_resolved", "ref": self.ASK, "id": "wffffffffff1",
-                         "source": source or 'user:%s/%s "stop the stale harness-console 6101"' % (self.SID, self.UID)})
-        (wals / "main.jsonl").write_text("".join(json.dumps(r, separators=(",", ":")) + "\n" for r in rows))
+    def test_a_live_kill_record_resolves_to_its_pids(self):
+        record = self.store.grant("kill", {"pids": [4242, 4243]}, "user", "stale console", home=self.home)
+        self.assertEqual(ak.resolve_approval(record["id"], "s", self.home),
+                         {"ask": record["id"], "source": "ah approvals", "pids": [4242, 4243]})
 
-    NOW = 1794045600.0 + 7200  # 2026-11-07T12:00:00Z
+    def test_unknown_revoked_other_kind_and_pidless_records_are_refused(self):
+        other = self.store.grant("delete", {"path": "/tmp/x"}, "user", "a delete, not a kill", home=self.home)
+        pidless = self.store.grant("kill", {"project": str(self.home)}, "user", "no pids named", home=self.home)
+        revoked = self.store.grant("kill", {"pids": [7]}, "user", "revoked below", home=self.home)
+        self.store.revoke(revoked["id"], "user", home=self.home)
+        for ident in ("nope-0000", other["id"], pidless["id"], revoked["id"]):
+            with self.assertRaises(ak.KillError, msg=ident) as caught:
+                ak.resolve_approval(ident, "s", self.home)
+            self.assertEqual(caught.exception.code, "approval_invalid")
+        with self.assertRaises(ak.KillError):
+            ak.resolve_approval("a b", "s", self.home)
 
-    def resolve(self, ask=None, session=None):
-        return ak.resolve_approval(ask or self.ASK, session or self.SID, self.home, now=self.NOW)
-
-    def test_a_user_resolved_ask_verifies_and_carries_the_human_text(self):
-        self.world()
-        got = self.resolve()
-        self.assertIn("harness-console 6101", got["text"])
-        self.assertEqual(got["ask"], self.ASK)
-
-    def test_unverified_or_stale_approvals_are_refused(self):
-        bad = {
-            "unresolved": (dict(resolved=False), "no ask_resolved"),
-            "stale": (dict(at="2026-11-05T10:00:00Z"), "older than"),
-            "not human": (dict(origin="peer"), "verified human turn"),
-            "pasted": (dict(text="look <pasted_content>stop the stale harness-console 6101</pasted_content>",
-                            source='pasted:%s/%s "stop the stale harness-console 6101"' % (SID_, UID_)),
-                       "verified human turn"),
-            "excerpt not in turn": (dict(text="hello there, nothing to stop today"), "verified human turn"),
-        }
-        for name, (kw, why) in bad.items():
-            with self.subTest(name=name):
-                self.tearDown_world()
-                self.world(**kw)
-                with self.assertRaises(ak.KillError) as caught:
-                    self.resolve()
-                self.assertIn(why, str(caught.exception))
-        self.tearDown_world()
-        self.world()
-        for ask, session, why in (("wzzzzzzzzzzz", None, "no ask"),
-                                  (None, "99999999-2222-3333-4444-555555555555", "no ask"),
-                                  ("bad id!", None, "needs the id")):
-            with self.subTest(ask=ask, session=session):
-                with self.assertRaises(ak.KillError) as caught:
-                    self.resolve(ask, session)
-                self.assertIn(why, str(caught.exception))
-
-    def tearDown_world(self):
-        import shutil
-        shutil.rmtree(self.home / ".claude", ignore_errors=True)
-
-
-SID_, UID_ = ApprovalResolution.SID, ApprovalResolution.UID
-
-
-class ApprovedPids(unittest.TestCase):
-    """delta red-team D-F3: only an explicit pid list approves."""
-
-    def test_lists(self):
-        self.assertEqual(ak.approved_pids("stop pids 10968, 28579 and 39962 please"), {10968, 28579, 39962})
-        self.assertEqual(ak.approved_pids("pid: 4242"), {4242})
-        self.assertEqual(ak.approved_pids("the 2025 runs and claude can go"), set())
-
-
-class SessionBinding(unittest.TestCase):
-    """delta red-team D-F2: --session-scope and --approved-by use the caller's own session only."""
-    SID = "11111111-2222-3333-4444-555555555555"
-
-    def verdict(self, cmd, session):
-        with tempfile.TemporaryDirectory() as tmp:
-            return kg.decide(cmd, cwd=tmp, policy=kg.load_policy(), home=tmp, main=True, session=session)[0]
-
-    def test_ah_refuses_another_session(self):
-        import ah
-        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": self.SID}):
-            for extra in (["--session-scope"], ["--approved-by", "wa1b2c3d4e5f"]):
-                with self.subTest(extra=extra):
-                    args = ah.build_parser().parse_args(["kill", "--pid", "4242", "--reason", "stale",
-                                                         "--session", "other-session-0001"] + extra)
-                    with self.assertRaises(ah.AhError) as caught:
-                        ah.run(args, Path(home))
-                    self.assertIn("this session only", str(caught.exception))
-
-
-class HookAllowsAhKill(unittest.TestCase):
-    """kill_guard does not re-judge `ah kill`: ah kill refuses and audits per pid itself (redesign 2026-11-24)."""
-
-    def test_every_ah_kill_form_passes_the_guard(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            for cmd in ("python3 -I ~/.claude/hooks/ah.py kill --help",
-                        "python3 ~/.claude/hooks/ah.py kill --pid 4242 --reason x --approved-by wa1b2c3d4e5f",
-                        "ah kill --pid 4242 --reason stuck --session-scope",
-                        "python3 -I ~/.claude/hooks/ah.py kill --pid 4242 --reason orphaned --host win-1 --foreign"):
-                with self.subTest(cmd=cmd):
-                    self.assertEqual(kg.decide(cmd, cwd=tmp, home=tmp)[0], "allow")
+    def test_the_kill_guard_spawn_ledger_and_session_scope_are_gone(self):
+        self.assertFalse(hasattr(ak, "session_spawns"))
+        self.assertFalse(hasattr(ak, "_kill_guard"))
+        self.assertNotIn("session_scope", ak.kill_local.__code__.co_varnames)
 
 
 if __name__ == "__main__":

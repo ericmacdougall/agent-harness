@@ -703,14 +703,6 @@ class GitBackstop(Fixture):
         control = self.commit("Merge side into main", {"CLAUDECODE": "1"})
         self.assertEqual(control.returncode, 1, "without MERGE_HEAD the same text is not a merge")
 
-    def test_the_git_hook_runs_through_the_launcher_as_the_installer_writes_it(self):
-        sys.path.insert(0, str(HOOKS.parents[1]))
-        import install
-        script = Path("/h/.claude/hooks/commit_policy.py")
-        self.assertEqual(cp.git_hook_command(script), install.git_hook_command(script))
-        self.assertIn("ah_hook.py", cp.git_hook_command(script))
-        self.assertTrue(cp.git_hook_command(script).endswith(" commit_policy.py git-hook"))
-
     def test_missing_script_never_breaks_commits(self):
         copy = self.root / "hooks-copy"
         shutil.copytree(HOOKS, copy)

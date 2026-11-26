@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Append a human-readable event to this user's Claude Code WAL."""
+"""Append a human-readable event to this user's Claude Code WAL.
+
+`--source` is a free label of where a requirement, ask, decision, scope or blocker came from (`user:<session>/<uuid>
+"words"`, `ticket:`, `file:`, `inferred:` ...). Release 1001 resolves nothing: a row without one is written and flagged
+`unsourced`, with one warning."""
+from __future__ import annotations
 
 import argparse
 import json
@@ -19,10 +24,10 @@ EVENTS = {'intent', 'scope', 'decision', 'risk', 'check', 'commit', 'blocker', '
 GOAL_RE = re.compile(r'^[a-z0-9][a-z0-9_-]{0,63}$')
 TICKET_RE = re.compile(r'^\s*(?:GoodQA\s+)?[A-Za-z][A-Za-z0-9-]{0,62}\s*#\s*[1-9][0-9]{0,9}\s*$')
 REALLY_TESTED_RE = re.compile(r'^\s*REALLY_TESTED\s+[A-Za-z0-9._-]+')
-SHA_OR_VERSION_RE = re.compile(r"\b(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b|\bv\d+\.\d+(?:\.\d+)?\b|\b\d+\.\d+\.\d+\b")  # as goals_view.SHA_OR_VERSION
-# Events whose origin must be traceable (provenance.py). The mode per event is in provenance_policy.json.
+SHA_OR_VERSION_RE = re.compile(r"\b(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b|\bv\d+\.\d+(?:\.\d+)?\b|\b\d+\.\d+\.\d+\b")  # as ah.SHA_OR_VERSION
+# Events that carry a Source label; one written without it is flagged unsourced (never refused).
 SOURCED = ('requirement', 'ask', 'blocker', 'scope', 'decision')
-TOOL_WRITERS = frozenset({'escalation', 'ahd', 'dropped_gate', 'ah-run'})  # rows these tools write on an agent's behalf (goodqa#14791)
+TOOL_WRITERS = frozenset({'dropped_gate', 'ah-run'})  # rows these tools write on an agent's behalf (goodqa#14791)
 SECRET_PATTERN = re.compile(
     r'(?i)(?:\bgh[pousr]_[A-Za-z0-9_]+|\bgithub_pat_[A-Za-z0-9_]+|'
     r'\bsk-[A-Za-z0-9-]{12,}|\bAKIA[A-Z0-9]{12}|'
@@ -38,58 +43,6 @@ SECRET_PATTERN = re.compile(
     r'\b[a-z][a-z0-9+.-]*://[^\s/?#@]+@[^\s/?#]+|'
     r'-----BEGIN (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----)'
 )
-
-
-def provenance_check(event, source, allow_mc=False, session=None):
-    """(mode, problem-or-None, is_assumption, normalised-source-or-None). Never raises: a resolver failure is a
-    problem, not a crash. `session` (the WAL folder's session id) is where a quoted source is looked up."""
-    try:
-        import provenance
-    except ImportError:
-        return 'warn', 'provenance.py is not installed', False, None
-    try:
-        mode = provenance.load_policy()['wal'].get(event, 'warn')
-        if mode == 'off':
-            return mode, None, False, None
-        if not source:
-            return mode, f'{event} has no --source', False, None
-        ctx = {}
-        if allow_mc:
-            ctx['allow_mc'] = True
-        if session:
-            ctx['session'] = session
-        result = provenance.resolve(source, ctx)
-        normalized = result.get('normalized')
-        if not result['ok']:
-            first = result['problems'][0] if result['problems'] else {'code': 'rejected', 'message': 'rejected'}
-            return mode, f"source rejected ({first['code']}): {first['message']}", result['assumption'], normalized
-        if event in ('requirement', 'ask') and provenance.weak_problem(result):
-            return mode, provenance.weak_problem(result), result['assumption'], normalized
-        if provenance.unreachable_warning(result):  # tracker outage: warn, never refuse
-            return 'warn', provenance.unreachable_warning(result), result['assumption'], normalized
-        return mode, None, result['assumption'], normalized
-    except Exception as error:
-        return 'warn', f'provenance check failed ({type(error).__name__})', False, None
-
-
-def ask_entry(path, ref: str):
-    """The last `ask` entry with id `ref` in this WAL (bounded tail read), or None."""
-    try:
-        import safe_input  # noqa: PLC0415
-        tail = safe_input.read_tail(path, 4 << 20)
-    except Exception:  # noqa: BLE001
-        return None
-    found = None
-    for raw in tail.splitlines():
-        if ref.encode() not in raw:
-            continue
-        try:
-            rec = json.loads(raw)
-        except ValueError:
-            continue
-        if isinstance(rec, dict) and rec.get('event') == 'ask' and rec.get('id') == ref:
-            found = rec
-    return found
 
 
 def open_ask_exists(path, ref: str) -> bool:
@@ -129,15 +82,14 @@ def sibling_ask_wal(path, ref: str):
     if len(holders) != 1:
         return None
     needle = ref.encode()
-    for other in wals:  # a resolution anywhere in the session closes it (provenance ledger rule)
+    for other in wals:  # a resolution anywhere in the session closes it
         try:
-            import provenance  # noqa: PLC0415
-            # red-team F2 and M2: the whole file (not a 4 MiB tail), through the bounded reader that opens regular files
-            # only (a FIFO cannot hang it), caps the size and the scan time, and reports an oversized line as None
-            for raw in provenance._lines_containing(other, needle):
-                if raw is None:
-                    return None  # a line too long to read could hold the resolution: do not guess that it is open
-                if b'"ask_resolved"' in raw:
+            import safe_input  # noqa: PLC0415
+            # red-team F2 and M2: the whole file through the bounded reader that opens regular files only (a FIFO
+            # cannot hang it) and caps the size; a file over the cap could hold the resolution, so it is not guessed open
+            data = safe_input.read_bounded(other, 64 << 20)
+            for raw in data.splitlines():
+                if needle in raw and b'"ask_resolved"' in raw:
                     rec = json.loads(raw)
                     if isinstance(rec, dict) and rec.get('event') == 'ask_resolved' and rec.get('ref') == ref:
                         return None
@@ -151,15 +103,15 @@ def main():
     parser.add_argument('--wal', type=Path, required=True)
     parser.add_argument('--event', choices=sorted(EVENTS), required=True)
     parser.add_argument('--note', required=True)
-    parser.add_argument('--source', help='origin: user:<session>/<uuid> "excerpt" | ticket: | wal: | file: | inferred: (see provenance.py)')
+    parser.add_argument('--source', help='origin label: user:<session>/<uuid> "excerpt" | ticket: | wal: | file: | inferred:')
     parser.add_argument('--reason', help='why this is asked of the user (required for ask)')
     parser.add_argument('--owner', help='ask only: the agent id whose stream this ask belongs to (a wait on it excuses only that owner)')
     parser.add_argument('--ref', help='id of the ask being closed (ask_resolved)')
     parser.add_argument('--decision', choices=('approved', 'declined'),
-                        help='ask_resolved only: the explicit outcome (escalation.py reads this field, never the note text)')
+                        help='ask_resolved only: the explicit outcome (readers use this field, never the note text)')
     parser.add_argument('--by', help='tool that writes this row on an agent\'s behalf (never flagged unsourced; cites its state in the note)')
     parser.add_argument('--recites', help='id of an unsourced entry of this WAL that this sourced row re-cites (clears its unsourced flag)')
-    parser.add_argument('--goal', help='mission goal id this row is evidence for (ah goals lists it as a tag candidate)')
+    parser.add_argument('--goal', help='goal id this row is evidence for (a free label)')
     parser.add_argument('--ticket', help='ticket this row is about, e.g. goodqa#123')
     parser.add_argument('--result', choices=('PASS', 'FAIL'), help='REALLY_TESTED rows: the stated result')
     parser.add_argument('--live', action='store_true', help='REALLY_TESTED rows: the test ran against the live system')
@@ -226,49 +178,27 @@ def main():
             print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': 'ask_resolved source must be the answer: user:, answer:, queue:, mc: or ticket:',
                               'hint': 'an ask cannot be closed on an inferred: or file: source'}), file=sys.stderr)
             return 2
-        mode, problem, assumption, normalized = provenance_check('ask', args.source, allow_mc=True,  # sourced like an ask (M1)
-                                                                 session=path.parent.name)
-        if problem:
-            print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': problem[:300],
-                              'hint': 'the resolution source must resolve: user:, answer:, queue: or ticket:'}), file=sys.stderr)
-            return 2
-        if args.source.strip().lower().startswith('mc:'):
-            import provenance as _prov  # noqa: PLC0415
-            # The decision must be for THIS session's ask as it reads in THIS main WAL now (spec rev 2: ids repeat
-            # across sessions and WALs, and an ask an owner registered is never closed by a dashboard click).
-            bound = _prov.mc_bind(args.source.strip(), args.ref, args.decision, ask=ask_entry(path, args.ref),
-                                  session=path.parent.name, wal=path.stem if ask_wal is None else ask_wal)
-            if bound:
-                print(json.dumps({'status': 'REFUSED', 'event': 'ask_resolved', 'problem': bound[:300],
-                                  'hint': 'an mc: source closes only the ask it names, with its own decision'}), file=sys.stderr)
-                return 2
         record['ref'] = args.ref
         if ask_wal:
             record['ask_wal'] = ask_wal
         record['source'] = args.source.strip()[:2000]
-        if normalized and normalized != record['source']:
-            record['source_normalized'] = normalized[:2000]
         if args.decision:
             record['decision'] = args.decision
-        if assumption:
-            record['assumption'] = True
     elif args.decision:
         parser.error('--decision applies to ask_resolved only')
     if args.event in SOURCED:
-        # Since 2026-11-24 a source never stops a note: one that does not trace is kept as given, flagged unsourced
-        # and reported as a warning (docs/provenance.md).
-        mode, problem, assumption, normalized = provenance_check(args.event, args.source, session=path.parent.name)
-        if problem and mode != 'off':
-            warnings.append(problem[:300])
-            record['provenance'] = 'missing' if not args.source else 'unverified'
-            if not args.source or 'rejected' in problem or 'failed' in problem:  # missing, untraced or unresolvable
-                record['unsourced'] = True  # an unverifiable ticket (tracker unreachable) is not flagged
-        if args.source:
+        # A source never stops a note: it is kept as given (a label, never resolved); a row without one is flagged.
+        if args.source and args.source.strip():
             record['source'] = args.source.strip()[:2000]
-            if normalized and normalized != record['source']:
-                record['source_normalized'] = normalized[:2000]
-            if assumption:
+            label = args.source.strip().lower()
+            if label.startswith('inferred'):
                 record['assumption'] = True
+            if label.startswith('mc:'):  # a dashboard click answers an ask; it is not the source of anything else
+                record['unsourced'] = True
+                warnings.append(f'an mc: source does not source a {args.event}; written and flagged unsourced')
+        else:
+            record['unsourced'] = True
+            warnings.append(f'{args.event} has no --source; written and flagged unsourced')
     if args.by:
         if args.by.strip() not in TOOL_WRITERS:
             parser.error(f'--by must be one of {sorted(TOOL_WRITERS)}: tool-written rows are an allowlist, not a claim')
@@ -279,7 +209,7 @@ def main():
         record['recites'] = args.recites
     append(path, record)
     for warning in warnings:
-        print('wal_note: provenance warning: ' + warning, file=sys.stderr)
+        print('wal_note: warning: ' + warning, file=sys.stderr)
     print(json.dumps({'status': 'WROTE', 'event': args.event, 'id': record['id'], 'wal': str(path),
                       **({'warnings': warnings} if warnings else {})}))
 

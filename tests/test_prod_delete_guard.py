@@ -1,9 +1,11 @@
 """goodqa#14908: prod_delete_guard.
 
 The detection cases are Hawkeye's own (tests/test-prod-delete-guard.py: H-1, H-1b, H-1c, the H-2
-accepted limitations and the BLOCKER 1-3 regression pins). Grants replace hawk_ask with a
-user-sourced file under ~/.agent-harness/state. Every test uses its own temporary HOME. Commands are
-judged by evaluate() or by the hook run as a child process, and are never executed.
+accepted limitations and the BLOCKER 1-3 regression pins). Release 1001 registers the guard on the database tools only,
+never on Bash, and lifts a refusal with a live `ah approve delete --host <target>` approval. The shell-shaped cases run
+through a local `db_tool_patterns` tool (`mcp__shell__run`, field `command`), the only way such text reaches the guard
+now. Every test uses its own temporary HOME. Commands are judged by evaluate() or by the hook run as a child process,
+and are never executed.
 PDG_HOOKS_DIR points the suite at another implementation; the mutants in the review packet use it
 to show the suite failing first.
 """
@@ -17,6 +19,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 import uuid
 from pathlib import Path
 
@@ -29,21 +32,33 @@ import prod_delete_guard as pdg  # noqa: E402
 SID = "0f4c2b6e-8d1a-4e5b-9c3d-7a2e1f6b5c4d"  # Claude Code session ids are UUIDs (provenance answer: form)
 
 
+SHELL_TOOL = "mcp__shell__run"  # a db_tool_patterns tool whose `command` field is read as a command
+
+
 def bash(command):
-    return {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": command}}
+    return {"hook_event_name": "PreToolUse", "tool_name": SHELL_TOOL, "tool_input": {"command": command}}
 
 
-def ok_resolver(source, home=None):
-    return {"text": "yes", "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+def approve(home, target, expires=None, kind="delete", granted_by="user"):
+    """Record what `ah approve delete --host <target>` records, in the approvals store under `home`."""
+    import ah_approvals  # noqa: PLC0415
+    return ah_approvals.grant(kind, {"host": target}, granted_by, "test: approved production delete", expires=expires,
+                              home=home)
 
 
 class Case(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="pdg-")
         self.home = Path(os.path.realpath(self._tmp.name))
-        self._env = {k: os.environ.get(k) for k in ("HOME", "CLAUDE_CONFIG_DIR")}
+        self._env = {k: os.environ.get(k) for k in ("HOME", "CLAUDE_CONFIG_DIR", "AH_LOCAL_CONFIG")}
         os.environ["HOME"] = str(self.home)
         os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        local = self.home / "local.json"
+        local.write_text(json.dumps({"db_tool_patterns": [{"tool": SHELL_TOOL, "fields": ["command"]}]}))
+        os.environ["AH_LOCAL_CONFIG"] = str(local)
+        import ah_local  # noqa: PLC0415
+        ah_local.reset()
+        self.addCleanup(ah_local.reset)
         self.wal = self.home / ".claude/wals/s/agent-pdg.jsonl"
         self.wal.parent.mkdir(parents=True)
 
@@ -65,45 +80,6 @@ class Case(unittest.TestCase):
 
     def assertAllowed(self, command, **kw):
         self.assertEqual(self.verdict(bash(command), **kw), "allow", command)
-
-    def human_turn(self, text="Yes, drop it (Recommended)", when=None):
-        """An AskUserQuestion answer whose selected option is `text` (grants come only from answers)."""
-        return self.answer("Which action should I take?", text, when=when)
-
-    def typed_turn(self, text, when=None):
-        uid = str(uuid.uuid4())
-        stamp = when or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        path = self.home / ".claude/projects/p" / (SID + ".jsonl")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        record = {"type": "user", "uuid": uid, "timestamp": stamp, "sessionId": SID, "origin": {"kind": "human"},
-                  "message": {"role": "user", "content": text}}
-        with open(path, "a") as fh:
-            fh.write(json.dumps(record) + "\n")
-        return "user:%s/%s" % (SID, uid)
-
-    def answer(self, question, choice, options=None, when=None):
-        use, uid = "toolu_%s" % uuid.uuid4().hex[:16], str(uuid.uuid4())
-        stamp = when or time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
-        opts = [{"label": o, "description": o} for o in (options or [choice, "No"])]
-        ask = {"type": "assistant", "uuid": str(uuid.uuid4()), "timestamp": stamp, "sessionId": SID,
-               "message": {"role": "assistant", "content": [{"type": "tool_use", "id": use, "name": "AskUserQuestion",
-                                                             "input": {"questions": [{"question": question,
-                                                                                      "options": opts}]}}]}}
-        reply = {"type": "user", "uuid": uid, "timestamp": stamp, "sessionId": SID,
-                 "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use, "content": "ok"}]},
-                 "toolUseResult": {"answers": {question: choice}}}
-        path = self.home / ".claude/projects/p" / (SID + ".jsonl")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a") as fh:
-            fh.write(json.dumps(ask) + "\n" + json.dumps(reply) + "\n")
-        return "answer:%s/%s" % (SID, uid)
-
-    def write_grants(self, grants):
-        path = pdg.grants_path(str(self.home))
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"grants": grants}))
-        return path
-
 
 class Detection(Case):
     """Hawkeye's cases, as end-to-end verdicts with no grant recorded."""
@@ -183,13 +159,25 @@ class Detection(Case):
             with self.subTest(ev=ev):
                 self.assertEqual(self.verdict(ev), "allow")
 
-    def test_matcher_covers_every_judged_tool_shape(self):
-        for name in ("Bash", "mcp__cloudflare__d1_database_query", "mcp__pg__execute_sql",
+    def test_matcher_covers_every_judged_tool_shape_and_never_bash(self):
+        for name in ("mcp__cloudflare__d1_database_query", "mcp__pg__execute_sql",
                      "mcp__x__run_sql", "mcp__x__query", "mcp__x__sql", "mcp__cloudflare__hyperdrive_configs_list"):
             with self.subTest(name=name):
                 self.assertTrue(re.fullmatch(pdg.MATCHER, name))
-        for name in ("Write", "Edit", "Read", "Agent"):
+        for name in ("Bash", "PowerShell", "Write", "Edit", "Read", "Agent"):
             self.assertFalse(re.fullmatch(pdg.MATCHER, name), name)
+        self.assertFalse(re.fullmatch(pdg.matcher(), "Bash"))
+
+    def test_a_bash_payload_is_not_judged_even_when_a_local_pattern_names_bash(self):
+        cmd = "psql --host=prod-db.example.com -c 'TRUNCATE sessions'"
+        event = {"tool_name": "Bash", "tool_input": {"command": cmd}}
+        self.assertEqual(self.verdict(event), "allow")
+        (self.home / "local.json").write_text(json.dumps({"db_tool_patterns": [{"tool": "Bash", "fields": ["command"]},
+                                                                              {"tool": ".*", "fields": ["command"]}]}))
+        import ah_local  # noqa: PLC0415
+        ah_local.reset()
+        self.assertEqual(self.verdict(event), "allow")
+        self.assertFalse(re.fullmatch(pdg.matcher(), "Bash"))
 
 
 class LocalDbTools(unittest.TestCase):
@@ -227,171 +215,6 @@ class LocalDbTools(unittest.TestCase):
         sys.path.insert(0, str(ROOT))
         import install
         self.assertEqual(install.prod_delete_matcher(), pdg.matcher())
-
-
-class Grants(Case):
-    CMD = "psql --host=prod-db.example.com -c 'TRUNCATE sessions'"
-    TARGET = "prod-db.example.com"
-
-    def real_grant(self, target=None, ttl=600, **kw):
-        source = self.human_turn("Yes, run the delete on %s" % (target or self.TARGET))
-        return pdg.grant(source, target or self.TARGET, str(self.wal), ttl=ttl, home=str(self.home), **kw)
-
-    def stored(self):
-        return json.loads(pdg.grants_path(str(self.home)).read_text())["grants"]
-
-    def store(self, grants):
-        pdg.grants_path(str(self.home)).parent.mkdir(parents=True, exist_ok=True)
-        pdg.grants_path(str(self.home)).write_text(json.dumps({"grants": grants}))
-
-    def test_signed_grant_for_exact_target_allows(self):
-        self.real_grant()
-        self.assertAllowed(self.CMD)
-        self.assertAllowed(self.CMD)  # reusable until it expires (stated design)
-
-    def test_target_is_an_exact_token_never_a_substring(self):
-        # native review F2: each of these grants used to widen into every prod delete
-        cases = (("prod-db-1", "psql -h prod-db-10 -c 'DELETE FROM users'"),
-                 ("staging-x", "psql -h prod-main -c 'DELETE FROM users' # staging-x"),
-                 ("prod-db.example", "psql -h prod-db.example.com -c 'DELETE FROM users'"))
-        for target, command in cases:
-            with self.subTest(target=target):
-                self.real_grant(target)
-                self.assertDenied(command)
-
-    def test_keyword_and_client_targets_refused(self):
-        for target in ("DELETE", "psql", "TRUNCATE", "drop", "mysql", "a b", "pr", "prod*", " x-db"):
-            with self.subTest(target=target):
-                with self.assertRaises(ValueError):
-                    self.real_grant(target)
-
-    def test_every_prod_target_needs_its_own_grant(self):
-        self.real_grant("prod-a")
-        cmd = "psql -h prod-a -c 'DELETE FROM t'; mysql -h prod-b -e 'DROP DATABASE x'"
-        self.assertDenied(cmd)
-        self.real_grant("prod-b")
-        self.assertAllowed(cmd)
-
-    def test_connection_string_grant_names_host_or_database(self):
-        cmd = "psql 'postgresql://u:p@prod-db.example.com:5432/main' -c 'DROP TABLE users'"
-        self.assertDenied(cmd)
-        self.real_grant("prod-db.example.com")
-        self.assertAllowed(cmd)
-
-    def test_hand_written_unsigned_grant_denies(self):
-        # native review F1: a JSON entry with a far expiry and an old real source used to allow
-        source = self.human_turn(when="2020-01-01T00:00:00Z")
-        self.store([{"scope": "prod-db", "target": self.TARGET, "user_source": source, "granted_at": 1,
-                     "expires_at": 4102444800, "source_ts": 1577836800}])
-        self.assertDenied(self.CMD)
-
-    def test_tampered_or_overlong_signed_grant_denies(self):
-        self.real_grant()
-        good = self.stored()[0]
-        for field, value in (("expires_at", good["granted_at"] + pdg.MAX_TTL + 600), ("target", "prod-other"),
-                             ("source_ts", good["source_ts"] - 2 * 86400)):
-            with self.subTest(field=field):
-                bad = dict(good, **{field: value})
-                self.store([bad])
-                self.assertDenied(self.CMD if field != "target" else "psql -h prod-other -c 'TRUNCATE x'")
-                # re-signed with the real key, the bounds still deny an overlong or stale grant
-                key = pdg._read_key(str(self.home))
-                bad["mac"] = pdg._mac(key, bad)
-                self.store([bad])
-                if field != "target":
-                    self.assertDenied(self.CMD)
-
-    def test_signed_grant_of_another_scope_denies(self):
-        self.real_grant()
-        bad = dict(self.stored()[0], scope="log-delete")
-        bad["mac"] = pdg._mac(pdg._read_key(str(self.home)), bad)
-        self.store([bad])
-        self.assertDenied(self.CMD)
-
-    def test_expired_grant_denies_and_says_so(self):
-        self.real_grant(ttl=1)
-        result = pdg.evaluate(bash(self.CMD), home=str(self.home), now=time.time() + 5)
-        self.assertEqual(result[0], "deny")
-        self.assertIn("expired", result[1])
-
-    def test_grant_whose_source_no_longer_resolves_denies(self):
-        self.real_grant()
-        (self.home / ".claude/projects/p" / (SID + ".jsonl")).write_text("")
-        self.assertDenied(self.CMD)
-
-    def test_source_lookup_ignores_claude_config_dir(self):
-        # the answer lives only under CLAUDE_CONFIG_DIR: a lookup that honoured it would grant (mutant M23)
-        question, label = "Delete on %s?" % self.TARGET, "Yes, run the delete on %s" % self.TARGET
-        source = self.answer(question, label)
-        in_home = self.home / ".claude/projects/p" / (SID + ".jsonl")
-        fake = self.home / "fake-claude"
-        (fake / "projects/x").mkdir(parents=True)
-        moved = fake / "projects/x" / (SID + ".jsonl")
-        moved.write_text(in_home.read_text())
-        in_home.write_text("")
-        os.environ["CLAUDE_CONFIG_DIR"] = str(fake)
-        with self.assertRaises(ValueError):
-            pdg.grant(source, self.TARGET, str(self.wal), home=str(self.home))
-        # control: the same answer under <home>/.claude grants, so the refusal above is about the location
-        in_home.write_text(moved.read_text())
-        pdg.grant(source, self.TARGET, str(self.wal), home=str(self.home))
-
-    def test_corrupt_unreadable_or_unkeyed_store_denies(self):
-        # native review F4: these used to give "ask"
-        path = pdg.grants_path(str(self.home))
-        path.parent.mkdir(parents=True, exist_ok=True)
-        for content in ("{not json", '{"grants": 3}', '{"grants": [1]}'):
-            with self.subTest(content=content):
-                path.write_text(content)
-                self.assertEqual(self.verdict(bash(self.CMD)), "deny")
-        path.unlink()
-        self.real_grant()
-        pdg.key_path(str(self.home)).unlink()
-        self.assertDenied(self.CMD)
-        path.unlink()
-        path.mkdir()
-        self.assertDenied(self.CMD)
-        self.assertAllowed("ls")  # a broken store never touches non-matching commands
-
-    def test_error_after_match_denies(self):
-        saved = pdg.matching_grants
-        pdg.matching_grants = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
-        try:
-            self.assertDenied(self.CMD)
-        finally:
-            pdg.matching_grants = saved
-
-    def test_real_grant_round_trip_through_provenance_and_wal(self):
-        entry = self.real_grant()
-        self.assertEqual(entry["scope"], "prod-db")
-        for path in (pdg.grants_path(str(self.home)), pdg.key_path(str(self.home))):
-            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
-        wal = [json.loads(line) for line in self.wal.read_text().splitlines()]
-        self.assertTrue(any("prod_delete_guard grant" in r.get("note", "") for r in wal))
-
-    def test_grant_refusals_write_nothing(self):
-        source = self.human_turn("delete on %s" % self.TARGET)
-        old = self.human_turn("delete on %s" % self.TARGET, when="2026-01-01T00:00:00Z")
-        cases = (dict(user_source="inferred: from me -- x"), dict(user_source="ticket:GoodQA goodqa#1"),
-                 dict(user_source="user:%s/%s" % (SID, uuid.uuid4())), dict(user_source=old),
-                 dict(target="pr"), dict(target=" prod-db "), dict(ttl=0), dict(ttl=pdg.MAX_TTL + 1), dict(wal=""))
-        for over in cases:
-            kw = dict(user_source=source, target=self.TARGET, wal=str(self.wal), ttl=600, home=str(self.home))
-            kw.update(over)
-            with self.subTest(over=over):
-                with self.assertRaises(ValueError):
-                    pdg.grant(**kw)
-                self.assertFalse(pdg.grants_path(str(self.home)).exists())
-
-    def test_failed_wal_record_writes_no_grant(self):
-        with self.assertRaises(ValueError):
-            self.real_grant(record=lambda *a: False)
-        self.assertFalse(pdg.grants_path(str(self.home)).exists())
-
-    def test_expired_and_unsigned_grants_are_pruned_on_write(self):
-        self.store([{"scope": "prod-db", "target": "prod-old", "expires_at": 1}])
-        self.real_grant()
-        self.assertEqual([g["target"] for g in self.stored()], [self.TARGET])
 
 
 class Bypasses(Case):
@@ -453,16 +276,6 @@ class Bypasses(Case):
                 self.assertDenied(command)
         self.assertAllowed("psql -h prod-db -c 'UPDATE users SET email=null WHERE id=4'")
 
-    def test_d1_tool_grant_names_database_id(self):
-        ev = {"tool_name": "mcp__cloudflare__d1_database_query",
-              "tool_input": {"database_id": "panel-prod-d1", "sql": "DELETE FROM devices"}}
-        self.assertEqual(self.verdict(ev), "deny")
-        pdg.grant(self.human_turn("ok, delete on panel-prod-d1"), "panel-prod-d1", str(self.wal), home=str(self.home))
-        self.assertEqual(self.verdict(ev), "allow")
-        ev["tool_input"] = {"sql": "DELETE FROM devices"}  # no database named: nothing a grant can cover
-        self.assertEqual(self.verdict(ev), "deny")
-
-
 class HookProcess(Case):
     """The installed shape: python3 -I <script>, payload on stdin, like doctor's canary."""
 
@@ -482,21 +295,6 @@ class HookProcess(Case):
                            capture_output=True, text=True, timeout=60, check=False)
         self.assertEqual((r.returncode, r.stdout), (0, ""))
 
-    def test_cli_grant_and_list(self):
-        source = self.human_turn("Yes, truncate on prod-db.example.com")
-        cmd = [sys.executable, str(HOOKS / "prod_delete_guard.py")]
-        r = subprocess.run(cmd + ["grant", "--user-source", source, "--target", "prod-db.example.com", "--wal",
-                                  str(self.wal), "--ttl", "120"], capture_output=True, text=True, timeout=60)
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(json.loads(r.stdout)["status"], "GRANTED")
-        listed = subprocess.run(cmd + ["list"], capture_output=True, text=True, timeout=60)
-        self.assertEqual([g["target"] for g in json.loads(listed.stdout)], ["prod-db.example.com"])
-        refused = subprocess.run(cmd + ["grant", "--user-source", "inferred: x", "--target", "prod-db", "--wal",
-                                        str(self.wal)], capture_output=True, text=True, timeout=60)
-        self.assertEqual(refused.returncode, 2)
-        self.assertEqual(json.loads(refused.stderr)["status"], "REFUSED")
-
-
 class Install(unittest.TestCase):
     def test_installer_registers_guard_fail_open_with_matcher(self):
         sys.path.insert(0, str(ROOT))
@@ -505,7 +303,8 @@ class Install(unittest.TestCase):
         groups = [g for g in install.managed_hooks(claude)["PreToolUse"]
                   if any(str(claude / "hooks" / "prod_delete_guard.py") in install.hook_argv(h) for h in g["hooks"])]
         self.assertEqual(len(groups), 1)
-        self.assertEqual(groups[0]["matcher"], pdg.MATCHER)
+        self.assertEqual(groups[0]["matcher"], pdg.matcher())
+        self.assertFalse(re.fullmatch(groups[0]["matcher"], "Bash"))
         self.assertNotIn("onFailure", groups[0]["hooks"][0])
         self.assertIn("prod_delete_guard.py", install.HOOKS)
         self.assertIn(str(claude / "hooks" / "prod_delete_guard.py"), install.managed_scripts(claude))
@@ -562,52 +361,10 @@ class Round3(Case):
             with self.subTest(command=command):
                 self.assertEqual(self.verdict(self.ev(command)), "allow")
 
-    def test_r4_a_turn_that_does_not_name_the_target_funds_no_grant(self):
-        for text in ("thanks, looks good", "hi", "yes, delete on prod-db-10", "drop prod-dbx"):
-            with self.subTest(text=text):
-                with self.assertRaises(ValueError) as caught:
-                    pdg.grant(self.human_turn(text), "prod-db", str(self.wal), home=str(self.home))
-                self.assertIn("does not name", str(caught.exception))
-        self.assertFalse(pdg.grants_path(str(self.home)).exists())
-        pdg.grant(self.human_turn("Yes, DELETE the rows on PROD-DB."), "prod-db", str(self.wal), home=str(self.home))
-        self.assertAllowed("psql -h prod-db -c 'DELETE FROM t'")
-
-    def test_r4_source_older_than_an_hour_refused(self):
-        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 2 * 3600))
-        with self.assertRaises(ValueError):
-            pdg.grant(self.human_turn("delete on prod-db", when=stamp), "prod-db", str(self.wal), home=str(self.home))
-
-    def test_r4_answer_selecting_an_option_naming_the_target_funds_a_grant(self):
-        good = self.answer("Run DELETE FROM sessions?", "Approve DELETE on prod-db (Recommended)")
-        pdg.grant(good, "prod-db", str(self.wal), home=str(self.home))
-        self.assertAllowed("psql -h prod-db -c 'DELETE FROM sessions'")
-        other = self.answer("Ship the release notes?", "Yes")
-        with self.assertRaises(ValueError):
-            pdg.grant(other, "prod-other", str(self.wal), home=str(self.home))
-
     def test_r5_d1_target_skips_flags_and_flag_targets_refused(self):
         desc, groups = pdg.targets_production("wrangler d1 execute --remote mydb --command 'DELETE FROM t'")
         self.assertEqual(groups, [("mydb",)])
-        with self.assertRaises(ValueError):
-            pdg.grant(self.human_turn("delete on --remote"), "--remote", str(self.wal), home=str(self.home))
-
-    def test_r6_key_must_be_a_private_regular_file(self):
-        pdg.grant(self.human_turn("delete on prod-db"), "prod-db", str(self.wal), home=str(self.home))
-        key = pdg.key_path(str(self.home))
-        self.assertAllowed("psql -h prod-db -c 'DELETE FROM t'")
-        os.chmod(key, 0o644)
-        self.assertDenied("psql -h prod-db -c 'DELETE FROM t'")
-        os.chmod(key, 0o600)
-        os.link(key, self.home / "key-copy")
-        self.assertDenied("psql -h prod-db -c 'DELETE FROM t'")
-        os.unlink(self.home / "key-copy")
-        planted = self.home / "public.key"
-        planted.write_bytes(key.read_bytes())
-        os.chmod(planted, 0o600)
-        key.unlink()
-        os.symlink(planted, key)
-        self.assertDenied("psql -h prod-db -c 'DELETE FROM t'")
-
+        self.assertTrue(pdg.valid_target("--remote"))  # a flag is never an approvable target
 
 class Round4(Case):
     """Native delta re-review of ca56501 (hk-wave1-r3-ca56501.md): B1-B7 and N1."""
@@ -633,31 +390,6 @@ class Round4(Case):
 
     def ev(self, command):
         return dict(bash(command), cwd=str(self.home))
-
-    def refused(self, source, target="prod-db"):
-        with self.assertRaises(ValueError):
-            pdg.grant(source, target, str(self.wal), home=str(self.home))
-
-    def test_b1_only_the_selected_answer_counts(self):
-        self.refused(self.answer("Delete the users table rows on prod-db?", "No"))
-        self.refused(self.answer("Which database should I clean up?", "staging-db", options=["staging-db", "prod-db"]))
-        self.refused(self.answer("Run the migration on staging-db first, before anything touches prod-db?", "Yes"))
-        self.refused(self.answer("Delete rows?", "No, keep prod-db as it is", options=["Delete on prod-db",
-                                                                                   "No, keep prod-db as it is"]))
-        self.refused(self.typed_turn("do NOT touch prod-db under any circumstances"))
-        self.refused(self.typed_turn("yes, delete on prod-db"))  # typed turns cannot be told from negations
-        self.assertFalse(pdg.grants_path(str(self.home)).exists())
-        self.assertDenied("psql -h prod-db -c 'DELETE FROM users'")
-        pdg.grant(self.answer("Delete the stale rows?", "Approve DELETE on prod-db"), "prod-db", str(self.wal),
-                  home=str(self.home))
-        self.assertAllowed("psql -h prod-db -c 'DELETE FROM users'")
-
-    def test_b6_target_must_stand_alone_and_db_only_grants_do_not_cover_prod_hosts(self):
-        self.refused(self.human_turn("Approve: prod-db.example.com:5432 failed"))
-        self.refused(self.human_turn("Approve restore of /srv/backups/prod-db/latest.sql"))
-        pdg.grant(self.human_turn("Approve DELETE on app"), "app", str(self.wal), home=str(self.home))
-        self.assertDenied("psql 'postgresql://u@prod-billing/app' -c 'DROP TABLE users'")
-        self.assertDenied("psql 'postgres://u@prod-auth.example.com/app' -c 'DROP DATABASE app'")
 
     def test_b2_oversized_command_keeps_a_positional_prod_database(self):
         filler = "SELECT 1; " * 7000  # about 70 KB inside the quoted -c
@@ -740,7 +472,7 @@ class Round5(Case):
             (self.cwd / name).write_text(body)
 
     def hook(self, command):
-        payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": command},
+        payload = {"hook_event_name": "PreToolUse", "tool_name": SHELL_TOOL, "tool_input": {"command": command},
                    "cwd": str(self.cwd)}
         env = dict(os.environ, HOME=str(self.home))
         env.pop("CLAUDE_CONFIG_DIR", None)
@@ -808,38 +540,67 @@ class Round5(Case):
                     "head -c 99 evil.sql | psql -h prod-db -U svc -c 'SELECT 1'",
                     "head -c 99 evil.sql | psql -h prod-db app < ok.sql"), "allow")
 
-    def test_h4_declining_or_second_target_answers_fund_nothing(self):
-        for text in ("Don’t delete prod-db", "Nope, prod-db stays", "Abort: prod-db must be preserved",
-                     "Reject DELETE on prod-db", "Delete on staging-db; prod-db untouched", "Nah, prod-db",
-                     "Approve DELETE on staging-db (prod-db only after the backup)", "Deny prod-db"):
-            with self.subTest(text=text):
-                self.assertFalse(pdg.names_target({"text": text}, "prod-db"), text)
-        self.assertTrue(pdg.names_target({"text": "Approve DELETE on prod-db"}, "prod-db"))
-        self.assertTrue(pdg.names_target({"text": "Approve DELETE on hold-db"}, "hold-db"))  # was an over-refusal
 
+class Approvals(Case):
+    """Release 1001: the approvals store is the one record (docs/approvals.md); the signed grant file is gone."""
+    CMD = "psql --host=prod-db.example.com -c 'TRUNCATE sessions'"
+    TARGET = "prod-db.example.com"
 
-class GrantWalCitation(Case):
-    """wal_note.py (goodqa#14927) refuses an answer: source with no verbatim excerpt; the grant cites one."""
+    def test_a_live_delete_approval_for_the_exact_target_allows(self):
+        self.assertDenied(self.CMD)
+        approve(self.home, self.TARGET)
+        self.assertAllowed(self.CMD)
+        self.assertAllowed(self.CMD.replace(self.TARGET, self.TARGET.upper()))  # case-folded
 
-    def test_grant_records_a_resolvable_cited_answer_in_the_wal(self):
-        source = self.human_turn('Yes, run the delete on prod-db.example.com "now"')
-        pdg.grant(source, "prod-db.example.com", str(self.wal), home=str(self.home))
-        rows = [json.loads(line) for line in self.wal.read_text().splitlines() if line.strip()]
-        row = [r for r in rows if "prod_delete_guard grant" in str(r.get("note"))][-1]
-        self.assertEqual(row["source"], '%s "Yes, run the delete on prod-db.example.com"' % source)
-        self.assertFalse(row.get("assumption") or row.get("quarantined"), row)
+    def test_the_target_is_an_exact_name_never_a_substring(self):
+        approve(self.home, "prod-db")
+        self.assertDenied(self.CMD)
+        approve(self.home, "example.com")
+        self.assertDenied(self.CMD)
 
-    def test_answer_too_short_to_cite_is_refused_with_a_reason(self):
-        source = self.human_turn("db-x1")
-        with self.assertRaisesRegex(ValueError, "too short to cite"):
-            pdg.grant(source, "db-x1", str(self.wal), home=str(self.home))
-        self.assertFalse(pdg.grants_path(str(self.home)).exists() and pdg.load_grants(str(self.home)))
+    def test_every_prod_target_needs_its_own_approval(self):
+        both = "psql -h prod-a -c 'DELETE FROM t' | psql -h prod-b -c 'DELETE FROM u'"
+        approve(self.home, "prod-a")
+        self.assertDenied(both)
+        approve(self.home, "prod-b")
+        self.assertAllowed(both)
 
-    def test_wal_refusal_reason_reaches_the_caller(self):
-        source = self.human_turn("Approve DELETE on prod-db")
-        with self.assertRaisesRegex(ValueError, r"no grant was written \(nope\)"):
-            pdg.grant(source, "prod-db", str(self.wal), home=str(self.home), record=lambda *a: "nope")
+    def test_an_approval_without_a_host_or_of_another_kind_covers_nothing(self):
+        import ah_approvals  # noqa: PLC0415
+        ah_approvals.grant("delete", {"project": str(self.home)}, "user", "test: project-wide delete", home=self.home)
+        approve(self.home, self.TARGET, kind="kill")
+        self.assertDenied(self.CMD)
 
+    def test_an_expired_or_revoked_approval_denies(self):
+        import ah_approvals  # noqa: PLC0415
+        record = approve(self.home, self.TARGET)
+        self.assertAllowed(self.CMD)
+        ah_approvals.revoke(record["id"], "user", home=self.home)
+        self.assertDenied(self.CMD)
+        later = time.time() + 7200
+        approve(self.home, self.TARGET, expires="1h")
+        self.assertAllowed(self.CMD)
+        self.assertEqual(self.verdict(bash(self.CMD), now=later), "deny")
+
+    def test_keyword_and_flag_names_never_count_as_targets(self):
+        for word in ("prod", "production", "delete", "psql", "--remote", "a b", "x*"):
+            with self.subTest(word=word):
+                self.assertTrue(pdg.valid_target(word))
+        self.assertEqual(pdg.valid_target(self.TARGET), "")
+
+    def test_the_refusal_names_the_approve_command_and_an_unreadable_store_denies(self):
+        reason = pdg.evaluate(bash(self.CMD), home=str(self.home))[1]
+        self.assertIn("ah approve delete --host prod-db.example.com", reason)
+        with mock.patch("ah_approvals.records", side_effect=OSError("disk")):
+            self.assertEqual(self.verdict(bash(self.CMD)), "deny")
+
+    def test_the_grant_cli_was_removed(self):
+        for verb in ("grant", "list"):
+            r = subprocess.run([sys.executable, str(HOOKS / "prod_delete_guard.py"), verb, "--target", "x"],
+                               capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 2)
+            self.assertEqual(json.loads(r.stderr)["status"], "REMOVED")
+            self.assertIn("ah approve delete", r.stderr)
 
 
 if __name__ == "__main__":

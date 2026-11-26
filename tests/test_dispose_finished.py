@@ -104,11 +104,6 @@ class FinishedEndsAnOwner(unittest.TestCase):
         self.assertTrue(liveness.disposition_live({"kind": "finished", "at": NOW - 86400 * 30}, NOW))
         self.assertTrue(liveness.row_disposed({"disposition": {"kind": "finished"}}))
 
-    def test_tier_gate_frees_the_slot_of_a_finished_owner(self):
-        import tier_gate
-        self.assertTrue(tier_gate._slot_freed({"disposition": {"kind": "finished"}}))
-        self.assertFalse(tier_gate._slot_freed({"disposition": {"kind": "finished"}, "decision_required": True}))
-
     def test_cli_payload_has_one_implementation(self):
         import ah_kill
         import ah_roles

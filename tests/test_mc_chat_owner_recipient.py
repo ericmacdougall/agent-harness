@@ -9,7 +9,6 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "harness" / "hooks"))
 import mc_chat
-import mc_inbox
 
 OPENAI = {"harness": "openai", "name": "mission-control", "generation": "12345678-1234-4234-8234-123456789abc"}
 CLAUDE = {"harness": "claude", "agent_id": "owner-agent-1", "main_session": "main-one"}
@@ -62,21 +61,6 @@ class OwnerRecipientTests(unittest.TestCase):
                 self.assertEqual(caught.exception.code, "bad-owner")
         self.assertEqual(list((self.root / "chat/inbox").glob("*.json")), [])
 
-    def test_claude_binding_matches_registered_main_and_survives_retry(self):
-        mc_chat.register_target("main-one", os.getpid(), root=self.root)
-        record, _ = mc_chat.new_message("claude", "talk to this owner", owner=dict(CLAUDE),
-                                        session="main-one", client_key="claude-owner-key", root=self.root)
-        self.assertEqual(mc_chat.pending("claude", "main-one", self.root), [record])
-        self.assertIn("owner=claude:owner-agent-1", mc_chat.frame(record))
-        self.assertIn("via main", mc_chat.frame(record))
-        self.assertIn("mc_inbox.py reply", mc_chat.frame(record))
-        with self.assertRaises(mc_chat.ChatError) as caught:
-            mc_chat.new_message("claude", "talk to this owner", owner=dict(CLAUDE, main_session="main-two"),
-                                session="main-one", client_key="claude-new-key1", root=self.root)
-        self.assertEqual(caught.exception.code, "bad-owner")
-        reply = mc_chat.write_reply(record["id"], "claude", "owner says ready", root=self.root)
-        self.assertEqual(reply["owner"], CLAUDE)
-
     def test_generic_pending_unread_claim_and_reply_exclude_named_openai(self):
         record = self.seed_existing()
         self.assertEqual(mc_chat.pending("codex", root=self.root), [])
@@ -106,33 +90,6 @@ class OwnerRecipientTests(unittest.TestCase):
         self.assertFalse(mc_chat.claim(record["id"], self.root, owner=replacement))
         self.assertTrue(mc_chat.claim(record["id"], self.root, owner=dict(OPENAI)))
         self.assertEqual(mc_chat.state(record["id"], self.root)["status"], "delivered")
-
-    def test_supervised_frame_has_limited_authority_and_no_reply_command(self):
-        record = self.seed_existing()
-        frame = mc_chat.frame(record)
-        self.assertIn(mc_chat.AUTHORITY, frame)
-        self.assertIn("USER_VIA_DASHBOARD", frame)
-        self.assertIn("untrusted dashboard text begins", frame)
-        self.assertIn("owner=openai:mission-control", frame)
-        self.assertIn(OPENAI["generation"], frame)
-        self.assertIn("Return your answer normally", frame)
-        self.assertNotIn("mc_inbox.py reply", frame)
-        self.assertNotIn("from the user are the user's own words", frame)
-
-    def test_generic_read_cannot_claim_a_named_openai_message(self):
-        record = self.seed_existing()
-        previous = os.environ.get("MC_HOME")
-        os.environ["MC_HOME"] = str(self.root)
-        try:
-            with self.assertRaises(mc_chat.ChatError) as caught:
-                mc_inbox.deliver(record)
-        finally:
-            if previous is None:
-                os.environ.pop("MC_HOME", None)
-            else:
-                os.environ["MC_HOME"] = previous
-        self.assertEqual(caught.exception.code, "owner-route-required")
-        self.assertEqual(mc_chat.state(record["id"], self.root)["status"], "queued")
 
     def queued(self, key, owner=None, ts=100):
         return mc_chat.new_message("codex", "ordinary work", client_key=key, owner=owner,

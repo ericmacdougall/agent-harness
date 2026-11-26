@@ -140,7 +140,8 @@ class ChaosProcesses(unittest.TestCase):
             # The installer adds its durable scratch default and keeps the user's env values.
             self.assertEqual(settings['env'], {'FIXTURE': 'keep',
                                                'CLAUDE_CODE_TMPDIR': str(home / '.agent-harness' / 'scratch')})
-            self.assertEqual(sum('wal.py' in json.dumps(item) for item in settings['hooks']['PreToolUse']), 1)
+            self.assertEqual(sum('wal.py' in json.dumps(item) for item in settings['hooks']['SessionStart']), 1)
+            self.assertEqual(sum('wal.py' in json.dumps(item) for item in settings['hooks']['PreToolUse']), 0)
             for source in (ROOT / 'harness/agents').iterdir():
                 self.assertEqual((claude / 'agents' / source.name).read_bytes(), source.read_bytes())
             self.assertFalse(list(claude.rglob('.agent-harness-*')))

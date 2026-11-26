@@ -621,15 +621,18 @@ class Installers(unittest.TestCase):
 
     def test_import_walk_reaches_known_chain(self):
         chain = self.export_chain()
-        for module in ('ah_export', 'ah', 'redact', 'safe_input', 'goals_view', 'mission_coverage'):
+        for module in ('ah_export', 'ah', 'redact', 'safe_input', 'liveness'):
             self.assertIn(module, chain)
 
     def test_installer_lists_cover_import_chain(self):
         needed = self.export_chain()
-        for installer in ('install.py', 'install_codex.py'):
-            listed = self.listed(installer)
-            for module in needed:
-                self.assertIn(module + '.py', listed, f'{installer} lacks {module}.py')
+        sys.path.insert(0, str(ROOT))
+        import install  # noqa: PLC0415 - install_codex ships install.HOOKS minus Claude-only hooks
+        for module in needed:
+            self.assertIn(module + '.py', install.HOOKS, f'install.HOOKS lacks {module}.py')
+        claude_only = (ROOT / 'install_codex.py').read_text(encoding='utf-8').split('CLAUDE_ONLY = ', 1)[1].split('\n', 1)[0]
+        for module in needed:
+            self.assertNotIn("'%s.py'" % module, claude_only, f'install_codex.py leaves out {module}.py')
 
 
 class Cli(Base):

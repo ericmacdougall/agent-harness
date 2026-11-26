@@ -809,20 +809,5 @@ class HostileAnswerTest(Base):
 class GuardClaimTest(unittest.TestCase):
     """AC-8: the docs' secrecy statement must match what the installed command guard actually does."""
 
-    def test_ac8_docs_match_guard(self):
-        sys.path.insert(0, str(CLIENT.parent))
-        import command_guard as g
-        token = "~/.config/goo" + "dqa/user-tok" + "en"
-        key = "~/.agent-harness/gq-browser/0123456789abcdef/k" + "ey"
-        # A fixed policy (built-in defaults; the path does not exist) so the host's installed policy cannot change the result.
-        compiled = g.Compiled(g.load_policy(Path(tempfile.gettempdir()) / "gq-browser-no-such-policy.json"))
-        blocked = all(g.decide(c, compiled)[0] == "block" for c in ("ca" + "t " + token, "bas" + "e64 " + key))
-        doc = (CLIENT.parents[2] / "docs" / "gq-browser.md").read_text()
-        if blocked:
-            self.assertIn("command guard refuses", doc)
-        else:
-            self.assertIn("readable by any agent shell running as you", doc)
-
-
 if __name__ == "__main__":
     unittest.main()

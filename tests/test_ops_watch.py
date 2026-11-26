@@ -802,10 +802,8 @@ class WalInjectionTests(Base):
                  "key": "disk:volume:/", "message": "/ 97% used"}, home=self.home)
         ow.emit({"host": ow.default_host(), "source": "ops-watch", "event": "raise", "severity": "critical",
                  "key": "disk:volume:/System/Volumes/Data", "message": "98% used"}, home=self.home)
-        first = ctx(self.invoke("prompt", {"session_id": "s1", "prompt": "hi"}))
-        self.assertIn("[critical] disk:volume:/_/Volumes/Data: ", first)  # new, critical, this machine's disk
-        self.assertNotIn("dev2", first)  # another host's disk is not this session's to act on
-        self.assertEqual(ctx(self.invoke("prompt", {"session_id": "s1", "prompt": "again"})), "")
+        # release 1001: no per-prompt hook, so a prompt brings nothing; the next session start carries the alerts
+        self.assertEqual(ctx(self.invoke("prompt", {"session_id": "s1", "prompt": "hi"})), "")
         sub = ctx(self.invoke("subagent", {"session_id": "s1", "agent_id": "a1", "agent_type": "task-owner"}))
         self.assertNotIn("critical", sub)
         start = ctx(self.invoke("session", {"session_id": "s2", "source": "startup"}))

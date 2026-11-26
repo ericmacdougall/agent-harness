@@ -113,23 +113,6 @@ def lock(root):
     return fd
 
 
-def enrolled_copy_generation(cwd):
-    configured = os.environ.get("HARNESS_COPY_HYGIENE_HOME")
-    copies = ((Path(configured) if configured else Path.home()) / ".agent-harness/test-copies").resolve()
-    path = Path(cwd).resolve(strict=True)
-    if copies not in path.parents or len(path.relative_to(copies).parts) != 2:
-        return None
-    if not Path(str(path) + ".lock").is_file():
-        return None
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    try:
-        import copy_hygiene
-    finally:
-        sys.path.pop(0)
-    with copy_hygiene.copy_lock(str(path), create=False, wait=False) as descriptor:
-        return copy_hygiene.copy_generation(descriptor)
-
-
 def enroll(root, source):
     manifest = validate(json.loads(read(source)))
     root.mkdir(mode=0o700, parents=False, exist_ok=True)
@@ -144,12 +127,9 @@ def enroll(root, source):
             return
         if (root / "state.json").exists():
             raise ValueError("orphan state requires reconciliation")
-        generation = enrolled_copy_generation(manifest["cwd"])
         atomic(root / "manifest.json", manifest)
         state = {"manifest_sha256": digest(raw), "attempts": 0,
                  "deadline": time.time() + manifest["task_timeout"], "status": "enrolled"}
-        if generation is not None:
-            state["copy_generation"] = generation
         atomic(root / "state.json", state)
     finally:
         os.close(fd)

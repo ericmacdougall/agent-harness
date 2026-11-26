@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
-r"""PreToolUse hook: refuse destructive SQL aimed at a PRODUCTION database unless a recorded,
-user-sourced, signed grant names that exact database (goodqa#14908).
+r"""PreToolUse hook on the named database tools: refuse destructive SQL aimed at a PRODUCTION database unless a
+live approval of the approvals store names that exact database or host (goodqa#14908, docs/approvals.md).
+
+Release 1001: registered on the MCP database tools and the local `db_tool_patterns` only, never on Bash (a Bash
+call starts no harness hook). It stays until production credentials are scoped (docs/direction.md).
 
 Why: an agent once deleted rows from a live database after announcing the intent in chat, with no
 recorded approval.
@@ -9,7 +12,7 @@ What counts as destructive (after `/* ... */` comments and shell quote character
 `DEL""ETE` and `DELETE/**/FROM` still match): DELETE FROM, DROP TABLE|DATABASE|INDEX|SCHEMA,
 TRUNCATE, and UPDATE ... SET with no WHERE in the same statement.
 
-What counts as a production TARGET (each yields the exact target value a grant must name):
+What counts as a production TARGET (each yields the exact target value an approval must name):
   - wrangler d1 execute <db> ... --remote                  -> <db>
   - a connection string naming prod/production              -> its host or its database (one target,
                                                                either name covers it)
@@ -47,32 +50,15 @@ does not name prod.
 
 Fail direction:
   - Before a match, any error allows. A parser bug must not block ordinary work.
-  - After a match, any error denies, including an unreadable, corrupt or unsigned grant store.
+  - After a match, any error denies, including an unreadable approvals store.
 
-Grants
-  prod_delete_guard.py grant --user-source answer:<session>/<uuid> --target <exact host or db> --wal <WAL>
-                             [--ttl SECONDS] [--note TEXT]
-  prod_delete_guard.py list
-- --user-source must be an answer:<session>/<uuid> id (an AskUserQuestion answer; ah user-msg finds
-  it) that provenance.py resolves, from the pinned ~/.claude, at most 1 hour old. The user's own selected
-  answer must name the target as a whole name ("Approve DELETE on <target>") and must not decline (no,
-  nope, not, keep, reject, untouched, ... outside the target name). The agent's question text never
-  counts; typed user: turns are refused.
-- --target must equal, case-folded, one of the target values the guard extracts from the command
-  (for example `prod-db.example.com`, or `app_production`). It is never a substring match. SQL
-  words, client names, bare prod/production and names starting with "-" are refused as targets. A
-  connection string to a prod host is covered only by a grant on that host. A command with several
-  prod targets needs a grant for each one.
-- The TTL defaults to 900 seconds and cannot exceed 3600. The grant can be reused until it expires.
-- Each grant is HMAC-signed with ~/.agent-harness/state/prod-delete.key (0600, created on first
-  use). At check time the guard re-verifies the signature and the TTL and source-age bounds, and
-  resolves the source again. command_guard refuses shell writes to the grant file and the key.
-  The key is used only when it is a regular file, mode 0600, owned by the caller, with one link; it is
-  opened without following a symlink, and the store is replaced through an O_EXCL|O_NOFOLLOW temp file.
-  Residual, disclosed: a same-user process, or the Write and Edit tools (command_guard judges Bash only),
-  can read or plant the key and so sign a grant, skipping only the WAL record; provenance proves
-  the cited answer is real and names the target, not what the user believed the option meant. The WAL record
-  and the exact-target binding keep the claim auditable and narrow.
+Approvals
+  ah approve delete --host <exact host or db> --reason "<why>" [--expires 1h]
+- The owner (or a supervisor, inside its projects) records it; `ah approvals` lists it. The approval's host must equal,
+  case-folded, one of the target values the guard extracts (for example `prod-db.example.com`, or `app_production`).
+  It is never a substring match, and an approval without a host covers nothing here. A command with several prod
+  targets needs an approval for each one.
+- Release 1001 removed `prod_delete_guard.py grant` and its signed grant file: the approvals store is the one record.
 
 Contract (https://code.claude.com/docs/en/hooks): stdin carries {"tool_name", "tool_input", "cwd", ...}.
 The output is hookSpecificOutput.permissionDecision "deny", returned on exit 0. Register this hook
@@ -80,19 +66,11 @@ without onFailure=block, because it fails open before a match.
 """
 from __future__ import annotations
 
-import argparse
-import hashlib
-import hmac
 import json
 import os
 import re
-import secrets
 import shlex
-import stat
-import subprocess
 import sys
-import time
-from datetime import datetime
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -166,14 +144,13 @@ RESERVED_TARGETS = {"prod", "production", "delete", "drop", "truncate", "update"
                     "index", "from", "set", "where", "remote", "execute", "d1", "wrangler", "ssh", "docker", "exec"}
 
 TOOL_COMMAND_FIELDS = (
-    (re.compile(r"^Bash$"), ("command",)),
     (re.compile(r"(?i)d1_database_query$"), ("sql", "query")),
     (re.compile(r"(?i)^mcp__.*__(execute_sql|run_sql|query|sql)$"), ("sql", "query", "statement")),
 )
 TOOL_IS_PRODUCTION_BY_CONSTRUCTION = re.compile(r"(?i)^mcp__.*__(d1_database_query|hyperdrive_.*)$")
 TOOL_DB_FIELDS = ("database_id", "databaseId", "database", "database_name", "databaseName", "id")
-# The built-in matcher; install.py registers matcher(), which adds the local db_tool_patterns.
-MATCHER = r"Bash|.*d1_database_query|mcp__.*__(execute_sql|run_sql|query|sql)|mcp__.*__hyperdrive_.*"
+# The built-in matcher; install.py registers matcher(), which adds the local db_tool_patterns. No Bash (release 1001).
+MATCHER = r".*d1_database_query|mcp__.*__(execute_sql|run_sql|query|sql)|mcp__.*__hyperdrive_.*"
 LOCAL_DEFAULT_FIELDS = ("command", "cmd", "script", "sql", "query", "payload")
 
 
@@ -197,21 +174,12 @@ def local_tool_fields() -> tuple:
 
 
 def matcher() -> str:
-    """MATCHER plus every local db tool pattern: the matcher install.py registers."""
-    return "|".join([MATCHER] + [raw for _, _, raw in local_tool_fields()])
+    """MATCHER plus every local db tool pattern: the matcher install.py registers. A local pattern that could match
+    Bash is left out, so no configuration puts a hook back on Bash."""
+    return "|".join([MATCHER] + [raw for pattern, _, raw in local_tool_fields() if not pattern.match("Bash")])
 
 FILE_READ_LIMIT = 200000
-GRANTS_NAME = "prod-delete-grants.json"
-KEY_NAME = "prod-delete.key"
-LOCK_NAME = "prod-delete-grants.lock"
-GRANT_SCOPE = "prod-db"
-DEFAULT_TTL = 900
-MAX_TTL = 3600
-MAX_SOURCE_AGE = 3600
-CLOCK_SLACK = 60
 MIN_TARGET = 3
-MAX_GRANTS = 64
-GRANTS_MAX_BYTES = 256 * 1024
 DECLINE = re.compile(r"\b(?:no|nope|nah|not|don'?t|never|keep|kept|cancel|skip|stop|leave|hold|wait|later|instead|"
                      r"abort|reject|deny|denied|untouched|preserved?|spare|only\s+after)\b", re.I)
 SOURCE_RE = re.compile(r"^(user|answer):([A-Za-z0-9._-]{1,120})/([0-9a-fA-F-]{8,64})$")
@@ -412,7 +380,7 @@ def _after(words: list, index: int, opts_with_value) -> str:
 def targets_production(command: str, env=None):
     """(description, [target groups]) of the production targets this command names, or ("", []).
     Each group is a tuple of alternative names for one target (a connection string's host and its
-    database); a grant naming any one of them covers that target."""
+    database); an approval naming any one of them covers that target."""
     env = os.environ if env is None else env
     found, why = [], []
 
@@ -430,7 +398,7 @@ def targets_production(command: str, env=None):
         if _prod(conn):
             parts = _conn_parts(conn)
             if parts and _prod(parts[0]):
-                parts = parts[:1]  # a database-only grant ("app") never covers a prod host
+                parts = parts[:1]  # a database-only approval ("app") never covers a prod host
             add("a connection string naming a prod/production database", parts)
     assigned = {}
     for m in ENV_ASSIGN.finditer(command):
@@ -514,269 +482,51 @@ def command_text_for_event(ev: dict) -> str:
     ti = ev.get("tool_input")
     if not tool or not isinstance(ti, dict):
         return ""
-    for pat, keys in TOOL_COMMAND_FIELDS + tuple((p, f) for p, f, _ in local_tool_fields()):
+    for pat, keys in TOOL_COMMAND_FIELDS + tuple((p, f) for p, f, _ in local_tool_fields() if not p.match("Bash")):
         if pat.search(tool):
             return "\n".join(v for v in (_as_text(ti.get(k)) for k in keys) if v.strip())
     return ""
 
 
-# ---- grants -------------------------------------------------------------------------------------
-class StoreBroken(Exception):
-    """The grant store exists but cannot be trusted; a matched command is denied."""
-
-
-def home_dir(home=None) -> Path:
-    return Path(home) if home else Path.home()
-
-
-def state_dir(home=None) -> Path:
-    return home_dir(home) / ".agent-harness" / "state"
-
-
-def grants_path(home=None) -> Path:
-    return state_dir(home) / GRANTS_NAME
-
-
-def key_path(home=None) -> Path:
-    return state_dir(home) / KEY_NAME
-
-
-def _read_key(home=None, create=False):
-    import safe_input  # noqa: PLC0415
-    path = key_path(home)
-    if create and not os.path.lexists(path):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "wb") as fh:
-                fh.write(secrets.token_bytes(32))
-        except FileExistsError:
-            pass
-    if not os.path.lexists(path):
-        return None
-    try:
-        st = os.lstat(path)
-        if not stat.S_ISREG(st.st_mode) or stat.S_IMODE(st.st_mode) != 0o600 or st.st_uid != os.getuid() \
-                or st.st_nlink != 1:
-            raise StoreBroken("grant key is not a private regular file (a symlink, a link, another owner or "
-                              "mode %o); only `grant` creates it" % stat.S_IMODE(st.st_mode))
-        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        with os.fdopen(fd, "rb") as fh:
-            key = fh.read(257)
-    except OSError as exc:
-        raise StoreBroken("grant key unreadable (%s)" % type(exc).__name__) from exc
-    if len(key) > 256:
-        raise StoreBroken("grant key is too long")
-    if len(key) < 32:
-        raise StoreBroken("grant key is too short")
-    return key
-
-
-def _mac(key: bytes, entry: dict) -> str:
-    body = json.dumps({k: v for k, v in entry.items() if k != "mac"}, sort_keys=True, separators=(",", ":")).encode()
-    return hmac.new(key, body, hashlib.sha256).hexdigest()
-
-
-def load_grants(home=None) -> list:
-    """Every grant in the store; [] when there is no store. Raises StoreBroken on anything untrustworthy."""
-    import safe_input  # noqa: PLC0415 - only a matched command reads the grant file
-    path = grants_path(home)
-    if not os.path.lexists(path):
-        return []
-    try:
-        raw = safe_input.read_bounded(path, GRANTS_MAX_BYTES)
-    except safe_input.InputRejected as exc:
-        raise StoreBroken("grant file %s could not be read (%s)" % (path, exc.code)) from exc
-    try:
-        data = safe_input.safe_json_loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError) as exc:
-        raise StoreBroken("grant file %s is not valid JSON" % path) from exc
-    grants = data.get("grants") if isinstance(data, dict) else None
-    if not isinstance(grants, list) or not all(isinstance(g, dict) for g in grants):
-        raise StoreBroken("grant file %s has no valid grants list" % path)
-    return grants
-
-
-def resolve_user_source(source: str, home=None) -> dict:
-    """{"text", "timestamp"} of the human turn or answer the source names, read from the pinned
-    <home>/.claude (never CLAUDE_CONFIG_DIR); raises ValueError otherwise."""
-    m = SOURCE_RE.match(source or "")
-    if not m:
-        raise ValueError("source must be user:<session>/<uuid> or answer:<session>/<uuid>")
-    import provenance  # loaded lazily: the allow path never needs it
-    kind, session, uid = m.groups()
-    claude = home_dir(home) / ".claude"
-    try:
-        turn = (provenance.user_turn if kind == "user" else provenance.answer_turn)(session, uid, claude)
-    except provenance.Problem as exc:
-        raise ValueError("%s: %s" % (exc.code, exc)) from exc
-    return dict(turn, kind=kind)
-
-
-def names_target(turn: dict, target: str) -> bool:
-    """The user's own selected answer names the exact target as a whole name (not inside a host, port or path),
-    and does not decline. The agent's question text never counts: it is not the user's words."""
-    said = str(turn.get("text") or "").replace("\u2019", "'").replace("\u2018", "'").casefold()
-    whole = r"(?<![\w.:/@-])%s(?![\w-]|[.:/@]\w)" % re.escape(target.casefold())
-    if not re.search(whole, said):
-        return False
-    # decline words count outside the target name only, so a target such as hold-db can still be granted
-    return not DECLINE.search(re.sub(whole, " ", said))
-
-
-def _epoch(ts) -> float:
-    if not isinstance(ts, str) or not ts:
-        raise ValueError("source turn has no timestamp")
-    return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
-
-
+# ---- approvals ----------------------------------------------------------------------------------
 def valid_target(target) -> str:
-    """'' when the grant target is acceptable, else why not."""
+    """'' when a target name can be approved, else why not."""
     if not isinstance(target, str) or len(target) < MIN_TARGET or target != target.strip():
-        return "--target must be at least %d characters with no surrounding space" % MIN_TARGET
+        return "the target must be at least %d characters with no surrounding space" % MIN_TARGET
     if target.startswith("-") or any(ch.isspace() for ch in target) or any(ch in target for ch in "*?[]$`;|&<>'\"#"):
-        return "--target must be one host or database name, with no spaces, quotes or wildcards"
+        return "the target must be one host or database name, with no spaces, quotes or wildcards"
     if target.casefold() in RESERVED_TARGETS or DB_CLIENT.fullmatch(target):
-        return "--target %r is a keyword, a client name or bare prod; name the exact host or database" % target
+        return "%r is a keyword, a client name or bare prod; name the exact host or database" % target
     return ""
 
 
-def _grant_ok(grant: dict, key, now: float):
-    """'' when the stored grant is signed and within its bounds, else why not."""
-    try:
-        granted, expires, source_ts = (float(grant.get(k)) for k in ("granted_at", "expires_at", "source_ts"))
-    except (TypeError, ValueError):
-        return "a grant has missing or non-numeric times"
-    if key is None or not hmac.compare_digest(_mac(key, grant), str(grant.get("mac", ""))):
-        return "a grant's signature does not verify"
-    if grant.get("scope") != GRANT_SCOPE or valid_target(grant.get("target")):
-        return "a grant has the wrong scope or an invalid target"
-    if expires <= now:
-        return "the matching grant has expired"
-    if granted > now + CLOCK_SLACK or expires - granted > MAX_TTL or granted - source_ts > MAX_SOURCE_AGE \
-            or source_ts > granted + CLOCK_SLACK:
-        return "a grant is outside the TTL or source-age bounds"
-    return ""
-
-
-def matching_grants(targets: list, home=None, now=None, resolver=None):
-    """({target group: grant} for each covered target, why-not for the first uncovered one). Each entry
-    of `targets` is a group of alternative names (or one name). Raises StoreBroken."""
-    now = time.time() if now is None else now
-    resolver = resolver or resolve_user_source
-    grants = load_grants(home)
-    key = _read_key(home) if grants else None
-    covered, why = {}, "no grant recorded"
+def matching_approvals(targets: list, home=None, now=None, records=None):
+    """({target group: approval record} for each covered group, why-not for the first uncovered one). Each entry of
+    `targets` is a group of alternative names (or one name). A group is covered by a live `delete` approval whose host
+    equals one of its names (case-folded) and is a valid target. Raises on an unreadable store (the caller denies)."""
+    import ah_approvals  # noqa: PLC0415 - only a matched command reads the store
+    rows = list(ah_approvals.records(home) if records is None else records)
+    covered = {}
     for target in targets:
-        names = {n.casefold() for n in ((target,) if isinstance(target, str) else target)}
-        for grant in grants:
-            if str(grant.get("target", "")).casefold() not in names:
-                continue
-            problem = _grant_ok(grant, key, now)
-            if problem:
-                why = problem
-                continue
-            try:
-                turn = resolver(str(grant.get("user_source") or ""), home)
-                if abs(_epoch(turn.get("timestamp")) - float(grant["source_ts"])) > 1:
-                    raise ValueError("source timestamp differs from the one granted")
-            except Exception as exc:  # noqa: BLE001 - a grant whose source no longer resolves is no grant
-                why = "a grant names %s but its user source no longer resolves (%s)" % (grant.get("target"), str(exc)[:160])
-                continue
-            covered[target] = grant
-            break
+        names = (target,) if isinstance(target, str) else tuple(target)
+        wanted = {n.casefold() for n in names}
+        for record in reversed(rows):
+            host = str((record.get("scope") or {}).get("host") or "")
+            if host.casefold() in wanted and not valid_target(host) \
+                    and ah_approvals.covers(record, "delete", {"host": host}, now):
+                covered[target] = record
+                break
         else:
-            if target not in covered:
-                return covered, "%s: %s" % ("/".join((target,) if isinstance(target, str) else target), why)
+            return covered, "%s: no live delete approval names it" % "/".join(names)
     return covered, ""
 
 
-def _write_grants(grants: list, home=None) -> None:
-    path = grants_path(home)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".%d.%s.tmp" % (os.getpid(), secrets.token_hex(4)))
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        json.dump({"schema": 2, "grants": grants}, fh, indent=1, sort_keys=True)
-        fh.write("\n")
-    os.replace(tmp, path)
-
-
-def _record_wal(wal: Path, note: str, source: str):
-    """True when wal_note.py recorded the decision, else its reason (bounded). Only True counts as recorded."""
-    helper = HERE / "wal_note.py"
+def approve_hint(target: str) -> str:
     try:
-        r = subprocess.run([sys.executable, str(helper), "--wal", str(wal), "--event", "decision", "--note", note,
-                            "--source", source], capture_output=True, text=True, timeout=30, check=False)
-    except (OSError, subprocess.SubprocessError) as exc:
-        return type(exc).__name__
-    return True if r.returncode == 0 else ((r.stderr or r.stdout).strip()[-300:] or "exit %d" % r.returncode)
-
-
-def wal_source(user_source: str, answer_text: str) -> str:
-    """The provenance source for the grant's WAL decision: the answer id plus a verbatim quoted excerpt of the
-    selected answer (wal_note.py refuses an answer: source without one). The excerpt is the longest run of the
-    answer that has no double quote or `...` (provenance's segment marker), at most 300 characters."""
-    pieces = [x.strip() for chunk in str(answer_text or "").split('"') for x in chunk.split("...")]
-    excerpt = max(pieces, key=len, default="")[:300].strip()
-    if len(excerpt) < 12:
-        raise ValueError("the selected answer is too short to cite in the WAL (12+ characters without quotes): use "
-                         "an option label such as 'Approve DELETE on <target>'")
-    return '%s "%s"' % (user_source, excerpt)
-
-
-def grant(user_source: str, target: str, wal, ttl: int = DEFAULT_TTL, note: str = "", home=None, now=None,
-          resolver=None, record=None) -> dict:
-    """Record one signed grant. Raises ValueError with a reason on refusal."""
-    import fcntl  # noqa: PLC0415
-    now = time.time() if now is None else now
-    resolver = resolver or resolve_user_source
-    record = record or _record_wal
-    if not wal:
-        raise ValueError("--wal is required: every grant is recorded in the session WAL")
-    problem = valid_target(target)
-    if problem:
-        raise ValueError(problem)
-    if not 1 <= int(ttl) <= MAX_TTL:
-        raise ValueError("--ttl must be between 1 and %d seconds" % MAX_TTL)
-    if not str(user_source or "").startswith("answer:"):
-        raise ValueError("--user-source must be an AskUserQuestion answer (answer:<session>/<uuid>): a typed turn "
-                         "cannot be told apart from a refusal")
-    turn = resolver(user_source, home)
-    if not names_target(turn, target):
-        raise ValueError("the cited answer does not name %s (or it declines): ask with AskUserQuestion and an option "
-                         "label naming the exact target, such as 'Approve DELETE on %s', then cite that answer"
-                         % (target, target))
-    cited = wal_source(user_source, turn.get("text"))
-    source_ts = _epoch(turn.get("timestamp"))
-    if now - source_ts > MAX_SOURCE_AGE or source_ts > now + CLOCK_SLACK:
-        raise ValueError("the user source is older than %d hours (or in the future); ask again" % (MAX_SOURCE_AGE // 3600))
-    sd = state_dir(home)
-    sd.mkdir(parents=True, exist_ok=True)
-    lock = os.open(str(sd / LOCK_NAME), os.O_WRONLY | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        try:
-            grants = load_grants(home)
-            key = _read_key(home, create=True)
-        except StoreBroken as exc:
-            raise ValueError("the grant store is unreadable (%s); fix or move it before granting" % exc)
-        grants = [g for g in grants if not _grant_ok(g, key, now)]  # drop expired and unsigned entries
-        if len(grants) >= MAX_GRANTS:
-            raise ValueError("too many live grants (%d)" % MAX_GRANTS)
-        entry = {"scope": GRANT_SCOPE, "target": target, "user_source": user_source, "source_ts": source_ts,
-                 "granted_at": int(now), "expires_at": int(now) + int(ttl), "note": (note or "")[:300],
-                 "nonce": secrets.token_hex(8)}
-        entry["mac"] = _mac(key, entry)
-        recorded = record(Path(wal), "prod_delete_guard grant: scope=%s target=%s ttl=%ss note=%s" % (
-            GRANT_SCOPE, target, int(ttl), entry["note"]), cited)
-        if recorded is not True:
-            raise ValueError("the WAL record failed, so no grant was written (%s)" % str(recorded)[:300])
-        grants.append(entry)
-        _write_grants(grants, home)
-    finally:
-        os.close(lock)
-    return entry
+        import ah_approvals  # noqa: PLC0415
+        return ah_approvals.command_hint("delete", host=target)
+    except Exception:  # noqa: BLE001
+        return 'ah approve delete --host %s --reason "<why>"' % target
 
 
 # ---- hook ---------------------------------------------------------------------------------------
@@ -785,7 +535,7 @@ def decision(kind: str, reason: str) -> str:
                                               "permissionDecisionReason": reason}})
 
 
-def evaluate(ev, home=None, now=None, resolver=None, env=None):
+def evaluate(ev, home=None, now=None, env=None, records=None):
     """None to allow, else ("deny", reason). The only entry point that can deny."""
     try:
         if not isinstance(ev, dict):
@@ -817,23 +567,19 @@ def evaluate(ev, home=None, now=None, resolver=None, env=None):
         verb = " ".join(match.group(0).upper().split())[:40]
         if not values:
             return ("deny", "REFUSED: this command runs %s against %s, and the guard cannot extract an exact target "
-                            "name, so no grant can cover it. Name the host or database explicitly." % (verb, target))
-        try:
-            covered, why = matching_grants(values, home, now, resolver)
-        except StoreBroken as exc:
-            return ("deny", "REFUSED: this command runs %s against %s, and the grant store cannot be trusted (%s). "
-                            "Failing closed." % (verb, target, exc))
+                            "name, so no approval can cover it. Name the host or database explicitly." % (verb, target))
+        covered, why = matching_approvals(values, home, now, records)
         if not why:
             return None
-        return ("deny", "REFUSED: this command runs %s against %s (targets: %s), and no recorded grant covers it "
-                        "(%s).\n\nProduction deletes need a RECORDED approval, not one announced in chat. Ask the user "
-                        "with AskUserQuestion, then record the answer for each exact target:\n  python3 "
-                        "~/.claude/hooks/prod_delete_guard.py grant --user-source answer:<session>/<uuid> --target "
-                        "<exact target> --wal <session WAL>\n(ah user-msg finds the answer id.) Once granted, do the "
-                        "work; do not refuse after approval." % (verb, target, ", ".join("/".join(g) for g in values), why))
+        first = next((g for g in values if g not in covered), values[0])
+        name = first if isinstance(first, str) else first[0]
+        return ("deny", "REFUSED: this command runs %s against %s (targets: %s), and no approval covers it (%s).\n\n"
+                        "Production deletes need a RECORDED approval, not one announced in chat. The owner records one "
+                        "for each exact target:\n  %s\nOnce approved, do the work; do not refuse after approval."
+                        % (verb, target, ", ".join("/".join(g) for g in values), why, approve_hint(name)))
     except Exception as exc:  # noqa: BLE001
-        return ("deny", "REFUSED: a destructive statement aimed at a production database was detected and the grant "
-                        "check failed (%s). Failing closed is deliberate." % type(exc).__name__)
+        return ("deny", "REFUSED: a destructive statement aimed at a production database was detected and the "
+                        "approval check failed (%s). Failing closed is deliberate." % type(exc).__name__)
 
 
 def hook_main() -> int:
@@ -850,33 +596,13 @@ def hook_main() -> int:
 
 
 def cli(argv) -> int:
-    parser = argparse.ArgumentParser(prog="prod_delete_guard.py", description="Recorded grants for production deletes.")
-    sub = parser.add_subparsers(dest="cmd", required=True)
-    g = sub.add_parser("grant", help="record a user-sourced grant for one exact production target")
-    g.add_argument("--user-source", required=True)
-    g.add_argument("--target", required=True)
-    g.add_argument("--wal", required=True)
-    g.add_argument("--ttl", type=int, default=DEFAULT_TTL)
-    g.add_argument("--note", default="")
-    sub.add_parser("list", help="print live, signed grants")
-    args = parser.parse_args(argv)
-    if args.cmd == "list":
-        try:
-            now = time.time()
-            grants = load_grants()
-            key = _read_key() if grants else None
-            print(json.dumps([g for g in grants if not _grant_ok(g, key, now)], indent=1, sort_keys=True))
-        except StoreBroken as exc:
-            print(json.dumps({"status": "UNREADABLE", "problem": str(exc)}), file=sys.stderr)
-            return 1
-        return 0
-    try:
-        entry = grant(args.user_source, args.target, args.wal, args.ttl, args.note)
-    except (ValueError, OSError) as exc:
-        print(json.dumps({"status": "REFUSED", "problem": str(exc)[:400]}), file=sys.stderr)
+    if argv[:1] in (["grant"], ["list"]):
+        print(json.dumps({"status": "REMOVED", "problem": "prod_delete_guard.py %s was removed in release 1001: record "
+                          "the approval with `ah approve delete --host <exact target>` and list it with `ah approvals`"
+                          % argv[0]}), file=sys.stderr)
         return 2
-    print(json.dumps({"status": "GRANTED", **{k: v for k, v in entry.items() if k != "mac"}}, sort_keys=True))
-    return 0
+    print("usage: prod_delete_guard.py (a PreToolUse hook; reads the event on stdin)", file=sys.stderr)
+    return 2
 
 
 if __name__ == "__main__":

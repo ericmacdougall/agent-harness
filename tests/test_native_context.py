@@ -874,18 +874,16 @@ class StaleRuntimeDetector(unittest.TestCase):
 class Packaging(unittest.TestCase):
     @staticmethod
     def manifest(filename, field):
-        import ast
+        """The installer's shipped list. Importing install.py / install_codex.py runs nothing (main() is guarded)."""
+        import importlib
         root = Path(__file__).resolve().parents[1]
-        tree = ast.parse((root / filename).read_text())
-        assignment = next(node for node in tree.body if isinstance(node, ast.Assign)
-                          and any(isinstance(target, ast.Name) and target.id == field for target in node.targets))
-        return ast.literal_eval(assignment.value)
+        if str(root) not in sys.path:
+            sys.path.insert(0, str(root))
+        return list(getattr(importlib.import_module(filename[:-3]), field))
 
     def test_both_manifests_ship_native_dependencies_without_running_installers(self):
         expected = {"native_context.py", "native_user_source.py", "native_admission.py"}
         for filename, field in (("install.py", "HOOKS"), ("install_codex.py", "DELIVERY_HELPERS")):
-            # Read the literal manifest via AST; importing/running installers is
-            # unnecessary and could change local configuration.
             names = self.manifest(filename, field)
             self.assertTrue(expected <= set(names), (filename, expected - set(names)))
             self.assertTrue(all(names.count(name) == 1 for name in expected))
@@ -902,16 +900,15 @@ class Packaging(unittest.TestCase):
                 shutil.copyfile(root / "harness" / "hooks" / name, helpers / name)
             shutil.copyfile(root / "codex" / "hooks" / "wal.py", helpers / "wal.py")
             shutil.copyfile(root / "harness" / "hooks" / "ops_watch.py", helpers / "ops_watch.py")
-            code = ("import json,sys; sys.path.insert(0,sys.argv[1]); import wal_note,ah; "
-                    "print(json.dumps(ah.doctor(),sort_keys=True))")
+            code = ("import json,sys; from pathlib import Path; sys.path.insert(0,sys.argv[1]); import wal_note,ah; "
+                    "print(json.dumps(ah.sessions_view(Path(sys.argv[2])),sort_keys=True))")
             env = {key: value for key, value in os.environ.items() if key in {"PATH", "SYSTEMROOT"}}
             env.update(HOME=str(home), AH_HOME=str(home), AH_EXPECT_AHD="0")
-            run = subprocess.run([sys.executable, "-I", "-B", "-c", code, str(helpers)],
+            run = subprocess.run([sys.executable, "-I", "-B", "-c", code, str(helpers), str(home)],
                                  env=env, cwd=home, text=True, capture_output=True, timeout=5)
             self.assertEqual(run.returncode, 0, run.stderr)
             result = json.loads(run.stdout)
-            self.assertTrue(result["ok"], result)
-            self.assertTrue(any(row["check"] == "import wal_note" and row["ok"] for row in result["checks"]))
+            self.assertEqual(result["sessions"], [], result)  # wal_note and ah import from only the Codex copy set
             self.assertFalse((home / ".codex" / "hooks.json").exists())
             self.assertFalse((home / ".codex" / "config.toml").exists())
 

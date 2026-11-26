@@ -19,7 +19,7 @@ from unittest import mock
 HOOKS = Path(__file__).resolve().parents[1] / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
 import ah  # noqa: E402
-import goals_view as gv  # noqa: E402
+import ah  # noqa: E402  (ah status reads these fields)
 
 NOW = 1_800_000_000.0
 SESSION = "sess-structured-01"
@@ -45,20 +45,20 @@ class WalNote(unittest.TestCase):
     def rows(self):
         return [json.loads(x) for x in self.wal.read_text().splitlines()]
 
-    def test_structured_fields_land_and_goals_view_reads_them(self):
+    def test_structured_fields_land_and_ah_status_reads_them(self):
         r = self.note("--event", "check", "--note", "REALLY_TESTED pp-live: sign-in on prod abc1234", "--goal",
                       "parentproof", "--ticket", "goodqa#615", "--result", "PASS", "--live")
         self.assertEqual(r.returncode, 0, r.stderr)
         row = self.rows()[-1]
         self.assertEqual((row["goal"], row["ticket"], row["result"], row["live"]),
                          ("parentproof", "goodqa#615", "PASS", True))
-        self.assertEqual(gv.verdict(row), "PASS")
+        self.assertEqual(ah.check_verdict(row), "PASS")
 
     def test_deploy_event_needs_a_sha_or_version(self):
         self.assertNotEqual(self.note("--event", "deploy", "--note", "deployed to prod").returncode, 0)
         r = self.note("--event", "deploy", "--note", "deployed def5678 to prod", "--goal", "parentproof")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(gv.verdict(self.rows()[-1]), "DEPLOY")
+        self.assertEqual(ah.check_verdict(self.rows()[-1]), "DEPLOY")
 
     def test_bad_values_are_refused(self):
         self.assertNotEqual(self.note("--event", "check", "--note", "REALLY_TESTED x: ok", "--goal", "Bad Goal!")

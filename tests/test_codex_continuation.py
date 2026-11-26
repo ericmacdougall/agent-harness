@@ -186,7 +186,6 @@ class ContinuationTests(unittest.TestCase):
         self.state('active')
         first = self.event('Stop', turn_id='initial', stop_hook_active=False)
         self.assertEqual(first['decision'], 'block')
-        self.event('UserPromptSubmit', prompt='a different turn')
         self.state('active')  # Idempotent, not a refill.
         second = self.event('Stop', turn_id='new-turn', stop_hook_active=False)
         self.assertNotIn('decision', second)
@@ -334,7 +333,6 @@ class AlertParityAndDegrade(unittest.TestCase):
                        home=Path(self.home.name))
         # 2026-11-24: one ops_watch.session_summary line at SessionStart; nothing per prompt or per sub-agent start
         for payload, shown in (({'hook_event_name': 'SessionStart', 'session_id': 'alerts', 'source': 'startup'}, True),
-                               ({'hook_event_name': 'UserPromptSubmit', 'session_id': 'alerts', 'prompt': 'hi'}, False),
                                ({'hook_event_name': 'SubagentStart', 'session_id': 'alerts', 'agent_id': 'a1',
                                  'agent_type': 'general-purpose'}, False)):
             result = self.run_hook(payload)
@@ -359,13 +357,13 @@ class AlertParityAndDegrade(unittest.TestCase):
         self.assertNotIn('DECOY-LOADED', json.loads(result.stdout)['hookSpecificOutput']['additionalContext'])
 
     def test_unwritable_wal_dir_degrades_to_a_note_instead_of_blocking(self):
-        first = self.run_hook({'hook_event_name': 'UserPromptSubmit', 'session_id': 'ro', 'prompt': 'hi'})
+        first = self.run_hook({'hook_event_name': 'SessionStart', 'session_id': 'ro', 'source': 'startup'})
         self.assertEqual(first.returncode, 0, first.stderr)
         session_dir = Path(self.home.name, '.agent-harness') / 'codex-wals' / 'ro'
         self.assertTrue(session_dir.is_dir(), sorted(str(p) for p in (Path(self.home.name) / '.agent-harness').rglob('*'))[:10])
         wal_file = session_dir / 'main.jsonl'
         os.chmod(wal_file, 0o400); self.addCleanup(lambda: os.chmod(wal_file, 0o600))
-        result = self.run_hook({'hook_event_name': 'UserPromptSubmit', 'session_id': 'ro', 'prompt': 'again'})
+        result = self.run_hook({'hook_event_name': 'SessionStart', 'session_id': 'ro', 'source': 'resume'})
         self.assertEqual(result.returncode, 0, result.stderr)
         context = json.loads(result.stdout)['hookSpecificOutput']['additionalContext']
         self.assertIn('WAL append failed', context); self.assertIn('EACCES', context)

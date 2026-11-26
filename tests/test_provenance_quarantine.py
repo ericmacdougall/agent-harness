@@ -111,24 +111,6 @@ class Quarantine(Base):
         self.assertTrue(row.get("unsourced"))
         self.assertEqual(row["note"], "we go with python")
 
-    def test_untraced_source_is_written_and_labelled_unsourced(self):
-        """2026-11-24 (inverts the 2026-11-06 refusal): a source that does not trace is kept as given, the row is
-        written with unsourced=True and the warning names the cause; nothing is refused for a source's form."""
-        for src in ("inferred: from af794b88 ledger read ; QAC journal whens -- free text inputs are not sources",
-                    "whatever I say", "ticket:not-a-ticket"):
-            with self.subTest(src):
-                before = len(self.rows())
-                rc, doc = self.note("--event", "decision", "--note", "we go with python", "--source", src)
-                self.assertEqual(rc, 0, doc)
-                self.assertEqual(doc.get("status"), "WROTE")
-                self.assertEqual(len(self.rows()), before + 1)
-                self.assertTrue(self.rows()[-1].get("unsourced"))
-                self.assertEqual(self.rows()[-1]["source"], src)  # kept as given
-        # a missing source still writes, flagged
-        rc, doc = self.note("--event", "decision", "--note", "no source at all")
-        self.assertEqual(rc, 0, doc)
-        self.assertTrue(self.rows()[-1].get("unsourced"))
-
     def test_inferred_free_text_input_names_the_input_not_the_source(self):
         """The rejection of `inferred: from <free text> -- why` must say which input is not a source; the old message
         said the Source must start with inferred: although it did (main WAL w8d5f765ea4c)."""
@@ -193,22 +175,6 @@ class NoteSourceAuto(base.Env):
                            capture_output=True, text=True, env=env, timeout=60)
         self.assertEqual(p.returncode, 2)
         self.assertIn("allowlist", p.stderr)
-
-    def test_note_with_an_unbackable_source_is_written_unsourced(self):
-        """M2: when the chosen source cannot be backed here, `ah note` says so. Since 2026-11-24 the row is written
-        labelled unsourced and the result is ok=True, unsourced=True (it was refused and dropped from 2026-11-06)."""
-        now = time.time()
-        with open(self.wal, "a") as fh:
-            fh.write(json.dumps({"at": iso(now - 600), "event": "scope", "id": "wsrc00000002", "note": "unbackable ancestor",
-                                 "source": 'user:12345678-1234-1234-1234-123456789abc/12345678-1234-1234-1234-123456789abd "gone"'}) + "\n")
-        before = len(self.rows())
-        rc, done = self.ah("note", "--wal", str(self.wal), "--source", "auto", "--note", "follow-up")
-        self.assertTrue(done["ok"], done)
-        self.assertTrue(done.get("unsourced"), done)
-        self.assertFalse(done.get("quarantined"), done)
-        self.assertFalse(done.get("refused"), done)
-        self.assertEqual(len(self.rows()), before + 1)
-        self.assertTrue(self.rows()[-1].get("unsourced"))
 
     def test_no_ancestor_is_refused_not_guessed(self):
         rc, plan = self.ah("note", "--wal", str(self.wal), "--source", "auto", "--dry-run", "--note", "orphan decision")

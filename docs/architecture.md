@@ -1,59 +1,57 @@
 # Architecture
 
-Agent Harness is a set of installed instructions, role definitions and standalone Python helpers around Claude Code and Codex, plus a small Go binary and an unreleased Go console. There is no server. State lives in files on the machine that runs the agents. This page describes what the repository contains; the exact behavior of each helper is in [operations](operations.md) and, for Claude, [HARNESS.md](../HARNESS.md).
+Agent Harness is a set of installed instructions, role definitions, generated sandbox settings and standalone Python helpers around Claude Code and Codex. There is no server and no daemon. State lives in files on the machine that runs the agents. The decided direction and its reasons are in [direction](direction.md); the exact behavior of each helper is in [operations](operations.md).
 
 ## Components
 
 | Component | Where | What it does |
 | --- | --- | --- |
-| Policy text | `HARNESS.md` (installed as a marked block in `~/.claude/CLAUDE.md`), `codex/AGENTS.md`, `codex/skills/agent-harness` | Tells the agent when to use the fast path, when to delegate, and which gates apply. Instructions only: an agent can ignore them. |
+| Standing rules | `HARNESS.md` (installed as a marked block in `~/.claude/CLAUDE.md`), `codex/AGENTS.md`, `codex/skills/agent-harness` | What is enforced and where, and the tools to use. Advice: an agent can ignore it; the boundaries below do not depend on it. |
 | Roles | `harness/agents` (4 Claude roles), `codex/agents` (6 Codex roles) | Task owner, fixer, red-team, click-tester, plus reviewer and rescue on Codex. |
-| Hooks and helpers | `harness/hooks/*.py` | Python scripts called by tool hooks or by the main agent: `wal.py` (write-ahead log), `commit_policy.py`, `peer_review.py`, `deliver.py` and `integrate_local.py`, `merge_gate.py`, `command_guard.py`, `kill_guard.py`, `heavy_job_guard.py`, `spec_flow.py`, `provenance.py`, `usage_guard.py`, `escalation.py`, `ah.py`, `ops_watch.py`, `ahd.py`. |
-| Installers | `install.py`, `install_codex.py`, `install_tui_plugin.py`, `log_backup_install.py`, `netwatch_install.py` | Preview by default, `--apply` to write; they merge settings and back up replaced files. |
-| `harness` binary | `cmd/harness`, `internal/*` | Go CLI. Currently ports `harness tickets` (the local git-ref ledger, see [ledger](ledger.md)), `ledger-mcp`, and `version`. Other subcommands refuse and point back to the Python helper. |
-| Console | `console/` | Local Go application with an embedded browser UI that drives Codex and Claude Code CLIs. Unreleased baseline; see [console](console.md). |
-| TUI plugin | `plugins/harness-tui` | Optional offline reference view opened from a chat; also answers Mission Control chat from Claude desktop. See [tui-plugin](tui-plugin.md). |
-| Mission Control | `harness/mission_control`, `mission_control_install.py`, `harness/hooks/mc_inbox.py` | Local read-only realtime fleet dashboard with chat, run by launchd on the Mac; see [mission-control](mission-control.md). |
+| Boundaries | `ah_sandbox.py`, `sandbox_base.json`, `ah_doctor.py` | Per-role sandbox and permission settings (worker, reviewer, supervisor) for Claude Code `--settings` or managed settings and for Codex permission profiles; `ah doctor` proves on the host that each denial holds, with a positive twin ([sandbox](sandbox.md), [doctor](doctor.md)). |
+| Merge rule | `ah_repo.py`, `peer_review.py` | `ah repo protect` sets a GitHub ruleset that requires `harness/review`; the review runner posts it for the exact head ([merge-rule](merge-rule.md)). |
+| Hooks | `ah_hook.py` and ten registrations | The off-switch launcher, the session folder (`session_env.py`), notes (`wal.py`), the save (`autosave.py`), the answer inbox (`owner_inbox.py`), the handoff nudge (`dropped_gate.py`) and the named database tool check (`prod_delete_guard.py`). None on Bash ([reference](harness-reference.md#hooks-release-1001)). |
+| Tools | `ah.py` and the modules it dispatches to, `deliver.py`, `wal_note.py`, `bg_job.py` | `ah secret`, `ah log-push`, `ah kill`, `ah worktree-remove`, `ah reap`, `ah co`, `ah approvals`, `ah owners`, `ah status`, `ah off|on`. |
+| Installers | `install.py`, `install_codex.py`, `log_backup_install.py`, `netwatch_install.py`, `mission_control_install.py` | Preview by default, `--apply` to write; they merge settings, back up replaced files and record the release ([off-switch](off-switch.md)). |
+| Mission Control | `harness/mission_control`, `mission_control_install.py` | Optional local read-only dashboard; nothing in the core depends on it ([mission-control](mission-control.md)). |
 
 ## Data flow
 
 ```mermaid
 flowchart LR
     U[User request] --> M[Main agent]
-    M -- scope brief --> O[Owner agent in its own worktree]
-    M -. hook events .-> W[(Session WAL, private JSONL)]
-    O -. hook events .-> W
+    M -- scope brief --> O[Owner agent in its session folder]
+    M -. notes .-> W[(Session WAL, private JSONL)]
+    O -. notes .-> W
     O -- commits --> G[Feature branch]
-    G --> R[peer_review.py: plan, code-inspection, pr]
-    R -- fresh report bound to HEAD --> M
+    G --> R[peer_review.py pr]
+    R -- harness/review status on the head --> GH[GitHub ruleset]
     M --> D[deliver.py prepare]
     D --> P[Draft PR]
-    P -- authorized merge, merge_gate.py checks --> F[deliver.py finish]
+    P -- merge allowed only with a passing status --> F[deliver.py finish]
     F --> C[Original checkout, fast-forward]
-    D -. remote blocked, explicit local mode .-> L[integrate_local.py]
-    L --> C
+    O -. turn end .-> S[autosave.py: unpushed work saved]
 ```
 
-1. Tool hooks append metadata (not prompt text or tool arguments) to a per-session WAL under `~/.claude/wals`, or `~/.agent-harness/codex-wals` on Codex. Agents add human-readable intent, decision and result notes with `wal_note.py`.
-2. Commits pass `commit_policy.py` before they run (PreToolUse hook, plus a git `commit-msg` backstop on Git 2.54+).
-3. Review reports from `peer_review.py` name a stage, the reviewed HEAD and the packet hash, so a stale report is detectable.
-4. Merge and delete commands pass guard hooks (`merge_gate.py`, `command_guard.py`, `kill_guard.py`, `heavy_job_guard.py`) that fail closed on commands they cannot parse.
-5. `deliver.py` publishes only the feature branch and never merges the PR. Recovery state is kept in the repository's Git common directory.
+1. A session gets its folder and TMPDIR at start (`session_env.py`). The sandbox, when the session was launched with a role's settings, limits writes to the project, the session folder and the caches, and denies reads of key files.
+2. Agents add intent, decision, ask and handoff notes with `wal_note.py`. Transcripts are the mechanical record.
+3. Review reports from `peer_review.py` name the reviewed HEAD; the runner posts `harness/review` for it. A later push is a new head with no status.
+4. GitHub refuses a merge without that status, a force-push and a branch deletion. No hook judges a merge or commit command.
+5. At every turn end unpushed work is saved; the reaper removes dead sessions' checkouts after saving them ([lifecycle](lifecycle.md)).
 
 ## Limits that shape the design
 
-- The hooks are not a sandbox. They block known-dangerous command shapes and record evidence; they cannot prove a test was meaningful or a review independent. See [validation](validation.md) and [FINDINGS](FINDINGS.md).
+- Claude Code's sandbox covers its Bash tool; the file tools are held by permission deny rules, which a determined local user can edit.
+- The review status can be forged with the owner's own token until the reviewer posts through an identity workers cannot read.
 - Claude Code `--safe-mode` disables `CLAUDE.md` and hooks.
 - Windows is untested for the Python helpers.
-- Python helpers need Python 3.10+ (Claude edition) or 3.11+ (Codex edition). CI also imports the hook modules on Python 3.9.
+- Installed hooks run on the host's `python3` (3.9 on macOS); the installers need 3.10+ (Claude) or 3.11+ (Codex).
 
 ## Build and test
 
 ```sh
 python3 -m compileall -q install.py harness tests
-python3 -m unittest discover -s tests -v      # Python helpers (CI step "Unit and integration tests")
-go vet ./... && go test ./...                 # repository root: harness binary and internal packages
-cd console && go test ./... && go build -o harness-console .   # console, Go 1.22+
+python3 -m unittest discover -s tests -v
 ```
 
-`.github/workflows/ci.yml` runs the Python and Go suites, checks that the committed CPython and secret-pattern goldens are current, and does a reproducible build. `console.yml` runs the console suite, race detector, vet and cross-platform builds. `release.yml` builds `harness` from a `v*` tag with attestation; no tag has been pushed yet.
+`.github/workflows/ci.yml` runs the Python suite on Linux and macOS and imports every hook module on Python 3.9.

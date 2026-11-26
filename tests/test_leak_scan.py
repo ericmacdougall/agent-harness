@@ -499,28 +499,6 @@ class RoundThreeFindings(unittest.TestCase):
             with self.assertRaises(ValueError):
                 sf.load_spec_policy(sbase)
 
-    def test_installer_migrates_existing_personal_values_before_overwrite(self):
-        sys.path.insert(0, str(ROOT))
-        import install
-        with tempfile.TemporaryDirectory() as tmp:
-            claude = Path(tmp) / ".claude"
-            (claude / "hooks").mkdir(parents=True)
-            (claude / "hooks" / "commit_policy.json").write_text(json.dumps({
-                "backstop_repos": ["example\\.invalid/"], "enforcement": "on",
-                "ticket_systems": {"goodqa": {"repos": ["example\\.invalid/"], "org_id": "o", "endpoint": "https://x.invalid/"}}}))
-            notes = install.migrate_local_profiles(claude)
-            target = claude / "hooks" / "commit_policy.local.json"
-            self.assertTrue(notes and target.is_file())
-            self.assertEqual(oct(target.stat().st_mode & 0o777), "0o600")
-            data = json.loads(target.read_text())
-            self.assertEqual(data["backstop_repos"], ["example\\.invalid/"])
-            self.assertNotIn("endpoint", data["ticket_systems"]["goodqa"])
-            self.assertNotIn("enforcement", data)
-            before = target.read_text()
-            self.assertEqual(install.migrate_local_profiles(claude), [])  # never overwrites
-            self.assertEqual(target.read_text(), before)
-
-
 class RoundFourFindings(unittest.TestCase):
     """B1 delimiter smuggling, B2 non-dict projects, L5 migration route filter."""
 
@@ -575,63 +553,8 @@ class RoundFourFindings(unittest.TestCase):
             done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=dict(os.environ, HOME=tmp))
             self.assertEqual(done.stdout.strip(), "VALUEERROR", done.stdout + done.stderr)
 
-    def test_migration_filters_route_keys_so_the_loader_accepts_the_result(self):
-        sys.path.insert(0, str(ROOT))
-        import install
-        import commit_policy as cp
-        with tempfile.TemporaryDirectory() as tmp:
-            claude = Path(tmp) / ".claude"
-            (claude / "hooks").mkdir(parents=True)
-            (claude / "hooks" / "commit_policy.json").write_text(json.dumps({"ticket_systems": {"goodqa": {
-                "repos": ["example\\.invalid/"], "org_id": "o",
-                "projects": {"p": {"project_id": "1", "org_id": "o", "endpoint": "https://x.invalid/", "note": "n"}}}}}))
-            install.migrate_local_profiles(claude)
-            data = json.loads((claude / "hooks" / "commit_policy.local.json").read_text())
-            self.assertEqual(set(data["ticket_systems"]["goodqa"]["projects"]["p"]), {"project_id", "org_id"})
-            base = Path(tmp) / "commit_policy.json"
-            base.write_text((ROOT / "harness" / "hooks" / "commit_policy.json").read_text())
-            (Path(tmp) / "commit_policy.local.json").write_text((claude / "hooks" / "commit_policy.local.json").read_text())
-            with mock.patch.dict(os.environ):
-                os.environ.pop("AGENT_HARNESS_POLICY_LOCAL", None)
-                cp.load_policy(base)  # must not raise
-
-
 class CodexInstallKeepsEnforcement(unittest.TestCase):
     """Native review F1: install_codex copied the generic policies over a host's personal values."""
-
-    def test_upgrade_over_a_legacy_codex_home_keeps_repos_backstop_and_org(self):
-        sys.path.insert(0, str(ROOT))
-        import install_codex
-        import commit_policy as cp
-        if sys.version_info < (3, 11):
-            self.skipTest("install_codex needs Python 3.11+ (tomllib)")
-        with tempfile.TemporaryDirectory() as tmp:
-            home = Path(tmp)
-            harness = home / ".codex" / "agent-harness"
-            harness.mkdir(parents=True)
-            legacy = json.loads((ROOT / "harness" / "hooks" / "commit_policy.json").read_text())
-            legacy["backstop_repos"] = ["example\\.invalid/"]
-            legacy["ticket_systems"]["goodqa"].update({"repos": ["example\\.invalid/"], "org_id": "00000000-0000-4000-8000-000000000042"})
-            (harness / "commit_policy.json").write_text(json.dumps(legacy))
-            install_codex.install(home, True)
-            with mock.patch.dict(os.environ):
-                os.environ.pop("AGENT_HARNESS_POLICY_LOCAL", None)
-                policy = cp.load_policy(harness / "commit_policy.json")
-            self.assertEqual(policy["backstop_repos"], ["example\\.invalid/"])
-            goodqa = policy["ticket_systems"]["goodqa"]
-            self.assertEqual(goodqa["repos"], ["example\\.invalid/"])
-            self.assertEqual(goodqa["org_id"], "00000000-0000-4000-8000-000000000042")
-            self.assertEqual(oct((harness / "commit_policy.local.json").stat().st_mode & 0o777), "0o600")
-            self.assertTrue((harness / "commit_policy.local.json.example").is_file())
-            self.assertIn("spec_policy.local.json", install_codex.local_profile_status(home, harness))  # the one still missing is named
-
-    def test_status_line_reports_missing_profiles_for_codex(self):
-        sys.path.insert(0, str(ROOT))
-        import install
-        with tempfile.TemporaryDirectory() as tmp:
-            line = install.local_profile_status(Path(tmp), Path(tmp) / "agent-harness")
-            self.assertIn("MISSING", line)
-
 
 if __name__ == "__main__":
     unittest.main()

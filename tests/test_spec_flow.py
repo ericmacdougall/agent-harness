@@ -1278,29 +1278,6 @@ class Hook(SpecFlowCase):
                                mode="warn", enforced_projects=[])
         self.assertEqual(code, 0)
 
-    def test_bulk_with_malformed_items_and_mixed_case_server_are_gated(self):
-        self.assertEqual(self.hook("bulk_update_issues", {"items": {ISSUE: "done"}}, **self.enforce())[0], 2)
-        self.assertEqual(self.hook("bulk_update_issues", {"items": ["x"]}, **self.enforce())[0], 2)
-        self.assertTrue(sf.TOOL_PATTERN.match("mcp__GoodQA__update_issue"))
-        self.assertTrue(re.match(install.GOODQA_STATUS_TOOLS, "mcp__plugin_GoodQA_goodqa__call_api"))
-
-    def test_ahc_bookkeeping_note_is_never_a_record(self):
-        """goodqa#16034 AC-30: an ahc D24 freshness note never counts as evidence, a spec record or a click-test,
-        even when it carries a well-formed record block; an ordinary comment that merely quotes the label later on
-        is still read."""
-        good = sf.record_body("summary", {"v": 1, "kind": "evidence", "ac": ["AC-1"]})
-        plain = {"id": str(uuid.uuid4()), "body": good}
-        self.assertEqual(len(sf.ticket_records([plain], 65536)[0]), 1, "fixture: the same block is a valid record")
-        note = {"id": str(uuid.uuid4()), "body": sf.BOOKKEEPING_LABEL + ": receipt bookkeeping posted by ahc.\n" + good}
-        records, ignored = sf.ticket_records([note], 65536)
-        self.assertEqual(records, [])
-        self.assertIn(sf.BOOKKEEPING_LABEL, ignored[0])
-        import ahc_runner
-        self.assertTrue(sf.is_bookkeeping(ahc_runner.d24_note(
-            {"repo": "o/n", "pr": 7, "head": "a" * 40}, [("a" * 40, "feat(x): y")])),
-            "the daemon's note must carry exactly the label spec_flow skips")
-        self.assertFalse(sf.is_bookkeeping("Owner checkpoint. Not " + sf.BOOKKEEPING_LABEL))
-
     def test_deeply_nested_record_is_ignored(self):
         comment = {"id": str(uuid.uuid4()),
                    "body": f"x\n\n```{sf.RECORD_FENCE}\n" + "[" * 40 + "]" * 40 + "\n```"}
@@ -1542,47 +1519,5 @@ class WalStop(unittest.TestCase):
         self.assertFalse((home / ".claude" / "wals" / "s1" / "agent-ghost.jsonl").exists())
 
 
-class Install(unittest.TestCase):
-    def test_reinstall_keeps_one_spec_gate_and_one_stop_hook(self):
-        sys.path.insert(0, str(HOOKS.parents[1]))
-        import install
-        claude = Path("/tmp/claude-home/.claude")
-        settings = install.merged_settings(install.merged_settings({}, claude), claude)
-        pre = [h for entry in settings["hooks"]["PreToolUse"] for h in entry["hooks"]
-               if (install.hook_argv(h) or [""])[0].endswith("spec_flow.py")]
-        stops = [h for entry in settings["hooks"]["SubagentStop"] for h in entry["hooks"]]
-        # The model ladder (tier_gate.py stop) is a second, separate SubagentStop hook; each must appear once.
-        ladder = [h for h in stops if (install.hook_argv(h) or [""])[0].endswith("tier_gate.py")]
-        dropped = [h for h in stops if (install.hook_argv(h) or [""])[0].endswith("dropped_gate.py")]  # goodqa#14791 I7
-        ported = [h for h in stops if (install.hook_argv(h) or [""])[0].endswith(("wal_cadence.py", "worktree_hygiene.py"))]
-        self.assertEqual(len(ported), 2)  # Hawkeye ports, goodqa#14908: one each
-        stops = [h for h in stops if h not in ladder and h not in dropped and h not in ported]
-        self.assertEqual(len(ladder), 1)
-        self.assertEqual(len(dropped), 1)
-        self.assertEqual(len(pre), 1)
-        self.assertEqual((pre[0]["timeout"], pre[0]["onFailure"]), (60, "block"))
-        self.assertEqual(len(stops), 1)
-        self.assertEqual(settings["hooks"]["SubagentStop"][0]["matcher"], install.SUBAGENT_MATCHER)
-        self.assertIn("spec_flow.py", install.HOOKS)
-        self.assertGreater(60, json.loads((HOOKS / "spec_policy.json").read_text())["hook_deadline_seconds"])
-
-
 if __name__ == "__main__":
     unittest.main()
-
-
-class DocumentedCommands(unittest.TestCase):
-    def test_every_documented_example_parses(self):
-        import re
-        import shlex
-        doc = (HOOKS.parents[1] / "docs" / "operations.md").read_text()
-        lines = [line.split("  #")[0] for line in doc.splitlines() if line.startswith("python3 $S ")]
-        self.assertGreaterEqual(len(lines), 10)
-        parser = sf.build_parser()
-        for line in lines:
-            # Optional parts are shown in [brackets]; check the line with them included.
-            # A <placeholder> stands for one argument even when it contains spaces.
-            line = re.sub(r"<[^<>]*>", lambda m: "PLACEHOLDER", line)
-            words = shlex.split(line.replace("[", " ").replace("]", " "))[2:]
-            with self.subTest(line=line):
-                parser.parse_args(words)
