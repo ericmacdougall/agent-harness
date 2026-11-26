@@ -906,54 +906,40 @@ sys.exit(int(os.environ.get('CLAUDE_EXIT', '0')))
         result = subprocess.run(command, text=True, capture_output=True, env=environment, timeout=STANDARD_HELPER_WATCHDOG_SECONDS)
         self.assertEqual(result.returncode, 2); self.assertIn('review-only', result.stderr)
 
-    def test_top_rung_launches_astra_only_with_approve_top(self):
-        import escalation as ladder, model_tiers as tiers
-        state = self.root / 'ladder'; state.mkdir(mode=0o700)
-        wals = self.root / 'wals'; (wals / 's1').mkdir(parents=True)
-        os.environ['AGENT_HARNESS_WALS_DIR'] = str(wals); self.addCleanup(lambda: os.environ.pop('AGENT_HARNESS_WALS_DIR', None))
-        wal = wals / 's1' / 'main.jsonl'
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
-        import top_assent_fixture as fx
-        fx.use_claude_home(self, self.root / 'claude')
-        src = fx.user_turn(self.root / 'claude', 'yes, use fable for rescue-t')
-        wal.write_text(json.dumps({'id': 'w1', 'event': 'ask', 'note': 'permission for [task:rescue-t] top rung',
-                                   'source': src}) + '\n'
-                       + json.dumps({'id': 'w2', 'event': 'ask_resolved', 'ref': 'w1', 'note': 'yes', 'decision': 'approved'}) + '\n')
-        ladder.Ledger(state, tiers.load_policy()).approve_top('rescue-t', 'w1', wal)
+    def test_top_rung_launches_astra_only_with_a_top_rung_approval(self):
+        # 2026-11-25: the permission is `ah approve top-rung --task T` in the approvals store (the ladder ledger is gone)
+        sys.path.insert(0, str(RESCUE.parent))
+        import ah_approvals
+        store = self.root / 'approvals-home'
         capture = self.root / 'astra-prompt.txt'
         command = [sys.executable, str(RESCUE), '--repo', str(self.repo), '--packet', str(self.packet),
                    '--output', str(self.output), '--task', 'rescue-t', '--rung', 'R5']
         environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + scrubbed_system_path(),
-                       'CAPTURE_CODEX_PROMPT': str(capture), 'AGENT_HARNESS_ESCALATION_DIR': str(state), 'CODEX_ACTION': 'top'}
+                       'CAPTURE_CODEX_PROMPT': str(capture), 'AH_HOME': str(store), 'CODEX_ACTION': 'top'}
+        refused = subprocess.run(command, text=True, capture_output=True, env=environment, timeout=STANDARD_HELPER_WATCHDOG_SECONDS)
+        self.assertEqual(refused.returncode, 2, refused.stderr)
+        self.assertIn('ah approve top-rung --task rescue-t', refused.stderr)
+        self.assertFalse(capture.exists())
+        ah_approvals.grant('top-rung', {'task': 'rescue-t'}, 'user', 'fable rescue', home=str(store))
         result = subprocess.run(command, text=True, capture_output=True, env=environment, timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
         self.assertEqual(result.returncode, 3, result.stderr)
         report = json.loads(self.output.read_text())
         self.assertEqual(report['source'], 'Codex gpt-6-astra medium (rung R5)')
         self.assertTrue(capture.exists())
 
-    def test_task_only_run_launches_the_ledger_rung(self):
-        import escalation as ladder, model_tiers as tiers
-        state = self.root / 'ladder'; state.mkdir(mode=0o700)
-        ledger = ladder.Ledger(state, tiers.load_policy())
-        block = json.dumps({'schema': 1, 'kind': 'final', 'run_id': 'b' * 32, 'evidence': 'EXECUTED', 'subject': {'head': 'a' * 40},
-                            'invocation': {}, 'execution': 'COMPLETED', 'result': 'NO_RESULT', 'reason': 'CODE_FINDINGS',
-                            'usage': {'provider_launches': 1, 'reported': []},
-                            'review': {'stage': 'CODE_INSPECTION', 'verdict': 'BLOCK', 'findings': ['F1']}}, sort_keys=True)
-        for salt in ('1', '2', '3', '4'):
-            # Each failure at a new HEAD: a repeat at the same HEAD without a claimed fix counts once.
-            receipt = json.loads(block); receipt['salt'] = salt; receipt['subject'] = {'head': salt * 40}
-            ledger.record('rescue-r2', json.dumps(receipt, sort_keys=True).encode(), kind='review', source='test')
-        self.assertEqual(ledger.status('rescue-r2')['rung'], 'R2')
+    def test_task_only_run_launches_the_lowest_rung(self):
+        # 2026-11-25: a task key no longer selects a rung from a ladder ledger; without --rung the lowest rung runs
         capture = self.root / 'r2-prompt.txt'
         command = [sys.executable, str(RESCUE), '--repo', str(self.repo), '--packet', str(self.packet),
                    '--output', str(self.output), '--task', 'rescue-r2']
         environment = {**os.environ, 'PATH': str(self.bin) + os.pathsep + scrubbed_system_path(),
-                       'CAPTURE_CODEX_PROMPT': str(capture), 'AGENT_HARNESS_ESCALATION_DIR': str(state), 'CODEX_ACTION': 'r2'}
+                       'CAPTURE_CODEX_PROMPT': str(capture), 'AH_HOME': str(self.root / 'approvals-home'),
+                       'CODEX_ACTION': 'r2'}
         result = subprocess.run(command, text=True, capture_output=True, env=environment, timeout=FUNCTIONAL_HELPER_WATCHDOG_SECONDS)
         self.assertEqual(result.returncode, 3, result.stderr)
         report = json.loads(self.output.read_text())
-        self.assertEqual(report['source'], 'Codex gpt-6.1-sol high (rung R2)')
-        self.assertEqual(report['rung'], 'R2'); self.assertIn('ledger rung', report['rung_why'])
+        self.assertEqual(report['rung'], 'R0')
+        self.assertIn('lowest rung', report['rung_why'])
 
     def test_claude_written_work_is_rescued_by_codex_and_codex_work_by_claude(self):
         capture = self.root / 'claude-prompt.txt'

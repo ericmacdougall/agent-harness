@@ -572,25 +572,19 @@ class PeerReviewTests(unittest.TestCase):
         self.assertEqual(section, "")
         self.assertIn("HARNESS_DOMAIN_GATES", source)
 
-    def test_enforce_refuses_review_when_checklist_unavailable(self):
+    # 2026-11-25: peer_review reads no installed policy any more (spec_flow and spec_policy.json are retired), so its
+    # domain checklist is advisory prompt guidance: a broken checklist or a truncated scan never refuses a review,
+    # and what a limit may have hidden is named in the prompt.
+    def test_a_broken_checklist_never_refuses_the_review(self):
         repo = make_repo({"foundry.toml": "x"})
-        enforce = {"domain_gates": {"mode": "enforce"}}
         bad = Path(tempfile.mkdtemp()) / "c.json"
         bad.write_text("{not json")
-        with mock.patch.object(sf, "load_spec_policy", return_value=enforce), mock.patch.object(dg, "CHECKLIST_FILE", bad):
-            with self.assertRaises(OSError) as ctx:
-                pr.domain_section(repo, "b" * 40, changed_paths=["src/A.sol"])
-        self.assertIn("refusing to review", str(ctx.exception))
-        with mock.patch.object(sf, "load_spec_policy", return_value=enforce):
-            not_git = Path(tempfile.mkdtemp())
-            with self.assertRaises(OSError):  # a real scan error still refuses
-                pr.domain_section(not_git, "b" * 40, changed_paths=[])
-            clean = make_repo({"a/package.json": "{}", "b/package.json": "{}"})  # clean scan, no signal: unaffected
-            self.assertEqual(pr.domain_section(clean, "b" * 40, changed_paths=[]), ("", None))
-        warn = {"domain_gates": {"mode": "warn"}}  # control: warn keeps the warning behaviour
-        with mock.patch.object(sf, "load_spec_policy", return_value=warn), mock.patch.object(dg, "CHECKLIST_FILE", bad), \
-                contextlib.redirect_stderr(io.StringIO()):
+        err = io.StringIO()
+        with mock.patch.object(dg, "CHECKLIST_FILE", bad), contextlib.redirect_stderr(err):
             self.assertEqual(pr.domain_section(repo, "b" * 40, changed_paths=["src/A.sol"]), ("", None))
+        self.assertIn("domain checklist skipped", err.getvalue())
+        clean = make_repo({"a/package.json": "{}", "b/package.json": "{}"})  # clean scan, no signal: unaffected
+        self.assertEqual(pr.domain_section(clean, "b" * 40, changed_paths=[]), ("", None))
 
     def evasion_repos(self):
         ethers = json.dumps({"dependencies": {"ethers": "6"}})
@@ -603,84 +597,41 @@ class PeerReviewTests(unittest.TestCase):
         }
         return cases
 
-    def test_enforce_refuses_when_a_limit_may_hide_the_signal(self):
-        enforce = {"domain_gates": {"mode": "enforce"}}
-        allow = {"domain_gates": {"mode": "enforce", "allow_truncated": True}}
+    def test_a_limit_that_may_hide_the_signal_is_named_in_the_prompt(self):
         for name, (repo, limits) in self.evasion_repos().items():
             with self.subTest(case=name):
-                with mock.patch.multiple(dg, **{"MAX_FILES": dg.MAX_FILES, **limits}):
-                    with mock.patch.object(sf, "load_spec_policy", return_value=enforce):
-                        with self.assertRaises(OSError) as ctx:
-                            pr.domain_section(repo, "b" * 40, changed_paths=[])
-                    self.assertIn("allow_truncated", str(ctx.exception))
-                    with mock.patch.object(sf, "load_spec_policy", return_value=allow), contextlib.redirect_stderr(io.StringIO()):
-                        section, _ = pr.domain_section(repo, "b" * 40, changed_paths=[])
-                    self.assertIn("Domain scan incomplete", section)  # visible in the review prompt, not only stderr
-                    with mock.patch.object(sf, "load_spec_policy", return_value={"domain_gates": {"mode": "warn"}}), \
-                            contextlib.redirect_stderr(io.StringIO()):
-                        section, _ = pr.domain_section(repo, "b" * 40, changed_paths=[])
-                    self.assertIn("Domain scan incomplete", section)
-                    block = sf.append_domain_block("# Spec\n", repo, {})
-                    self.assertIn("Domain scan incomplete", block)  # and in the spec block
+                with mock.patch.multiple(dg, **{"MAX_FILES": dg.MAX_FILES, **limits}), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    section, _ = pr.domain_section(repo, "b" * 40, changed_paths=[])
+                self.assertIn("Domain scan incomplete", section)  # visible in the review prompt, not only stderr
 
-    def test_decoy_detected_domain_does_not_bypass_enforce(self):
+    def test_a_decoy_domain_still_gets_its_checklist(self):
         ethers = json.dumps({"dependencies": {"ethers": "6"}})
         decoy = make_repo({"Anchor.toml": "[programs]", "package.json": ethers[:-1] + ', "pad": "' + "x" * 3000 + '"}'})
         deep = make_repo({"Anchor.toml": "[programs]",
                           "package.json": '{"dependencies": {"ethers": "6"}, "x": ' + "[" * 500 + "]" * 500 + "}"})
-        enforce = {"domain_gates": {"mode": "enforce"}}
-        allow = {"domain_gates": {"mode": "enforce", "allow_truncated": True}}
         self.assertIn("too deeply nested", dg.detect_full(deep)[1])  # deep case runs at default limits, not the size cap
         for name, repo, limits in (("padded", decoy, {"MAX_MANIFEST_BYTES": 2000}), ("deep", deep, {})):
-            with self.subTest(case=name), mock.patch.multiple(dg, **{"MAX_FILES": dg.MAX_FILES, **limits}):
-                with mock.patch.object(sf, "load_spec_policy", return_value=enforce):
-                    with self.assertRaises(OSError):
-                        pr.domain_section(repo, "b" * 40, changed_paths=[])
-                _, problems = sf.domain_lint(SPEC, repo, enforce)  # the two callers agree
-                self.assertTrue(any("fails closed" in p for p in problems), problems)
-                for policy in (allow, {"domain_gates": {"mode": "warn"}}):
-                    with mock.patch.object(sf, "load_spec_policy", return_value=policy), contextlib.redirect_stderr(io.StringIO()):
-                        section, _ = pr.domain_section(repo, "b" * 40, changed_paths=[])
-                    self.assertIn("Domain scan incomplete", section)
-                    self.assertIn("solana", section.split("Domain scan incomplete")[1])  # names what was detected
-                    self.assertIn("### solana", section)  # the visible checklist still applies
-                warnings, problems = sf.domain_lint(SPEC, repo, allow)  # lint honours allow_truncated for both limits
-                self.assertFalse(any("fails closed" in p for p in problems), problems)
+            with self.subTest(case=name), mock.patch.multiple(dg, **{"MAX_FILES": dg.MAX_FILES, **limits}), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                section, _ = pr.domain_section(repo, "b" * 40, changed_paths=[])
+                self.assertIn("Domain scan incomplete", section)
+                self.assertIn("solana", section.split("Domain scan incomplete")[1])  # names what was detected
+                self.assertIn("### solana", section)  # the visible checklist still applies
 
-    def test_unreadable_policy_warns_loudly(self):
-        repo = make_repo({"foundry.toml": "x"})
-        err = io.StringIO()
-        with mock.patch.object(sf, "load_spec_policy", side_effect=ValueError("bad")), contextlib.redirect_stderr(err):
-            pr.domain_section(repo, "b" * 40, changed_paths=["src/A.sol"])
-        self.assertIn("enforce refusals are OFF", err.getvalue())
-        padded = make_repo({"package.json": json.dumps({"dependencies": {"ethers": "6"}, "pad": "x" * 3000})})
-        with mock.patch.object(sf, "load_spec_policy", side_effect=ValueError("bad")), \
-                mock.patch.object(dg, "MAX_MANIFEST_BYTES", 2000), contextlib.redirect_stderr(io.StringIO()):
-            section, _ = pr.domain_section(padded, "b" * 40, changed_paths=[])  # really off: no refusal despite the hidden signal
-        self.assertIn("Domain scan incomplete", section)
-
-    def test_allow_truncated_only_from_installed_policy(self):
+    def test_allow_truncated_only_from_a_policy(self):
         enforce = {"domain_gates": {"mode": "enforce"}}
-        repo, limits = self.evasion_repos()["oversized manifest"]
+        repo, _ = self.evasion_repos()["oversized manifest"]
         (repo / ".harness").mkdir()
         (repo / ".harness" / "domain-gates.json").write_text(json.dumps({"allow_truncated": True, "disabled": True, "mode": "warn"}))
         subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
-        with mock.patch.multiple(dg, **{"MAX_FILES": dg.MAX_FILES, **limits}), \
-                mock.patch.dict(os.environ, {"HARNESS_DOMAIN_GATES_ALLOW_TRUNCATED": "1"}), \
-                mock.patch.object(sf, "load_spec_policy", return_value=enforce):
-            with self.assertRaises(OSError) as ctx:  # repo file and env var cannot allow the truncated scan
-                pr.domain_section(repo, "b" * 40, changed_paths=[".github/x"])
-            self.assertIn("allow_truncated", str(ctx.exception))
+        with mock.patch.dict(os.environ, {"HARNESS_DOMAIN_GATES_ALLOW_TRUNCATED": "1"}):
             state = dg.settings(repo, enforce)
-            self.assertFalse(state["disabled"])
-            for fragment in ("HARNESS_DOMAIN_GATES_ALLOW_TRUNCATED ignored", "allow_truncated ignored",
-                             "key mode ignored", "disabled ignored"):
-                self.assertIn(fragment, state["warning"])
-            warnings, problems = sf.domain_lint(SPEC, repo, enforce)
-            self.assertTrue(problems)  # lint also stays closed
-            self.assertTrue(any("allow_truncated ignored" in w for w in warnings))
+        self.assertFalse(state["disabled"])
+        for fragment in ("HARNESS_DOMAIN_GATES_ALLOW_TRUNCATED ignored", "allow_truncated ignored",
+                         "key mode ignored", "disabled ignored"):
+            self.assertIn(fragment, state["warning"])
         self.assertFalse(dg.allow_truncated(enforce))
-        self.assertFalse(any("allow_truncated" in a for a in sys.argv))  # no CLI flag exists to set it
 
     def test_hidden_neg_and_waiver_in_html_comments_do_not_count(self):
         neg = SPEC.replace("- NEG-1 (AC-1): a zero deposit is refused.",
@@ -705,16 +656,6 @@ class PeerReviewTests(unittest.TestCase):
             self.assertIsNone(source)
         section, source = pr.domain_section(repo, "b" * 40, changed_paths=["src/A.sol"])  # trusted: file existed before the diff
         self.assertEqual((section, source), ("", ".harness/domain-gates.json"))
-
-    def test_peer_review_honours_policy_enforce_over_repo_file(self):
-        repo = make_repo({"foundry.toml": "x", ".harness/domain-gates.json": json.dumps({"disabled": True})})
-        with mock.patch.object(sf, "load_spec_policy", return_value={"domain_gates": {"mode": "enforce"}}):
-            section, source = pr.domain_section(repo, "b" * 40, changed_paths=["src/A.sol"])
-        self.assertIn("Domain checklist", section)
-        with mock.patch.object(sf, "load_spec_policy", return_value={"domain_gates": {"disabled": True}}):
-            section, source = pr.domain_section(repo, "b" * 40, changed_paths=["src/A.sol"])
-        self.assertEqual(section, "")
-        self.assertEqual(source, "spec_policy.json")
 
     def test_case_variant_opt_out_file_is_distrusted(self):
         repo = make_repo({"foundry.toml": "x"})

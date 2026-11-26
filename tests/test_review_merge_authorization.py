@@ -289,7 +289,18 @@ class EndToEndTests(unittest.TestCase):
                            "Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT: PASS\\nReviewed.')\n")
         self.fake("claude", "import sys\nsys.stdin.read()\nprint('VERDICT: PASS\\nReviewed.')\n")
         value = {"number": 5, "url": "https://github.com/o/r/pull/5", "headRefOid": self.head, "state": "OPEN"}
-        self.fake("gh", "import json\nprint(json.dumps(" + repr(value) + "))\n")
+        self.fake_gh(value)
+
+    def fake_gh(self, value):
+        """`gh pr view` answers `value`; a bound PR review also posts harness/review and reads it back (2026-11-25)."""
+        statuses = str(self.root / "gh-statuses.json")
+        self.fake("gh", "import json, os, sys\nargs = sys.argv[1:]\nstate = " + repr(statuses) + "\n"
+                        "rows = json.load(open(state)) if os.path.exists(state) else []\n"
+                        "if args[:1] == ['api'] and 'POST' in args:\n"
+                        "    row = dict(json.loads(sys.stdin.read()), id=len(rows) + 1)\n"
+                        "    json.dump([row] + rows, open(state, 'w'))\n    print(json.dumps(row))\n"
+                        "elif args[:1] == ['api']:\n    print(json.dumps(rows))\n"
+                        "else:\n    print(json.dumps(" + repr(value) + "))\n")
 
     def fake(self, name, body):
         path = self.bin / name
@@ -374,7 +385,7 @@ class EndToEndTests(unittest.TestCase):
         self.packet.write_text("Scope and evidence.\nReviewed HEAD " + head +
                                "\n$ python3 -m unittest discover tests\nRan 1 test in 0.1s\nOK\nexit 0\n")
         value = {"number": 5, "url": "https://github.com/o/r/pull/5", "headRefOid": head, "state": "OPEN"}
-        self.fake("gh", "import json\nprint(json.dumps(" + repr(value) + "))\n")
+        self.fake_gh(value)
         output = self.root / "two.md"
         env = dict(os.environ, HOME=str(self.root), PATH=str(self.bin) + os.pathsep + "/usr/bin:/bin",
                    AGENT_HARNESS_USAGE_DIR=str(self.root / "usage"),
@@ -404,7 +415,7 @@ class EndToEndTests(unittest.TestCase):
         self.packet.write_text("Scope and evidence.\nReviewed HEAD " + head +
                                "\n$ python3 -m unittest discover tests\nRan 1 test in 0.1s\nOK\nexit 0\n")
         value = {"number": 5, "url": "https://github.com/o/r/pull/5", "headRefOid": head, "state": "OPEN"}
-        self.fake("gh", "import json\nprint(json.dumps(" + repr(value) + "))\n")
+        self.fake_gh(value)
         output = self.root / ("review-%s.md" % head[:12])
         env = dict(os.environ, HOME=str(self.root), PATH=str(self.bin) + os.pathsep + "/usr/bin:/bin",
                    AGENT_HARNESS_USAGE_DIR=str(self.root / "usage"),
@@ -484,7 +495,7 @@ class EndToEndTests(unittest.TestCase):
         self.packet.write_text("Scope and evidence.\nReviewed HEAD " + self.head +
                                "\n$ python3 -m unittest discover tests\nRan 1 test in 0.1s\nOK\nexit 0\n")
         value = {"number": 5, "url": "https://github.com/o/r/pull/5", "headRefOid": self.head, "state": "OPEN"}
-        self.fake("gh", "import json\nprint(json.dumps(" + repr(value) + "))\n")
+        self.fake_gh(value)
         result = self.run_review("--author-harness", "claude")
         self.assertNotIn("Merge authorization:", result.stdout, result.stdout + result.stderr)
         self.assertIn("do not prove the author harness", result.stderr)

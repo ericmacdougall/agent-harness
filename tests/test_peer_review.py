@@ -465,7 +465,6 @@ Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT:
                     stack.enter_context(patch.dict(os.environ, {'PATH': str(self.bin) + os.pathsep + system_path()}))
                     stack.enter_context(patch.object(sys, 'argv', ['review', 'plan', '--repo', str(self.repo),
                                        '--packet', str(self.packet), '--output', str(output)]))
-                    stack.enter_context(patch.object(module, 'plan_resource_gate', return_value=(0, '')))
                     stack.enter_context(patch.object(module, 'make_snapshot', side_effect=snapshot))
                     model = stack.enter_context(patch.object(module, 'review_snapshot', side_effect=review))
                     stack.enter_context(patch.object(module.tempfile.TemporaryDirectory, 'cleanup', cleanup))
@@ -877,17 +876,17 @@ print(json.dumps({{'role': 'assistant', 'content': 'KIMI_ADVISORY: ACCEPT\\nVERD
         self.assertIn('ADVISORY ONLY', result.stdout)
         self.assertNotIn('Usage receipt', result.stdout)
 
-    def test_kimi_advisory_is_not_recorded_in_the_task_ladder_as_a_review(self):
-        ladder_dir = self.root / 'ladder'
-        ladder_dir.mkdir(mode=0o700)
-        env = {'AGENT_HARNESS_ESCALATION_DIR': str(ladder_dir)}
-        # control: a normal primary answer under the same task does reach the ladder
-        control = self.invoke(extra=['--task', 'lad-k', '--author-rung', 'R2', '--author-harness', 'claude'], env=env)
-        self.assertIn('Ladder:', control.stderr)
+    def test_kimi_advisory_posts_no_review_status(self):
+        env = fake_gh(self)
+        binding = ['--github-repo', 'o/r', '--pr', '5', '--author-rung', 'R2', '--author-harness', 'claude']
+        # control: a normal primary answer with the same binding does post harness/review
+        control = self.invoke(extra=binding, env=env)
+        self.assertEqual(control.returncode, 0, control.stderr)
+        self.assertEqual(len(gh_posts(self)), 1)
         self.output.unlink()
-        result, _ = self.kimi_review(extra=['--task', 'lad-k', '--author-rung', 'R2', '--author-harness', 'claude'], env=env)
+        result, _ = self.kimi_review(extra=binding, env=env)
         self.assertEqual(result.returncode, 4, result.stderr)
-        self.assertNotIn('Ladder:', result.stderr)
+        self.assertEqual(len(gh_posts(self)), 1, 'an advisory opinion is never a review status')
 
     def test_secondary_kimi_is_not_called_when_the_primary_answers(self):
         launches = self.root / 'launches'
@@ -1050,7 +1049,6 @@ print(json.dumps({{'role': 'assistant', 'content': 'KIMI_ADVISORY: ACCEPT\\nVERD
         with patch.object(sys, 'argv', ['review', 'plan', '--repo', str(self.repo),
                                        '--packet', str(self.packet), '--output', str(self.output)]), \
              patch.dict(os.environ, {'PATH': str(self.bin) + os.pathsep + system_path()}), \
-             patch.object(module, 'plan_resource_gate', return_value=(0, '')), \
              patch.object(module, 'review_snapshot', return_value=('fixture', 'PLAN_RESULT: ACCEPT', '')), \
              patch.object(os, 'fsync', side_effect=fsync_then_mutate), \
              contextlib.redirect_stderr(errors):
@@ -1083,7 +1081,6 @@ print(json.dumps({{'role': 'assistant', 'content': 'KIMI_ADVISORY: ACCEPT\\nVERD
         with patch.object(sys, 'argv', ['review', 'plan', '--repo', str(self.repo),
                                        '--packet', str(self.packet), '--output', str(self.output)]), \
              patch.dict(os.environ, {'PATH': str(self.bin) + os.pathsep + system_path()}), \
-             patch.object(module, 'plan_resource_gate', return_value=(0, '')), \
              patch.object(module, 'review_snapshot', return_value=('fixture', 'PLAN_RESULT: ACCEPT', '')), \
              patch.object(os, 'link', side_effect=link_then_mutate), \
              contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
@@ -1249,126 +1246,6 @@ print(json.dumps({{'role': 'assistant', 'content': 'KIMI_ADVISORY: ACCEPT\\nVERD
         self.assertEqual(result.returncode, 2, result.stdout)
         self.assertFalse(capture.exists())
         self.assertTrue(self.output.is_dir())
-
-    # PR 247 F4 (goodqa#16049): agent-harness runs no GitHub CI, so the PR review is the merge gate for the ahc
-    # release list. These run the real `pr` entry point on a fixture repository shaped like agent-harness.
-    RELEASE_HELPERS = ('ah', 'ops_watch', 'peer_review')
-
-    def release_commit(self, message, *, files=None, manifest='current', install_names=('ahc_core.py',),
-                       helpers=None, install_text=None):
-        """HEAD declares its shipped modules in install.py HOOKS and its helpers in ahc_guard.HELPER_SCRIPTS, as
-        agent-harness does; 'current' writes the list ahc_release_hashes.py --write would."""
-        hooks = self.repo / 'harness' / 'hooks'
-        hooks.mkdir(parents=True, exist_ok=True)
-        for name, text in (files or {}).items():
-            (hooks / name).write_text(text)
-        helpers = helpers if helpers is not None else {n: n + '.py' for n in self.RELEASE_HELPERS}
-        (self.repo / 'install.py').write_text(install_text or (
-            'HOOKS = (' + ', '.join('"%s"' % n for n in (*install_names, 'ah.py')) + ',)\n'))
-        (hooks / 'ahc_guard.py').write_text('import re\nHELPER_SCRIPTS = %r\n' % (helpers,))
-        if manifest == 'current':
-            sha = lambda name: hashlib.sha256((hooks / name).read_bytes()).hexdigest()  # noqa: E731
-            manifest = {'files': {n: sha(n) for n in install_names},
-                        'helpers': {n: sha(f) for n, f in helpers.items()}}
-        if manifest is not None:
-            (hooks / 'ahc_release.json').write_text(manifest if isinstance(manifest, str) else json.dumps(manifest))
-        subprocess.run(['git', '-C', str(self.repo), 'add', '-A'], check=True)
-        subprocess.run(['git', '-C', str(self.repo), 'commit', '-qm', message], check=True)
-
-    def release_base(self):
-        self.release_commit('ahc release base', files={'ahc_core.py': 'core = 1\n', 'ah.py': 'ah = 1\n',
-                                                        'ops_watch.py': 'watch = 1\n', 'peer_review.py': 'review = 1\n'})
-
-    def assert_release_refused(self, *fragments):
-        launches = self.root / 'release-launches'
-        result = self.invoke(env={'PROVIDER_LAUNCH_LOG': str(launches)})
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        for fragment in ('Review refused: harness/hooks/ahc_release.json', *fragments):
-            self.assertIn(fragment, result.stderr)
-        self.assertFalse(launches.exists(), 'a stale release list must refuse before any provider launch')
-        self.assertFalse(self.output.exists(), 'a refused review writes no report, so no merge authorization')
-        usage = self.root / 'usage-state'
-        runs = [p for p in usage.rglob('*') if p.is_file() and b'peer-review-pr' in p.read_bytes()] if usage.exists() else []
-        self.assertEqual(runs, [], 'no PR review run (so no PASS evidence) may be recorded')
-        return result
-
-    def test_r247_f4_a_drifted_helper_refuses_the_pr_review_before_any_provider(self):
-        self.release_base()
-        self.release_commit('change a helper without regenerating', files={'ah.py': 'ah = 2\n'}, manifest=None)
-        result = self.assert_release_refused('helpers ah (sha256 differs)', 'scripts/ahc_release_hashes.py --write')
-        self.assertNotIn('ops_watch', result.stderr)
-
-    def test_r247_f4_a_drifted_ahc_module_refuses_the_pr_review(self):
-        self.release_base()
-        self.release_commit('change a module without regenerating', files={'ahc_core.py': 'core = 2\n'}, manifest=None)
-        self.assert_release_refused('files ahc_core.py (sha256 differs)')
-
-    def test_r247_f4_dropping_a_listed_helper_refuses_the_pr_review(self):
-        self.release_base()
-        hooks = self.repo / 'harness' / 'hooks'
-        manifest = json.loads((hooks / 'ahc_release.json').read_text())
-        del manifest['helpers']['ah']
-        self.release_commit('drop a helper from the list', files={'ah.py': 'ah = 2\n'}, manifest=manifest)
-        self.assert_release_refused('helpers ah (declared by ahc_guard.HELPER_SCRIPTS, not listed)')
-
-    def test_r247_f4_a_newly_declared_helper_that_is_not_listed_refuses(self):
-        self.release_base()
-        manifest = json.loads((self.repo / 'harness' / 'hooks' / 'ahc_release.json').read_text())
-        self.release_commit('declare a helper without listing it', files={'extra.py': 'extra = 1\n'}, manifest=manifest,
-                            helpers={**{n: n + '.py' for n in self.RELEASE_HELPERS}, 'extra': 'extra.py'})
-        self.assert_release_refused('helpers extra (declared by ahc_guard.HELPER_SCRIPTS, not listed)')
-
-    def test_r247_f4_a_listed_helper_nothing_declares_refuses(self):
-        self.release_base()
-        manifest = json.loads((self.repo / 'harness' / 'hooks' / 'ahc_release.json').read_text())
-        manifest['helpers']['ghost'] = 'f' * 64
-        self.release_commit('list a helper nothing declares', manifest=manifest)
-        self.assert_release_refused('helpers ghost (listed, but ahc_guard.HELPER_SCRIPTS does not declare it)')
-
-    def test_r247_f4_a_module_no_longer_shipped_leaves_the_list_and_passes(self):
-        # what --check requires: ahc_core.py stays on disk (as ahc_scan.py does) but install.py no longer ships it
-        self.release_base()
-        self.release_commit('stop shipping a module', install_names=())
-        result = self.invoke()
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-
-    def test_r247_f4_a_listed_name_nothing_declares_refuses(self):
-        self.release_base()
-        manifest = json.loads((self.repo / 'harness' / 'hooks' / 'ahc_release.json').read_text())
-        self.release_commit('stop shipping a module but keep listing it', install_names=(), manifest=manifest)
-        self.assert_release_refused('files ahc_core.py (listed, but install.py does not ship it)')
-
-    def test_r247_f4_a_declaration_that_is_not_a_literal_refuses(self):
-        self.release_base()
-        self.release_commit('compute HOOKS', install_text='NAMES = ["ahc_core.py"]\nHOOKS = tuple(NAMES)\n')
-        self.assert_release_refused('install.py HOOKS is not a literal')
-
-    def test_r247_f4_an_unlisted_shipped_module_refuses_the_pr_review(self):
-        self.release_base()
-        hooks = self.repo / 'harness' / 'hooks'
-        manifest = json.loads((hooks / 'ahc_release.json').read_text())
-        self.release_commit('ship a new module without listing it', files={'ahc_new.py': 'new = 1\n'},
-                            manifest=manifest, install_names=('ahc_core.py', 'ahc_new.py'))
-        self.assert_release_refused('files ahc_new.py (shipped by install.py, not listed)')
-
-    def test_r247_f4_a_malformed_or_deleted_list_refuses_the_pr_review(self):
-        for label, manifest in (('not json', '{'), ('bad digest', {'files': {'ahc_core.py': 'x'}, 'helpers': {}}),
-                                ('deleted', None)):
-            with self.subTest(label):
-                self.release_base()
-                if manifest is None:
-                    (self.repo / 'harness' / 'hooks' / 'ahc_release.json').unlink()
-                self.release_commit('break the list: ' + label, manifest=manifest)
-                self.assert_release_refused()
-
-    def test_r247_f4_a_regenerated_list_passes_and_the_report_names_it(self):
-        self.release_base()
-        self.release_commit('change a helper and regenerate', files={'ah.py': 'ah = 2\n'})
-        result = self.invoke()
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        listed = (self.repo / 'harness' / 'hooks' / 'ahc_release.json').read_bytes()
-        self.assertIn('ahc release list: current at this HEAD (harness/hooks/ahc_release.json SHA-256 '
-                      + hashlib.sha256(listed).hexdigest() + ')', self.output.read_text())
 
 
 class ProviderEnvelopeTests(unittest.TestCase):
@@ -1866,36 +1743,16 @@ else:
         report = self.output.read_text()
         self.assertIn('Author-Rung: R2\n', report); self.assertIn('Reviewer-Rung: R3\n', report)
         self.assertIn('Reviewer-Selection: openai gpt-6.1-sol xhigh;', report)
-        receipts = list((self.ladder / 'selections').glob('*.json'))
-        self.assertEqual(len(receipts), 1)
-        receipt = json.loads(receipts[0].read_text())
-        self.assertEqual((receipt['task'], receipt['stage'], receipt['author_rung'], receipt['selection']['rung']),
-                         ('lad-1', 'code-inspection', 'R2', 'R3'))
-        self.assertEqual(receipt['packet_sha256'], hashlib.sha256(self.packet.read_bytes()).hexdigest())
+        # 2026-11-25: the selection is in the report headers and the usage receipt; no ladder state is written
+        self.assertEqual(list(self.ladder.iterdir()), [])
 
     def test_permission_rung_reviewer_needs_a_recorded_permission(self):
-        import escalation as ladder
-        import model_tiers as tiers
         refused = self.run_review('--author-rung', 'R5', '--author-harness', 'claude')
         self.assertEqual(refused.returncode, 2, refused.stderr)
         self.assertIn("needs the user's permission", refused.stderr)
         self.assertIn('ah approve top-rung --task', refused.stderr)
-        self.assertFalse(self.argv_file.exists()); self.assertFalse((self.ladder / 'selections').exists())
-        wals = self.root / 'wals'; (wals / 's').mkdir(parents=True)
-        wal = wals / 's' / 'main.jsonl'
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
-        import top_assent_fixture as fx
-        fx.use_claude_home(self, self.root / 'claude')
-        src = fx.user_turn(self.root / 'claude', 'yes, use fable to review lad-5')
-        wal.write_text(json.dumps({'id': 'w9', 'event': 'ask', 'note': 'fable review for [task:lad-5]', 'source': src}) + '\n'
-                       + json.dumps({'id': 'w10', 'event': 'ask_resolved', 'ref': 'w9', 'note': 'yes', 'decision': 'approved'}) + '\n')
-        os.environ['AGENT_HARNESS_WALS_DIR'] = str(wals); self.addCleanup(lambda: os.environ.pop('AGENT_HARNESS_WALS_DIR', None))
-        ladder.Ledger(self.ladder, tiers.load_policy()).approve_top('lad-5', 'w9', wal)
-        allowed = self.run_review('--task', 'lad-5', '--author-rung', 'R5', '--author-harness', 'claude')
-        self.assertEqual(allowed.returncode, 3, allowed.stderr)
-        argv = json.loads(self.argv_file.read_text())
-        # Claude author, Codex present: the cross-harness reviewer is Astra high, launched only with the record.
-        self.assertIn('gpt-6-astra', argv); self.assertIn('Permission: w9\n', self.output.read_text())
+        self.assertFalse(self.argv_file.exists())
+        self.assertFalse(self.output.exists())
 
     def test_permission_rung_reviewer_accepts_a_top_rung_approval(self):
         # 2026-11-24 integration: `ah approve top-rung --task T` (the approvals store) is the user's permission too
@@ -1920,19 +1777,15 @@ else:
         self.assertEqual(argv[argv.index('--model') + 1], 'opus')
         self.assertIn('Reviewer-Rung: R2\n', self.output.read_text())
 
-    def test_block_feeds_one_fail_event_and_a_replay_is_a_noop(self):
-        sys.path.insert(0, str(REVIEW.parent))
-        import escalation as ladder, model_tiers as tiers
-        self.run_review('--task', 'lad-3', '--author-rung', 'R0')
-        state = ladder.Ledger(self.ladder, tiers.load_policy()).load('lad-3')
-        self.assertEqual(len(state['events']), 1)
-        event = state['events'][0]
-        self.assertEqual((event['class'], event['kind'], event['why']), ('FAIL', 'review', 'material review finding'))
-        self.assertEqual(event['source'], 'peer_review:code-inspection')
-        final = next((self.root / 'usage-state' / 'runs').glob('*/final.json'))
-        self.assertEqual(event['receipt_sha256'], hashlib.sha256(final.read_bytes()).hexdigest())
-        status = ladder.Ledger(self.ladder, tiers.load_policy()).record('lad-3', final.read_bytes(), kind='review', source='replay')
-        self.assertTrue(status['replayed']); self.assertEqual(status['failures_at_rung'], 1)
+    def test_a_block_writes_no_ladder_state(self):
+        # 2026-11-25: the model-ladder ledger is gone; a review's result lives in its usage receipt (and, for a bound
+        # PR, in the harness/review status), never in a per-task ladder.
+        result = self.run_review('--task', 'lad-3', '--author-rung', 'R0')
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertNotIn('Ladder', result.stderr)
+        self.assertEqual(list(self.ladder.iterdir()), [])
+        final = json.loads(next((self.root / 'usage-state' / 'runs').glob('*/final.json')).read_text())
+        self.assertEqual((final['result'], final['review']['verdict']), ('CHECK_FAILED', 'BLOCK'))
 
     def test_unknown_author_is_reviewed_at_opus_sol_medium_and_flagged(self):
         self.run_review()  # no task and no author rung: the author is unknown
@@ -2438,3 +2291,324 @@ class ProviderOutputBoundDelta3Tests(unittest.TestCase):
         self.assertEqual(launches.call_count, 2, 'a missing executable allows the one independent fallback')
         self.assertEqual(caught.exception.outcome['reason'], 'TRANSIENT_INFRA')
         self.assertTrue(options['store'].release_pool.called, 'nothing ran, so the pool is released')
+
+
+# ---- 2026-11-25 (docs/merge-rule.md): the review runner posts harness/review for the exact HEAD it reviewed -------
+
+FAKE_GH = r'''import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+stdin = sys.stdin.read() if '--input' in args else ''
+with open(os.environ['FAKE_GH_LOG'], 'a') as stream:
+    stream.write(json.dumps({'args': args, 'stdin': stdin}) + '\n')
+state = Path(os.environ['FAKE_GH_STATE'])
+if args[:2] == ['pr', 'view']:
+    repo = args[args.index('-R') + 1]
+    print(json.dumps({'number': int(args[2]), 'url': 'https://github.com/%s/pull/%s' % (repo, args[2]),
+                      'headRefOid': os.environ.get('FAKE_GH_HEAD') or 'f' * 40, 'state': 'OPEN'}))
+    sys.exit(0)
+if args[:1] == ['api']:
+    method = args[args.index('-X') + 1]
+    path = next(a for a in args if a.startswith('repos/'))
+    statuses = json.loads(state.read_text()) if state.exists() else []
+    if method == 'POST' and '/statuses/' in path:
+        if os.environ.get('FAKE_GH_POST_FAIL'):
+            print(json.dumps({'message': 'Validation Failed'}))
+            print('gh: Validation Failed (HTTP 422)', file=sys.stderr)
+            sys.exit(1)
+        body = json.loads(stdin)
+        entry = dict(body, id=len(statuses) + 1, sha=path.rsplit('/', 1)[1], target_url=body.get('target_url'))
+        statuses.insert(0, entry)
+        state.write_text(json.dumps(statuses))
+        print(json.dumps(entry))
+        sys.exit(0)
+    if method == 'GET' and path.split('?')[0].endswith('/statuses'):
+        if os.environ.get('FAKE_GH_READBACK_EMPTY'):
+            print('[]')
+            sys.exit(0)
+        sha = path.split('/')[4]
+        print(json.dumps([s for s in statuses if s['sha'] == sha]))
+        sys.exit(0)
+print('gh: unexpected call', file=sys.stderr)
+sys.exit(1)
+'''
+
+
+def fake_gh(test, **extra):
+    """Install a fake `gh` in the test's bin directory; returns the environment that drives it."""
+    test.fake('gh', FAKE_GH)
+    head = subprocess.run(['git', '-C', str(test.repo), 'rev-parse', 'HEAD'], check=True, capture_output=True,
+                          text=True).stdout.strip()
+    return {'FAKE_GH_LOG': str(test.root / 'gh-log.jsonl'), 'FAKE_GH_STATE': str(test.root / 'gh-statuses.json'),
+            'FAKE_GH_HEAD': head, **extra}
+
+
+def gh_calls(test):
+    log = test.root / 'gh-log.jsonl'
+    return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+
+
+def gh_posts(test):
+    return [call for call in gh_calls(test) if call['args'][:1] == ['api'] and 'POST' in call['args']]
+
+
+class GitHubReviewStatusTests(unittest.TestCase):
+    fake = PeerReviewTests.fake
+    invoke = PeerReviewTests.invoke
+    evidence = staticmethod(PeerReviewTests.evidence)
+    BINDING = ['--github-repo', 'o/r', '--pr', '5']
+
+    def setUp(self):
+        PeerReviewTests.setUp(self)
+        self.head = subprocess.run(['git', '-C', str(self.repo), 'rev-parse', 'HEAD'], check=True,
+                                   capture_output=True, text=True).stdout.strip()
+
+    def review(self, verdict=None, **env):
+        environment = fake_gh(self, **env)
+        if verdict is not None:
+            environment['CODEX_VERDICT'] = verdict
+        return self.invoke(extra=self.BINDING, env=environment)
+
+    def final(self):
+        return json.loads(next((self.root / 'usage-state' / 'runs').glob('*/final.json')).read_text())
+
+    def posted(self):
+        posts = gh_posts(self)
+        self.assertEqual(len(posts), 1, posts)
+        path = next(a for a in posts[0]['args'] if a.startswith('repos/'))
+        return path, json.loads(posts[0]['stdin'])
+
+    def test_pass_posts_success_for_the_reviewed_head(self):
+        result = self.review()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        path, body = self.posted()
+        self.assertEqual(path, 'repos/o/r/statuses/' + self.head)
+        self.assertEqual((body['state'], body['context']), ('success', 'harness/review'))
+        run_id = self.final()['run_id']
+        self.assertTrue(body['description'].startswith('PASS by Codex '), body)
+        self.assertTrue(body['description'].endswith('; receipt ' + run_id), body)
+        self.assertLessEqual(len(body['description']), 140)
+        self.assertIn('harness/review success', result.stdout)
+        # the binding was read from GitHub before the review, the status read back after the post
+        calls = gh_calls(self)
+        self.assertEqual(calls[0]['args'][:2], ['pr', 'view'])
+        self.assertIn('/statuses', next(a for a in calls[-1]['args'] if a.startswith('repos/')))
+
+    def test_block_posts_failure(self):
+        result = self.review('VERDICT: BLOCK\nF1: the handler drops the error')
+        self.assertEqual(result.returncode, 3, result.stderr)
+        _, body = self.posted()
+        self.assertEqual(body['state'], 'failure')
+        self.assertTrue(body['description'].startswith('BLOCK by Codex '), body)
+
+    def test_a_provider_failure_posts_nothing(self):
+        quota = json.dumps({'type': 'turn.failed', 'error': {'code': 'insufficient_quota'}})
+        result = self.review(CODEX_EVENTS=quota, CLAUDE_EXIT='1', CLAUDE_VERDICT='')
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(gh_posts(self), [])
+        self.assertNotIn('review-status post', result.stderr)
+
+    def test_a_failed_post_keeps_the_review_and_exits_four_with_the_retry_command(self):
+        result = self.review(FAKE_GH_POST_FAIL='1')
+        self.assertEqual(result.returncode, 4, result.stderr)
+        self.assertIn('VERDICT: PASS', self.output.read_text())  # the review result stands
+        run_id = self.final()['run_id']
+        self.assertTrue((self.root / 'usage-state' / 'runs' / run_id / 'settled.json').exists())
+        self.assertIn('ah review-status post --repo o/r --sha %s --state success --description' % self.head,
+                      result.stderr)
+        self.assertIn('receipt ' + run_id, result.stderr)
+
+    def test_a_readback_that_differs_exits_four(self):
+        result = self.review(FAKE_GH_READBACK_EMPTY='1')
+        self.assertEqual(result.returncode, 4, result.stderr)
+        self.assertIn('ah review-status post --repo o/r --sha ' + self.head, result.stderr)
+
+    def test_pass_with_tickets_becomes_block_and_reaches_the_owner(self):
+        report = ('VERDICT: PASS-WITH-TICKETS\nF1: rename the helper\n'
+                  'TICKETED: F1 | category: maintainability | ticket: GoodQA goodqa#42')
+        result = self.review(report)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertTrue(self.output.read_text().split('\n\n', 1)[1].startswith('VERDICT: BLOCK'))
+        self.assertEqual(self.final()['review']['verdict'], 'BLOCK')
+        _, body = self.posted()
+        self.assertEqual(body['state'], 'failure')
+        self.assertTrue(body['description'].startswith('ticketed findings: owner decides'), body)
+
+    def test_a_block_with_ticketed_declarations_stays_block(self):
+        report = 'VERDICT: BLOCK\nF1: rename the helper\nTICKETED: F1 | category: maintainability | ticket: GoodQA g#1'
+        result = self.review(report)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertNotIn('PASS-WITH-TICKETS', self.output.read_text())
+        _, body = self.posted()
+        self.assertEqual(body['state'], 'failure')
+        self.assertTrue(body['description'].startswith('ticketed findings: owner decides'), body)
+
+    def test_without_a_binding_nothing_is_posted(self):
+        result = self.invoke(env=fake_gh(self))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(gh_calls(self), [])
+
+    def test_a_binding_to_another_head_refuses_before_any_review(self):
+        launches = self.root / 'launches'
+        result = self.invoke(extra=self.BINDING, env=fake_gh(self, FAKE_GH_HEAD='e' * 40,
+                                                            PROVIDER_LAUNCH_LOG=str(launches)))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('differs from the requested repository, number, HEAD or open state', result.stderr)
+        self.assertFalse(launches.exists())
+        self.assertEqual(gh_posts(self), [])
+
+    def test_no_main_stamp_is_still_accepted(self):
+        result = self.invoke(extra=[*self.BINDING, '--no-main-stamp'], env=fake_gh(self))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class PrBindingTests(unittest.TestCase):
+    """verify_pr_binding reads the PR through ah_repo.pr_head and still compares repo, number, head and open state."""
+    HEAD = 'a' * 40
+
+    def setUp(self):
+        sys.path.insert(0, str(REVIEW.parent))
+        import peer_review
+        self.review = peer_review
+
+    def runner(self, **changes):
+        value = {'number': 5, 'url': 'https://github.com/o/r/pull/5', 'headRefOid': self.HEAD, 'state': 'OPEN'}
+        value.update(changes)
+        return lambda args, timeout, cwd=None, stdin=None: (0, json.dumps(value), '')
+
+    def test_exact_binding(self):
+        self.assertEqual(self.review.verify_pr_binding('o/r', 5, self.HEAD, runner=self.runner()),
+                         {'repo': 'o/r', 'pr': 5})
+        self.assertEqual(self.review.verify_pr_binding('O/R', 5, self.HEAD, runner=self.runner())['repo'], 'o/r')
+
+    def test_every_difference_refuses(self):
+        for change in ({'number': 6}, {'url': 'https://github.com/o/x/pull/5'}, {'url': 'https://github.com/o/r/pull/6'},
+                       {'headRefOid': 'b' * 40}, {'headRefOid': self.HEAD.upper()}, {'state': 'MERGED'},
+                       {'state': 'CLOSED'}, {'url': 'https://github.com.evil/o/r/pull/5'}):
+            with self.subTest(change=change), self.assertRaises(OSError):
+                self.review.verify_pr_binding('o/r', 5, self.HEAD, runner=self.runner(**change))
+        failing = lambda args, timeout, cwd=None, stdin=None: (1, '', 'gh: offline')  # noqa: E731
+        with self.assertRaises(OSError):
+            self.review.verify_pr_binding('o/r', 5, self.HEAD, runner=failing)
+        for repo, number, head in (('o/r/x', 5, self.HEAD), ('o/r', 0, self.HEAD), ('o/r', 5, 'abc')):
+            with self.subTest(repo=repo), self.assertRaises(OSError):
+                self.review.verify_pr_binding(repo, number, head, runner=self.runner())
+
+
+class ReviewerLaunchTests(unittest.TestCase):
+    """The reviewer runs under the reviewer sandbox when the owner installed one (docs/merge-rule.md)."""
+
+    def setUp(self):
+        sys.path.insert(0, str(REVIEW.parent))
+        import peer_review
+        self.review = peer_review
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name)
+
+    def test_claude_gets_the_reviewer_settings_file_only_when_it_exists(self):
+        self.assertEqual(self.review.claude_sandbox_args(home=self.home), [])
+        settings = self.home / '.agent-harness' / 'sandbox' / 'reviewer.claude.json'
+        settings.parent.mkdir(parents=True)
+        settings.write_text('{}\n')
+        self.assertEqual(self.review.claude_sandbox_args(home=self.home), ['--settings', str(settings)])
+
+    def test_codex_uses_the_ah_reviewer_profile_only_when_config_declares_it(self):
+        from types import SimpleNamespace
+        stub = SimpleNamespace(codex_launch_args=lambda role: ['-c', 'default_permissions="ah-%s"' % role,
+                                                               '-c', 'shell_environment_policy.set.AH_ROLE="%s"' % role])
+        config = self.home / '.codex' / 'config.toml'
+        with patch.dict(sys.modules, {'ah_sandbox': stub}):
+            self.assertEqual(self.review.codex_sandbox_args(home=self.home, env={}), ['--sandbox', 'read-only'])
+            config.parent.mkdir(parents=True)
+            config.write_text('[permissions.ah-worker]\nextends = ":workspace"\n')
+            self.assertEqual(self.review.codex_sandbox_args(home=self.home, env={}), ['--sandbox', 'read-only'])
+            config.write_text('# x\n[permissions.ah-reviewer]\nextends = ":read-only"\n')
+            self.assertEqual(self.review.codex_sandbox_args(home=self.home, env={}),
+                             ['-c', 'default_permissions="ah-reviewer"', '-c',
+                              'shell_environment_policy.set.AH_ROLE="reviewer"'])
+            config.write_text('[permissions."ah-reviewer"]\nextends = ":read-only"\n')
+            self.assertEqual(self.review.codex_sandbox_args(home=self.home, env={})[1],
+                             'default_permissions="ah-reviewer"')
+            other = self.home / 'codex-home'
+            other.mkdir()
+            self.assertEqual(self.review.codex_sandbox_args(home=self.home, env={'CODEX_HOME': str(other)}),
+                             ['--sandbox', 'read-only'])
+        with patch.dict(sys.modules, {'ah_sandbox': None}):  # not installed: the read-only sandbox stays
+            self.assertEqual(self.review.codex_sandbox_args(home=self.home, env={}), ['--sandbox', 'read-only'])
+
+    def test_the_reviewer_child_runs_as_role_reviewer(self):
+        seen = {}
+
+        def fake(cmd, **kwargs):
+            seen.update(kwargs['env'])
+            return subprocess.CompletedProcess(cmd, 0, '', '')
+        with patch.object(self.review, 'run_process', fake):
+            self.review.run(['true'], 'prompt', self.home, 5)
+        self.assertEqual(seen.get('AH_ROLE'), 'reviewer')
+
+
+class ReviewerLaunchCLITests(unittest.TestCase):
+    fake = PeerReviewTests.fake
+    invoke = PeerReviewTests.invoke
+    evidence = staticmethod(PeerReviewTests.evidence)
+
+    def setUp(self):
+        PeerReviewTests.setUp(self)
+        self.argv = self.root / 'claude-argv.json'
+        self.fake('claude', f'''import json, os, sys
+from pathlib import Path
+sys.stdin.read()
+Path({str(self.argv)!r}).write_text(json.dumps({{'argv': sys.argv, 'role': os.environ.get('AH_ROLE')}}))
+print('CODE_INSPECTION_RESULT: ACCEPT\\nReviewed.')
+''')
+        (self.bin / 'codex').unlink()
+        self.home = self.root / 'home'
+        self.home.mkdir()
+
+    def test_claude_reviewer_is_launched_with_the_installed_reviewer_settings(self):
+        settings = self.home / '.agent-harness' / 'sandbox' / 'reviewer.claude.json'
+        settings.parent.mkdir(parents=True)
+        settings.write_text('{}\n')
+        result = self.invoke(stage='code-inspection', env={'HOME': str(self.home)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        seen = json.loads(self.argv.read_text())
+        self.assertEqual(seen['argv'][seen['argv'].index('--settings') + 1], str(settings))
+        self.assertEqual(seen['role'], 'reviewer')
+
+    def test_without_the_file_claude_has_no_settings_flag(self):
+        result = self.invoke(stage='code-inspection', env={'HOME': str(self.home)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        seen = json.loads(self.argv.read_text())
+        self.assertNotIn('--settings', seen['argv'])
+        self.assertEqual(seen['role'], 'reviewer')
+
+
+KILLED_MODULES = ('merge_gate', 'commit_policy', 'escalation', 'spec_flow', 'provenance', 'resource_budget')
+
+
+class ImportWithoutKilledModulesTests(unittest.TestCase):
+    """peer_review and rescue import and start with every kill-list module absent (W3 deletes them)."""
+
+    def test_imports_with_the_kill_list_absent(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / 'hooks'
+            shutil.copytree(REVIEW.parent, target, ignore=shutil.ignore_patterns(
+                *(name + '.py' for name in KILLED_MODULES), '__pycache__'))
+            for name in KILLED_MODULES:
+                self.assertFalse((target / (name + '.py')).exists())
+            code = ('import sys; sys.path.insert(0, %r)\n'
+                    'import peer_review, rescue, ah_repo\n'
+                    'missing = [m for m in %r if m in sys.modules]\n'
+                    'assert not missing, missing\n' % (str(target), KILLED_MODULES))
+            for python in (sys.executable, '/usr/bin/python3'):
+                if not Path(python).exists():
+                    continue
+                with self.subTest(python=python):
+                    done = subprocess.run([python, '-I', '-c', code], capture_output=True, text=True, timeout=60,
+                                          cwd=folder)
+                    self.assertEqual(done.returncode, 0, done.stderr)
+            for script in ('peer_review.py', 'rescue.py'):
+                done = subprocess.run([sys.executable, '-s', str(target / script), '--help'], capture_output=True,
+                                      text=True, timeout=60, cwd=folder)
+                self.assertEqual(done.returncode, 0, done.stderr)

@@ -109,9 +109,8 @@ class CodexOnlyCLI(unittest.TestCase):
         self.assertEqual(final['usage']['review_routing']['actual_reviewer'], 'codex')
         self.assertEqual(final['usage']['review_routing']['requested_mode'], 'codex-only')
         self.assertIn('Reviewer-Rung: R1\n', self.output.read_text())
-        selection = json.loads(next((self.ladder / 'selections').glob('*.json')).read_text())
-        self.assertEqual(selection['author_harness'], 'openai')
-        self.assertEqual(selection['review_routing']['attempt_order'], ['codex'])
+        self.assertEqual(final['usage']['review_routing']['attempt_order'], ['codex'])
+        self.assertFalse(self.ladder.exists(), 'no selection receipt or ladder state is written any more')
 
     def test_missing_codex_never_uses_available_claude(self):
         (self.bin / 'codex').unlink()
@@ -139,7 +138,8 @@ class CodexOnlyCLI(unittest.TestCase):
 
 
 class SelectionIsolation(unittest.TestCase):
-    def test_legacy_fixture_never_writes_the_ambient_selection_store(self):
+    def test_a_review_never_writes_the_ambient_escalation_store(self):
+        # 2026-11-25: selection receipts went with the model ladder; the ambient store is never touched.
         with tempfile.TemporaryDirectory() as folder:
             ambient = Path(folder) / 'ambient'; selections = ambient / 'selections'
             selections.mkdir(parents=True)
@@ -152,7 +152,7 @@ class SelectionIsolation(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(sorted(p.name for p in selections.iterdir()), ['sentinel.json'])
                     self.assertEqual(sentinel.read_text(), 'owned sentinel')
-                    self.assertTrue(list((fixture.root / 'escalation-state' / 'selections').glob('*.json')))
+                    self.assertFalse((fixture.root / 'escalation-state').exists())
                 finally:
                     fixture.doCleanups()
 

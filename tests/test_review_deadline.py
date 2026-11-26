@@ -264,11 +264,9 @@ class DeadlineReachesTheProvider(unittest.TestCase):
         self.assertIn('per-provider deadline 2700 s from provider_timeout by_effort max', timing)
         self.assertRegex(timing, r'snapshot step \d+ s of its \d+ s deadline')
         self.assertEqual(final['usage']['timing']['run_id'], run_id)
+        # 2026-11-25: no ladder any more; a timeout is no result, so nothing is counted and no status is posted
         self.assertIn('A timeout is not counted as a ladder failure', err)
-        ladder_line = next(line for line in err.splitlines() if line.startswith('Ladder: '))
-        self.assertIn('NOT_COUNTED (infrastructure or uncertain result (TIMEOUT))', ladder_line)
-        self.assertIn('a timeout is not counted as a ladder failure, but it spent review launch 1 of 8', ladder_line)
-        self.assertNotIn('Ladder limit:', err)
+        self.assertNotIn('Ladder', err)
 
     # Every started provider step is timed (PR 339 review follow-up): the Kimi fallback step too, and a step whose
     # call raised after the spawn. Failing first against 9822b621, except the guard.
@@ -438,10 +436,7 @@ class TimeoutsOnTheLadder(unittest.TestCase):
                                                   'subagent_type': 'task-owner'}, 'session_id': 's1'},
             self.policy, self.ledger, session_id='s1')
         self.assertEqual((decision, reason), ('deny', note))
-        import rescue
-        with self.assertRaises(esc.LedgerError) as refused:
-            rescue.rescue_rung(self.policy, 'h22-l', None)
-        self.assertEqual(refused.exception.message, note)
+        # 2026-11-25: rescue.py no longer reads the ladder ledger (its rung is --rung or the lowest)
 
     def test_findings_at_the_launch_ceiling_do_not_mention_timeouts(self):
         # Positive control: eight distinct findings spend the same ceiling without a timeout sentence.

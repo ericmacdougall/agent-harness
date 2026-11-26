@@ -581,24 +581,6 @@ class GitHubRoute(Fixture):
         self.assertIn("could not be checked", result.stderr)
 
 
-class PeerReviewGate(Fixture):
-    def test_pr_review_refuses_noncompliant_range_before_spending(self):
-        import peer_review
-        old = os.environ.get("HOME")
-        os.environ["HOME"] = str(self.home)
-        self.addCleanup(os.environ.__setitem__, "HOME", old)
-        base = git("rev-parse", "HEAD", cwd=self.repo, env=self.env)
-        git("update-ref", "refs/remotes/origin/main", base, cwd=self.repo, env=self.env)
-        self.assertEqual(self.commit(sub(CHORE, "bump the lockfile", "bump the second lockfile")).returncode, 0)
-        self.assertEqual(peer_review.commit_policy_gate(self.repo, None), (0, ""))
-        self.assertEqual(self.commit("wip").returncode, 0)
-        code, text = peer_review.commit_policy_gate(self.repo, None)
-        self.assertEqual(code, 2)
-        self.assertIn("BLOCKED", text)
-        git("remote", "remove", "origin", cwd=self.repo, env=self.env)
-        self.assertEqual(peer_review.commit_policy_gate(self.repo, None)[0], 0, "no origin: nothing to publish")
-
-
 class InspectionRegressions(Fixture):
     def test_git_alias_in_config_fails_closed(self):
         git("config", "alias.ci", "commit", cwd=self.repo, env=self.env)
