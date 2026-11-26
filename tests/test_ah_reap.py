@@ -4,7 +4,7 @@ Real git repositories in a temporary directory with a temporary HOME; nothing he
 ~/.agent-harness, ~/.claude or a real host. A bare repository named as `rescue_remote` through AH_LOCAL_CONFIG stands
 in for the remote, the global git config rewrites https://fixture.invalid/ and https://github.com/acme/ to local bare
 repositories, and `docker` is a script that answers from files and records what it was asked.
-The deletion path follows section F of the t2-dev report: each rule there has a test below.
+The deletion path follows section F of a worker host's disk report: each rule there has a test below.
 """
 import contextlib
 import hashlib
@@ -1233,10 +1233,10 @@ class PathOption(Case):
     def test_one_named_folder_outside_the_work_root_is_treated_as_ownerless(self):
         idle = self.folder()
         (idle / "node_modules").mkdir()
-        loose = self.repo(self.home / "timbar-pr41")
+        loose = self.repo(self.home / "proj-pr41")
         work = self.commit(loose, "work.txt")
         (loose / "node_modules").mkdir()
-        beside = self.repo(self.home / "timbar-pr42")
+        beside = self.repo(self.home / "proj-pr42")
         code, out = self.reap("run", "--idle-hours", "0", "--path", loose)
         self.assertEqual(code, 0, out)
         self.assertTrue((loose / "work.txt").is_file())    # a dry run
@@ -1246,7 +1246,7 @@ class PathOption(Case):
         self.assertTrue((beside / ".git").is_dir())        # only what was named
         self.assertTrue((idle / "node_modules").is_dir())  # and not the work root
         ref, = [ref for ref in self.refs() if ref.endswith("/heads/main")]
-        self.assertRegex(ref, r"^refs/rescue/[^/]+/loose/timbar-pr41-[0-9a-f]{8}/[0-9]{8}T[0-9]{6}Z-[0-9a-f]{4}/heads/main$")
+        self.assertRegex(ref, r"^refs/rescue/[^/]+/loose/proj-pr41-[0-9a-f]{8}/[0-9]{8}T[0-9]{6}Z-[0-9a-f]{4}/heads/main$")
         self.assertEqual(self.refs()[ref], work)
         self.assertEqual({row["session"] for row in self.rows()}, {None})
 
