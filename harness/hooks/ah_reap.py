@@ -246,7 +246,8 @@ def _survey(folder) -> dict:
             except OSError:
                 continue
             if not stat.S_ISDIR(info.st_mode):
-                found["newest"] = max(found["newest"], info.st_mtime)
+                if entry.name not in (git_save.REAPING, git_save.LIFE):   # the reaper's own marks
+                    found["newest"] = max(found["newest"], info.st_mtime)
                 if checkout is None and stat.S_ISREG(info.st_mode) and info.st_size > BIG_FILE:
                     found["big"].append({"path": entry.path, "bytes": info.st_size})
             elif device != dev:
