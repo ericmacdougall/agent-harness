@@ -248,6 +248,9 @@ class Eligibility(Case):
         (folder / "app" / "README.md").write_text("x\n")
         self.age(folder, 100)
         (folder / "app" / ".git" / "objects" / "new").write_text("x")
+        (folder / "sepgit").mkdir()
+        (folder / "sepgit" / git_save.LIFE).write_text("0" * 32)     # its marks in a git dir not named .git
+        (folder / "sepgit" / git_save.REAPING).write_text("")
         os.utime(folder / "app", None)
         code, out = self.reap("run", "--apply")
         self.assertEqual(code, 0, out)

@@ -535,6 +535,13 @@ def _bundle(f, want, saved, path):
         raise SaveError("the bundle would be written inside the checkout")
     refs = {("refs/" if name.startswith(("heads/", "tags/")) else "refs/heads/rescue/") + name: sha
             for name, sha in want.items()}
+    # a ref whose commit is already reachable from a commit proven on the remote needs no bundle (git bundle would
+    # leave it out, or refuse an empty bundle when every ref is like that)
+    where = f["toplevel"] or f["git_dir"]
+    refs = {ref: sha for ref, sha in refs.items()
+            if not any(_git(where, "merge-base", "--is-ancestor", sha, s)[0] == 0 for s in saved)}
+    if not refs:
+        return {}
     _mkdirs(os.path.dirname(path))
     part = "%s.%d.tmp" % (path, os.getpid())
     try:
@@ -544,15 +551,7 @@ def _bundle(f, want, saved, path):
                   stdin="".join(ref + "\n" for ref in refs) + "".join("^%s\n" % sha for sha in saved))
             _must(scratch, "bundle", "verify", "-q", part, timeout=NET_SECONDS)
             listed = [x.split(" ", 1) for x in _must(scratch, "bundle", "list-heads", part).splitlines() if " " in x]
-        got = {ref: sha for sha, ref in listed}
-        for ref, sha in list(refs.items()):
-            if got.get(ref) == sha:
-                continue
-            # git bundle leaves out a ref whose commit is already reachable from `saved` (proven on the remote):
-            # that ref needs no bundle, so it is not a failure
-            if ref not in got and any(_git(f["toplevel"] or f["git_dir"], "merge-base", "--is-ancestor", sha, s)[0] == 0 for s in saved):
-                del refs[ref]
-                continue
+        if any({ref: sha for sha, ref in listed}.get(ref) != sha for ref, sha in refs.items()):
             raise SaveError("the bundle does not list every ref with its commit id")
         os.replace(part, path)
     finally:
@@ -627,6 +626,8 @@ def _store(repo, f, tips, where, checked) -> dict:
             return dict(out, where="remote", url=ah_log_push.shown_url(dest["url"]), refs=refs)
     path = _home("rescue", where + ".bundle")
     refs = _bundle(f, want, saved, path)
+    if not refs:   # every unsaved tip is already inside what the remote holds: nothing to save
+        return out
     origin = ah_log_push.shown_url(f["real_remote"] or f["origin"] or "")
     restore = ("git clone %s back && git -C back fetch %s 'refs/*:refs/rescued/*'" % (origin, path)
                if saved and origin else "git clone %s back" % path)   # leaving out commits gives prerequisites

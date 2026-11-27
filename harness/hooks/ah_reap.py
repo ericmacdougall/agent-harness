@@ -335,7 +335,8 @@ def _activity(look, since=None):
                         if entry.name != ".git":
                             stack.append(entry.path)
                         continue
-                    latest = max(latest, info.st_mtime)
+                    if entry.name not in (git_save.REAPING, git_save.LIFE):   # the reaper's own marks
+                        latest = max(latest, info.st_mtime)
                     size += info.st_size
         except OSError:
             return latest, size, False
