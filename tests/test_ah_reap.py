@@ -239,6 +239,21 @@ class Eligibility(Case):
             self.reap("run", "--apply")
             self.assertEqual((folder / ".venv").exists(), not gone, value)
 
+    def test_only_files_outside_git_reset_the_idle_clock(self):
+        # the reaper's own work touches directory times (it removes things) and .git (a save writes objects):
+        # neither may make a folder look used, or a folder it once failed to finish would never be idle again
+        folder = self.folder()
+        (folder / "node_modules").mkdir()
+        (folder / "app" / ".git" / "objects").mkdir(parents=True)
+        (folder / "app" / "README.md").write_text("x\n")
+        self.age(folder, 100)
+        (folder / "app" / ".git" / "objects" / "new").write_text("x")
+        os.utime(folder / "app", None)
+        code, out = self.reap("run", "--apply")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("hours ago", out)
+        self.assertFalse((folder / "node_modules").exists(), out)
+
     def test_a_folder_marked_done_needs_one_idle_hour(self):
         folder = self.folder()
         (folder / "node_modules").mkdir()

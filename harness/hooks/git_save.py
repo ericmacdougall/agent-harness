@@ -544,7 +544,15 @@ def _bundle(f, want, saved, path):
                   stdin="".join(ref + "\n" for ref in refs) + "".join("^%s\n" % sha for sha in saved))
             _must(scratch, "bundle", "verify", "-q", part, timeout=NET_SECONDS)
             listed = [x.split(" ", 1) for x in _must(scratch, "bundle", "list-heads", part).splitlines() if " " in x]
-        if any({ref: sha for sha, ref in listed}.get(ref) != sha for ref, sha in refs.items()):
+        got = {ref: sha for sha, ref in listed}
+        for ref, sha in list(refs.items()):
+            if got.get(ref) == sha:
+                continue
+            # git bundle leaves out a ref whose commit is already reachable from `saved` (proven on the remote):
+            # that ref needs no bundle, so it is not a failure
+            if ref not in got and any(_git(f["toplevel"] or f["git_dir"], "merge-base", "--is-ancestor", sha, s)[0] == 0 for s in saved):
+                del refs[ref]
+                continue
             raise SaveError("the bundle does not list every ref with its commit id")
         os.replace(part, path)
     finally:
