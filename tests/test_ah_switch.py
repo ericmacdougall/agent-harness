@@ -107,7 +107,7 @@ class LauncherWiring(TempHome):
         hooks = install.managed_hooks(self.claude)
         launcher = str(self.claude / "hooks" / "ah_hook.py")
         python = [h for groups in hooks.values() for g in groups for h in g["hooks"] if h["command"] == "python3"]
-        self.assertGreater(len(python), 40)
+        self.assertEqual(len(python), 10)  # docs/direction.md: about six, none on Bash (tests/test_registrations.py)
         for handler in python:
             self.assertEqual(handler["args"][0], launcher, handler)
             self.assertNotIn("/", handler["args"][1])
@@ -141,20 +141,6 @@ class LauncherWiring(TempHome):
         for event, groups in self.direct_form(install.managed_hooks(self.claude), self.claude).items():
             doubled["hooks"].setdefault(event, []).extend(groups)
         self.assertEqual(install.merged_settings(doubled, self.claude)["hooks"], fresh["hooks"])
-
-    def test_git_backstop_runs_through_the_launcher(self):
-        calls = []
-
-        def fake_run(argv, **kw):
-            calls.append(argv)
-            out = "git version 2.60.0\n" if argv[1] == "--version" else ""
-            return subprocess.CompletedProcess(argv, 1 if "--get-all" in argv else 0, out, "")
-        with mock.patch("subprocess.run", fake_run):
-            install.git_hook_status(self.home, install.GIT_HOOK_KEY, self.claude / "hooks" / "commit_policy.py", apply=True)
-        command = next(c[-1] for c in calls if "--replace-all" in c and f"hook.{install.GIT_HOOK_KEY}.command" in c)
-        self.assertIn(str(self.claude / "hooks" / "ah_hook.py"), command)
-        self.assertIn('"$f" commit_policy.py git-hook', command)
-
 
 class SwitchRoundTrip(TempHome):
     def write(self, text, name=".claude/CLAUDE.md"):
@@ -192,6 +178,44 @@ class SwitchRoundTrip(TempHome):
         log = (self.home / ".agent-harness" / "logs" / "switch.log").read_text().splitlines()
         self.assertEqual(len(log), 4)
         self.assertIn("off by", log[0])
+
+    def test_off_reaches_the_sandbox_files_and_the_codex_default_profile(self):
+        """The release 1001 red team: off left the role files (peer_review's reviewer switch) and Codex's
+        default_permissions = "ah-worker" in force, so off did not mean off once the boundary was rolled out."""
+        os.environ.pop("CODEX_HOME", None)
+        box = self.home / ".agent-harness" / "sandbox"
+        box.mkdir(parents=True)
+        for role in ("worker", "reviewer", "supervisor"):
+            (box / f"{role}.claude.json").write_text('{"role": "%s"}\n' % role)
+        config = self.write('model = "x"\ndefault_permissions = "ah-worker" # agent-harness-codex\n'
+                            '[permissions.ah-worker]\ndescription = "d"\n', ".codex/config.toml")
+        before = config.read_bytes()
+        result = ah_switch.switch_off(self.home)
+        self.assertEqual(sorted(result["sandbox_stashed"]), ["reviewer.claude.json", "supervisor.claude.json",
+                                                             "worker.claude.json"])
+        self.assertFalse((box / "reviewer.claude.json").exists())   # the review runner's switch is off
+        self.assertEqual(result["codex_default_permissions"], "parked")
+        self.assertIn('# agent-harness off: default_permissions = "ah-worker"', config.read_text())
+        import tomllib
+        self.assertNotIn("default_permissions", tomllib.loads(config.read_text()))
+        self.assertIn("sandbox files stashed", ah_switch.status_line(ah_switch.status(self.home)))
+        on = ah_switch.switch_on(self.home)
+        self.assertFalse(on["off"])
+        self.assertEqual(config.read_bytes(), before)
+        self.assertEqual((box / "reviewer.claude.json").read_text(), '{"role": "reviewer"}\n')
+        self.assertEqual(list(ah_switch.sandbox_stash_dir(self.home).glob("*.json")), [])
+
+    def test_off_prints_the_sudo_line_for_a_managed_drop_in(self):
+        managed = self.home / "managed" / "50-agent-harness.json"
+        managed.parent.mkdir()
+        managed.write_text("{}")
+        with mock.patch.object(ah_switch, "MANAGED_FILES", (str(managed),)):
+            notes = ah_switch.switch_off(self.home)["managed"]
+            self.assertEqual(notes, [f"sudo mv {managed} {managed}.off"])
+            self.assertIn("managed drop-in still enforces", ah_switch.status_line(ah_switch.status(self.home)))
+            self.assertTrue(managed.exists())   # never moved without root
+            os.rename(managed, str(managed) + ".off")
+            self.assertEqual(ah_switch.switch_on(self.home)["managed"], [f"sudo mv {managed}.off {managed}"])
 
     def test_block_absent_and_file_missing_still_switch(self):
         path = self.write("only mine\n")
@@ -233,13 +257,32 @@ class SwitchRoundTrip(TempHome):
         self.assertEqual(on.returncode, 0, on.stderr)
         self.assertTrue(on.stdout.startswith("harness: ON"), on.stdout)
 
+    def test_shim_answers_its_four_words_and_nothing_else(self):
+        """The name collision: no delegation to another `harness` on PATH, even one that would succeed."""
+        bindir = self.home / "otherbin"
+        bindir.mkdir()
+        other = bindir / "harness"
+        other.write_text("#!/bin/sh\necho delegated > \"$HOME/delegated\"\nexit 0\n")
+        other.chmod(0o755)
+        env = {"HOME": str(self.home), "PATH": f"{bindir}:/usr/bin:/bin"}
+        shim = ROOT / "harness" / "bin" / "harness"
+        for words in (["review"], ["gates"], [], ["-h"], ["--help"]):
+            done = subprocess.run(["/bin/sh", str(shim), *words], capture_output=True, text=True, env=env, timeout=30)
+            self.assertEqual(done.returncode, 2, words)
+            self.assertIn("usage: harness off", done.stderr)
+        self.assertFalse((self.home / "delegated").exists())
+        self.assertNotIn("PATH", shim.read_text().split("case", 1)[1])  # no PATH walk after the case list
+
 
 class Services(TempHome):
-    def test_off_stops_loaded_agents_and_on_restarts_only_those(self):
+    def agents(self, *labels):
         agents = self.home / "Library" / "LaunchAgents"
-        agents.mkdir(parents=True)
-        for label in ("com.agent-harness.ahd", ah_switch.FLOOR_LABEL, "com.agent-harness.ops-watch"):
+        agents.mkdir(parents=True, exist_ok=True)
+        for label in labels:
             (agents / f"{label}.plist").write_text("<plist/>")
+
+    def test_off_stops_loaded_agents_by_default_and_on_restarts_only_those(self):
+        self.agents("com.agent-harness.log-backup", ah_switch.FLOOR_LABEL, "com.agent-harness.ops-watch")
         calls = []
 
         def run(argv):
@@ -247,36 +290,62 @@ class Services(TempHome):
             if argv[1] == "print":
                 return 0 if not argv[2].endswith("ops-watch") else 113  # ops-watch present but not loaded
             return 0
-        result = ah_switch.switch_off(self.home, services=True, run=run, system="darwin")
-        self.assertEqual(sorted(result["services_stopped"]), sorted(["com.agent-harness.ahd", ah_switch.FLOOR_LABEL]))
+        result = ah_switch.switch_off(self.home, run=run, system="darwin")  # no services= argument: the default
+        self.assertEqual(sorted(result["services_stopped"]), sorted(["com.agent-harness.log-backup", ah_switch.FLOOR_LABEL]))
+        self.assertTrue([c for c in calls if c[1] == "bootout" and c[2].endswith("log-backup")])
+        self.assertTrue([c for c in calls if c[1] == "disable" and c[2].endswith("log-backup")])
         self.assertFalse([c for c in calls if c[1] == "bootout" and c[2].endswith("ops-watch")])
         calls.clear()
         on = ah_switch.switch_on(self.home, run=run, system="darwin")
-        self.assertEqual(sorted(on["services_started"]), sorted(["com.agent-harness.ahd", ah_switch.FLOOR_LABEL]))
+        self.assertEqual(sorted(on["services_started"]), sorted(["com.agent-harness.log-backup", ah_switch.FLOOR_LABEL]))
         self.assertEqual(len([c for c in calls if c[1] == "bootstrap"]), 2)
         self.assertFalse((self.home / ".agent-harness" / "off-stash" / "services.json").exists())
 
-    def test_floor_watcher_units(self):
-        plist_path, data = ah_switch.floor_watch_units(self.home, "darwin")[0]
-        import plistlib
-        plist = plistlib.loads(data)
-        self.assertEqual(plist["Label"], "com.agent-harness.floor")
-        self.assertEqual(plist["ThrottleInterval"], 30)
-        self.assertEqual(plist["ProgramArguments"][-3:], ["floor-check", "--repair", "--quiet"])
-        self.assertIn(str(self.claude / "settings.json"), plist["WatchPaths"])
-        self.assertIn(str(self.home / ".agent-harness" / "install-state.json"), plist["WatchPaths"])
+    def test_keep_services_stops_none(self):
+        self.agents("com.agent-harness.log-backup")
         calls = []
-        line = install.floor_watch_status(self.home, True, None, run=lambda a: calls.append(a) or 0, system="darwin")
-        self.assertIn("loaded", line)
-        self.assertTrue(plist_path.exists())
-        self.assertIn(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_path)], calls)
-        line = install.floor_watch_status(self.home, True, False, run=lambda a: 0, system="darwin")
+        result = ah_switch.switch_off(self.home, services=False, run=lambda a: calls.append(a) or 0, system="darwin")
+        self.assertEqual((result["services_stopped"], calls), ([], []))
+        self.assertTrue(ah_switch.is_off(self.home))
+
+    def test_cli_off_stops_services_unless_keep_services_and_accepts_the_old_flag(self):
+        seen = []
+        with mock.patch.object(ah_switch, "switch_off", lambda home, reason="", services=True, **kw:
+                               seen.append(services) or {"off": True}), \
+                mock.patch.object(ah_switch, "status_line", lambda data: "harness: OFF"):
+            for argv in (["off"], ["off", "--keep-services"], ["off", "--services"]):
+                with mock.patch("sys.stdout"):
+                    self.assertEqual(ah_switch.main(["--home", str(self.home), *argv]), 0)
+        self.assertEqual(seen, [True, False, True])
+
+    def test_retired_jobs_are_not_in_the_lists(self):
+        names = " ".join(ah_switch.MAC_LABELS + ah_switch.LINUX_UNITS)
+        self.assertNotIn("ahd", names)
+        self.assertNotIn("ahc", names)
+
+    def test_linux_stops_only_units_installed_under_this_home(self):
+        units = self.home / ".config" / "systemd" / "user"
+        units.mkdir(parents=True)
+        (units / "log-backup.timer").write_text("[Timer]\n")
+        calls = []
+        result = ah_switch.switch_off(self.home, run=lambda a: calls.append(a) or 0, system="linux")
+        self.assertEqual(result["services_stopped"], ["log-backup.timer"])
+        touched = {c[-1] for c in calls}
+        self.assertEqual(touched, {"log-backup.timer"})  # ops-watch.timer etc. have no unit file here: never asked
+
+    def test_old_floor_watcher_is_removed_and_never_installed(self):
+        self.assertFalse(hasattr(ah_switch, "install_floor_watch"))
+        self.assertFalse(hasattr(ah_switch, "repaired_hooks"))
+        plist = ah_switch.floor_watch_units(self.home, "darwin")[0]
+        plist.parent.mkdir(parents=True)
+        plist.write_text("<plist/>")
+        calls = []
+        line = ah_switch.remove_floor_watch(self.home, run=lambda a: calls.append(a) or 0, system="darwin")
         self.assertIn("removed", line)
-        self.assertFalse(plist_path.exists())
-        self.assertIs(ah_switch.read_state(self.home)["floor_watch"], False)
-        units = dict(ah_switch.floor_watch_units(self.home, "linux"))
-        path_unit = units[self.home / ".config/systemd/user/agent-harness-floor.path"].decode()
-        self.assertIn(f"PathChanged={self.claude / 'hooks'}", path_unit)
+        self.assertFalse(plist.exists())
+        self.assertEqual(calls, [["launchctl", "bootout", f"gui/{os.getuid()}/{ah_switch.FLOOR_LABEL}"]])
+        self.assertEqual(ah_switch.remove_floor_watch(self.home, run=lambda a: 1 / 0, system="darwin"),
+                         "floor watcher: not installed")
 
 
 class Downgrade(TempHome):
@@ -365,54 +434,62 @@ class Floor(TempHome):
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["flavors"]["claude"]["state"], "ok")
 
-    def check_repair(self, state_overwrite):
+    def check_report(self, state_overwrite):
         self.old_installer(state_overwrite)
+        before = {p: p.read_bytes() for p in (self.hooks / "wal.py", self.claude / "settings.json", self.claude / "CLAUDE.md")}
         found = ah_switch.floor_check(self.home)
         self.assertFalse(found["ok"])
         problems = " ".join(found["flavors"]["claude"]["problems"])
         self.assertIn("wired directly", problems)
         self.assertIn("1 managed file(s) differ", problems)
-        self.assertEqual((self.hooks / "wal.py").read_text(), "# wal.py OLD\n")  # detection writes nothing
-        fixed = ah_switch.floor_check(self.home, repair=True)
-        self.assertEqual(fixed["flavors"]["claude"]["state"], "repaired", fixed)
-        self.assertEqual((self.hooks / "wal.py").read_text(), "# wal.py release 1000\n")
-        self.assertEqual(json.loads((self.claude / "settings.json").read_text()), json.loads(self.settings_after_install))
-        self.assertEqual((self.claude / "CLAUDE.md").read_text(), "mine\n\n" + self.block() + "\nmine after\n")
-        self.assertTrue(ah_switch.floor_check(self.home)["ok"])  # converged: a second run changes nothing
-        self.assertEqual(ah_switch.read_state(self.home)["flavors"]["claude"]["release"], 1000)
-        log = (self.home / ".agent-harness" / "logs" / "floor.log").read_text().splitlines()
-        self.assertEqual(len(log), 1)
-        self.assertIn("repaired claude to release 1000", log[0])
+        self.assertIn("install.py --apply", ah_switch.floor_line(found))
+        self.assertEqual({p: p.read_bytes() for p in before}, before)  # report only: nothing is written back
+        self.assertFalse((self.home / ".agent-harness" / "logs" / "floor.log").exists())
 
-    def test_old_installer_overwrite_is_detected_and_repaired(self):
-        self.check_repair(state_overwrite=False)
+    def test_old_installer_overwrite_is_reported_not_repaired(self):
+        self.check_report(state_overwrite=False)
 
-    def test_old_installer_that_also_rewrote_install_state_is_repaired(self):
-        self.check_repair(state_overwrite=True)
+    def test_old_installer_that_also_rewrote_install_state_is_reported(self):
+        self.check_report(state_overwrite=True)
 
-    def test_repair_respects_off(self):
-        ah_switch.switch_off(self.home, "testing")
+    def test_floor_check_never_writes_settings_even_when_wiring_differs(self):
+        settings = json.loads((self.claude / "settings.json").read_text())
+        settings["hooks"]["SessionStart"] = []  # wiring differs from the snapshot
+        (self.claude / "settings.json").write_text(json.dumps(settings))
+        (self.backups / "20261125T100000000000Z-bbbb").mkdir()  # and an old installer ran
+        before = (self.claude / "settings.json").read_bytes()
+        for argv in (["floor-check"], ["floor-check", "--json"], ["floor-check", "--quiet"]):
+            with mock.patch("sys.stdout"):
+                self.assertEqual(ah_switch.main(["--home", str(self.home), *argv]), 1)
+        self.assertEqual((self.claude / "settings.json").read_bytes(), before)
+
+    def test_repair_fails_loudly(self):
+        self.old_installer()
+        before = (self.claude / "settings.json").read_bytes()
+        with mock.patch("sys.stderr") as err:
+            self.assertEqual(ah_switch.main(["--home", str(self.home), "floor-check", "--repair"]), 2)
+        said = "".join(c.args[0] for c in err.write.call_args_list)
+        self.assertIn("--repair was removed in release 1001", said)
+        self.assertEqual((self.claude / "settings.json").read_bytes(), before)
+
+    def test_instructions_while_off_are_reported(self):
+        ah_switch.switch_off(self.home, "testing", services=False)
         self.old_installer(block=True)  # the old installer puts its block back while OFF
-        fixed = ah_switch.floor_check(self.home, repair=True)
-        self.assertEqual(fixed["flavors"]["claude"]["state"], "repaired")
-        self.assertTrue(ah_switch.is_off(self.home))
-        self.assertNotIn(START, (self.claude / "CLAUDE.md").read_text())
-        self.assertEqual((self.hooks / "wal.py").read_text(), "# wal.py release 1000\n")
-        ah_switch.switch_on(self.home)
-        self.assertEqual((self.claude / "CLAUDE.md").read_text(), "mine\n\n" + self.block() + "\nmine after\n")
+        found = ah_switch.floor_check(self.home)
+        self.assertIn("harness instructions present while OFF", found["flavors"]["claude"]["problems"])
+        self.assertIn(START, (self.claude / "CLAUDE.md").read_text())  # left as found
 
     def test_a_newer_install_in_progress_or_done_is_left_alone(self):
         ah_switch.mark_pending(self.home, "claude", 1001)
         self.old_installer()
-        self.assertEqual(ah_switch.floor_check(self.home, repair=True)["flavors"]["claude"]["state"],
-                         "install_in_progress")
+        self.assertEqual(ah_switch.floor_check(self.home)["flavors"]["claude"]["state"], "install_in_progress")
         ah_switch.update_state(self.home, lambda s: (s.pop("pending"), s["flavors"]["claude"].__setitem__("release", 1001)))
-        self.assertEqual(ah_switch.floor_check(self.home, repair=True)["flavors"]["claude"]["state"], "newer_install")
+        self.assertEqual(ah_switch.floor_check(self.home)["flavors"]["claude"]["state"], "newer_install")
         self.assertEqual((self.hooks / "wal.py").read_text(), "# wal.py OLD\n")
 
-    def test_hand_edit_without_an_old_installer_sign_is_not_reverted(self):
+    def test_hand_edit_without_an_old_installer_sign_is_not_drift(self):
         (self.hooks / "wal.py").write_text("# my local experiment\n")
-        result = ah_switch.floor_check(self.home, repair=True)
+        result = ah_switch.floor_check(self.home)
         self.assertEqual(result["flavors"]["claude"]["state"], "ok")
         self.assertIn("hand edits", result["flavors"]["claude"]["note"])
         self.assertEqual((self.hooks / "wal.py").read_text(), "# my local experiment\n")
@@ -439,14 +516,14 @@ class InstallIntegration(TempHome):
         user = "my rules\n"
         (self.claude / "CLAUDE.md").write_text(user)
         out = self.run_install()
-        self.assertIn("release 1000", out)
+        self.assertIn("release 1001", out)
         self.assertIn("switch shim", out)
         state = ah_switch.read_state(self.home)
-        self.assertEqual(state["flavors"]["claude"]["release"], 1000)
+        self.assertEqual(state["flavors"]["claude"]["release"], 1001)
         self.assertTrue(ah_switch.floor_check(self.home)["ok"])
         self.assertTrue(os.access(self.home / ".agent-harness" / "bin" / "harness", os.X_OK))
         installed = (self.claude / "CLAUDE.md").read_bytes()
-        ah_switch.switch_off(self.home)
+        ah_switch.switch_off(self.home, services=False)
         self.assertEqual((self.claude / "CLAUDE.md").read_text(), user)
         self.run_install()  # while OFF: files and wiring, no instruction block
         self.assertEqual((self.claude / "CLAUDE.md").read_text(), user)

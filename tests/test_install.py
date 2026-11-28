@@ -149,7 +149,7 @@ class InstallerTests(unittest.TestCase):
         first = json.loads((self.claude / "settings.json").read_text())
         self.assertEqual(first["model"], "sonnet")
         self.assertEqual(first["permissions"]["deny"], ["Read(**/.env)"])
-        self.assertEqual(len(first["hooks"]["PreToolUse"]), 14)  # user + command guard + kill guard + WAL + ladder + commit policy + heavy-job guard + copy hygiene + agent gate + spec gate + ask gate + dropped-gate pretool + mission-gate pretool + prod-delete guard
+        self.assertEqual(len(first["hooks"]["PreToolUse"]), 2)  # the user's own + the prod-delete guard (database tools)
         self.assertNotIn("skipDangerousModePermissionPrompt", first)
         self.assertIn("My existing instructions.", (self.claude / "CLAUDE.md").read_text())
         self.assertEqual((self.claude / "CLAUDE.md").read_text().count(START), 1)
@@ -159,30 +159,7 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual((self.claude / "CLAUDE.md").read_text().count(START), 1)
         self.assertTrue(list((self.claude / "agent-harness-backups").rglob("settings.json")))
 
-    def test_installs_resource_guards_wiring_and_red_team_idempotently(self):
-        install(self.home, apply=True)
-        for name in ("heavy_job_guard.py", "run_capped.py", "run_probe.py", "resource_budget.py", "agent_gate.py",
-                     "resource_limits.json"):
-            self.assertEqual((self.claude / "hooks" / name).read_bytes(), (ROOT / "harness/hooks" / name).read_bytes(), name)
-        self.assertIn("run_probe.py", (self.claude / "agents" / "red-team.md").read_text())
-        settings = json.loads((self.claude / "settings.json").read_text())
-        groups = {tuple((hook_argv(group["hooks"][0]) or [""])[:1]): group for group in settings["hooks"]["PreToolUse"]}
-        heavy = groups[(str(self.claude / "hooks" / "heavy_job_guard.py"),)]
-        gate = groups[(str(self.claude / "hooks" / "agent_gate.py"),)]
-        self.assertEqual(heavy["matcher"], "Bash")
-        self.assertEqual(gate["matcher"], "Agent|Task|Workflow")
-        for group in (heavy, gate):  # fail-open: a guard bug must never block every Bash or Agent call
-            self.assertNotIn("onFailure", group["hooks"][0])
-        limits = json.loads((self.claude / "hooks" / "resource_limits.json").read_text())
-        self.assertEqual((limits["max_live_owners"], limits["enforce"]), (16, False))  # the one owner cap
-        before = (self.claude / "settings.json").read_bytes()
-        hook_bytes = {n: (self.claude / "hooks" / n).read_bytes() for n in ("heavy_job_guard.py", "agent_gate.py")}
-        install(self.home, apply=True)  # second run changes nothing
-        self.assertEqual((self.claude / "settings.json").read_bytes(), before)
-        self.assertEqual(sum(1 for g in json.loads(before)["hooks"]["PreToolUse"] if (hook_argv(g["hooks"][0]) or [""])[0].endswith("heavy_job_guard.py")), 1)
-        self.assertEqual(hook_bytes, {n: (self.claude / "hooks" / n).read_bytes() for n in hook_bytes})
-
-    def test_reinstall_keeps_exactly_one_of_each_group_from_both_feature_sets(self):
+    def test_reinstall_keeps_exactly_one_of_each_handler(self):
         for _ in range(3):
             install(self.home, apply=True)
         hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
@@ -195,79 +172,36 @@ class InstallerTests(unittest.TestCase):
                         key = (event, group.get("matcher"), os.path.basename(args[0]), tuple(args[1:]))
                         counts[key] = counts.get(key, 0) + 1
         self.assertTrue(counts and all(v == 1 for v in counts.values()), counts)
+        self.assertEqual(len(counts), 10)
         names = {k[2] for k in counts}
-        self.assertTrue({"heavy_job_guard.py", "agent_gate.py", "provenance_hooks.py", "wal.py", "commit_policy.py",
-                         "spec_flow.py"} <= names, names)
-        self.assertTrue(any(k[:3] == ("PreToolUse", "Bash", "heavy_job_guard.py") for k in counts))
-        self.assertTrue(any(k[:3] == ("PreToolUse", "Agent|Task|Workflow", "agent_gate.py") for k in counts))
-        install(self.home, apply=True, provenance=False)  # provenance can still be removed without touching the guards
-        after = json.loads((self.claude / "settings.json").read_text())["hooks"]
-        flat = json.dumps(after)
-        self.assertNotIn("provenance_hooks.py", flat)
-        self.assertIn("heavy_job_guard.py", flat)
-        self.assertIn("agent_gate.py", flat)
+        self.assertEqual(names, {"session_env.py", "wal.py", "autosave.py", "owner_inbox.py", "dropped_gate.py",
+                                 "prod_delete_guard.py"})
 
-    def provenance_entries(self):
-        settings = json.loads((self.claude / "settings.json").read_text())
-        script = str(self.claude / "hooks" / "provenance_hooks.py")
-        found = []
-        for event, groups in settings.get("hooks", {}).items():
-            for group in groups:
-                for hook in group.get("hooks", []):
-                    if script in hook_argv(hook):
-                        found.append((event, group.get("matcher"), hook_argv(hook)[1]))
-        return sorted(found, key=str)
 
-    def test_ledger_reminder_hook_is_registered_failopen_once_and_preserves_foreign_hooks(self):
+    def test_foreign_session_start_hook_survives_and_a_reinstall_changes_nothing(self):
         foreign = {"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "other-start"}]}]}}
         (self.claude / "settings.json").write_text(json.dumps(foreign))
         install(self.home, apply=True)
-        install(self.home, apply=True)
-
-        def entries():
-            hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
-            return {event: [h for g in hooks.get(event, []) for h in g["hooks"]
-                            if (hook_argv(h) or [""])[0].endswith("ledger_reminder.py")]
-                    for event in ("SessionStart", "UserPromptSubmit")}
-
-        found = entries()
-        self.assertEqual(found["UserPromptSubmit"], [])  # SessionStart only since 2026-11-24
-        for event, hooks in found.items():
-            if event == "UserPromptSubmit":
-                continue
-            self.assertEqual(len(hooks), 1, event)  # registered once, not duplicated by a reinstall
-            self.assertNotIn("onFailure", hooks[0])
-            self.assertLessEqual(hooks[0]["timeout"], 3)
         start = json.loads((self.claude / "settings.json").read_text())["hooks"]["SessionStart"]
         self.assertTrue(any(h.get("command") == "other-start" for g in start for h in g["hooks"]))
         before = (self.claude / "settings.json").read_bytes()
         install(self.home, apply=True)
-        self.assertEqual((self.claude / "settings.json").read_bytes(), before)  # a further run changes nothing
-        self.assertTrue((self.claude / "hooks" / "ledger_reminder.py").exists())
+        self.assertEqual((self.claude / "settings.json").read_bytes(), before)
 
-    def test_provenance_gates_are_registered_once_and_survive_reinstall(self):
-        foreign = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "other-stop"}]}]}}
-        (self.claude / "settings.json").write_text(json.dumps(foreign))
-        install(self.home, apply=True)
-        expected = [("PostToolUse", "AskUserQuestion", "answer"), ("PreToolUse", "AskUserQuestion", "ask-gate"),
-                    ("Stop", None, "stop-lint"),
-                    ("UserPromptSubmit", None, "prompt")]
-        self.assertEqual(self.provenance_entries(), expected)
-        install(self.home, apply=True)
-        install(self.home, apply=True)
-        self.assertEqual(self.provenance_entries(), expected)  # neither dropped nor duplicated
-        stop = json.loads((self.claude / "settings.json").read_text())["hooks"]["Stop"]
-        self.assertTrue(any(h.get("command") == "other-stop" for g in stop for h in g["hooks"]))  # foreign hook kept
-
-    def test_hand_wired_provenance_entries_are_replaced_not_duplicated(self):
-        script = str(self.claude / "hooks" / "provenance_hooks.py")
+    def test_hand_wired_retired_entries_are_removed(self):
+        hooks_dir = self.claude / "hooks"
         manual = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "python3",
-                                                  "args": [script, "stop-lint"], "timeout": 99}]}]}}
+                                                  "args": [str(hooks_dir / "provenance_hooks.py"), "stop-lint"],
+                                                  "timeout": 99}]}],
+                            "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "python3",
+                                                                          "args": [str(hooks_dir / "command_guard_hook.py"), "hook"]}]}]}}
         (self.claude / "settings.json").write_text(json.dumps(manual))
         install(self.home, apply=True)
-        self.assertEqual([e for e in self.provenance_entries() if e[0] == "Stop"], [("Stop", None, "stop-lint")])
-        stop = json.loads((self.claude / "settings.json").read_text())["hooks"]["Stop"]
-        self.assertEqual([h["timeout"] for g in stop for h in g["hooks"]], [10, 15, 15, 15, 30, 20, 30])  # managed stop-lint replaced the manual one; dropped-owner gate, mission gate, idle guard (goodqa#15943), WAL cadence, worktree hygiene and the save hook (autosave.py, docs/lifecycle.md) follow
+        hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
+        stop = [os.path.basename(hook_argv(h)[0]) for g in hooks["Stop"] for h in g["hooks"]]
+        self.assertEqual(stop, ["autosave.py", "dropped_gate.py"])
+        self.assertEqual([os.path.basename(hook_argv(h)[0]) for g in hooks["PreToolUse"] for h in g["hooks"]],
+                         ["prod_delete_guard.py"])
 
     def test_foreign_hook_sharing_a_group_and_users_empty_event_list_survive(self):
         script = str(self.claude / "hooks" / "provenance_hooks.py")
@@ -275,18 +209,19 @@ class InstallerTests(unittest.TestCase):
                                                {"type": "command", "command": "python3", "args": [script, "stop-lint"]}]}],
                            "Notification": []}}
         (self.claude / "settings.json").write_text(json.dumps(mixed))
-        install(self.home, apply=True, provenance=False)
+        install(self.home, apply=True)
         hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
-        self.assertEqual([h["command"] for g in hooks["Stop"] for h in g["hooks"]], ["other-stop", "python3", "python3", "python3", "python3", "python3", "python3"])  # foreign kept; dropped gate, mission gate, idle guard (goodqa#15943), WAL cadence, worktree hygiene and the save hook (autosave.py) are not provenance hooks
+        self.assertEqual([h["command"] for g in hooks["Stop"] for h in g["hooks"]], ["other-stop", "python3", "python3"])  # foreign kept; the save and the dropped-owner gate
         self.assertTrue(any("dropped_gate.py" in str(h.get("args")) for g in hooks["Stop"] for h in g["hooks"]))
         self.assertEqual(hooks["Notification"], [])  # untouched, not ours
 
     def test_an_upgrade_removes_the_retired_registrations(self):
-        # 2026-11-24: these four no longer do anything; an existing settings.json loses them on reinstall
         hooks_dir = self.claude / "hooks"
         old = {"Stop": [{"hooks": [{"type": "command", "command": "python3", "args": [str(hooks_dir / name), *rest]}]}
                         for name, rest in (("status_truth.py", ["stop"]), ("mc_inbox.py", ["hook"]),
-                                           ("owner_inbox.py", ["hook"]))],
+                                           ("idle_guard.py", ["stop"]), ("wal_cadence.py", []))],
+               "PostToolUseFailure": [{"hooks": [{"type": "command", "command": "python3",
+                                                  "args": [str(hooks_dir / "idle_guard.py"), "reject"]}]}],
                "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python3",
                                                 "args": [str(hooks_dir / "ledger_reminder.py")]}]},
                                     {"hooks": [{"type": "command", "command": "other-prompt"}]}]}
@@ -296,39 +231,111 @@ class InstallerTests(unittest.TestCase):
 
         def scripts(event):
             return [os.path.basename(hook_argv(h)[0]) for g in hooks.get(event, []) for h in g["hooks"] if hook_argv(h)]
-        for name in ("status_truth.py", "mc_inbox.py", "owner_inbox.py"):
-            self.assertNotIn(name, scripts("Stop"))
-        self.assertNotIn("ledger_reminder.py", scripts("UserPromptSubmit"))
-        self.assertIn("ledger_reminder.py", scripts("SessionStart"))
-        for name in ("status_truth.py", "mc_inbox.py", "owner_inbox.py"):
-            self.assertIn(name, scripts("UserPromptSubmit"))  # their other registrations stay
+        self.assertEqual(scripts("Stop"), ["autosave.py", "dropped_gate.py"])
+        self.assertEqual(scripts("UserPromptSubmit"), ["owner_inbox.py"])
+        self.assertNotIn("PostToolUseFailure", hooks)  # an event left empty by the upgrade goes
         self.assertTrue(any(h.get("command") == "other-prompt" for g in hooks["UserPromptSubmit"] for h in g["hooks"]))
 
-    def test_idle_guard_registrations_survive_reinstall_once_each(self):  # goodqa#15943 (receipt r6 F2)
-        def idle_entries():
-            hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
-            return sorted((event, hook_argv(h)[1], h["timeout"]) for event, groups in hooks.items() for g in groups
-                          for h in g["hooks"] if "idle_guard.py" in str(h.get("args")))
-        expected = [("PermissionDenied", "reject", 5), ("PostToolUseFailure", "reject", 5), ("Stop", "stop", 15),
-                    ("UserPromptSubmit", "reject", 5)]
-        install(self.home, apply=True)
-        self.assertEqual(idle_entries(), expected)
-        install(self.home, apply=True)
-        install(self.home, apply=True, provenance=False)
-        self.assertEqual(idle_entries(), expected)  # neither dropped nor duplicated
-        self.assertTrue((self.claude / "hooks" / "idle_guard.py").is_file())
+    def test_an_upgrade_moves_the_retired_guard_files_into_the_backup(self):
+        """The release 1001 red team: an upgrade from 1000 left command_guard.py, merge_gate.py and the rest on disk."""
+        hooks_dir = self.claude / "hooks"
+        hooks_dir.mkdir(parents=True)
+        for name in ("command_guard.py", "merge_gate.py", "kill_guard_policy.json", "commit_policy.json"):
+            (hooks_dir / name).write_text("# release 1000\n")
+        (hooks_dir / "my_own_hook.py").write_text("# the user's\n")
+        os.symlink(hooks_dir / "my_own_hook.py", hooks_dir / "tier_gate.py")   # not a regular file: left alone
+        changes = install(self.home, apply=True)
+        for name in ("command_guard.py", "merge_gate.py", "kill_guard_policy.json", "commit_policy.json"):
+            self.assertFalse((hooks_dir / name).exists(), name)
+            kept = list((self.claude / "agent-harness-backups").glob("*/retired/" + name))
+            self.assertEqual(len(kept), 1, name)
+            self.assertEqual(kept[0].read_text(), "# release 1000\n")
+        self.assertTrue((hooks_dir / "my_own_hook.py").exists())
+        self.assertTrue((hooks_dir / "tier_gate.py").is_symlink())
+        self.assertTrue(any("retired file" in c for c in changes), changes)
 
-    def test_no_provenance_hooks_flag_unregisters_and_default_restores(self):
-        install(self.home, apply=True)
-        self.assertEqual(len(self.provenance_entries()), 4)  # ask-gate, answer (goodqa#16651), stop-lint, prompt
-        install(self.home, apply=True, provenance=False)
-        self.assertEqual(self.provenance_entries(), [])
-        hooks = json.loads((self.claude / "settings.json").read_text())["hooks"]
-        self.assertEqual([str(h.get("args")) for g in hooks["Stop"] for h in g["hooks"] if "dropped_gate.py" in str(h.get("args"))].__len__(), 1)  # the gate stays; provenance entries went
-        self.assertTrue(any("wal.py" in str(h.get("args")) for g in hooks["UserPromptSubmit"] for h in g["hooks"]))
-        self.assertTrue((self.claude / "hooks" / "provenance_hooks.py").is_file())  # files stay installed
-        install(self.home, apply=True)
-        self.assertEqual(len(self.provenance_entries()), 4)
+    def test_removed_flags_fail_loudly_before_anything_is_written(self):
+        for flag in ("--services", "--no-provenance-hooks", "--no-command-guard", "--floor-watch", "--no-floor-watch"):
+            with self.subTest(flag=flag):
+                done = subprocess.run([sys.executable, str(ROOT / "install.py"), "--apply", "--home", str(self.home),
+                                       flag], capture_output=True, text=True, timeout=120,
+                                      env={**os.environ, "HOME": str(self.home)})
+                self.assertEqual(done.returncode, 2)
+                self.assertIn(f"install.py: {flag} was removed in release 1001:", done.stderr)
+                self.assertEqual(list(self.claude.iterdir()), [])
+
+    def test_while_off_the_sandbox_files_go_to_the_off_stash(self):
+        import install as installer  # noqa: PLC0415
+        switch = installer.switch_module()
+        (self.home / ".agent-harness").mkdir(exist_ok=True)
+        (self.home / ".agent-harness" / "OFF").write_text("{}")
+        line = installer.sandbox_status(self.home, apply=True)
+        self.assertIn("OFF", line)
+        self.assertFalse((self.home / ".agent-harness" / "sandbox" / "reviewer.claude.json").exists())
+        self.assertTrue((switch.sandbox_stash_dir(self.home) / "reviewer.claude.json").is_file())
+
+    def test_sandbox_files_are_written_private_and_equal_to_ah_sandbox(self):
+        import install as installer  # noqa: PLC0415
+        sandbox = installer.sandbox_module()
+        self.assertIn("would write", installer.sandbox_status(self.home, apply=False))
+        self.assertFalse((self.home / ".agent-harness" / "sandbox").exists())
+        line = installer.sandbox_status(self.home, apply=True)
+        self.assertIn("wrote", line)
+        for role in sandbox.ROLES:
+            path = Path(sandbox.installed_path(self.home, role))
+            self.assertEqual(path.parent, self.home / ".agent-harness" / "sandbox")
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            expected = json.dumps(sandbox.claude_settings(role, home=self.home), indent=2, sort_keys=True) + "\n"
+            self.assertEqual(path.read_text(), expected)
+            self.assertEqual(json.loads(path.read_text())["env"]["AH_ROLE"], role)
+        self.assertEqual(stat.S_IMODE((self.home / ".agent-harness" / "sandbox").stat().st_mode), 0o700)
+        settings = self.claude / "settings.json"
+        self.assertFalse(settings.exists())  # inert: no role selected, no managed settings, settings.json untouched
+        for managed in (Path("/Library/Application Support/ClaudeCode/managed-settings.d/50-agent-harness.json"),
+                        self.home / ".claude" / "managed-settings.json"):
+            self.assertFalse(managed.exists() and managed.stat().st_mtime > path.stat().st_mtime - 5, managed)
+
+    def test_a_symlinked_sandbox_file_is_refused(self):
+        import install as installer  # noqa: PLC0415
+        sandbox = installer.sandbox_module()
+        target = Path(sandbox.installed_path(self.home, sandbox.ROLES[0]))
+        target.parent.mkdir(parents=True)
+        outside = self.home / "outside.json"
+        outside.write_text("mine\n")
+        target.symlink_to(outside)
+        self.assertIn("refused", installer.sandbox_status(self.home, apply=True))
+        self.assertEqual(outside.read_text(), "mine\n")
+
+    def test_no_launchctl_or_systemctl_for_a_non_default_home(self):
+        import install as installer  # noqa: PLC0415
+        calls = []
+        real = subprocess.run
+
+        def spy(argv, *a, **kw):
+            if argv and str(argv[0]) in ("launchctl", "systemctl"):
+                calls.append(argv)
+            return real(argv, *a, **kw)
+        with patch("subprocess.run", spy):
+            line = installer.floor_watch_status(self.home, apply=True)
+        self.assertIn("skipped (non-default --home)", line)
+        self.assertEqual(calls, [])
+        self.assertFalse(hasattr(installer, "install_services"))
+        self.assertFalse(hasattr(installer, "service_commands"))
+
+    def test_the_shim_moves_a_foreign_harness_aside_and_writes_itself(self):
+        import install as installer  # noqa: PLC0415
+        bindir = self.home / ".agent-harness" / "bin"
+        bindir.mkdir(parents=True)
+        other = bindir / "harness"
+        other.write_bytes(b"\x7fELF a go binary")
+        line = installer.shim_status(self.home, apply=True, now=1764000000)
+        retired = bindir / "harness.retired-20251124T160000Z"
+        self.assertIn(str(retired), line)
+        self.assertEqual(retired.read_bytes(), b"\x7fELF a go binary")  # kept, never deleted
+        self.assertIn(installer.SHIM_MARK, other.read_bytes())
+        self.assertTrue(os.access(other, os.X_OK))
+        self.assertIn("switch shim:", installer.shim_status(self.home, apply=True))  # now ours: rewritten in place
+        self.assertEqual(sorted(p.name for p in bindir.iterdir()), ["harness", retired.name])
 
     def test_tolerates_user_hook_with_empty_args(self):
         (self.claude / "settings.json").write_text(json.dumps(
@@ -336,7 +343,7 @@ class InstallerTests(unittest.TestCase):
         ))
         install(self.home, apply=True)
         settings = json.loads((self.claude / "settings.json").read_text())
-        self.assertEqual(len(settings["hooks"]["PreToolUse"]), 14)  # + command guard + kill guard + ladder + heavy-job guard + copy hygiene + agent gate + spec gate + ask gate + dropped-gate pretool + mission-gate pretool + prod-delete guard
+        self.assertEqual(len(settings["hooks"]["PreToolUse"]), 2)  # the user's own + the prod-delete guard
         self.assertEqual(settings["hooks"]["PreToolUse"][0]["hooks"][0]["args"], [])
 
     def test_backups_are_private(self):
@@ -393,7 +400,7 @@ class InstallerTests(unittest.TestCase):
         install(self.home, apply=True)
         groups = json.loads((self.claude / "settings.json").read_text())["hooks"]["PreToolUse"]
         self.assertEqual(groups[0], {**group, "hooks": [foreign]})
-        self.assertEqual(len(groups), 14)  # foreign + command guard + kill guard + WAL + ladder + commit policy + heavy-job guard + copy hygiene + agent gate + spec gate + ask gate + dropped-gate pretool + mission-gate pretool + prod-delete guard
+        self.assertEqual(len(groups), 2)  # foreign + prod-delete guard
 
     def test_refuses_symlinked_parent_directories_before_writing(self):
         for name in ("agents", "hooks", "tools", "agent-harness-backups", ".claude"):

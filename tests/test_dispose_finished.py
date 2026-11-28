@@ -74,10 +74,22 @@ class Finished(unittest.TestCase):
         self.assertTrue(row["disposition"]["live"])
         self.assertNotIn(REVIEWER, ah.owners(self.home, SESSION, now=NOW)["undisposed"])
 
-    def test_a_running_task_is_not_finished(self):
-        with self.assertRaises(ah.AhError) as caught:
-            self.dispose(RUNNING)
-        self.assertEqual(caught.exception.code, "not_finished")
+    def test_the_callers_word_is_enough_even_while_the_process_runs(self):
+        """Release 1001: a reviewer that returned its verdict was refused because its process still looked alive
+        ("the task tool refused to dispose a finished reviewer"). The state is no longer checked; --reason is kept."""
+        ah.write(self.home, "task.dispose", {"agent": RUNNING, "session": SESSION, "kind": "finished", "at": iso(NOW),
+                                             "reason": "returned its verdict"}, SESSION)
+        row = self.row(RUNNING)
+        self.assertEqual(row["disposition"]["kind"], "finished")
+
+    def test_done_is_the_plain_word_for_finished(self):
+        args = ah.build_parser().parse_args(["task", "dispose", "--agent", REVIEWER, "--kind", "done",
+                                             "--reason", "merged and reported"])
+        self.assertEqual(args.kind, "done")
+        with mock.patch.object(ah, "write", return_value={"ok": True}) as write:
+            ah.run(args, self.home)
+        self.assertEqual(write.call_args[0][2]["kind"], "finished")
+        self.assertEqual(write.call_args[0][2]["reason"], "merged and reported")
 
     def test_another_session_needs_a_role(self):
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": OTHER}):
@@ -103,11 +115,6 @@ class FinishedEndsAnOwner(unittest.TestCase):
         self.assertIn("finished", liveness.ENDING_DISPOSITIONS)
         self.assertTrue(liveness.disposition_live({"kind": "finished", "at": NOW - 86400 * 30}, NOW))
         self.assertTrue(liveness.row_disposed({"disposition": {"kind": "finished"}}))
-
-    def test_tier_gate_frees_the_slot_of_a_finished_owner(self):
-        import tier_gate
-        self.assertTrue(tier_gate._slot_freed({"disposition": {"kind": "finished"}}))
-        self.assertFalse(tier_gate._slot_freed({"disposition": {"kind": "finished"}, "decision_required": True}))
 
     def test_cli_payload_has_one_implementation(self):
         import ah_kill

@@ -59,9 +59,6 @@ atomic consumption retain their existing behavior.
 Run the disposable source controls from the repository root with
 `python3 -B -m unittest discover -s tests -p test_native_main.py -v`.
 The controls use fake kernel/code identities and disposable SQLite databases.
-Run the disposable installer hook controls with
-`python3 -B -m unittest discover -s tests -p test_command_guard_install_files.py -v`.
-Use `python3 -B tests/mutants_install_files.py --component guard` to confirm that
-the isolated controls detect each deliberately broken guard variant. Use the
+The installer hook controls that ran against the command guard were deleted with it in release 1001. Use the
 [reviewed merged-source repair flow](harness-repair.md) to refresh the installed
 hooks. An authorized root flow and a child denial establish installed compatibility.

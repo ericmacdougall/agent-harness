@@ -40,24 +40,25 @@ value back, `security find-generic-password -w` may print a value that is not pl
 
 This fetches each secret and runs the command with the values in that command's environment only. Anything the
 command prints has those exact values replaced with `[REDACTED:ah-secret]`. Values shorter than 4 bytes are not
-masked. The command's exit code is passed through. The command guard still judges the command after `--`.
+masked. The command's exit code is passed through. Nothing judges the command after `--` (release 1001 deleted the
+command guard), and `ah secret` runs outside the sandbox (docs/sandbox.md, harness tools), so the command does too.
 
-`ah secret list` prints names only. `ah secret rm NAME` deletes a secret. The command guard allows that only for
-Fable, Astra and supervisor sessions. The tool itself cannot tell who is calling it.
+`ah secret list` prints names only. `ah secret rm NAME` deletes a secret. It runs only for the owner (a terminal
+outside any agent) or a session launched or recorded as a supervisor; a worker or reviewer is refused with the
+command the owner runs (`ah_roles.launch_role`).
 
 Programs that read a key file themselves (`ssh -i KEY`, `--key-file=PATH`, `docker run --env-file .env`, a dotenv
 loader) are fine. Pass them the path.
 
 ## Who may read secrets directly
 
-Fable and Astra may (the owner's rule, 2026-11-24). For them the command guard drops its secret-read refusals and
-appends one line per command to `~/.agent-harness/logs/secret-access.jsonl`. The line holds the rule ids, the tool,
-the model and the session. It never holds the command.
+Since release 1001 no hook reads a command, so nothing refuses `cat .env` or `printenv` by its text. What holds is the
+sandbox a session is launched with (docs/sandbox.md): the key files in `secret_paths` (`~/.ssh`, `~/.aws`, `~/.codex/
+auth.json`, `~/.config/gcloud`, `~/.config/goodqa`, the owner's key files under `~/.config`, `~/.git-credentials`,
+`~/.npmrc` and the rest) cannot be read by any role's shell, and `Read(**/.env)` and its siblings deny project `.env`
+files to the Read tool and the file commands Claude Code recognises. `ah doctor` lists the credential-shaped files
+that no role denies (`secrets-readable`); add them to `local.json` `sandbox_extra_deny_read`.
 
-Every other agent is refused only when a command would actually read a secret out to the transcript, a pipe, a file
-elsewhere or the network. Examples are `cat ~/.ssh/id_rsa`, a bare `printenv` or `env`, `gh auth token`,
-`security find-generic-password -w`, `rclone config show` and `cat .env`. The refusal names `ah secret exec` as the
-way to proceed. A command that only names a credential location is never refused. That covers sample text in a test
-generator, fixtures, heredocs written to a file, grep patterns, comments, commit messages, `--help`, `bash -n`,
-`ls` and `stat` of a key file, and `jq 'keys'`. When the guard cannot finish its analysis, secret text alone is
-allowed with a note.
+Not covered, stated: a session launched without the role file (today, every session until the rollout) has no such
+boundary; the gh token in the login keychain stays usable (pushing needs it); `printenv` prints whatever the session's
+own environment holds. Fable and Astra mean nothing to the boundary: the role comes from the launch file.

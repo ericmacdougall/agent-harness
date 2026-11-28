@@ -63,43 +63,10 @@ class Base(unittest.TestCase):
 
 
 class PromptBudget(Base):
-    def test_second_prompt_emits_nothing_when_nothing_is_new(self):
-        seed_alerts(self.home)
-        self.wal("session", {"session_id": SESSION, "source": "startup"})
-        first = self.wal("prompt", {"session_id": SESSION, "prompt": "first"})
-        second = self.wal("prompt", {"session_id": SESSION, "prompt": "second"})
-        self.assertEqual(first, "")
-        self.assertEqual(second, "")
-        # the WAL still records every prompt
-        rows = [json.loads(x) for x in (self.home / ".claude/wals" / SESSION / "main.jsonl").read_text().splitlines()]
-        self.assertEqual([r["event"] for r in rows], ["session", "prompt", "prompt"])
-
-    def test_a_new_critical_alert_about_this_session_is_shown_once(self):
-        seed_alerts(self.home)
-        self.wal("session", {"session_id": SESSION, "source": "startup"})
-        ops_watch.emit({"host": ops_watch.default_host(), "source": "ops-watch", "event": "raise",
-                        "severity": "critical", "key": f"liveness:{SESSION[:8]}/agent-afeed", "message": "owner dropped",
-                        "detail": {"session": SESSION[:8]}}, home=self.home)
-        # another session's new critical alert is not this session's to act on
-        ops_watch.emit({"host": ops_watch.default_host(), "source": "ops-watch", "event": "raise",
-                        "severity": "critical", "key": f"liveness:{OTHER[:8]}/agent-bfeed", "message": "owner dropped",
-                        "detail": {"session": OTHER[:8]}}, home=self.home)
-        text = self.context(self.wal("prompt", {"session_id": SESSION, "prompt": "go"}))
-        self.assertIn("agent-afeed", text)
-        self.assertNotIn("agent-bfeed", text)
-        self.assertLessEqual(len(text), 600)
-        self.assertEqual(self.wal("prompt", {"session_id": SESSION, "prompt": "again"}), "")
-
-    def test_no_triage_reminder_or_work_dir_per_prompt(self):
-        self.wal("session", {"session_id": SESSION, "source": "startup"})
-        out = self.wal("prompt", {"session_id": SESSION, "prompt": "x"})
-        self.assertNotIn("triage", out)
-        self.assertNotIn("Durable work dir", out)
-
-    def test_a_session_that_missed_its_start_is_told_its_wal_once(self):
-        text = self.context(self.wal("prompt", {"session_id": SESSION, "prompt": "x"}))
-        self.assertIn("Session WAL:", text)
-        self.assertEqual(self.wal("prompt", {"session_id": SESSION, "prompt": "y"}), "")
+    def test_a_prompt_adds_nothing_and_writes_no_row(self):
+        # Release 1001: `wal.py prompt` is no longer registered; a stale registration says and records nothing.
+        self.assertEqual(self.wal("prompt", {"session_id": SESSION, "prompt": "first"}), "")
+        self.assertFalse((self.home / ".claude" / "wals" / SESSION / "main.jsonl").exists())
 
 
 class SessionStartBudget(Base):
@@ -127,17 +94,6 @@ class SessionStartBudget(Base):
 
 
 class Duplicates(Base):
-    def test_duplicate_registrations_in_one_turn_emit_once(self):
-        seed_alerts(self.home)
-        self.assertTrue(self.wal("session", {"session_id": SESSION, "source": "startup"}))
-        self.assertEqual(self.wal("session", {"session_id": SESSION, "source": "startup"}), "")
-        ops_watch.emit({"host": ops_watch.default_host(), "source": "ops-watch", "event": "raise",
-                        "severity": "critical", "key": f"liveness:{SESSION[:8]}/agent-afeed", "message": "owner dropped",
-                        "detail": {"session": SESSION[:8]}}, home=self.home)
-        payload = {"session_id": SESSION, "prompt": "same prompt"}
-        outputs = [self.wal("prompt", payload) for _ in range(4)]
-        self.assertEqual(sum(1 for o in outputs if o.strip()), 1, outputs)
-
     def test_parallel_registrations_emit_once(self):
         payload = json.dumps({"session_id": SESSION, "source": "startup"})
         procs = [subprocess.Popen([sys.executable, str(WAL), "session"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,

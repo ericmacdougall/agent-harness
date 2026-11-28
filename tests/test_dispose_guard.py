@@ -249,34 +249,22 @@ class DeployedShaCoversTheBranch(Base):
 class SupersededAndWontdo(Base):
     N = 3
 
-    def test_need_an_existing_ticket_and_never_count_as_done(self):
+    def test_a_free_text_reason_is_enough_and_never_counts_as_done(self):
+        """Release 1001: superseded and wontdo take the agent's own words; no GoodQA ticket grammar, no lookup, no
+        length or word count, and two owners may share a reason (a finished reviewer and its twin)."""
         a0, a1, a2 = agent(0), agent(1), agent(2)
-        with self.assertRaises(ah.AhError):  # no ticket
-            self.dispose(a0, kind="superseded", reason="replaced by the S3 slice which owns the same scope")
-        with mock.patch.object(ah, "_ticket_exists", return_value=False):
-            with self.assertRaises(ah.AhError) as cm:
-                self.dispose(a0, kind="superseded", ref="GoodQA goodqa#99999999",
-                             reason="replaced by the S3 slice which owns the same scope")
-            self.assertEqual(cm.exception.code, "evidence")
-        with mock.patch.object(ah, "_ticket_exists", return_value=None):  # cannot confirm: no closure
-            with self.assertRaises(ah.AhError) as cm:
-                self.dispose(a0, kind="superseded", ref="GoodQA goodqa#14791",
-                             reason="replaced by the S3 slice which owns the same scope")
-            self.assertEqual(cm.exception.code, "evidence_unverifiable")
-        with mock.patch.object(ah, "_ticket_exists", return_value=True):
-            self.dispose(a0, kind="superseded", ref="GoodQA goodqa#14791",
-                         reason="replaced by the S3 slice which owns the same scope")
-            self.dispose(a1, kind="wontdo", ref="GoodQA goodqa#14800",
-                         reason="the user dropped the console export feature from the plan")
-            with self.assertRaises(ah.AhError) as cm:  # a template is still a template
-                self.dispose(a2, kind="wontdo", ref="GoodQA goodqa#14801",
-                             reason="the user dropped the console export feature from the plan")
-            self.assertEqual(cm.exception.code, "reason")
+        with self.assertRaises(ah.AhError) as cm:  # a reason is still required
+            self.dispose(a0, kind="superseded", reason="  ")
+        self.assertEqual(cm.exception.code, "reason")
+        with mock.patch.object(ah, "_ticket_exists", side_effect=AssertionError("no ticket lookup")):
+            self.dispose(a0, kind="superseded", reason="moved to the S3 slice")
+            self.dispose(a1, kind="wontdo", reason="dropped from the plan", ref="the owner said so in chat")
+            self.dispose(a2, kind="wontdo", reason="dropped from the plan")
         doc = self.owners()
         states = {o["agent_id"]: o["state"] for o in doc["owners"]}
-        self.assertEqual((states[a0], states[a1]), ("superseded", "wontdo"))
-        self.assertNotIn(a0, doc["undisposed"])
-        self.assertNotIn("done", (states[a0], states[a1]))
+        self.assertEqual((states[a0], states[a1], states[a2]), ("superseded", "wontdo", "wontdo"))
+        for a in (a0, a1, a2):
+            self.assertNotIn(a, doc["undisposed"])
         self.assertEqual(doc["counts"].get("done", 0), 0)
 
 
@@ -339,18 +327,6 @@ class Legacy(Base):
                          reason="audited the legacy owner: the S3 slice replaced its scope entirely")
         doc = self.owners()
         self.assertNotIn(a0, doc["legacy_unverified"])
-
-    def test_a_sub_agent_cannot_legacy_itself(self):
-        self.epoch(NOW - 1000)
-        with mock.patch.dict(os.environ, {"AH_AGENT_ID": agent(0)}):  # the owner, by its declared id
-            with self.assertRaises(ah.AhError) as cm:
-                self.dispose(agent(0), kind="legacy")
-        self.assertEqual(cm.exception.code, "forbidden")
-        for kind in ("legacy", "superseded", "wontdo"):
-            out = dropped_gate.cmd_pretool({"tool_name": "Bash", "agent_id": agent(1), "tool_input": {
-                "command": f"ah task dispose --agent {agent(0)} --kind {kind} --ref 'GoodQA goodqa#1'"}})
-            self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny", kind)
-
 
 class Grandfather(Base):
     N = 4

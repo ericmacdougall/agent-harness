@@ -19,7 +19,7 @@ from unittest import mock
 HOOKS = Path(__file__).resolve().parents[1] / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
 import ah  # noqa: E402
-import goals_view as gv  # noqa: E402
+import ah  # noqa: E402  (ah status reads these fields)
 
 NOW = 1_800_000_000.0
 SESSION = "sess-structured-01"
@@ -45,20 +45,20 @@ class WalNote(unittest.TestCase):
     def rows(self):
         return [json.loads(x) for x in self.wal.read_text().splitlines()]
 
-    def test_structured_fields_land_and_goals_view_reads_them(self):
+    def test_structured_fields_land_and_ah_status_reads_them(self):
         r = self.note("--event", "check", "--note", "REALLY_TESTED pp-live: sign-in on prod abc1234", "--goal",
                       "parentproof", "--ticket", "goodqa#615", "--result", "PASS", "--live")
         self.assertEqual(r.returncode, 0, r.stderr)
         row = self.rows()[-1]
         self.assertEqual((row["goal"], row["ticket"], row["result"], row["live"]),
                          ("parentproof", "goodqa#615", "PASS", True))
-        self.assertEqual(gv.verdict(row), "PASS")
+        self.assertEqual(ah.check_verdict(row), "PASS")
 
     def test_deploy_event_needs_a_sha_or_version(self):
         self.assertNotEqual(self.note("--event", "deploy", "--note", "deployed to prod").returncode, 0)
         r = self.note("--event", "deploy", "--note", "deployed def5678 to prod", "--goal", "parentproof")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(gv.verdict(self.rows()[-1]), "DEPLOY")
+        self.assertEqual(ah.check_verdict(self.rows()[-1]), "DEPLOY")
 
     def test_bad_values_are_refused(self):
         self.assertNotEqual(self.note("--event", "check", "--note", "REALLY_TESTED x: ok", "--goal", "Bad Goal!")
@@ -100,6 +100,31 @@ class Status(unittest.TestCase):
         self.assertIn("blog worker ae83610c deployed to prod", legacy)  # prose: never LIVE
         self.assertTrue(all(e["label"].startswith("LEGACY_") for e in r["live_legacy"]))
         self.assertIn("FAILED", ah.status_text(r))
+
+
+
+
+class SandboxRefusal(unittest.TestCase):
+    """The release 1001 red team: a note written as part of a compound command stays sandboxed, and ~/.claude is
+    write-protected there, so the write fails. wal_note says how to proceed instead of a traceback."""
+
+    def test_a_refused_write_names_the_command_to_run_alone(self):
+        sys.path.insert(0, str(HOOKS))
+        import wal_note
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"HOME": tmp}):
+            wal = Path(tmp) / ".claude" / "wals" / SESSION / "main.jsonl"
+            wal.parent.mkdir(parents=True)
+            argv = ["wal_note.py", "--wal", str(wal), "--event", "handoff", "--note", "left: tests"]
+            out = __import__("io").StringIO()
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(wal_note, "append",
+                                                                         side_effect=PermissionError(1, "EPERM")), \
+                    mock.patch("sys.stdout", out):
+                code = wal_note.main()
+        self.assertEqual(code, 3)
+        answer = json.loads(out.getvalue())
+        self.assertEqual((answer["status"], answer["code"]), ("REFUSED", "sandbox"))
+        self.assertIn("as its own command", answer["message"])
+        self.assertIn("python3 ~/.claude/hooks/wal_note.py --wal", answer["message"])
 
 
 if __name__ == "__main__":

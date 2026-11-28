@@ -29,15 +29,22 @@ STABLE API (sibling guards import this through a guarded import; keep these sign
         record = ah_approvals.allowed("merge", repo="owner/name", pr=12) if ah_approvals else None
 
 Kinds: merge, delete, kill, top-rung, release, secret, spend, harness, other.
-Who grants: the owner, and a supervisor session (ah_roles / ~/.agent-harness/roles.json) inside the projects it
-supervises. `secret`, `spend` and `harness` stay with the owner. A `harness` approval lets a harness-maintaining
-supervisor change (or weaken) the guard or rule named in `what`; without `what` it is standing for every harness change.
-For `harness` the `what` fact is matched (case-insensitive, globs allowed); for other kinds `what` is description. The CLI decides who is calling (caller()); grant() checks that a
-supervisor's scope sits inside its projects.
+Who grants: the owner, and a supervisor session inside the projects it supervises. Who is calling comes from the
+launch (ah_roles.launch_role: AH_ROLE from the session's settings or Codex profile; without it, the owner at a terminal
+or a session the owner recorded in roles.json), never from the model. The projects are the supervisor's own roles.json
+entry, else the role default entry (`ah supervisor set --role-default --project DIR`). `secret`, `spend` and `harness`
+stay with the owner. A `harness` approval lets a harness-maintaining supervisor change (or weaken) the rule named in
+`what`; without `what` it is standing for every harness change. For `harness` the `what` fact is matched
+(case-insensitive, globs allowed); for other kinds `what` is description. The CLI decides who is calling (caller());
+grant() checks that a supervisor's scope sits inside its projects.
+
+The operating system backs the roles: a worker's sandbox keeps this store and roles.json read-only, so a worker that
+claims a role it was not launched with still cannot write here. The CLI turns that OSError into a refusal (exit 3)
+that names the path and the one command the owner or a supervisor session runs.
 
 Store: ~/.agent-harness/approvals.jsonl, mode 0600, append-only (a revoke is a new line), written under an flock.
-The reader skips lines it cannot parse. Threat model as everywhere: careless agents, not one that edits this file.
-Standard library only.
+The reader skips lines it cannot parse. Threat model as everywhere: careless or misled agents, not one that edits this
+file. Standard library only.
 """
 from __future__ import annotations
 
@@ -63,9 +70,11 @@ TASK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 SHA = re.compile(r"^[0-9a-fA-F]{7,40}$")
 DURATION = re.compile(r"^(\d{1,5})([mhdw])$")
 REMOTE = re.compile(r"github\.com[:/]+([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?\s*$", re.M)
-# Environment markers of a command run inside an agent's tool call (same list as commit_policy.AGENT_MARKERS).
-# CODEX_HOME is not one: people export it in their shell profile.
+# Environment markers of a command run inside an agent's tool call (ah_roles.AGENT_MARKERS is the same list).
+# CODEX_HOME is not one: people export it in their shell profile. AH_ROLE also marks an agent (in_agent): only a
+# launch sets it.
 AGENT_MARKERS = ("CLAUDECODE", "CODEX_THREAD_ID", "CODEX_TOOL_CALL_ID", "CODEX_SANDBOX", "AI_AGENT")
+ROLE_DEFAULT_KEY = "(role default)"  # `ah supervisor list`: the entry a launched supervisor uses without its own
 
 
 class Refused(Exception):
@@ -308,8 +317,9 @@ def list_approvals(project=None, kind=None, live=True, home=None) -> list:
 # ---- who may grant ----------------------------------------------------------------------------------------------
 
 def _supervisor_projects(session: str, home=None) -> list:
+    """The supervisor's own roles.json entry, else the role default entry (ah_roles.supervisor_entry)."""
     import ah_roles
-    entry = ah_roles.load_roles(home)["supervisors"].get(session) or {}
+    entry = ah_roles.supervisor_entry(session, home)
     return [p for p in entry.get("projects") or [] if isinstance(p, str)]
 
 
@@ -418,8 +428,11 @@ def revoke(approval_id, by, home=None) -> dict:
 # ---- who is calling (CLI) ---------------------------------------------------------------------------------------
 
 def in_agent(env=None) -> bool:
+    """The command runs inside an agent: an agent marker, a session id only an agent runtime exports, or an AH_ROLE
+    that only a launch sets."""
     env = os.environ if env is None else env
-    return any(env.get(name) for name in AGENT_MARKERS)
+    return (any(env.get(name) for name in AGENT_MARKERS + ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID"))
+            or "AH_ROLE" in env)
 
 
 def calling_session(env=None) -> str:
@@ -442,32 +455,45 @@ def verify_user_msg(session: str, msg_id: str) -> str:
     return str(match.get("text") or "")
 
 
-PATH_HINT = ("Fix: the owner runs the same `ah approve ...` in a terminal; or, citing the owner's own message, add "
-             "`--as-user --user-msg <id from ah user-msg --recent 3>`; or the owner makes this session a supervisor "
-             "(`ah supervisor set --session <id> --project <dir>`).")
+PATH_HINT = ("Fix: ask the owner or a supervisor session to run it; the owner runs the same `ah approve ...` in a "
+             "terminal, or, citing the owner's own message, you add `--as-user --user-msg <id from ah user-msg "
+             "--recent 3>`.")
+ASK = "ask the owner or a supervisor session"
 
 
-def caller(as_user=False, user_msg=None, env=None, home=None, verify=None):
-    """("user" | "supervisor:<session>", source or None). Raises Refused for a plain agent.
+def caller(as_user=False, user_msg=None, env=None, home=None, verify=None, kind=None):
+    """("user" | "supervisor:<session>", source or None). Raises Refused for a worker or a reviewer.
 
-    The owner: the command is not running inside an agent's tool call (no agent environment marker), or the agent
-    passed --as-user with the id of the owner's message that asks for it. A supervisor: the calling session
-    (CLAUDE_CODE_SESSION_ID) is recorded in roles.json. Limit: a sub-agent's shell carries its parent's session id, so
-    a supervisor's sub-agents can grant too (mission_gate could stamp main's call to close this)."""
+    The role is the launch role (ah_roles.launch_role), never the model. The owner: no AH_ROLE and no agent marker
+    (a person in a terminal), or an agent that passed --as-user with the id of the owner's message that asks for it. A
+    supervisor: launched with AH_ROLE=supervisor, or an agent session the owner recorded in roles.json. The OS backs
+    this: a worker's sandbox cannot write the store, whatever it claims. Limit: a sub-agent's shell carries its
+    parent's environment, so a supervisor's sub-agents can grant inside the supervisor's projects too."""
+    import ah_roles
     env = os.environ if env is None else env
-    if not in_agent(env):
+    role, source = ah_roles.role_and_source(env, home)
+    if role == "owner":
         return "user", None
     session = calling_session(env)
     if as_user:
+        if kind in OWNER_ONLY_KINDS:
+            # The cited message is checked only for being one of the owner's turns, not for asking for this grant,
+            # so an agent cannot record an owner-only approval this way (release 1001 red team).
+            raise Refused(f"--as-user cannot record a {kind} approval: the owner runs `ah approve {kind} ...` in his "
+                          "own terminal")
         if not user_msg:
             raise Refused("--as-user needs --user-msg <id from `ah user-msg --recent 3`>")
         if not session:
             raise Refused("--as-user needs the calling session (CLAUDE_CODE_SESSION_ID)")
         text = (verify or verify_user_msg)(session, user_msg)
-        return "user", f'{user_msg} "{" ".join(text.split())[:200]}"'
-    if session and session in _supervisor_sessions(home):
+        return "user", (f'{user_msg} "{" ".join(text.split())[:200]}" (recorded by {role} session {session}, '
+                        f'{source})')
+    if role == "supervisor":
+        if not session:
+            raise Refused("a supervisor grants under its session id, and CLAUDE_CODE_SESSION_ID (or CODEX_THREAD_ID) is "
+                          "not set; " + ASK)
         return "supervisor:" + session, None
-    raise Refused("this agent session is neither the owner nor a supervisor. " + PATH_HINT)
+    raise Refused(f"this session is a {role} ({source}); a {role} does not grant approvals. " + PATH_HINT)
 
 
 def session_model(session: str, home=None) -> str:
@@ -485,19 +511,22 @@ def session_model(session: str, home=None) -> str:
 
 
 def supervisors_view(home=None) -> dict:
+    """Each recorded supervisor session, plus the role default entry under ROLE_DEFAULT_KEY. `model` is shown for the
+    reader only; no permission reads it."""
     import ah_roles
+    data = ah_roles.load_roles(home)
     out = {}
-    for session, entry in ah_roles.load_roles(home)["supervisors"].items():
+    for session, entry in data["supervisors"].items():
         entry = entry if isinstance(entry, dict) else {}
         out[session] = {"projects": entry.get("projects") or [], "harness": entry.get("harness") is True,
                         "model": session_model(session, home) or "unknown", "set_at": entry.get("set_at"),
                         "by": entry.get("by")}
+    default = data.get(ah_roles.DEFAULT_KEY)
+    if default:
+        out[ROLE_DEFAULT_KEY] = {"projects": default.get("projects") or [], "harness": default.get("harness") is True,
+                                 "set_at": default.get("set_at"), "by": default.get("by"),
+                                 "for": "sessions launched with AH_ROLE=supervisor that have no entry of their own"}
     return out
-
-
-def _supervisor_sessions(home=None) -> set:
-    import ah_roles
-    return set(ah_roles.load_roles(home)["supervisors"])
 
 
 # ---- CLI --------------------------------------------------------------------------------------------------------
@@ -567,6 +596,8 @@ def _parser():
     s = sub.add_parser("supervisor", help="make a session a supervisor of projects (owner only)")
     s.add_argument("action", choices=("set", "clear", "list"))
     s.add_argument("--session")
+    s.add_argument("--role-default", action="store_true",
+                   help="the entry for sessions launched with AH_ROLE=supervisor that have no entry of their own")
     s.add_argument("--project", action="append", default=[])
     s.add_argument("--harness", action="store_true", help="this supervisor also maintains the harness "
                                                           "(changes still need an `ah approve harness` from the owner)")
@@ -577,75 +608,120 @@ def _out(data, as_json=True):
     sys.stdout.write((json.dumps(data, indent=2, sort_keys=True) if as_json else str(data)) + "\n")
 
 
+def _unwritable(error: OSError, path, hint: str) -> str:
+    """The refusal for a store the sandbox keeps read-only: the path, the error, and who runs the one command."""
+    where = error.filename if isinstance(getattr(error, "filename", None), str) else str(path)
+    reason = error.strerror or type(error).__name__
+    return (f"cannot write {where} ({reason}): this session's sandbox keeps it read-only, so {ASK} to run "
+            f"`{hint}`")
+
+
+def _approve_hint(args) -> str:
+    return command_hint(args.kind, project=args.project, pr=args.pr, path=args.path, task=args.task, pids=args.pids,
+                        host=args.host, what=args.what)
+
+
 def main(argv=None, env=None, home=None) -> int:
+    import shlex
     argv = [*(sys.argv[1:] if argv is None else argv)]
     args = _parser().parse_args(argv)
     try:
-        if args.cmd == "approve":
-            who, source = caller(args.as_user, args.user_msg, env=env, home=home)
-            scope = {"project": args.project, "pr": args.pr, "path": args.path, "task": args.task, "pids": args.pids,
-                     "host": args.host, "what": args.what}
-            record = grant(args.kind, scope, who, args.reason, expires=args.expires, exact_head=args.exact_head,
-                           source=source, home=home)
-            _out({"ok": True, "approval": record} if args.json else "approved " + table([record]), args.json)
-            return 0
-        if args.cmd == "approvals":
-            if args.action == "revoke":
-                if not args.target:
-                    raise ValueError("ah approvals revoke <id>")
-                who, _ = caller(args.as_user, args.user_msg, env=env, home=home)
-                record = revoke(args.target, who, home=home)
-                _out({"ok": True, "revoked": record} if args.json else "revoked " + table([record]), args.json)
-                return 0
-            if args.action == "check":
-                kind = args.target or args.kind
-                if kind not in KINDS:
-                    raise ValueError("ah approvals check <kind> [--project P --pr N --path X --task T ...]")
-                found = allowed(kind, project=args.project, repo=args.repo, pr=args.pr, path=args.path, task=args.task,
-                                pids=args.pids, host=args.host, head=args.head, what=args.what, home=home)
-                if args.json:
-                    _out({"approved": bool(found), "approval": found})
-                else:
-                    _out(("approved: " + table([found])) if found else
-                         f"not approved: no live {kind} approval covers this; ask the owner (and record the answer "
-                         "with `ah approve`)", False)
-                return 0 if found else 1
-            rows = list_approvals(project=args.project, kind=args.kind, live=not args.all, home=home)
-            _out(rows if args.json else table(rows), args.json)
-            return 0
-        if args.cmd == "supervisor":
-            import ah_roles
-            if args.action == "list":
-                _out(supervisors_view(home))
-                return 0
-            if in_agent(env):
-                raise Refused("only the owner, in a terminal, names supervisors: `python3 ~/.claude/hooks/ah.py "
-                              "supervisor set --session <id> --project <dir>`")
-            if not args.session:
-                raise ValueError("--session <id> is required")
-            if args.action == "clear":
-                _out({"ok": True, "cleared": ah_roles.clear_supervisor(args.session, home=home)})
-                return 0
-            if not args.project:
-                raise ValueError("--project <dir> (repeatable) is required")
-            entry = ah_roles.set_supervisor(args.session, args.project, by="user", home=home)
-            if args.harness:  # stored beside the projects; ah_roles.may_edit_harness reads it
-                data = ah_roles.load_roles(home)
-                data["supervisors"][args.session]["harness"] = True
-                ah_roles.save_roles(data, home)
-                entry = data["supervisors"][args.session]
-            _out({"ok": True, "supervisor": args.session, "entry": entry})
-            return 0
+        return _run(args, env, home)
     except Refused as error:
         _out({"ok": False, "code": "refused", "message": str(error)})
         return 3
     except ValueError as error:
         _out({"ok": False, "code": "bad_request", "message": str(error)})
         return 2
+    except OSError as error:  # the sandbox (or a read-only disk) refused a write: a refusal, never a traceback
+        import ah_roles
+        if args.cmd == "supervisor":
+            path, hint = ah_roles.state_dir(home) / ah_roles.ROLES_NAME, "ah " + " ".join(map(shlex.quote, argv))
+        elif args.cmd == "approve":
+            path, hint = store_path(home), _approve_hint(args)
+        else:
+            path, hint = store_path(home), "ah " + " ".join(map(shlex.quote, argv))
+        _out({"ok": False, "code": "refused", "message": _unwritable(error, path, hint)})
+        return 3
+
+
+def _run(args, env, home) -> int:
+    """One dispatch; main() turns Refused, ValueError and OSError into exit codes 3, 2 and 3."""
+    if args.cmd == "approve":
+        try:
+            who, source = caller(args.as_user, args.user_msg, env=env, home=home, kind=args.kind)
+        except Refused as error:
+            raise Refused(f"{error} The command to run: `{_approve_hint(args)}`.") from None
+        scope = {"project": args.project, "pr": args.pr, "path": args.path, "task": args.task, "pids": args.pids,
+                 "host": args.host, "what": args.what}
+        record = grant(args.kind, scope, who, args.reason, expires=args.expires, exact_head=args.exact_head,
+                       source=source, home=home)
+        _out({"ok": True, "approval": record} if args.json else "approved " + table([record]), args.json)
+        return 0
+    if args.cmd == "approvals":
+        if args.action == "revoke":
+            if not args.target:
+                raise ValueError("ah approvals revoke <id>")
+            who, _ = caller(args.as_user, args.user_msg, env=env, home=home)
+            record = revoke(args.target, who, home=home)
+            _out({"ok": True, "revoked": record} if args.json else "revoked " + table([record]), args.json)
+            return 0
+        if args.action == "check":
+            kind = args.target or args.kind
+            if kind not in KINDS:
+                raise ValueError("ah approvals check <kind> [--project P --pr N --path X --task T ...]")
+            found = allowed(kind, project=args.project, repo=args.repo, pr=args.pr, path=args.path, task=args.task,
+                            pids=args.pids, host=args.host, head=args.head, what=args.what, home=home)
+            if args.json:
+                _out({"approved": bool(found), "approval": found})
+            else:
+                _out(("approved: " + table([found])) if found else
+                     f"not approved: no live {kind} approval covers this; ask the owner (and record the answer "
+                     "with `ah approve`)", False)
+            return 0 if found else 1
+        rows = list_approvals(project=args.project, kind=args.kind, live=not args.all, home=home)
+        _out(rows if args.json else table(rows), args.json)
+        return 0
+    if args.cmd == "supervisor":
+        return _supervisor(args, env, home)
     return 2
+
+
+def _supervisor(args, env, home) -> int:
+    import ah_roles
+    if args.action == "list":
+        _out(supervisors_view(home))
+        return 0
+    if ah_roles.launch_role(os.environ if env is None else env, home) != "owner":
+        raise Refused("only the owner, in a terminal, names supervisors: `python3 ~/.claude/hooks/ah.py "
+                      "supervisor set --session <id> --project <dir>` (or `--role-default --project <dir>`)")
+    if args.role_default == bool(args.session):
+        raise ValueError("pass --session <id> or --role-default (one of them)")
+    if args.action == "clear":
+        cleared = (ah_roles.clear_role_default(home=home) if args.role_default
+                   else ah_roles.clear_supervisor(args.session, home=home))
+        _out({"ok": True, "cleared": cleared})
+        return 0
+    if not args.project:
+        raise ValueError("--project <dir> (repeatable) is required")
+    if args.role_default:
+        entry = ah_roles.set_role_default(args.project, by="user", harness=args.harness, home=home)
+        _out({"ok": True, "supervisor": ROLE_DEFAULT_KEY, "entry": entry})
+        return 0
+    entry = ah_roles.set_supervisor(args.session, args.project, by="user", home=home)
+    if args.harness:  # stored beside the projects; ah_roles.may_edit_harness reads it
+        data = ah_roles.load_roles(home)
+        data["supervisors"][args.session]["harness"] = True
+        ah_roles.save_roles(data, home)
+        entry = data["supervisors"][args.session]
+    _out({"ok": True, "supervisor": args.session, "entry": entry})
+    return 0
 
 
 list = list_approvals  # noqa: A001 - the documented API name; this module never calls the builtin list()
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+

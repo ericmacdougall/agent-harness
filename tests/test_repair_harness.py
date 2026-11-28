@@ -68,6 +68,9 @@ class RepairSequence(unittest.TestCase):
         self.assertEqual([call.args[0] for call in self.local.call_args_list], ["check"])
 
     def test_ssh_option_injection_refused_before_creating_stage(self):
+        mask = os.umask(0o022)
+        os.umask(mask)
+        self.addCleanup(os.umask, mask)  # main() sets the process umask to 077; later tests in this process need theirs
         with patch.object(sys, "argv", ["repair", "--ref", "a" * 40, "--host=-oProxyCommand=false"]):
             with patch.object(repair, "work_dir") as stage, self.assertRaisesRegex(repair.RepairError, "trusted SSH host"):
                 repair.main()
@@ -208,8 +211,8 @@ class StockInstallers(unittest.TestCase):
         self.assertEqual(len(applied["backups"]), 2)
         self.assertNotEqual(repair.snapshot(self.home / path for path in repair.HOOK_PATHS), prior)
         self.assertEqual(repair.snapshot([self.home / name for name in repair.SETTINGS] + [self.profile]), protected)
-        self.assertEqual((self.home / ".claude/hooks/commit_policy.local.json").read_text(),
-                         '{\n  "backstop_repos": [\n    "existing/repo"\n  ]\n}')
+        # Release 1001 has no commit policy, so nothing migrates its personal values into a local profile any more.
+        self.assertFalse((self.home / ".claude/hooks/commit_policy.local.json").exists())
 
     def test_tampered_archive_never_invokes_installer(self):
         with patch.object(repair, "bounded_install") as installer:

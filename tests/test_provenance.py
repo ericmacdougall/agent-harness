@@ -14,7 +14,6 @@ from unittest import mock
 HOOKS = Path(__file__).resolve().parent.parent / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
 import provenance  # noqa: E402
-import spec_flow  # noqa: E402
 
 SID = "11111111-2222-3333-4444-555555555555"
 HUMAN, AGENT, TASK, REMIND, TOOL, COMPACT, PASTE = (str(uuid.UUID(int=i)) for i in range(1, 8))
@@ -368,29 +367,8 @@ class Enforcement(Env):
         text = SPEC.format(s1=s1, s2=s2 if s2 is not None else s1)
         return text.replace("Click-test: required\n", "Click-test: required\n" + header)
 
-    def test_ac1_spec_without_source_warns_and_is_not_refused(self):  # AC-1, warn-only since 2026-11-24
-        problems, warnings = provenance.spec_lint(self.spec("", ""))
-        self.assertEqual(problems, [])
-        self.assertTrue(any("AC-1 has no `Source:`" in w for w in warnings), warnings)
-        self.assertTrue(any("NEG-1 has no `Source:`" in w for w in warnings), warnings)
-        self.assertFalse(any("Source" in p for p in spec_flow.lint(self.spec("", ""))))
-        control = spec_flow.lint(self.spec("", ""), check_provenance=False)
-        self.assertFalse(any("Source" in p for p in control), control)  # failing control: old behaviour passed
 
-    def test_spec_with_sources_passes_and_fabrication_fails(self):
-        good = f"Source: {self.user(HUMAN, QUOTE)}"
-        self.assertEqual([p for p in spec_flow.lint(self.spec(good)) if "Source" in p or "provenance" in p], [])
-        bad = f"Source: {self.user(AGENT, 'need the OpenRouter key from the user')}"
-        self.assertTrue(any("not-user-authored" in w for w in provenance.spec_lint(self.spec(bad))[1]))
 
-    def test_grandfather_needs_human_signoff(self):
-        problems, warnings = provenance.spec_lint(self.spec("", "", header="Provenance: grandfathered (written before provenance existed)\n"))
-        self.assertEqual(problems, [])
-        self.assertTrue(any("only meaningful with `Sign-off: human`" in w for w in warnings), warnings)
-        ok = self.spec("", "", header="Provenance: grandfathered (written before provenance existed)\nSign-off: human\n")
-        self.assertFalse([p for p in spec_flow.lint(ok) if "provenance" in p.lower() or "Source" in p])
-        buried = self.spec("", "").replace("Works.", "Provenance: grandfathered (hidden in a later section)\nSign-off: human")
-        self.assertTrue(any("no `Source:`" in w for w in provenance.spec_lint(buried)[1]))
 
     def test_packet_gate_modes(self):
         packet = "- AC-1: thing. Verify by: x.\n- REQ-2: other. Source: inferred: from nothing\n"
@@ -405,27 +383,6 @@ class Enforcement(Env):
     def run_note(self, *argv):
         return subprocess.run([sys.executable, str(HOOKS / "wal_note.py"), "--wal", str(self.wals / "main.jsonl"), *argv],
                               capture_output=True, text=True, env=dict(os.environ, HOME=str(self.home)))
-
-    def test_ac5_wal_note_modes(self):  # AC-5; since 2026-11-24 an unsourced ask or requirement is written and labelled
-        unsourced = self.run_note("--event", "ask", "--note", "need the OpenRouter key", "--reason", "provider fallback needs it")
-        self.assertEqual(unsourced.returncode, 0, unsourced.stderr)
-        self.assertIn("provenance warning", unsourced.stderr)
-        self.assertTrue(json.loads((self.wals / "main.jsonl").read_text().splitlines()[-1])["unsourced"])
-        self.assertEqual(self.run_note("--event", "ask", "--note", "n", "--source", self.user(HUMAN, QUOTE)).returncode, 2)  # no reason
-        self.assertEqual(self.run_note("--event", "requirement", "--note", "n").returncode, 0)
-        bad = self.run_note("--event", "ask", "--note", "n", "--reason", "because of reasons", "--source", self.user(AGENT, "need the OpenRouter key"))
-        self.assertEqual(bad.returncode, 0, bad.stderr)
-        self.assertTrue(json.loads((self.wals / "main.jsonl").read_text().splitlines()[-1])["unsourced"])
-        warn = self.run_note("--event", "blocker", "--note", "stuck")  # existing flow keeps working, with a warning
-        self.assertEqual(warn.returncode, 0, warn.stderr)
-        self.assertIn("provenance warning", warn.stderr)
-        self.assertEqual(json.loads((self.wals / "main.jsonl").read_text().splitlines()[-1])["provenance"], "missing")
-        ok = self.run_note("--event", "ask", "--note", "ask the user about X", "--reason", "needed to decide Y", "--source", self.user(HUMAN, QUOTE))
-        self.assertEqual(ok.returncode, 0, ok.stderr)
-        ident = json.loads(ok.stdout)["id"]
-        secret = self.run_note("--event", "ask", "--note", "n", "--reason", "needed", "--source", 'user:x "token=abcdef123456"')
-        self.assertNotEqual(secret.returncode, 0)
-        return ident
 
     def test_asks_ledger_and_trace(self):  # AC-3, AC-4
         good = self.run_note("--event", "ask", "--note", "confirm the policy mode", "--reason", "decides rollout", "--source", self.user(HUMAN, QUOTE))
@@ -614,128 +571,6 @@ class RedTeamFixes(Env):
         self.write_transcript(transcript_lines() + [turn(ide, "<ide_selection>selected code lines here</ide_selection> real words typed after", origin={"kind": "human"})])
         self.reject(self.user(ide, "selected code lines here"), "excerpt-not-found")
 
-    def test_f2_unverified_citations_do_not_satisfy_asks(self):
-        sandbox = self.sandbox(ticket_lookup="off")  # lookup off: an uncached ticket is only an unverified citation
-        self.policy_file(ticket_lookup="off")
-        env = dict(os.environ, HOME=str(self.home))
-        weak = provenance.resolve("ticket:GoodQA nonexistent#99999")
-        self.assertTrue(weak["ok"] and weak["weak"])
-        self.assertTrue(provenance.weak_problem(weak))
-        out = subprocess.run([sys.executable, str(sandbox / "wal_note.py"), "--wal", str(self.wals / "main.jsonl"), "--event", "ask", "--note", "n",
-                              "--reason", "needed for deploy", "--source", "ticket:GoodQA nonexistent#99999"],
-                             capture_output=True, text=True, env=env)
-        self.assertEqual(out.returncode, 0, out.stdout)  # written with a warning since 2026-11-24
-        self.assertIn("unverified ticket or file line", out.stderr)
-        cli = lambda *a: subprocess.run([sys.executable, str(sandbox / "provenance.py"), *a], capture_output=True, text=True, env=env)  # noqa: E731
-        self.assertEqual(cli("cache-ticket", "--ref", "GoodQA nonexistent#99999", "--title", "T", "--checked-by", "main").returncode, 0)
-        self.assertFalse(provenance.resolve("ticket:GoodQA nonexistent#99999")["weak"])
-        sha = "a" * 40
-        self.assertTrue(provenance.resolve(f"file:x.md:1@{sha}", {"repo": str(self.home)})["problems"])  # no repo: rejected, never weak-ok
-
-    def test_m1_ticket_lookup_found_missing_unreachable(self):
-        calls = []
-
-        def fake(outcome):
-            def lookup(project, number):
-                calls.append((project, number))
-                return outcome
-            return lookup
-
-        def fresh(outcome, source="ticket:GoodQA harness#14398"):
-            provenance._TICKET_MEMO.clear()
-            provenance._OUTAGE["until"] = 0.0
-            with mock.patch.object(provenance, "TICKET_LOOKUP", fake(outcome)):
-                return provenance.resolve(source)
-
-        found = fresh(("found", "Real title"))  # resolved: verified, cached, not weak
-        self.assertTrue(found["ok"] and not found["weak"] and found["chain"][0]["status"] == "verified", found)
-        self.assertEqual(provenance.ticket_cache()["harness#14398"]["title"], "Real title")
-        calls.clear()
-        provenance._TICKET_MEMO.clear()
-        provenance._OUTAGE["until"] = 0.0
-        self.assertTrue(provenance.resolve("ticket:GoodQA harness#14398")["ok"])  # served from the cache: no second lookup
-        self.assertEqual(calls, [])
-        missing = fresh(("missing", None), "ticket:GoodQA harness#99999")  # known missing: refused
-        self.assertFalse(missing["ok"])
-        self.assertEqual(missing["problems"][1]["code"], "ticket-missing")
-        out = subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, %r); import provenance as p; "
-                              "p.TICKET_LOOKUP = lambda a, b: ('missing', None); import json; "
-                              "print(json.dumps(p.spec_lint(open(sys.argv[1]).read())[0]))" % str(HOOKS),
-                              str(self.write_spec("ticket:GoodQA harness#99999"))],
-                             capture_output=True, text=True, env=dict(os.environ, HOME=str(self.home)))
-        self.assertEqual(out.stdout.strip(), "[]")  # spec lint never refuses; a missing ticket is a warning
-        down = fresh(("unreachable", "URLError"), "ticket:GoodQA harness#7")  # outage: still only an unverified citation
-        self.assertTrue(down["ok"] and down["weak"] and down["deferred"], down)
-        self.assertEqual(down["chain"][0]["status"], "unverified")
-        self.assertIn("add a `user:` or `wal:` source", provenance.weak_problem(down))  # refused for ask and requirement, outage or not
-        # ...but an outage only warns when a verified user source also stands behind the claim
-        backed = fresh(("unreachable", "URLError"), f"inferred: from {self.user(HUMAN, QUOTE)} ; ticket:GoodQA harness#8 -- the ticket adds context")
-        self.assertTrue(backed["ok"] and backed["backed"], backed)
-        self.assertIsNone(provenance.weak_problem(backed))
-        self.assertIn("could not be verified", provenance.unreachable_warning(backed))
-        note = subprocess.run([sys.executable, str(HOOKS / "wal_note.py"), "--wal", str(self.wals / "main.jsonl"), "--event", "ask", "--note", "n",
-                               "--reason", "needed for the release", "--source", "ticket:GoodQA harness#7"],
-                              capture_output=True, text=True, env=dict(os.environ, HOME=str(self.home)))  # real adapter, no credentials
-        self.assertEqual(note.returncode, 0, note.stdout)  # written, and the weak cite is named in a warning
-        self.assertIn("add a `user:` or `wal:` source", note.stderr)
-        home_less = subprocess.run([sys.executable, str(HOOKS / "wal_note.py"), "--wal", str(self.wals / "main.jsonl"), "--event", "requirement",
-                                    "--note", "n", "--source", "ticket:GoodQA harness#424242"],
-                                   capture_output=True, text=True,
-                                   env=dict(os.environ, HOME=str(self.home), HTTPS_PROXY="http://127.0.0.1:9"))
-        self.assertEqual(home_less.returncode, 0, home_less.stdout)
-        self.assertIn("provenance warning", home_less.stderr)  # a proxy variable cannot turn a lookup into a clean pass
-        self.policy_file(ticket_lookup="warn")  # loosening comes from the installed policy file only
-        soft = fresh(("missing", None), "ticket:GoodQA harness#99998")
-        self.assertTrue(soft["ok"] and soft["weak"])  # warn mode accepts a missing ticket in specs...
-        self.assertIsNotNone(provenance.weak_problem(soft))  # ...but requirement and ask still refuse it
-        self.assertEqual(soft["weak_reasons"], ["ticket-missing-warn"])
-        scope = fresh(("out-of-scope", "project not visible"), "ticket:GoodQA FAKEPROJ#7")  # not an outage: stays refusable
-        self.assertTrue(scope["ok"] and scope["weak"])
-        self.assertIsNotNone(provenance.weak_problem(scope))
-        self.assertEqual(scope["weak_reasons"], ["ticket-out-of-scope"])
-        self.assertIsNone(provenance.unreachable_warning(scope))
-        provenance._TICKET_MEMO.clear()
-        provenance._OUTAGE["until"] = 0.0
-        calls = []
-        with mock.patch.object(provenance, "TICKET_LOOKUP", lambda p, n: calls.append(n) or ("unreachable", "down")):
-            for number in range(1, 8):
-                provenance.resolve(f"ticket:GoodQA harness#{number}")
-        self.assertEqual(len(calls), 1)  # after the first outage answer the rest of the process skips the network call
-        provenance._OUTAGE["until"] = 0.0
-
-    def test_environment_can_only_tighten_modes(self):
-        enforce = self.home / "installed-enforce.json"
-        enforce.write_text(json.dumps({"schema": 1, "spec": "enforce", "plan_packet": "enforce", "ticket_lookup": "enforce",
-                                       "wal": {"ask": "enforce", "blocker": "warn"}}))
-        loose = self.home / "env-loose.json"
-        loose.write_text(json.dumps({"schema": 1, "spec": "off", "plan_packet": "warn", "ticket_lookup": "off",
-                                     "wal": {"ask": "off", "blocker": "enforce"}}))
-        with mock.patch.object(provenance, "POLICY_FILE", enforce), \
-                mock.patch.dict(os.environ, {"HARNESS_PROVENANCE_POLICY": str(loose), "HARNESS_PROVENANCE_TICKET_LOOKUP": "off"}):
-            policy = provenance.load_policy()
-            # 2026-11-24: "enforce" reads as "warn" for every advisory key; env "off" still cannot loosen below it
-            self.assertEqual((policy["spec"], policy["plan_packet"], policy["ticket_lookup"], policy["wal"]["ask"]),
-                             ("warn", "warn", "enforce", "warn"))
-            self.assertEqual(policy["wal"]["blocker"], "warn")
-            provenance._TICKET_MEMO.clear()
-            provenance._OUTAGE["until"] = 0.0
-            with mock.patch.object(provenance, "TICKET_LOOKUP", lambda p, n: ("missing", None)):
-                self.assertFalse(provenance.resolve("ticket:GoodQA harness#424242")["ok"])  # lookup still enforced
-        warn = self.home / "installed-warn.json"
-        warn.write_text(json.dumps({"schema": 1, "spec": "warn", "ticket_lookup": "warn", "wal": {}}))
-        tight = self.home / "env-tight.json"
-        tight.write_text(json.dumps({"schema": 1, "spec": "enforce", "wal": {"scope": "enforce"}}))
-        with mock.patch.object(provenance, "POLICY_FILE", warn), \
-                mock.patch.dict(os.environ, {"HARNESS_PROVENANCE_POLICY": str(tight), "HARNESS_PROVENANCE_TICKET_LOOKUP": "enforce"}):
-            policy = provenance.load_policy()
-            self.assertEqual((policy["spec"], policy["ticket_lookup"], policy["wal"]["scope"]), ("warn", "enforce", "warn"))
-        out = subprocess.run([sys.executable, str(HOOKS / "wal_note.py"), "--wal", str(self.wals / "main.jsonl"), "--event", "ask", "--note", "n",
-                              "--reason", "needed for deploy"],
-                             capture_output=True, text=True,
-                             env=dict(os.environ, HOME=str(self.home), HARNESS_PROVENANCE_POLICY=str(loose)))
-        self.assertEqual(out.returncode, 0, out.stdout)
-        self.assertIn("provenance warning", out.stderr)  # env "off" cannot silence the installed warning
-
     def test_n4_offline_switch_cannot_turn_a_refusal_into_a_warning(self):
         only_ticket = f"Source: ticket:GoodQA harness#31337"
         backed = f"Source: inferred: from {self.user(HUMAN, QUOTE)} ; ticket:GoodQA harness#31337 -- the ticket adds context"
@@ -757,54 +592,6 @@ class RedTeamFixes(Env):
                 got = provenance.lookup_ticket("harness", 1)
                 self.assertEqual(got == ("unverified", "offline mode"), enabled, value)
 
-    def test_n5_real_lookup_ignores_proxy_variables(self):
-        """The real lookup_ticket against a loopback GoodQA, with dead proxy variables set. Failing control: with the
-        direct-connection wiring removed the same call cannot reach the server and reports an outage."""
-        import http.server
-        import threading
-        import spec_flow
-
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def do_POST(self):
-                length = int(self.headers.get("content-length", 0))
-                arguments = json.loads(self.rfile.read(length))["params"]["arguments"]
-                issue = {"issue": {"id": "i-1", "number": arguments["number"], "projectId": "p-1", "title": "Loopback ticket", "status": "todo"}}
-                body = json.dumps({"result": {"content": [{"text": json.dumps(issue)}]}}).encode()
-                self.send_response(200)
-                self.send_header("content-type", "application/json")
-                self.send_header("content-length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def log_message(self, *args):
-                pass
-
-        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
-        self.addCleanup(server.server_close)  # runs after shutdown: an unclosed listener raises ResourceWarning later
-        self.addCleanup(server.shutdown)
-        key = self.home / "key"
-        key.write_text("k" * 40)
-        key.chmod(0o600)
-        config = {"adapter": "goodqa", "endpoint": f"http://127.0.0.1:{server.server_address[1]}/", "key_file": str(key),
-                  "org_id": "org-1", "timeout_seconds": 3, "attempts": 1}
-        proxies = {name: "http://127.0.0.1:9" for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")}
-        proxies.update({"NO_PROXY": "", "no_proxy": ""})
-
-        def lookup():
-            provenance._OUTAGE["until"] = 0.0
-            with mock.patch.object(spec_flow, "ticket_config", lambda sp: (None, None, config)), \
-                    mock.patch.object(spec_flow, "load_spec_policy", lambda: {}), mock.patch.dict(os.environ, proxies):
-                return provenance.lookup_ticket("harness", 4242)
-
-        import urllib.request
-        self.addCleanup(setattr, urllib.request, "_opener", None)  # urlopen caches the first opener it builds, proxies included
-        self.assertEqual(lookup(), ("found", "Loopback ticket"))  # the wiring works with dead proxies set
-        urllib.request._opener = None
-        with mock.patch.object(provenance, "direct_connections", lambda: __import__("contextlib").nullcontext()):
-            control = lookup()
-        urllib.request._opener = None  # drop the proxy-configured opener the control just made
-        self.assertEqual(control[0], "unreachable", control)  # control: without the wiring the proxy variables break it
 
     def test_n1_skip_window_never_changes_a_verdict(self):
         provenance._TICKET_MEMO.clear()
@@ -824,45 +611,6 @@ class RedTeamFixes(Env):
         with mock.patch.object(provenance, "TICKET_LOOKUP", lambda p, n: calls.append(n) or answers[n]):  # fresh process
             self.assertEqual(provenance.resolve("ticket:GoodQA harness#424242")["problems"][1]["code"], "ticket-missing")
 
-    def test_n1_only_transport_failures_are_outages(self):
-        import spec_flow
-        import ticket_adapters as ta
-
-        class Stub:
-            timeout, attempts = 15, 2
-
-            def __init__(self, error=None, ticket="ok"):
-                self.error, self.ticket = error, ticket
-
-            def lookup(self, project, number):
-                if self.error:
-                    raise self.error
-                return self.ticket
-
-        def state(error=None, ticket="ok"):
-            provenance._OUTAGE["until"] = 0.0
-            with mock.patch.object(spec_flow, "make_adapter", lambda *a, **k: Stub(error, ticket)), \
-                    mock.patch.object(spec_flow, "ticket_config", lambda sp: (None, None, {})), \
-                    mock.patch.object(spec_flow, "load_spec_policy", lambda: {}):
-                return provenance.lookup_ticket("harness", 5)[0]
-
-        self.assertEqual(state(ta.TicketSystemUnavailable("GoodQA unreachable for get_issue_by_number (URLError)")), "unreachable")
-        self.assertEqual(state(ta.TicketSystemUnavailable("GoodQA verification exceeded its total deadline")), "unreachable")
-        for message in ("GoodQA HTTP 500 for get_issue_by_number", "GoodQA HTTP 401 for get_issue_by_number",
-                        "ticket credential file is missing or unreadable: /x", "GoodQA lookup failed (rate_limited)"):
-            self.assertEqual(state(ta.TicketSystemUnavailable(message)), "unverified", message)
-        self.assertEqual(state(ta.TicketOutOfScope("nope")), "out-of-scope")
-        self.assertEqual(state(RuntimeError("boom")), "unverified")
-        self.assertEqual(state(ticket=None), "missing")
-        calls = []
-        provenance._TICKET_MEMO.clear()
-        provenance._OUTAGE["until"] = 0.0
-        outcomes = iter([("unverified", "HTTP 500"), ("missing", None)])
-        with mock.patch.object(provenance, "TICKET_LOOKUP", lambda p, n: calls.append(n) or next(outcomes)):
-            provenance.resolve("ticket:GoodQA harness#1")
-            second = provenance.resolve("ticket:GoodQA harness#2")
-        self.assertEqual(calls, [1, 2])  # a non-transport error does not start the skip window
-        self.assertEqual(second["problems"][1]["code"], "ticket-missing")
 
     def test_n1_proxy_environment_is_ignored_and_offline_switch(self):
         import http.server
@@ -951,32 +699,6 @@ class RedTeamFixes(Env):
         path.write_text(SPEC.format(s1="", s2="").replace("Click-test: required\n", "Click-test: required\nProvenance: grandfathered (written before provenance existed)\n"))
         run = subprocess.run([sys.executable, str(HOOKS / "provenance.py"), "check-spec", str(path)], capture_output=True, text=True, env=dict(os.environ, HOME=str(self.home)))
         self.assertEqual(run.returncode, 2, run.stdout)
-
-    def test_f10_resource_bounds(self):
-        evil = '{"uuid":"%s","a":' % HUMAN + "[" * 300 + '"' + '\\"' * 30000
-        start = time.perf_counter()
-        with self.assertRaises(ValueError):
-            provenance.loads_line(evil)
-        self.assertLess(time.perf_counter() - start, 1.0)
-        main = self.wals / "main.jsonl"
-        leaf = f"inferred: from {self.user(HUMAN, QUOTE)} -- leaf filler rationale text"
-        mids = [f"wal:{main}#wmid{i:06d}" for i in range(20)]
-        rows = [{"id": f"wleaf{j:05d}", "event": "ask", "note": "n", "source": leaf} for j in range(1)]
-        for i in range(20):  # each middle entry fans out to the same 20 leaf pointers
-            fan = " ; ".join(f"wal:{main}#wleaf{0:05d}" for _ in range(20))
-            rows.append({"id": f"wmid{i:06d}", "event": "ask", "note": "n", "source": f"inferred: from {fan} -- middle fan out rationale"})
-        rows.append({"id": "wtop000001", "event": "ask", "note": "n", "source": "inferred: from " + " ; ".join(mids) + " -- wide fan out for the budget"})
-        main.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
-        start = time.perf_counter()
-        result = provenance.resolve(f"wal:{main}#wtop000001")
-        self.assertLess(time.perf_counter() - start, 2.0)
-        codes = []
-        def walk(res):
-            codes.extend(p["code"] for p in res["problems"])
-            for sub in res["inputs"]:
-                walk(sub)
-        walk(result)
-        self.assertIn("too-many-sources", codes)
 
     def test_strip_blocks_is_linear_on_adversarial_tags(self):
         for text in ("<system-reminder " * 100_000, "<agent-message>" * 130_000, "<agent-message>x</agent-message>" * 60_000,

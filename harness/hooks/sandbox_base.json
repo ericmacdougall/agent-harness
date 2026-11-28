@@ -1,0 +1,139 @@
+{
+  "schema": 1,
+  "about": "Role data for ah_sandbox.py (docs/sandbox.md). Data, not code: paths start with ~/ so one file serves every user. local.json adds sandbox_allowed_domains, sandbox_extra_deny_read, sandbox_extra_write, sandbox_excluded_commands and sandbox_role.",
+  "secret_paths": [
+    "~/.ssh",
+    "~/.aws",
+    "~/.gnupg",
+    "~/.netrc",
+    "~/.git-credentials",
+    "~/.npmrc",
+    "~/.pypirc",
+    "~/.cargo/credentials",
+    "~/.cargo/credentials.toml",
+    "~/.kube",
+    "~/.docker/config.json",
+    "~/.config/gcloud",
+    "~/.config/rclone",
+    "~/.kimi-code",
+    "~/.password-store",
+    "~/.codex/auth.json",
+    "~/.claude/.credentials.json",
+    "~/.config/goodqa",
+    "~/.config/anthropic",
+    "~/.config/anthropic-arxiv-keys",
+    "~/.config/openai-arxiv-keys",
+    "~/.config/dataforseo",
+    "~/.config/fish-audio.env"
+  ],
+  "secret_globs_about": "Permission rules only (the Read tool and the file commands Claude Code recognises in Bash): project secret files by name, wherever they are. Not in the sandbox lists, which take paths, not globs.",
+  "secret_globs": [
+    "**/.env",
+    "**/.env.local",
+    "**/.env.*.local",
+    "**/.env.production"
+  ],
+  "record_paths": [
+    "~/.claude/projects",
+    "~/.codex/sessions",
+    "~/.codex/archived_sessions",
+    "~/.agent-harness/logs",
+    "~/.agent-harness/approvals.jsonl",
+    "~/.agent-harness/roles.json",
+    "~/.agent-harness/OFF",
+    "~/.agent-harness/off-stash",
+    "~/.agent-harness/releases",
+    "~/.agent-harness/inbox",
+    "~/.agent-harness/rescue",
+    "~/.agent-harness/sandbox",
+    "~/.agent-harness/local.json",
+    "~/.agent-harness/install-state.json",
+    "~/.agent-harness/floor.json",
+    "~/.claude/hooks",
+    "~/.codex/agent-harness"
+  ],
+  "worker_write": [
+    "~/.agent-harness/work",
+    "~/.agent-harness/tmp",
+    "~/.agent-harness/scratch",
+    "~/.agent-harness/state",
+    "~/.agent-harness/codex-wals",
+    "~/.claude/wals",
+    "~/.npm",
+    "~/.cache",
+    "~/Library/Caches"
+  ],
+  "supervisor_write_extra": [
+    "~/.agent-harness/approvals.jsonl",
+    "~/.agent-harness/inbox"
+  ],
+  "open_network_about": "Roles whose outbound network stays open in the first version (docs/direction.md): no allowedDomains and no strictAllowlist, so the proxy filters nothing. network_allow stays as the list a later allow-list starts from, measured in shadow first; reviewers keep reviewer_network_allow.",
+  "open_network": [
+    "worker",
+    "supervisor"
+  ],
+  "network_allow": [
+    "github.com",
+    "api.github.com",
+    "codeload.github.com",
+    "*.githubusercontent.com",
+    "ghcr.io",
+    "registry.npmjs.org",
+    "pypi.org",
+    "files.pythonhosted.org",
+    "proxy.golang.org",
+    "sum.golang.org"
+  ],
+  "reviewer_network_allow": [
+    "github.com",
+    "api.github.com",
+    "codeload.github.com",
+    "*.githubusercontent.com"
+  ],
+  "mach_lookup_about": "macOS: Mach services sandboxed commands may look up beyond Claude Code's own list. trustd.agent verifies TLS certificates for Go programs: without it gh fails with x509 OSStatus -26276 (the release 1001 e2e).",
+  "mach_lookup": [
+    "com.apple.trustd.agent"
+  ],
+  "harness_tools_about": "The harness's own tools that must run outside Claude Code's sandbox: each needs a record path, a secret store, the clipboard or a model login the sandbox denies. Each is excluded under three spellings: ~/, $HOME/ and the absolute home. A compound command (`cd x && ...`) stays sandboxed.",
+  "harness_tools": [
+    "python3 ~/.claude/hooks/wal_note.py *",
+    "python3 ~/.claude/hooks/peer_review.py *",
+    "python3 ~/.claude/hooks/ah.py secret *",
+    "python3 ~/.claude/hooks/ah.py kill *",
+    "python3 ~/.claude/hooks/ah.py worktree-remove *",
+    "python3 ~/.claude/hooks/ah.py log-push *",
+    "python3 ~/.claude/hooks/ah.py chat *"
+  ],
+  "excluded_commands": {
+    "worker": [
+      "ssh",
+      "ssh *",
+      "scp *",
+      "docker",
+      "docker *",
+      "go",
+      "go *",
+      "jest *",
+      "npx jest *",
+      "npx playwright *",
+      "pnpm exec playwright *",
+      "playwright *"
+    ],
+    "supervisor": [
+      "ssh",
+      "ssh *",
+      "scp *",
+      "docker",
+      "docker *",
+      "go",
+      "go *",
+      "jest *",
+      "npx jest *",
+      "npx playwright *",
+      "pnpm exec playwright *",
+      "playwright *",
+      "harness *"
+    ],
+    "reviewer": []
+  }
+}

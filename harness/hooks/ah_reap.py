@@ -246,7 +246,8 @@ def _survey(folder) -> dict:
             except OSError:
                 continue
             if not stat.S_ISDIR(info.st_mode):
-                found["newest"] = max(found["newest"], info.st_mtime)
+                if entry.name not in (git_save.REAPING, git_save.LIFE):   # the reaper's own marks
+                    found["newest"] = max(found["newest"], info.st_mtime)
                 if checkout is None and stat.S_ISREG(info.st_mode) and info.st_size > BIG_FILE:
                     found["big"].append({"path": entry.path, "bytes": info.st_size})
             elif device != dev:
@@ -314,7 +315,9 @@ def _activity(look, since=None):
     """(latest change, bytes, complete) of the folder, never following symlinks; its session log, transcripts and
     temp directory count as changes too. With `since` the walk stops at the first change after it: such a folder is
     not idle, and nothing more about it is needed."""
-    latest = max(workdir._mtime(Path(path)) for path in [look["real"]] + look["signs"])
+    # Only files count, outside .git: a directory's time changes when the reaper itself removes something in it,
+    # and .git changes when a save writes its snapshot, so either would reset the idle clock forever.
+    latest = max([workdir._mtime(Path(path)) for path in look["signs"]] or [0.0])
     size, seen, stack = 0, 0, [look["real"]]
     while stack:
         if since is not None and latest > since:
@@ -329,11 +332,13 @@ def _activity(look, since=None):
                         info = entry.stat(follow_symlinks=False)
                     except OSError:
                         continue
-                    latest = max(latest, info.st_mtime)
                     if stat.S_ISDIR(info.st_mode):
-                        stack.append(entry.path)
-                    else:
-                        size += info.st_size
+                        if entry.name != ".git":
+                            stack.append(entry.path)
+                        continue
+                    if entry.name not in (git_save.REAPING, git_save.LIFE):   # the reaper's own marks
+                        latest = max(latest, info.st_mtime)
+                    size += info.st_size
         except OSError:
             return latest, size, False
     return latest, size, True

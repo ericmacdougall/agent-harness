@@ -27,46 +27,13 @@ Normal protected pinned fast-forward preserves the supported layout and ignored-
 | `publish_feature.py` | Guarded feature branch push to `origin`. |
 | `integrate_local.py` | Checked scratch merge and protected fast-forward into the starting checkout. |
 | `watch-tests.py` | Polling test runner for source edits. |
-| `commit_policy.py`, `commit_policy.json`, `ticket_adapters.py` | Commit message policy: PreToolUse hook, git `commit-msg` backstop, range and GitHub checks, GoodQA ticket verification and delivery comments, waivers. |
+| `ticket_adapters.py` | GoodQA ticket reads for `ah ticket`. |
 | `domain_gates.py`, `domain_checklists.json` | Blockchain domain gates: detect blockchain work from repo signals and supply a risk checklist, test scaffolds and follow-up prompts to specs and review prompts. |
-| `worktree_hygiene.py` | Stop/SubagentStop check (rule S18): flags uncommitted work in a worktree the turn touched; reports unpushed, merged and duplicate worktrees. |
-| `wal_cadence.py` | Stop/SubagentStop nudge (rule W04): one advisory line, once per diff, when a big uncommitted diff has no recent human-readable WAL entry. |
-| `mission_coverage.py`, `mission_gate.py` | Mission goals (goodqa#15565): the goals file and its audit chain, the coverage rule, and the Stop hook that gives main one advisory line while a goal has no live owner, live disposition or done evidence (see Mission coverage). |
-| `prod_delete_guard.py` | PreToolUse gate on destructive SQL against production databases, lifted only by a user-sourced, target-bound grant. |
-| `spec_flow.py`, `spec_policy.json`, `spec_template.md` | Spec-driven tickets: spec documents, spec reviews, per-criterion evidence, click-test records, sign-off and the done gate (CLI, plan-review ticket gate, PreToolUse hook on GoodQA status changes). |
+| `prod_delete_guard.py` | PreToolUse gate on the named database tools (never Bash): destructive SQL against a production database needs a live `ah approve delete --host <target>` approval. |
 
-No background process is installed. Claude Code runs hooks, and the main agent invokes the other helpers when appropriate. The installer refuses symlinked managed files and directories, including its backup directory, before reading settings or writing files. Reinstallation preserves unrelated hooks even when they share an entry with a managed hook. The installer rejects non-regular managed files (including FIFOs) and files occupying managed directory paths. It reads all source payloads before writing, then backs up the captured original bytes in private files before replacing managed files. It keeps original directory and managed-file inodes open through installation and rollback. A missing directory is created under a random staging name, opened and checked while empty, then published under its final name; the installer does not infer that a newly opened final name is the directory it created. Each file write compares the captured parent and file identity; a replacement is refused before mutation. The published file inode is recorded before the directory `fsync`, so a later write error can still roll back that file. A descriptor for each published managed file remains open through rollback so its inode number cannot be recycled while the guard relies on it. Reads, replacements, and rollback traverse parents without following symlinks, and each replacement rechecks the visible parent after publication. A parent that moves during installation produces an error rather than a success report. On a caught write failure it attempts to restore the original bytes and permission bits of existing files and remove newly installed files. Restoration continues after an individual failure; an incomplete rollback reports affected paths and the backup directory. Backups and newly created empty directories remain. This is per-file atomic replacement with best-effort rollback, not a crash-safe transaction: power loss, process termination, or a second failure during recovery can still require manual restoration. In an eight-process disposable contention test, some installers may refuse an intervening directory creation and succeed on retry; the final installation remains coherent. Concurrent settings editors can still race over read-modify-write settings, so do not run them together.
+Release 1001 removed the command, kill, heavy-job and copy guards, the merge gate and commit policy hooks, the model ladder, provenance, the spec and mission gates, ahd and ahc, and the Go front door (docs/direction.md lists why). Ten hooks remain, none on Bash (docs/harness-reference.md). No background process is installed by install.py. Claude Code runs hooks, and the main agent invokes the other helpers when appropriate. The installer refuses symlinked managed files and directories, including its backup directory, before reading settings or writing files. Reinstallation preserves unrelated hooks even when they share an entry with a managed hook. The installer rejects non-regular managed files (including FIFOs) and files occupying managed directory paths. It reads all source payloads before writing, then backs up the captured original bytes in private files before replacing managed files. It keeps original directory and managed-file inodes open through installation and rollback. A missing directory is created under a random staging name, opened and checked while empty, then published under its final name; the installer does not infer that a newly opened final name is the directory it created. Each file write compares the captured parent and file identity; a replacement is refused before mutation. The published file inode is recorded before the directory `fsync`, so a later write error can still roll back that file. A descriptor for each published managed file remains open through rollback so its inode number cannot be recycled while the guard relies on it. Reads, replacements, and rollback traverse parents without following symlinks, and each replacement rechecks the visible parent after publication. A parent that moves during installation produces an error rather than a success report. On a caught write failure it attempts to restore the original bytes and permission bits of existing files and remove newly installed files. Restoration continues after an individual failure; an incomplete rollback reports affected paths and the backup directory. Backups and newly created empty directories remain. This is per-file atomic replacement with best-effort rollback, not a crash-safe transaction: power loss, process termination, or a second failure during recovery can still require manual restoration. In an eight-process disposable contention test, some installers may refuse an intervening directory creation and succeed on retry; the final installation remains coherent. Concurrent settings editors can still race over read-modify-write settings, so do not run them together.
 
 Before replacing a managed file, both installers also compare its current bytes and permission mode with the original snapshot. If either differs, they refuse the write and leave that path untouched. Rollback acts only on files this run published and refuses to replace or remove one whose published bytes or mode were edited in place. The backup contains the preflight snapshot, not a later external edit. A noncooperating editor can still write in the narrow interval between the final comparison and atomic replacement; filesystem rename has no portable compare-and-swap guard for file contents. Coordinate installers and editors if that race matters.
-
-## Literal Codex WAL notes
-
-The process guard recognizes a bounded append-data operation: a trusted absolute system or Homebrew Python entry, separate `-I -S` flags (optional `-B` and `-u` afterwards), the absolute installed `.codex/agent-harness/wal.py`, and `note` with exactly one each of `--wal`, `--event`, and `--note`. Use the existing absolute private native WAL supplied by the session hook. For Homebrew, prefer the fully resolved, versioned Cellar executable; alias directories such as `bin` or `opt` are refused when writable. Every original alias and intermediate target is checked, not only the final resolved binary. The reviewed writer bytes are pinned; source changes require updating the binding and its test. Symlinked, hardlinked, changed or uncertain writer/WAL paths retain ordinary interpreter analysis.
-
-For example, substitute the verified absolute paths on the executing host:
-
-```sh
-<trusted-absolute-python> -I -S <absolute-home>/.codex/agent-harness/wal.py note --wal <absolute-home>/.agent-harness/codex-wals/SESSION_ID/main.jsonl --event intent --note 'Scoped intent without private values'
-```
-
-Quoted literal prose is data, including signalling vocabulary. Active expansions, substitutions, redirects, wrappers, inline Python and unknown arguments receive ordinary checks. Other command segments are checked independently. Legacy note calls without isolated flags can still be conservatively refused; this recognition does not exempt arbitrary Python or grant authority over processes or another agent's WAL. Filesystem checks observe identity and content before execution; they do not isolate execution from a hostile concurrent writer with the same installed-account authority. System/Homebrew installation owners and OS administrators are trusted. The sole writable-ancestor exception is Darwin's physical `/opt/homebrew/Cellar` owned by root or the caller, group 80 resolving to `admin`, with no world write or extended ACL; other writable ancestors and writable interpreter files are refused. Administrators can already modify this toolchain; these checks do not establish a root-owned or code-signed binary.
-
-Known edit operations are classified before commit-message analysis, including raw patch data under a `command` key. Shell, orchestration, missing and unknown operation names retain command checks. A narrow system `env`/`sudo`/`timeout` grammar avoids scanning supervision options as Python code while retaining inner-command, substitution, redirection and stdin analysis; uncertain wrappers retain conservative scanning.
-
-## Managed test checkouts
-
-Use one copy per repository and PR or lane. Run the test under the lease.
-
-```sh
-python3 ~/.claude/hooks/copy_hygiene.py acquire --repo "$owner_checkout" --key "pr-$pr" \
-  --ref "$reviewed_commit" --require-reuse --run your-test-command
-```
-
-Omit `--require-reuse` only for an authorized first checkout. Without `--run`, acquisition reports the path and releases its lease immediately. With `--run`, the first output line records the verified path and commit, and the command runs in that checkout with its exit status propagated. The lease survives the CLI controller exiting while the command runs. The command must wait for workers it starts before it exits. The lease is held by the supervisor and ends when the foreground command returns. It does not protect a background worker after that point.
-
-An existing checkout can be reused at the disk floor. An advance to a different commit requires a clean, registered copy with no tracked, untracked or ignored changes and preserves tracked protected logs and WALs. At the same commit a leased command requires clean tracked files and can use existing local byproducts. A busy lease, absent copy under `--require-reuse`, or uncertain checkout fails acquisition without opening a fallback checkout.
-
-Reaping reports by default. If enabled explicitly, it holds the managed checkout lease and checks liveness, service protection and local state. It confirms the same directory, Git registration, commit, tree and index before asking Git to remove the linked checkout without force. Keep legacy and unmanaged copies and copies with tracked protected logs or WALs for separate disposition. Tools that operate outside the managed lease must be stopped before reaping.
 
 ## Installer scan (installer_scan.py)
 
@@ -90,7 +57,6 @@ python3 ~/.claude/hooks/peer_review.py pr --repo <worktree> --packet <p> --outpu
 - **Fast mode and swarm:** every call defaults to K3.1 Pro fast mode, which the CLI exposes as the alias `kimi-code/k3.1-pro-highspeed` (listed as "2x usage cost" against the subscription quota). Swarm cannot be enabled: the Kimi Code docs say only the user can turn swarm mode on (`/swarm` in the TUI), swarms are unavailable in `kimi -p`, and there is no flag or config key for it (confirmed by experiment on CLI 2.5.2). Docs checked 2026-11-07: https://moonshotai.github.io/kimi-code/ (llms-full.txt, release 2.3.2 and the AgentSwarm tool entry).
 - **Quota and state:** a quota or rate-limit failure is never retried by the wrapper: it exits 7 and writes a 30 minute cooldown in `~/.agent-harness/kimi/cooldown.json` so later calls refuse before launching. A local daily call cap (40) is kept in `~/.agent-harness/kimi/ledger.jsonl`. An unreadable or corrupt ledger or cooldown file fails closed. Callers cannot raise the cap or reset the cooldown: the only override is `--main-override-daily-calls N`, for the main agent, and the state-home and binary overrides exist only in test mode. Exit codes of `kimi_review.py` (not of `peer_review.py`, where 4 means advisory): 2 usage, 3 egress refusal, 4 call cap, 5 login or trusted CLI missing (run `kimi login` on the Mac and approve the device code), 6 other failure, 7 quota.
 - **Known limits of the gate (heuristics, not guarantees):** only email addresses are redacted; other personal data (phone numbers, card numbers, street addresses, national ids) passes. Obfuscated project names (`Y a t e s`, leetspeak), pretty-printed multi-line WAL entries and unlabelled base64 secrets that contain `/` can pass. The gate stops a careless or cooperative author, not a hostile one. Treat every packet as possibly retained and used for training.
-- **Advisory reports in other tools:** `spec_flow.py` and `review_map.py` ignore the verdict of any report whose header says `Advisory: yes`, so a Kimi opinion cannot be recorded as a spec review.
 - **Argv exposure:** the packet is passed as the CLI's `--prompt` argument because the CLI has no stdin or file input. On the single-user Mac that is visible to same-user processes (which can read the packet file anyway) and to root. Do not add a tool that persists full process arguments.
 - **Data handling (read before sending anything private):** the Kimi consumer privacy policy (https://www.kimi.com/user/agreement/userPrivacy?version=v2, effective 2026-11-12, updated 2026-11-05, retrieved 2026-11-07; the Chinese mainland version) names Kimi Code as a covered product and says: user inputs and outputs may be used to optimise models after encryption and de-identification, with an opt-out by contacting customer service (section 11) and no in-app toggle; personal information is kept "only as long as necessary" with no fixed retention period; data is stored in mainland China and is not provided abroad without separate consent. It has no coding-specific retention or training terms, and a separate product policy would take precedence. The Kimi Code membership guide (https://www.kimi.com/help/kimi-code/membership-guide) says nothing on retention, training or location, and the CLI uses the international endpoint `api.kimi.ai`, whose policy was not verified. Treat every packet as possibly retained, stored in China and used for training until the user opts out in writing and the international terms are confirmed. The egress gate limits what leaves, but it is not a licence to send private customer or production code.
 
@@ -211,71 +177,6 @@ These actions retain history and record actor/reason/evidence; they never manufa
 
 Before expensive commands, disk probes cover work/build, temp and receipt filesystems. Default floors are 2 GiB for compile/test work and 256 MiB otherwise, with `--minimum-free-bytes` for a declared override or known higher peak. Missing data or low space prevents launch. Floors are not predictions and are subject to concurrent consumption. No automatic cache deletion or broad process killing occurs. Process-group cleanup retains its existing detached-descendant limitations. Hashes/permissions catch accidental staleness or mutation; same-user receipts are cooperative evidence, not signed attestations.
 
-## Model ladder
-
-`~/.claude/hooks/model_tiers.json` is the one tier table (R0 Sonnet/Terra; R1 to R3 Opus/Sol at medium, high and xhigh; R4 Opus/Sol max and R6 Fable/Astra high are review-only; R5 Fable/Astra medium needs the user's permission). `model_tiers.py` answers deterministic questions about it:
-
-```sh
-python3 ~/.claude/hooks/model_tiers.py table
-python3 ~/.claude/hooks/model_tiers.py classify --model opus --effort high        # -> R2, claude
-python3 ~/.claude/hooks/model_tiers.py reviewer --author-rung R2 --author-harness claude   # -> R3 on the other harness
-```
-
-`escalation.py` keeps one locked, mode-0600 state file per task under `~/.agent-harness/escalation/`. Failure events come only from machine receipts: a usage-guard FINAL whose review verdict is BLOCK with named findings, or a guarded test FINAL that is red at a HEAD the owner claimed fixed (`claim-fix`). Zero-launch attempts, TRANSIENT_INFRA, LOW_DISK, QUOTA, AUTH, TIMEOUT and UNKNOWN never count. Each event is keyed by the receipt's sha256, so replaying it is a no-op. The rung is a pure function of the events: two failures on the same finding fingerprint advance one writing rung, a new fingerprint resets the count, review-only rungs are skipped, and the top automatic rung stays put until the user approves the next one.
-
-```sh
-python3 ~/.claude/hooks/escalation.py record --task TASK --run-id RUN_ID --kind review --source peer_review:code-inspection
-python3 ~/.claude/hooks/escalation.py claim-fix --task TASK --head FULL_SHA
-python3 ~/.claude/hooks/escalation.py status --task TASK
-python3 ~/.claude/hooks/escalation.py digest
-python3 ~/.claude/hooks/ah.py approve-top --task TASK --user-msg USER_MSG_ID --wal ~/.claude/wals/SESSION_ID/main.jsonl
-python3 ~/.claude/hooks/escalation.py approve-top --task TASK --ask ASK_ID --wal ~/.claude/wals/SESSION_ID/main.jsonl
-```
-
-`ah approve-top` is the one-command form (goodqa#15253 step 3). It takes an id from `ah user-msg --text-match fable`, checks that the user's own words ask for the top rung, writes the ask pair with `decision=approved`, and records the permission for that one task. There is no session-wide grant: a spawn needs `[task:TASK]` in its description. Both forms record the permission only when four things hold:
-- The WAL holds an `ask` with a user-turn source (`user:`, or the `queue:` and `answer:` variants that provenance treats the same way) naming the task, and an `ask_resolved` with `decision=approved` that references it.
-- The cited turn, re-read from the installed transcripts, has a sentence that names fable, astra or the top rung together with request words (use, pass, switch, let, approve). That sentence has no negation, condition or question.
-- The cited excerpt is part of that sentence.
-- The turn is less than 12 hours old (`caps.top_assent_max_age_seconds`).
-
-A recorded permission can be published to the GoodQA ledger with `ah decision publish --task TASK`, so the worker host accepts it without a local session (signed, per task, at most 12 h, revocable; see `docs/central-decisions.md`, goodqa#16651). `ah approve-top` also refuses if the user mentioned the top rung again later; the latest words decide. "Keep fable disabled", "fable? no" and a hand-written pair that cites an unrelated message are all refused (review F1 and F2). A state file that is missing, corrupt or locked resets the task to the lowest rung with a durable reset record (reason code, prior state hash, preserved copy) and a notification in `notifications.jsonl`; a corrupt file can never raise a rung. Every escalation or reset also appends a decision entry to the WAL named by `AGENT_HARNESS_MAIN_WAL`. Ladder limits (8 failing review launches, 3 automatic climbs, $60 per task, each counted launch spending the rung's review budget until helpers report real cost) block further writer spawns until a human signs off; `escalation.py gate-digest` lists what the hook refused or would have refused. On its own errors (an unreadable table, a symlinked or unwritable state directory) the hook denies spawns and `claude`/`codex`/`rescue.py`/`peer_review.py` launch lines only and never blocks plain shell use. `python3 ~/.claude/hooks/model_tiers.py mode` shows the installed mode and `mode --set warn` is the one-command rollback after the enforce flip (the rewrite reformats the table: sorted keys, indent 1). The Bash check reads literal tokens: `$c` and `--model $M` variable indirection, `xargs` and data-driven forms are not parsed (a `claude --model $M` line is denied as an off-table model under enforce: spell the model out), and a heredoc body mentioning a launch is split like text, so under enforce write such text to a file instead of a heredoc.
-
-**Owner cap.** One cap: `max_live_owners` in `resource_limits.json` (read with `resource_budget.owner_cap()`; `ah limits show`, and `ah limits set` where only the owner or a supervisor tightens it). Helper types (`caps.helper_types`: red-team, click-tester, reviewer, fixer, Explore, Plan, claude-code-guide, statusline-setup) never count; every other spawn type does, in every running state (live, quiet, SILENT); a stopped or disposed owner (closed, finished, superseded, wontdo, legacy) frees its slot. With `enforce` false (the default) a spawn over the cap gets a note and still runs.
-
-`tier_gate.py` is the PreToolUse hook for Agent, Task, Workflow and Bash. Bash lines launching `claude`, `codex`, `rescue.py` or `peer_review.py` are checked segment by segment (the line is split on unquoted `;`, `&&`, `||`, `|`, `&` and newlines; any denied segment denies the line; a review line at a permission rung needs the installed ledger's permission). A spawn names its task with `[task:KEY]` in the prompt or description; without it the hook generates a key and resets to the lowest rung. The requested model and effort must match the task's rung: above it is downgraded through `updatedInput`, below it needs a `[rung-below:REASON]` token, review-only rungs never write, reviewer spawns (red-team, click-tester, reviewer) sit one rung above, and the top writing rung needs the recorded permission. `mode` in `model_tiers.json` is `warn` (the hook only adds context and logs what enforce would do to `~/.agent-harness/escalation/gate.jsonl`) or `enforce`; an unreadable table denies.
-
-`peer_review.py --task TASK [--author-rung R] [--author-harness claude|openai]` picks the reviewer from the table (one rung above the author, the other harness preferred, the same harness one effort up when the other is unavailable, an unknown author reviewed at Opus/Sol medium and flagged), writes a selection receipt under `~/.agent-harness/escalation/selections/`, stamps `Author-Rung`, `Reviewer-Rung` and `Reviewer-Selection` on the report, and records the FINAL receipt in the task ledger so reviews count where they are consumed. `rescue.py --task TASK` runs at the task's computed writing rung on the other harness; `--rung` overrides it; a rung that needs permission is refused before any launch unless `approve-top` recorded it.
-
-### Dispatch records
-
-The ladder records which model each spawn actually ran on (goodqa#15794). This stops an author who was run below the task's rung from pushing the ladder up with failures that the rung's model did not produce.
-
-- **Open:** PreToolUse appends one line to `~/.agent-harness/escalation/<task>.dispatch-open.jsonl` for every Agent, Task or Workflow spawn that will run (allowed, or denied in warn mode), and for claude/codex/rescue Bash launches whose task key resolves. It takes no ledger lock. Every locked ledger operation merges the complete lines past a stored (inode, offset). Merging never truncates the file in place; an over-bound file (over 256 KiB) is renamed to `.old` after the ledger write.
-- **Close:** the PostToolUse `tier_gate.py dispatch` action closes the record with `resolvedModel` and `modelsUsed` and indexes `agent_id -> task`. It prints nothing and cannot block a tool that already ran.
-- **End:** SubagentStop sets `ended_at` and `ended_seq` and records `observed_effort` from the hook's `effort.level`. A foreground stop that arrives before its close is held as a pending stop for up to an hour.
-- **Resume:** SubagentStart for an indexed agent, or a SendMessage to its agent id (the PostToolUse matcher includes SendMessage), appends a `resume` line to the side file without taking the ledger lock; the next merge clears `ended_at` and reopens the dispatch as `phase: open` (reason `resumed`), so it is live again and never proven below: every window it overlaps keeps counting, even after its next stop. A forged resume line can only make windows count. A resume of an agent whose record was already shed adds a synthetic unknown (`resumed_unknown`). A SendMessage resolves its agent from the response's `resumedAgentId` first, then from `to` when `to` is an agent id; only the response's key names are logged. LIMITATION until the live check (spec AC-8 step 5): if neither resolves and SubagentStart does not reopen the dispatch, that resumed run is invisible and can under-count. The index keeps the newest 4,096 agents, so an agent resumed after 4,096 newer spawns is not found either. A resume line written before the agent's last stop is ignored. A resumed owner is never proven below again in the windows it touches, so continuing a Sonnet owner by SendMessage stops exclusions there. Resuming a reviewer whose record was already shed adds a `resumed_unknown`, which also keeps counting.
-- **Switch:** the exclusion below is off until `caps.dispatch_exclude_below_rung` is true in `model_tiers.json`. It ships false; main turns it on after the AC-8 live proof. While it is false, every FAIL counts. A FAIL that the rule would have excluded records `dispatch_check.decision: would_exclude` and appears in status as `would_exclude_below_rung`. `exclusion_enabled` shows which mode is active.
-  - The value must be the JSON literal `true` or `false`. The same applies to `caps.dispatch_narrow_by_stop_effort`. Inside the ledger, only `true` counts as on.
-  - Any other value, such as a quoted `"false"` or `1`, makes the whole tier table fail validation. The table then fails closed: tier_gate denies every Agent, Task and Workflow spawn and every claude/codex launch line, even in warn mode, and `escalation.py record` cannot run, so FAILs go unrecorded until the table is fixed.
-  - After every hand edit of this table, whether a flip or a rollback, load it once before anything else: run `python3 ~/.claude/hooks/escalation.py status --task <T>`. If that run reports a tier-table error, revert the edit at once.
-  - `install.py` copies `model_tiers.json`, so a reinstall resets a flipped switch to the shipped `false`. Check `exclusion_enabled` after every install and record the flip again if needed.
-- **Rule:** a FAIL at rung R is NOT_COUNTED ("dispatched below rung") only when at least one owner dispatch is considered and every considered non-reviewer dispatch (owners, fixers and other helpers) is a closed agent run whose candidate rungs all sit below R. Considered means: opened, resumed or ended since the ledger entered R, or still live. A run that started before the window and ended inside it is considered.
-- **ASSUMPTION:** before a stop, only the model family is known, so only Sonnet under an Opus rung (or Opus under a Fable rung) is excluded. An opus run at the wrong effort keeps counting. It appears in `counted_requested_below` ("counted, requested below rung, effort unverified"). `observed_effort` narrows candidates only when `caps.dispatch_narrow_by_stop_effort` is true. That flag is false until a live check proves the field reports the subagent's own effort (spec AC-9).
-- **What keeps counting:** an open dispatch, an unknown model, a Workflow or Bash dispatch, an at-rung fixer, or a synthetic unknown dispatch. Synthetic unknowns come from an over-bound, garbled (for example a crashed mid-line append), rewritten or non-regular side file, and each carries a `reason`.
-- **Not seen:** main working directly under a task key leaves no dispatch. A FAIL from main's own work during a window holding only below-rung owner dispatches is therefore excluded.
-- **Bounds:** at most 64 dispatches. Shedding goes reviewers first, then records no window can consider, then closed below-rung runs, then other window records, then live ones. Shedding a record that could block an exclusion writes `dispatch_taint`, and a tainted window keeps counting (`window_tainted` in status, `tainted` in `dispatch_check`). A shed live record taints every window for up to 24 hours and survives a reset, so a flood of forged valid side-file lines can block exclusions for that long; that errs toward counting. Dispatch records are also shed before they could push the ledger over its size bound; a merge alone never resets a ledger.
-- **Reviewer types:** red-team and click-tester dispatches are left out of the decision even though those agents can write. The type is the boundary; do not route writing through a reviewer spawn.
-- **Staleness:** a dispatch with no `ended_at` is presumed ended after 24 hours. A SubagentStop that never fires only keeps failures counting for that long.
-
-Read it with `python3 ~/.claude/hooks/escalation.py status --task TASK`:
-- `last_dispatch`;
-- `window_dispatches` (up to 8, each with phase, models, observed_effort, requested and selected rung, candidates, match against the current rung, and a reason for synthetic entries);
-- `excluded_below_rung` (count and latest reason);
-- `below_rung_dispatches`;
-- `counted_requested_below`.
-
-Every dispatch also writes a `dispatch` line to `gate.jsonl`. Open failures appear there as `dispatch_open_failed`.
-
 ## Review and rescue
 
 ```sh
@@ -326,8 +227,8 @@ The rescue wrapper does not stage or commit leftover model edits. It always exit
 | `REVIEW_NOT_STARTED` | `TRANSIENT_INFRA` | Local review infrastructure refused before the provider launch boundary (NOT_STARTED); no provider response was observed. | Inspect the local run receipt and provider-pool reservation or cooldown. Reconcile only with the required ownership evidence; do not retry unchanged. |
 | `REVIEW_LAUNCH_UNCONFIRMED` | `UNKNOWN` | No reviewer exit status was recorded; a provider process may have started. This does not establish a provider outage. | Inspect the run and child records and reconcile uncertain process ownership before any retry. Do not assume best-effort cleanup succeeded. |
 | `REVIEW_REPEAT_REQUIRED` | `BUDGET_EXHAUSTED` | An earlier attempt of this exact invocation (same packet, commit, reviewer and policy) already counts, so the usage guard refuses an unchanged rerun. Attempts that provably did no provider work are not counted. | Read the Detail line: it names the counted run and how it ended. If one rerun is justified, run the same command once more with --repeat-reason '<why, in plain words>' in single quotes (no apostrophe, $, backtick, backslash or newline); only one declared repeat is allowed per invocation. If the declared repeat is already used, change the packet (new evidence or a new commit) instead of rerunning; do not loop. |
-| `BUDGET_EXHAUSTED` | `BUDGET_EXHAUSTED` | The review run budget (two per-provider deadlines: the primary and one fallback) was used up. | Do not loop. Reconcile the usage store, then decide with the main agent whether one repeat with --repeat-reason is justified. The Timing line shows the snapshot step and each provider step against its deadline. A timeout is not counted as a ladder failure; it still spends one of the task review launches and the rung review budget. |
-| `PROVIDER_TIMEOUT` | `TIMEOUT` | The provider exceeded its per-provider deadline (provider_timeout in review_policy.json, by reviewer rung and effort). | Reconcile the run in the usage store before any retry; do not loop. The Timing line shows the snapshot step and each provider step against its deadline. A reviewer that needs longer is a provider_timeout change in review_policy.json (at most 3600 seconds per provider), not an unchanged rerun. A timeout is not counted as a ladder failure; it still spends one of the task review launches and the rung review budget. |
+| `BUDGET_EXHAUSTED` | `BUDGET_EXHAUSTED` | The review run budget (two per-provider deadlines: the primary and one fallback) was used up. | Do not loop. Reconcile the usage store, then decide with the main agent whether one repeat with --repeat-reason is justified. The Timing line shows the snapshot step and each provider step against its deadline. A timeout is not a verdict: no harness/review status is posted, so the pull request stays unmergeable until a review settles. |
+| `PROVIDER_TIMEOUT` | `TIMEOUT` | The provider exceeded its per-provider deadline (provider_timeout in review_policy.json, by reviewer rung and effort). | Reconcile the run in the usage store before any retry; do not loop. The Timing line shows the snapshot step and each provider step against its deadline. A reviewer that needs longer is a provider_timeout change in review_policy.json (at most 3600 seconds per provider), not an unchanged rerun. A timeout is not a verdict: no harness/review status is posted, so the pull request stays unmergeable until a review settles. |
 | `PROVIDER_IO_UNKNOWN` | `UNKNOWN` | The provider process could not be supervised to a known end. | Reconcile the unknown run in the usage store before any retry. |
 | `PROVIDER_INVALID_OUTPUT` | `INVALID_OUTPUT` | The provider produced no valid stage verdict. | Inspect the excerpt below; a rerun needs a changed packet or a declared repeat reason. |
 | `PROVIDER_OUTPUT_TOO_LARGE` | `OUTPUT_TOO_LARGE` | The provider output passed its size bound (16 MiB raw stream, or 1 MB of verdict-bearing text; Codex command output is exempt from the 1 MB bound). | Inspect the saved raw answer; a runaway reviewer or an oversized answer needs a changed packet or a declared repeat reason, not an unchanged rerun. |
@@ -417,406 +318,17 @@ No global Stop hook claims these steps occurred or blocks ordinary questions/bac
   - **Verdicts:** findings give `BLOCKED_POLICY` reason `SCAN_FINDINGS` and name the id, package, versions and target, never code excerpts or matches. A scan that cannot complete gives `SCAN_UNAVAILABLE`: a missing or mismatched binary, no docker, a database that could not be fetched, an unreadable report, a bad ignore file, or a commit with nothing scannable (`NOTHING_SCANNED`). Neither verdict is a pass. Standalone: `python3 ~/.claude/hooks/trivy_gate.py --repo . --trivy-image <ref@sha256:...>` (exit 0 clean, 1 findings, 2 unable to scan).
 - **Waivers:** `commit_policy_waivers` in the prepare output lists every commit-policy waiver (kind, subject, id, WAL) the checked range used (at most 50, with `commit_policy_waivers_total` when there are more; fields sanitised, WAL as a basename). A waiver record that exists but cannot be read, or holds a malformed item, sets `commit_policy_waivers_unreadable` instead of looking like no waivers. Finish output does not repeat the list.
 
-## Commit message policy
-
-Every agent commit uses one structured format, and the commits in ticket-tracked repositories must reference a ticket that was updated after the commit. The rules live in one file, `commit_policy.json`, installed beside the hooks: `~/.claude/hooks` for Claude Code and `~/.codex/agent-harness` for Codex. Edit that file to change the types, the sections, the boilerplate lists, the tracked repositories or the ticket systems.
-
-```text
-fix(deliver): refuse non-compliant commit ranges before publication
-
-Why: an agent reverted two production auth fixes with no recorded reason.
-What: prepare checks the owner's commit range and blocks violations.
-Testing: `python3 -m unittest tests.test_commit_policy` -> 42 passed
-Refs: GoodQA #14151
-Risk: optional; migrations, rollback
-
-Co-Authored-By: ...
-```
-
-### Modes (2026-11-24)
-
-The rules below are the shape to aim for; by default they only warn.
-
-- **`warn` (default).** The PreToolUse hook, the git `commit-msg` backstop, `check-message`, `gh pr create` and the range checks never block for form: subject length, type or scope spelling, missing `Why:`/`What:`/`Testing:`/`Refs:`, trailer order, ticket reference format. The hooks print at most three short warnings and exit 0; `check-message` prints `"status": "WARN"` with at most three warnings. A command whose message the hook cannot read is allowed unchecked, and a bug in the checker never blocks.
-- **Always refused, in every mode:** an empty message, and a message holding what `redact.py` identifies as a secret value (the kind is named, the value never printed).
-- **`strict`.** `"mode": "strict"` in `commit_policy.local.json`, or `check-message --strict`, restores blocking on every rule as described below.
-- **`off`.** `"enforcement": "off"` in `commit_policy.json` checks nothing.
-
-Ticket verification in the range checks (a referenced ticket must exist and name the commit) is unchanged: it is evidence, not form.
-
-### Message rules
-
-- **Subject.** Write `<type>(<scope>): <imperative summary>`, at most 72 characters, with no trailing period.
-  - Allowed types: `feat fix refactor perf test docs build ci chore revert security`.
-  - Summaries in the boilerplate list are rejected, such as `wip`, `update` and `various fixes`.
-- **Body sections.** After a blank line, write `Why:`, `What:`, `Testing:` and `Refs:` in that order. `Risk:` is optional.
-  - A section is rejected if it is empty, holds a placeholder, or is too short.
-- **Testing.** Name the exact command and its result. Bare text like "tests pass" is rejected. If you didn't test, write `not run: <reason>`.
-- **Refs.** Reference a GoodQA ticket as `GoodQA #N` (project `goodqa`) or `GoodQA <project-slug>#N`.
-  - PR references and `R-NNNNNN` coordinator records are recognized. They do not count as a ticket, because they cannot be verified.
-  - A repository is tracked when the `url` or `pushurl` of any remote, raw or rewritten by `insteadOf`, matches `ticket_systems.*.repos` (each URL is also matched in a normalized form: lowercase host without a trailing dot or port, scp-style or URL syntax, percent-decoding, `.`/`..` and doubled slashes resolved, `.git` dropped; SSH host aliases from `~/.ssh/config` are not visible). This applies to the GoodQA rule too. Renaming `origin`, pointing it at a fork with a tracked `pushurl`, or tracking only a second remote does not shed the rule. `check-range --push-url <url>` also counts the push destination.
-  - In tracked repositories only `chore` and `docs` may write `Refs: none (<reason>)`. Every other type needs a GoodQA ticket.
-  - Other repositories accept `none (<reason>)` for any type.
-  - **Local ledger refs** (`Refs: Ledger <slug>#<8+ hex>`, the `ledger` system) count only in untracked repositories that have a remote, or in remote-less repositories whose absolute top-level path fully matches a regex in `ticket_systems.ledger.allowed_repos` (empty by default). They never satisfy a tracked repository's rule. Each one is resolved through `harness tickets show --json --min-version --as-of --slug`, with a 5-second deadline; a missing, old, hanging or malformed binary rejects the commit as "could not verify". GoodQA verification and delivery comments ignore them. See [the local ledger](ledger.md#commit-policy).
-- **Reverts.** A revert uses type `revert` and includes `Reason:` and `Authorized-by:` lines. In tracked repositories, `Authorized-by:` must cite the GoodQA ticket that records the authorization.
-  - A commit is treated as a revert if its body says "This reverts commit", even when its subject uses another type.
-  - The policy enforces a recorded and verifiable citation. It cannot prove that a human approved the revert.
-- **Trailers** such as Co-Authored-By and Signed-off-by come last, after a blank line.
-- **Repeats.** A message identical to the previous commit's message is rejected.
-- **Exemptions.**
-  - Only real merges are exempt: a merge in progress (`MERGE_HEAD`), or a commit with more than one parent in a range. A single-parent commit whose subject starts with "Merge" is judged like any other, and so is a `gh pr merge --squash` message.
-  - `fixup!`, `squash!` and `amend!` commits are allowed only on an unpublished branch. The publication check always rejects them.
-
-### Enforcement points
-
-1. **PreToolUse hook** (`commit_policy.py hook`). It runs before each Claude Code Bash call and each Codex tool call.
-   - It reads the message from the forms it can check without running anything:
-     - `-m` (repeated) and `-am`;
-     - `--message=`;
-     - `-F <file>` and `-F -` with a quoted heredoc;
-     - `-m "$(cat <<'EOF' ... EOF)"`;
-     - `--amend --no-edit`, which checks HEAD's message;
-     - `-C <commit>`;
-     - `--fixup` and `--squash`;
-     - `gh pr merge --squash --subject --body`.
-   - In strict mode it fails closed with an explanation when it cannot know the message (in warn mode such a command is allowed unchecked):
-     - the message comes from `$VAR`, another `$()`, or an unquoted heredoc containing `$`;
-     - the commit would open an editor;
-     - `-F` names a file that does not exist yet;
-     - the command is a bare `git revert`, `git commit-tree`, `eval`, or `gh pr merge --squash` without a subject and body;
-     - git commit runs through another program (`xargs`, `find -exec`, `parallel`, `watch`, `sudo`, `env -S`), through a pipe into a shell (`echo ... | bash`), or under a command name computed at run time (`$G commit`);
-     - a command that commits also runs a git subcommand that is not built in. That subcommand may be an alias, and the same command can define one (`git config alias...`, `GIT_CONFIG_*`);
-     - another program in the same command touches the `-F` message file (`sed -i`, `python3 -c`, `truncate`, `>|`; reading with `cat`, `grep` or `git add` is fine);
-     - the message could change after the check: `-e`/`--edit`, `--cleanup=strip|scissors`, or a `-F` file that the same command writes (redirect, `tee`, `cp`/`mv`/`install`, or a write to an unknown path);
-     - git commit runs inside `$(...)` or backticks (for example `OUT=$(git commit ...)`), or `git history` rewrites messages;
-     - an unknown git subcommand (possibly an alias) runs where the repository configuration is not visible: an unknown working directory, or over ssh.
-
-   Shell keywords (`if`/`then`/`else`/`for`/`do`/`while`/`{ }`/`!`) and the wrappers `timeout`, `nice`, `ionice`, `stdbuf` and `caffeinate` (including their value flags) are unwrapped and checked. Shell options that take a value (`bash -o pipefail -c`, `--rcfile`, `-O`, `+o`) are understood. An alias call in a command that never contains the word `commit` (for example `git ci -m x`, locally or over ssh) is not analyzed. The git backstop catches it in tracked repositories on Git 2.54+, and the publication checks catch it everywhere. The same applies to deliberately obfuscated command names (for example `gi''t` inside a substitution). The hook guards against careless commits, not adversarial ones. A script file (`bash deploy.sh`) or a program such as `python3 -c` that commits is not visible to the hook. Outside the worker host/the worker host the git backstop covers those cases, and the publication checks cover them everywhere.
-
-   It also analyzes `ssh <host> '<remote command>'`, `ssh <host> bash -s <<'EOF'` and nested `bash -lc` strings, which is where most worker-host commits run. A remote host's files, HEAD and repository are not visible, so a remote `-F <file>`, `--amend --no-edit` or `-C` fails closed. Pass the message inline instead: `ssh host 'cd repo && git commit -F - <<"EOF" ... EOF'`. Remote commits are held to the ticket rule (`remote_tickets_required`).
-
-   In strict mode, when it blocks, it lists the problems and prints a template that starts from your subject line. In warn mode it prints at most three one-line warnings and allows the commit.
-2. **Git `commit-msg` backstop** (`commit_policy.py git-hook`). It is a Git 2.54+ config-based hook registered as `hook.agent-harness-commit-policy` (Claude) and `hook.agent-harness-commit-policy-codex` (Codex) in `~/.gitconfig`.
-   - It runs alongside each repository's own hooks and never changes `core.hooksPath`.
-   - It enforces only when both of these hold:
-     - an agent marker is present (`CLAUDECODE`, `CODEX_THREAD_ID`, `CODEX_TOOL_CALL_ID`, `CODEX_SANDBOX` or `AI_AGENT`);
-     - any remote URL of the repository matches `backstop_repos`.
-   - Everywhere else it stays silent: human commits, test fixtures, and other repositories that agents run.
-   - The installer reports "backstop inactive" when Git is older than 2.54.
-   - If the script is removed, the hook command exits 0.
-   - Not verified live: that Codex shells carry a `CODEX_*` marker (Codex quota was exhausted while this was built). For Codex, the PreToolUse hook is the primary gate.
-   - Some worker hosts run git 2.43, which has no backstop. A user-local git was not installed there, because the hosts are shared and a source-built git on agent PATHs risks breaking https push, LFS and credential helpers. On those hosts the protection is the ssh-aware PreToolUse hook plus the publication checks (`deliver.py prepare`, `gh pr create`, `peer_review.py pr`).
-3. **Publication check in `deliver.py prepare`.** It runs only when prepare is about to create a new generation. Re-entering an existing generation never repeats it.
-   - **Range checked:** commits reachable from the reviewed head, excluding the baseline and `refs/remotes/origin/<remote-branch>`, so upstream commits written by others are never judged. If upstream moved, run `git fetch origin` first.
-   - **Ticket check:** each referenced GoodQA ticket must exist and must have a comment that names one of these:
-     - The commit SHA (7+ hex characters). Such a comment necessarily postdates the commit.
-     - The branch. This comment must be newer than the commit time minus `clock_skew_seconds`.
-   - **PR text:** prepare also checks the PR title (at most 64 characters, so `title (#N)` fits) and the PR body (the same sections), because GitHub squash uses them as the final message.
-   - **Results.** Neither failure creates delivery state.
-     - `BLOCKED_COMMIT_POLICY` (exit 2) lists each failing commit and stale ticket, with the fix.
-     - `TICKETS_UNVERIFIED` (exit 6) means GoodQA was unreachable or answered unexpectedly. The check fails closed.
-   - **Projects the credential cannot see.** The key reaches one GoodQA org only (`org_id` is pinned to it), so GoodQA answers `project_not_found` for refs in other orgs such as `GoodQA solve#7`.
-     - Only projects listed in `ticket_systems.goodqa.unreachable_projects` (shipped: `solve`, `ai-course`, `harness`) are reported as `OUT_OF_SCOPE`. The ref still has to be well formed. The range passes with a warning naming `unreachable_reason`. `deliver.py prepare` and the PR-review gate print it; the `gh pr create` hook passes silently. Each warning is recorded once per ticket and head in `~/.agent-harness/commit-policy/warnings.jsonl`. finish skips the ticket's comment and lists it as not verified on the other tickets' comments.
-     - Any other `project_not_found` fails closed as `TICKETS_UNVERIFIED`. That covers a typo, an invented slug, another org's project not yet listed, and the default project `goodqa`, which is never treated as out of scope. A missing ticket in a project the key can see is still `MISSING` and blocks.
-     - Adding a confirmed slug is a config change. Empty the list once durable cross-org access lands.
-   - Local-only delivery verifies tickets too.
-   - **Credentials.** The member key file `~/.claude/goodqa-hive/member.key` (mode 600) is used first and keeps full access: verification, plus the finish and `notify` comments. Never copy it to another host.
-     - A host without that file reads `key_secret` (a Secret Manager secret named in your local profile) in-process through `gcloud secrets versions access`. The value is never passed in argv or the environment, and never written to disk.
-     - That credential is **read-only** in code: only `list_orgs`, `list_projects`, `get_issue_by_number` and `get_issue_comments` are allowed. Any write (a comment, a status change) is refused before a request is sent. On the worker host, `prepare` and PR review therefore verify tickets, but finish's ticket comment stays pending (exit 5). Post it from the Mac with the printed `notify` command.
-     - If gcloud cannot read the secret, verification fails closed (`TICKETS_UNVERIFIED`).
-   - **Project-qualified refs.** `GoodQA #N` means the default project `goodqa`. Tickets in another project need its slug, for example `GoodQA work-tracker-automatic#35633`. A `MISSING` result says so.
-   - **Legacy commits:** commits authored before `enforce_after` are reported as legacy and do not block.
-4. **Delivery comments in `deliver.py finish`.**
-   - After `DELIVERED`, `LOCAL_DELIVERED` or a repeat `ALREADY_DELIVERED`, finish comments on each referenced ticket once, with an idempotent operation id.
-   - The comment opens with the stage, "Merged (not yet deployed or live)" or "Delivered to the local checkout only". It then lists the delivered SHA, the PR, the checks that passed, and any waivers used.
-   - Exit 5 means the delivery succeeded but a ticket comment is still pending. Do not start recovery; re-run the same finish command or the printed `notify` command.
-   - Deployment happens outside `deliver.py`. After a deploy, post the evidence:
-
-     ```sh
-     python3 ~/.claude/hooks/commit_policy.py notify --repo <checkout> --base <baseline> --head <source-head> \
-       --seed <generation> --stage deployed --evidence '<where and how it was verified live>'
-     ```
-
-   - Status changes are off by default (`on_delivered_status` / `on_deployed_status`), because GoodQA's done states need independent acceptance.
-
-### Checks, waivers and audit
-
-- **Check a draft:** `python3 ~/.claude/hooks/commit_policy.py check-message --file msg.txt` (add `--repo <checkout>` to apply that repository's tracked-repo rule and resolve `Ledger` refs)
-- **Check a range:** `python3 ~/.claude/hooks/commit_policy.py check-range --repo . --base origin/main --head HEAD --branch <branch> --verify-tickets` (exit 0 pass, 2 blocked, 4 tickets unverified; `deliver.py prepare` reports the last case as exit 6 `TICKETS_UNVERIFIED`)
-- **Waivers.** Needed only in strict mode; in warn mode nothing blocks for form, so there is nothing to waive. The command accepts anything non-empty on the first try: any punctuation and length in `--reason` (a credential in it is redacted, not refused), any `--subject`, `--kind` defaulting to `message`, and `--wal` optional.
-
-  ```sh
-  python3 ~/.claude/hooks/commit_policy.py waive --subject <digest-or-sha> --reason '<why>' [--wal <your WAL>] [--kind message|commit|tickets]
-  ```
-
-  - The waiver is indexed in `~/.agent-harness/commit-policy/waivers.jsonl` (with its reason) and, when `--wal` names your session WAL, appended there too; a row that names a WAL counts only while that WAL record exists. It expires after `max_age_hours`.
-  - A `message` waiver applies only in the session that recorded it. A `tickets` waiver applies to one range head, which is the offline delivery path.
-  - Waivers are self-attested. The threat model is careless or hurried agents, not adversarial ones: an agent can edit the installed hooks anyway. The `waive` command is not on the permission allow list, but Codex with `approval_policy = "never"` and Claude in bypass or broad-allow modes will not prompt.
-  - Every waiver that gets used is listed in the reports and in the delivery ticket comment.
-- **Audit:** `commit_policy.py report --since 2026-11-04` lists the waivers and flags any whose WAL record is missing. It also lists out-of-scope ticket warnings (`warnings`, `warning_count`).
-
-### Rollout and rollback
-
-- A malformed `commit_policy.json` blocks nothing: the hooks print that nothing was checked and allow the command. Every other tool call runs before the file is read. The PreToolUse handler's timeout is 60 seconds, because `gh pr create` consults GitHub and GoodQA (internal budget: 10 + 15 + 25 seconds).
-- `mode` (`warn` default, `strict` from the local profile) decides whether form problems block; `enforcement` is derived from it (`warn` or `enforce`), and `"enforcement": "off"` in `commit_policy.json` turns every enforcement point off.
-- **Remove the git backstop:** `python3 ~/.claude/hooks/commit_policy.py uninstall-git-hook`. For the Codex key, use `git config --global --remove-section hook.agent-harness-commit-policy-codex`.
-- **Remove the PreToolUse hook:**
-  - Claude Code: delete the `commit_policy.py hook` handler from `~/.claude/settings.json`.
-  - Codex: delete it from `~/.codex/hooks.json`.
-
-## Command guard
-
-`command_guard.py` (GoodQA #14471) is a PreToolUse guard for shell commands. It blocks two kinds of command before they run: commands that delete, move or empty the harness's own logs and state, and commands that print secrets or configuration into a transcript. It exists because an agent once fed test strings through a heredoc, and the real shell then deleted `~/.claude/projects` and `~/.claude/wals` and printed rclone OAuth tokens. The guard is stdlib-only and runs on Python 3.9 to 3.13.
-
-### What it protects
-
-| Tier | Paths | Refused |
-| --- | --- | --- |
-| A (logs and state) | Claude transcripts (`~/.claude/projects`, history), Codex sessions and history, WALs (any `wals` directory, `main.jsonl`, `*.wal.jsonl`, and under a work dir on any home `wal`, `wal-*`, `wal_*` and `wal.*`), the approval state in `~/.agent-harness/state`, credential files, and the guard's own installed files | every destructive form: delete, move, truncate, overwrite, `find -delete`, `rsync --delete`, `rclone move/sync/delete/purge`, interpreter one-liners, `git clean` |
-| B (harness roots) | everything else under `~/.claude`, `~/.codex` and `~/.agent-harness`, for the local home and for `/home/*`, `/Users/*`, `/root` paths on ssh or container targets | delete, move, truncation, and replacing an existing file's content through a shell redirect (`>`, `>|`, `&>`, zsh `>!`, `1<>`, a `N<>` that a `>&N` dup or `exec` writes, every target of a zsh multios brace, and the existing files a redirect glob matches) or `tee`. `cat >! f`, `echo >! f`, `printf >! f` and a bare `>! f`, `&>! f` or `>&! f` empty the file in zsh, so they count as truncations, as `cat > f` does (see the note on `>!` below). Under `~/.agent-harness/work/<session>/...` a redirect may still replace a plain file (owners rerun `cmd > <task>/x.log`), except `*.json` receipts, `*.jsonl`, files in a folder named `state`, files directly in the work or scratch dir, and files in a directory marked with `.keep`. The same exception applies to a fully literal `/home/<user>/.agent-harness/{work,scratch}/...` path on another host, where the `.keep` and symlink checks cannot run; a `..`, variable or glob in such a path is refused. New files, `>>` appends and editor-tool edits are allowed; `cp` over an existing file here is not refused yet (GoodQA #14594) |
-
-A command that names an ancestor of a protected path (`rm -rf ~`), or a path the guard cannot resolve but that points at one (a variable, glob or `cd -` it cannot follow), is refused too.
-
-Exceptions, none of which applies to Tier A:
-
-- Under `~/.agent-harness/work`, deletes are allowed only inside the git repository the agent is working in. That is the working tree whose top level holds the effective working directory: the payload `cwd`, or Codex `tool_input.workdir`, updated by a `cd` or `pushd` earlier in the same command. The tree must have a real `.git` (a directory holding `HEAD`, or a `gitdir:` file) that existed before the command, and it must lie strictly below a task folder. The top level itself, its `.git` and `git worktree remove` stay refused. A wildcard that could reach `.git`, `.` or `..` (one starting with `.`, `?` or `[`) voids the exception. A `tmp/` folder directly in a task folder is also deletable, by literal path only, so `rm -rf tmp/*` is refused and the message suggests per-item deletes. `kit.json`, `*.jsonl` and `state` directories are never deletable by name anywhere under `~/.agent-harness`. Session folders, task folders and sibling task folders are cleaned up with `workdir.py prune --apply`. A refused `git worktree remove` names the `ah worktree-remove` route as constant text with placeholders. That advice fills in no path, host or remote of its own, because the verifier, not the message, decides the real path. The verifier reason printed before it is the verifier's own text and may name a remote or up to five ignored files. A stale-ref refusal names a constant `git fetch --prune <the remote that holds the deleted branch>` step first. The step says to prune only when every fetch refspec of that remote writes under `refs/remotes/<that remote>/` and pruneTags is not set. When the guard cannot tell where the agent is working, the delete is refused.
-- A command's own temp file (goodqa#15122): `"$T"` or `"$T/name"` may be removed or overwritten when the same command (or the script it runs) set `T=$(mktemp ...)` once with a plain `mktemp [-dqu] [-t prefix] [-p dir] [template]`, and the directory mktemp creates in is not a protected log, WAL or transcript location. The guard does not see the command's TMPDIR, so the default and `$TMPDIR` are checked against both the hook's TMPDIR (or `/tmp`) and `CLAUDE_CODE_TMPDIR`, symlinks resolved; a TMPDIR relocated under the harness is fine. The exemption is dropped (normal rules apply) when T is assigned, read, exported or looped over anywhere else, passed to a command other than plain readers, writers and rm (mv, cp, an interpreter or a function could make it a symlink), the command makes a symlink or sets TMPDIR, the path has `..`, a glob or more than one name after `$T`.
-- Literal paths in `~/.agent-harness/scratch/<a>/<b>/<c>/...` are deletable, except WAL-shaped files, `kit.json`, anything in a `tasks` folder, and `*.output` and `*.log` files. Agent task output falls under the log-retention rule and is never deleted without a verified backup.
-- A scratch path spelled through `$TMPDIR` or `$CLAUDE_CODE_TMPDIR` (also `${...}`) that the command does not assign is judged like its literal form (goodqa#15280). The hook cannot see the command's environment, so it tries every plausible value: the hook's own `TMPDIR` and `CLAUDE_CODE_TMPDIR`, `~/.agent-harness/scratch` (where the install relocates the Claude Code temp root) and `/tmp`. The strongest protection among them decides. `rm -rf "$TMPDIR/<a>/<b>/<c>/scratchpad/rftest"` is allowed. `rm -rf "$TMPDIR"`, a glob in it, a `tasks` folder or `*.output` file below it, and a `..` climb out of a scratchpad are refused. Before this change, the `$TMPDIR` forms of those deletes were allowed and the `$CLAUDE_CODE_TMPDIR` scratchpad form was refused. A path directly in the scratch root, such as `$TMPDIR/foo`, is refused like its literal form; use a session scratchpad or `mktemp`.
-- Under `~/.claude` and `~/.codex`, literal paths are deletable inside a git working tree whose top level sits two or more levels below the root and whose `.git` existed before the command.
-- In temp directories and inside git working trees outside the harness roots, WAL-shaped names (`wals/`, `main.jsonl`) are test data, not WALs.
-
-**Residual risks.** These are recorded, not hidden:
-
-- "Own worktree" means only "the repository the agent is working in". Any agent can `cd` into another agent's worktree, so the rule guards against mistakes; it is not an ownership boundary.
-- `git clean` is allowed inside the worktree and can remove untracked `*.jsonl` or WAL-shaped files there.
-- A `git init` run in an earlier command makes a folder count as a repository. That is outside the threat model, which covers careless or hurried agents, not an adversary.
-- Name-based refusals have false positives: `*.jsonl` results and `state` directories under `~/.agent-harness` cannot be deleted by name.
-- A script or program file that already exists when the command runs (`bin/tool`, `./run.sh`, `python3 tool.py`) is the repository's own tooling. Only its deletions of protected logs count, and a Python file's source is not scanned. A script written earlier in the same command is judged in full.
-- Inside the own worktree, a wildcard below the top level (`rm -rf build/*`) is judged by what it matches on disk when the guard runs. Hidden entries count, as if `dotglob` were set. A wildcard directly in the top level, one that can match a dot-name, or one behind a symlinked directory is judged by the pattern rule instead: it is refused when it could match a protected name. Above 2,000 matches in one command, the pattern rule also applies. A path whose `..` follows a symlink is judged where the shell really resolves it.
-- `find` with `-delete`, `-exec rm` or `-exec mv` is judged by its start directories, whatever `-name` filters it has. The guard skips leading options such as `-P`, `-D`, `-O3` and `--`. Start directories read with `-files0-from` are unknown and refused. The operands of the `-exec` command other than `{}` are judged too. So `find build -name '*.o' -delete` is allowed. `find . -name '*.pyc' -delete` from the worktree top is refused, because the walk reaches `.git`. This is a known false positive: run it from a subdirectory instead. Two attempts to relax it by its filters both opened bypasses.
-- `find -L` or `-follow` combined with a deleting action is refused.
-- Known gaps, unchanged since earlier rounds:
-  - an xargs here-string or heredoc line holding several paths is judged as one path;
-  - a pnpm or yarn global flag before the bin (`pnpm --silent rimraf`) hides the bin;
-  - a `-exec` operand that embeds `{}` (`{}/../x`) is not judged;
-  - the POSIX classes `[^x]` and `[[:lower:]]` in a worktree glob are matched literally;
-  - `cd -P` through a symlink is tracked logically.
-- A nested repository below the worktree (`src/vendor/.git`) is not the worktree's own `.git` and is not protected. A script written with `tee` and then run in the same command gets only the heredoc advisory, not the written-then-run analysis.
-- Not detected (tracked for a later round): `rsync` or `scp` of a whole credential directory such as `~/.ssh/` (single key files are caught); a PowerShell `Get-ChildItem ... | Remove-Item` pipeline whose `Remove-Item` has no path; macOS `ditto` over a protected directory; and a protected directory mounted into a container (`docker run -v ~/.claude:/c ... rm -rf /c/...`). The in-process `approve_delete` verifier can be replaced by code running in the same process. That is outside the threat model.
-- Variables the guard cannot resolve fail closed. A positional parameter (`$1`, `$@`, `$0`), a loop variable over a glob or a substitution, a `read` variable, or an `export`/`declare`/`local` value that names a protected path refuses a destructive command whenever the same command names a protected location anywhere. That includes, for example, `ls ~/.claude/projects; for f in $(...); do rm "$f"; done`.
-
-**Policy file.** `command_guard_policy.json` is optional and can only add protection. Its protective lists are merged into the built-in ones, and `broad_kill` may be set to `enforce`. Every other key is ignored, including allow-lists, regexes, temp roots and limits. The guard's own files (`command_guard*`, `redact.py`, `safe_input.py` in both hook directories) are refused for writes even when they do not exist yet, so an agent cannot create a policy file or a replacement module beside the hook. Block messages do not name the file.
-
-### Secret and configuration dumps
-
-Blocked: `rclone config show|dump|file|redacted|reconnect|paste`, a bare `rclone config`, `rclone config create|update|password` with values, `rclone authorize|reveal`, `--dump auth|headers|bodies`; `gh auth status --show-token`; and `gh auth token` in every shape except `VAR=$(gh auth token) gh <subcommand>`, where the subcommand is not `auth`, `config`, `extension`, `alias` or `secret`, with no other assignment, wrapper, redirect, pipe or further command. Also blocked: environment dumps (`env`, `printenv`, `set`, `export -p`, `declare -p|-x`, `compgen -v` with values, `${!name}`, and interpreter dumps such as `os.environ.items()`, `process.env`, `%ENV`, awk `ENVIRON` loops) and printing secret-named variables. `env | grep '^NAME='` or `grep -w NAME` with exact non-secret names is allowed. A prefix or substring filter (`env | grep -i GITHUB`) is still blocked, because it also matches `GITHUB_TOKEN`. Also blocked: `kubectl config view --raw`, `gh config get oauth_token`, `aws configure export-credentials`, `docker-credential-* get`, and `xargs cat` over paths listed from a credential directory. Reading credential files (ssh private keys, AWS, Codex `auth.json`, Claude `.credentials.json`, `rclone.conf`, `gh` `hosts.yml`, `.netrc`, `.npmrc`, `~/.env`, the approval key) with a printing reader or a network sender is blocked, and so is the same read through a copy made earlier in the command. So are recursive greps for secret words above a credential directory, Keychain password reads, `/proc/*/environ` and `ps e`. A project `.env` can still be sourced or added to git.
-
-`rclone config file` is blocked too. It prints only a path, but it is the first step of the incident, and `doctor` reports where the config lives.
-
-**Scripts.** Running a script is judged by what the script does: the guard reads an existing script file and applies the same effect rules to its commands.
-
-This is a text match with stated gaps. It does not catch a script that builds the name at runtime or calls another script, a name past the first 1 MiB, scripts reached after the pass's 1.5 seconds, a path the guard cannot resolve (`"$PWD/x"`, a glob, an exported variable), a runner it does not unwrap (`uv run`, `tmux`, `python3 -m cProfile`, `cat x | python3`), or a file run by another language (`node`, `perl`, `ruby`). A file on another host cannot be read. Copying the config as a command, such as `cp -r ~/.config/rclone /backup/x` or `cp` of the file itself, is not refused yet (GoodQA goodqa#14762).
-
-There are no per-script exceptions.
-
-### How it decides
-
-The command is lexed like a shell before any rule runs. The lexer handles quotes, `$'..'`, escapes, line continuations, heredocs (the body ends at its delimiter and the rest of the text is commands again), `$(..)`, backticks, pipes, redirects, brace expansion, prefix assignments, wrappers (`sudo`, `env`, `nice -n`, `timeout`, `xargs` including its here-string, heredoc, `< <(..)` and `-a` input, package runners `npx`, `bunx`, `pnpm dlx`, `yarn dlx`, `npm exec`, `uvx`, `pipx run`, `yarn`/`pnpm` (and `yarn run`) with a deleter bin, `shx`, `cross-env` and `cross-env-shell`, `eval "$(..)"`, `flock`, `script -c`, `tmux send-keys`, `osascript`, `at`), `sh -c` strings, `ssh` and `docker exec` commands, scripts written and then run in the same command, `$(which rm)`, absolute binary paths, and case and Unicode lookalikes. An unterminated quote or substitution, nesting that is too deep, or input over the analysis budget is blocked when the raw text names a protected location, a secret source, a credential location (`CRED_TEXT`: the GoodQA token and gq-browser directories, `.ssh`, `.aws` and the other credential paths, matched as written and with quotes and backslashes removed), or a code-execution step (a pipe into a shell, `eval`, `-c` or `-e` code, a decoder) together with a destructive verb. Otherwise it is a warning. When the analyser itself crashes or times out, the launcher `command_guard_hook.py` applies the same raw-text checks, its own copy of `CRED_TEXT` included, and allows a command that matches none of them. These raw-text checks decode nothing, so a credential path spelled with an ANSI-C escape (`goodq$'\x61'`), a segment held in a variable or a glob that hides its parent is not refused on that path: it is a warning, or allowed under the launcher. This is an accepted known limit (GoodQA goodqa#15905; OS-level redesign goodqa#15906). Block messages are passed through `redact.py` and never echo a secret.
-
-zsh and bash read `>!` differently, and the guard cannot tell which shell will run the text. zsh takes `>! w`, `>>! w`, `&>! w`, `>&! w`, `&>>! w` and `>>&! w` as a single clobber or append operator with `w` as its target. bash stops the operator before the `!`, so it writes a file named `!` and `w` is a command word; it rejects `>>&!` as a syntax error. A script containing one of these operators, quoted forms excepted, is analysed once under each reading, each starting from the same state, and refused if either reading refuses. This happens at every parse, including `bash -c`, `eval`, `ssh` and `$(..)` text, because a nested shell can read the operator differently from its parent.
-
-At the top level each reading sees its own later commands, so nothing has to be reconciled. Nested text (`eval`, `bash -c`, `ssh`, `$(..)`) has commands after it in the outer script. If its two readings end with different variables, aliases, links or working directories, or different text for one file other than bash's file named `!`, the command counts as unanalysable, because no single state describes both, even when nothing follows. An existing script is treated the same way although its state does not carry over. This can warn on harmless nested text, such as `bash -c 'echo a > out.log; echo b >>! out.log'`, and refuse it if the command's text or directory reads as sensitive. A file only one reading wrote is judged by what is on disk and then by its recorded text, because that reading may be the wrong one. When reading the disk text stops the analysis, the recorded text goes only to the raw-text check. For the commands that follow, a variable they disagree on is treated as unknown with its values as hints, which protects a path operand but not a command name, an option or a script path. A directory they disagree on is treated as unknown, and as protected if either names a protected location.
-
-A script with these operators forks at most three times around any one parse, whatever the nesting, because plain levels do not count. Past that, or when a script is too large for two parses inside the analysis budget, it gets one reading (zsh's). The command then counts as unanalysable: refused if its text names a protected location or secret, or pairs `eval`, `sh -c` or similar with a destructive verb, otherwise a warning. This also applies inside an existing script, where only the command line that runs it is read for protected text, so `bash deep.sh` gets a warning. Anything already refused stays refused through a budget stop, a nesting error or the hook's alarm. Text the guard has not reached when it stops goes to the raw-text check only (GoodQA #14634), and forks spend the same budget, so a later command in very large text (about 240 KB in one measured case) can go unread and the command only warns. A one-sided file's recorded text and the commands after it can go unread the same way, and the disk file that stops the read can be small: a 27-byte script that calls itself is enough. The guard reads at most eight script files and does not warn past that. A one-sided file's disk read counts toward the eight, so a script its recorded text runs can go unread and the command is allowed.
-
-A relative `cd` under a directory the guard could not resolve is judged by its text, as `cd "$X/.claude"` already was, with or without these operators: `cd "$D"; cd .claude; rm -f stale.txt` is refused.
-
-dash also reads `&>` as `&` followed by `>`, whatever follows it, and rejects `>&!`. The guard does not model dash's reading.
-
-For a script written earlier in the same command and then run by an interpreter the guard knows (`python3 run.py`, `node`, `perl`, `ruby`, `php` and others), one line naming a harness root under a real home spelling (`~`, an absolute home, `$HOME`, `os.environ`, `getenv`, or `.home` on any object), outside work and scratch, together with a call that can delete or write a file is refused. This matches text on that line, not the call's real target, so a comment, a dry-run print, a table of command strings used as test data, a copy out to `/tmp` or a new file under `~/.claude` on such a line is refused too, as are names like `~/.claude.bak`, `self.home`, perl's or php's own `$home` variable, and a read-only line where a later bare `w` follows `open`. Write such a script with the editor's file-writing tool instead. The rule does not follow a path held in a variable (including one named `home`), node's `os.homedir()`, ruby's `ENV['HOME']`, perl's `$ENV{HOME}`, `Path.home().joinpath(..)`, `os.chdir`, `shutil.move`, `shutil.copy`, `os.replace`, `os.rename`, `Path.rename`, `wb+` modes or `./run.py`, and it does not apply to existing scripts, `python3 -c` or an interpreter heredoc, which keep the log-only rule.
-
-A heredoc whose body contains a deletion of a protected location gets an advisory warning even when the heredoc only prints the text or writes it to a file, such as test data or a commit message. Heredoc text passes through the shell, which is how the incident happened. The warning points to the editor's file-writing tool and does not block. Interpreter heredocs are scanned as code, and a deletion of a log still blocks.
-
-The guard never emits an explicit allow, so the host's own permission flow still applies.
-
-### Fail open
-
-The registered command is the launcher `command_guard_hook.py`, not the analyser. It runs the analyser in a child
-process with a 10 s watchdog; when the child is missing, crashes, cannot start, prints invalid output or runs out of
-time, the command is allowed with one line on stderr (2026-11-24), whatever words it contains. Findings from a
-completed analysis still refuse. The one exception to "unsure allows" is a `>!` command the guard cannot judge under
-both shell readings whose visible text deletes, moves or overwrites a transcript, session WAL or audit-log path: that
-still refuses. The entries carry no `onFailure`. The Claude Code entry matches `Bash|PowerShell`; the Codex entry has no
-matcher (the host does not re-check `write_stdin` text) and is the last `PreToolUse` group, so Codex's position-keyed
-hook trust stays valid for the groups before it (GoodQA #14590).
-
-### Deleting logs on purpose
-
-The agent may approve a delete itself, but only after a backup that the approval command verifies in the same run:
-
-```bash
-python3 ~/.claude/hooks/command_guard.py approve-delete --path <literal path> --remote dropbox:<mirror dir> --wal <WAL path>
-```
-
-A verified copy on a remote named in `~/.agent-harness/local.json` `backup_remotes` (for example `{"b2": ["my-b2"]}`) approves a delete the same way. The name is pinned, not the type: every other remote of that type refuses, and no policy file can widen the list (see [local-config.md](local-config.md)).
-
-For a clean, published linked worktree retired through `ah worktree-remove`, register a backup approval on the executing host for each otherwise-blocking ignored file. A collapsed ignored subtree qualifies only when every regular file has its own valid approval. The delegated verifier rejects mounted subtrees, special files, links, nested repositories, open backed files and any unfamiliar or changed path. Preview leaves approvals available. During removal, it verifies content, then rebuilds Git status, index flags and the complete ignored coverage under the approval lock after activity checks. Bounded directory identities and membership include the root and ignored-path ancestors, so a new sibling during activity checking or lock waiting refuses without spending any grant. The same full grant set is consumed once before non-forced Git removal. Observed quiescence remains required; this does not make an uncontrolled external writer atomic with Git removal. A removal that fails or is unconfirmed after consumption requires fresh backup verification and approval. Raw `git worktree remove` keeps its own guard.
-
-`approve-delete` refuses in these cases:
-
-- a glob or variable path;
-- a whole root, or a whole `projects`, `wals`, `sessions` or other top-level log directory, or one of their parents;
-- more than 20,000 files;
-- anything changed in the last 10 minutes;
-- a remote that is not a named remote of type `dropbox`, or a remote named in local.json `backup_remotes` with that type (checked with `rclone listremotes --long`; a policy file cannot add a type or a name);
-- a remote copy that is missing a file, differs in size or hash, or offers sizes only.
-
-A tree of many small files cannot be mirrored file by file in reasonable time at the account write rate (one such tree ran at about 22 KiB/s). Back it up as one archive instead (goodqa#15068): run `tar -cf - <dir>` from the directory's parent so every member starts with `<dir>/`, optionally compress with `zstd` or gzip, stream it with `rclone rcat`, and upload a `.sha256` file (`<64-hex>  <archive name>`) and a `tar -tvf` listing beside it. Then:
-
-```bash
-python3 ~/.claude/hooks/command_guard.py approve-delete --path <literal dir> --archive dropbox:<dir>.tar.zst \
-  --archive-sha256 dropbox:<dir>.tar.zst.sha256 --archive-listing dropbox:<dir>.tar.listing.txt --wal <WAL path>
-```
-
-The guard streams the archive with `rclone cat`, never to disk. The proof is the member comparison: every regular file in the archive (path, size and content sha256) must equal the local tree, with nothing missing and nothing extra. The `.sha256` file and the listing are written by the same uploader, so they are consistency checks that catch a broken upload run, not extra safeguards: the archive's sha256 must equal the `.sha256` file (which must not hold the digest of empty input), and the listing's (path, size) set must equal the archive's.
-
-It refuses on any of these:
-
-- a truncated or corrupt stream, or a `zstd` error; every gzip member is read, as `gzip -dc` and bsdtar read them, and anything but zero padding after the end of the tar refuses;
-- a failed download, or a `.sha256` file or listing larger than its limit;
-- an absolute member path, a member path containing `..`, or a path named twice by members of any type (compared after Unicode NFC and case folding);
-- a symlink, hardlink or special member, or a symlink in the local tree (only regular files and directories are compared);
-- more than 4 members per local file plus 1000, decompressed data larger than twice the tree plus 256 MiB, or a read longer than the timeout;
-- a local file that changed between hashing and the end of verification;
-- `--no-backup` given with the archive flags;
-- any of the three remotes not being a named `dropbox` remote or a `backup_remotes` remote; one wrong-name remote among the three refuses the whole approval.
-
-macOS bsdtar stores extended attributes as AppleDouble `._name` companions that its own `tar -tvf` does not list. Such a member is ignored when it is not a local file, starts with the AppleDouble magic `00 05 16 07`, and its sibling is in the archive.
-
-The approval and its use in the audit log record the archive URL and its sha256. Verifying takes one full download and a hash of the local tree.
-
-The approval is single use, signed with a local key and bound to the exact realpath, device, inode and a stat manifest. The hook consumes it under a lock, so of two commands racing for one approval exactly one runs. Every approval, refusal and use goes to `~/.agent-harness/state/log-delete-audit.jsonl` and to the WAL; report it in the ticket status. `revoke-delete` removes every approval.
-
-### Deleting disposable copies without a backup (goodqa#14911)
-
-When the user approves deleting something without a backup, ask with AskUserQuestion: one question per path, in a call that asks only that question, naming the exact literal path, with the predefined option "Delete, no backup" (optionally "Delete, no backup (Recommended)"). That exact label is the only approval: "Delete after backing up" and similar labels never approve. Then cite the answer:
-
-```bash
-python3 ~/.claude/hooks/command_guard.py approve-delete --path <literal path> --no-backup \
-  --user-source answer:<session>/<uuid> --wal ~/.claude/wals/<same session>/main.jsonl [--ttl S]
-```
-
-The source must be exactly `answer:<session>/<uuid>`: no `user:` turn and no quoted excerpt. It must resolve, from the account's pinned `~/.claude`, to an AskUserQuestion answer that:
-
-- is at most 24 hours old;
-- answers a call with exactly one single-choice question, and that question is the key of the one answer;
-- is a predefined option, never "Other" free text, whose label is exactly "Delete, no backup" or "Delete, no backup (Recommended)";
-- answers a question that names the literal path as a whole path (`.../mirror-old` does not name `.../mirror`), and names no other path except ancestors of it given as context;
-- comes from a real transcript: no symlinked `projects` folder, project folder or transcript, and the session id must be the file's exact name (case included);
-- is from the same session as the `--wal`, which must already exist as a real file (no symlink) and hold a hook-written `pretool` entry dated before the answer. Give the session's `main.jsonl`.
-
-The account home comes from the password database. The route refuses to run when `HOME` or `CLAUDE_CONFIG_DIR` points elsewhere. The hook blocks any `approve-delete` command that sets `HOME`, `CLAUDE_CONFIG_DIR`, `PATH`, a `GIT_*`, `LD_*`, `DYLD_*` or `PYTHON*` variable, or goes through `env`. Every git command the route runs uses a system git by absolute path (`/usr/bin/git`, then Homebrew's) with a constructed environment: `PATH=/usr/bin:/bin`, the pinned `HOME`, `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, no other caller variable but `SSH_AUTH_SOCK`, and `ssh` as `/usr/bin/ssh`. A PATH shim or `GIT_EXEC_PATH` helper cannot answer for git. Bash commands that write, copy or link into `~/.claude/projects` (outside `projects/<dir>/memory/`), or make a symlink to it, are blocked as transcript forgery. This is best effort: `rsync`, `tar -C`, `unzip -d`, `ditto`, `git clone`, and interpreter code such as `node -e` or `sqlite3 .output` can still write there, with the same power as the Write and Edit tools (disclosed below).
-
-Only two kinds of target qualify, and only when deleting them loses nothing:
-
-- **The top of a git working tree.** Every file must be committed, with no changed, untracked or ignored file. No index entry may be assume-unchanged, and no skip-worktree file may be present on disk (absent sparse-checkout files are fine). The tree must have no stash, no linked worktree, no submodule or gitlink, no replace ref or graft, no filter driver in its config, no `.git/info/attributes` and no LFS store (`.git/lfs`). These are checked before `git status` runs, because status would run a filter. Every remote whose URL is a network URL (`https://`, `ssh://` or `git@host:`) on an allowlisted host (`marker.no_backup_remote_hosts`: `github.com` and `the worker host` by default) is listed once with `git ls-remote <url> refs/heads/* refs/tags/*`, run outside the repository. Every commit reachable from HEAD or any ref, including remote-tracking refs, must be reachable from those live shas. Tracking refs are never proof, because they can be stale or hand-set; a commit that only a stale tracking ref holds is refused (run `git fetch --prune`, or push it). A local path, a `file://` URL or the repository itself never counts. Live shas this clone lacks are left out, which can only refuse more; if the remote has moved on, run `git fetch` first.
-- **A disk image** (`.sparseimage`, `.dmg` or `.sparsebundle`) under `~/.agent-harness/work` that `hdiutil info` does not list as attached. Its size is recorded in the approval. Its contents are not inspected.
-
-The route also refuses in these cases:
-
-- the same answer (compared as `answer:<session>/<lower-case uuid>`) has already approved 4 paths. The count is taken under the marker lock, from the audit log, and an approval whose audit record cannot be written is not stored;
-- the path is a log, WAL, transcript or approval state (always refused, with no override), a harness root or one of its parents, or a top-level directory;
-- the path uses a glob or variable, is relative, or goes through a symlink or `..`;
-- the TTL is above 3600 s.
-
-Repository config cannot run anything or hide an edit during the checks: fsmonitor, hooks, the ext and file transports, ssh command, credential helper, pager and attributes file are all switched off, `core.checkStat`, `core.trustctime` and `core.ignoreStat` are forced to their defaults, filters are refused, and replace objects are ignored.
-
-The approval is single use and MAC-signed. It is bound to the exact path and its inode, and is recorded in the audit log and the WAL with the user source and expiry. At delete time the hook checks every local fact again. For a git tree that means status, index flags, submodules, replace refs, stash, worktrees, unpushed refs, HEAD and a digest of every ref. For an image it means size, mtime and attach state. A change in between voids the approval. The `ls-remote` proof is made at approval time only; at delete time the digest of every ref must be unchanged. A no-backup approval is used only by a command that is just `rm [-rRfv] [--] <approved path>`: any other segment, substitution, redirect, background job or second line is blocked, because an earlier segment could create work that exists nowhere else.
-
-Residuals, disclosed:
-- The check proves that the user answered a question naming the path and chose a "delete" answer. It does not read the question's wording beyond the path.
-- A same-user process can read the marker key, so the approval resists hand-edited markers, not an agent that sets out to forge one. This is the same as for the backup route.
-- Commits that only the reflog holds, and repositories that borrow this one's objects through alternates, are not checked.
-- The transcript store is agent-writable through the Write and Edit tools, which no hook judges, and through scripts run by name. A forged answer under a fresh project folder is therefore still possible; the route only refuses symlinks, Bash writes, case variants and a WAL that did not exist before the answer. The WAL check also trusts that `pretool` entries were written by the hook.
-- ssh still reads the user's `~/.ssh/config` (needed for a worker host in `trusted_git_hosts`). An agent that can edit that file could route that host's listing elsewhere (for example with `ProxyCommand`) and so forge the proof. Listings from every allowlisted remote are pooled, so a GitHub remote next to a worker-host remote does not help: if the worker host's ssh route is not trusted, set `marker.no_backup_remote_hosts` to `github.com` only. The approval records every host that answered.
-- A writer started in an earlier tool call can change the tree between the hook's recheck and the `rm` (the same holds for the backup route). Disk image contents are not inspected; only size, mtime and attach state are.
-- An allowlisted host constrains the host, not the repository path: a worker host accepts any path, including a disposable worktree that may be cleaned up later. Prefer a GitHub remote as the proof.
-- The backup route does not have the sole-segment rule; there the backup was verified first.
-
-### Removing an archive-backed tree on another host
-
-Use this when a tree on another host (one of the `hosts` in `~/.agent-harness/local.json`) has a verified Dropbox tar.gz, and a bundle if it has unpushed commits. That host's own guard has no user transcript, so it refuses relayed approvals. This route checks the approval on the Mac and then deletes over ssh, the way `ah kill --host` does (goodqa#15251):
-
-```
-python3 ~/.claude/hooks/remote_delete.py --host <host> --path /home/<user>/wt/<name> \
-    --archive-dir dropbox:<dir holding <name>.tar.gz, .tar.gz.sha256, .tar.gz.listing, .bundle> \
-    --user-source answer:<session>/<uuid> --wal <that session's WAL>
-```
-
-- **The answer:** a predefined option at most 24 h old that approves every named path as a whole, such as "Yes, remove all 11 (Recommended)", "Delete them" or "Remove it". "Delete only X", "Remove all except Y" and any decline word are refused. A number in the answer must equal the number of paths the question names, and when the question names more than one path the answer must state that number. A question that also holds a decline word (keep, leave, not, ...) approves nothing: list only the paths to remove. The session's WAL must hold a hook entry older than the answer.
-- **The question:** it must name the host, say the trees are backed up, and name the path, either absolute or as `~/...` under the remote home. One question may name several paths. An answer approves no more deletions than its question names paths, and never more than `archive_remote_max_paths_per_source` (16), counted from the audit log.
-- **On the remote host:** the tree is checked twice, at the check and at the delete. Each time the archive is downloaded first and the tree is compared after it, so nothing written during the download goes unseen. The tree must be:
-  - a plain directory at least two levels below home, outside the harness and credential folders (`.claude`, `.codex`, `.agent-harness`, `.ssh`, `.config`, `.gnupg`, `.aws`, `.kube`, `.docker`, `.local`, `.cache`, `Dropbox`);
-  - on one filesystem, with no mount point inside;
-  - when it is a git tree, a clean linked worktree without submodules. A checkout with its own `.git` directory is refused, because its branches and stash would go with it. A worktree with `.gitmodules` or a `modules` directory in its git dir is refused, because `git worktree remove` deletes the submodule repositories, unpushed commits included;
-  - equal to the archive: the archive streams to its recorded sha256, holds the same entries, and every file has the same size, mtime and sha256 and every symlink the same target. The listing has one line per member;
-  - covered by a bundle that verifies and holds HEAD, when HEAD has unpushed commits;
-  - the same directory (dev:inode) at the delete as at the check.
-- **The delete:** a worktree is removed with `git worktree remove --force` plus prune, and its branch stays. Any other tree is removed as a directory. Both hosts write an audit line.
-
-`remote_delete_agent.py` is the lower-level remote half that this route sends over ssh. Never run it directly: run by hand, it skips every approval check above and keeps only the remote archive checks.
-
-### Commands
-
-| Command | Purpose |
-| --- | --- |
-| `command_guard.py doctor` | Checks the installed files, the registration (matcher, Codex no-matcher) and runs built-in self-test probes. Exit 0 when healthy. |
-| `command_guard.py explain --file F [--cwd D]` | Shows the decision and every finding for a command stored in a file. Never put a command you are unsure about into a shell argument. |
-| `command_guard.py check 'CMD'` | Shows the decision for one command. Runs nothing. |
-| `command_guard.py replay T.jsonl...` | Counts decisions over real transcripts for false-positive measurement. Prints rule counts and digests, never commands. Failure-path blocks are counted separately. |
-| `command_guard.py scan-wal PATH...` | Reports secret shapes in WAL or transcript files without printing the values. |
-
-### Rollout and rollback
-
-Run `replay` over recent transcripts and the red-team hold-out set before the enforcing install on a machine. Then install with `install.py --apply` and `install_codex.py --apply`, and run `doctor`. Rollback is `install.py --apply --no-command-guard` (and the same flag for `install_codex.py`). That removes the registration and leaves the files in place. Removing the hook entry that points at `command_guard_hook.py` by hand works too.
-
-**Known gap.** Claude Code `Write`, `Edit`, `MultiEdit`, `NotebookEdit` and Codex `apply_patch` are not shell tools. The guard does not see them, so they can still overwrite or empty a transcript or WAL. Follow-up: GoodQA #14500.
-
-## Kill guard
-
-`kill_guard.py` (GoodQA #14506, redesign 2026-11-24) is a PreToolUse guard against stopping a process the caller does
-not own. It judges effect, not words: a broad kill (`pkill`, `killall`, `pgrep ... | xargs kill`, `fuser -k`) is resolved
-against the live process table, and only a match that is not the caller's is refused, together with `kill -1`-style
-"everything at once" forms.
-
-Who may stop what (roles from `ah_roles`):
-
-- anyone: its own processes (descendants of its agent process, pids started with `kill_guard.py spawn`, processes whose
-  cwd or program is in its work dir, scratch or worktree, `$!`, `$$`, job specs);
-- a supervisor: also processes of a project it supervises;
-- Fable or Astra: any process except the protected list (harness daemons, log backup, and what
-  `kill_guard_policy.json` marks staging/live); a harness maintainer may stop the harness daemons;
-- never, for anyone: pid 1, the agent session running the command, system processes.
-
-A live `ah approve kill --pids N` record (docs/approvals.md) lifts a role refusal; staging/live needs a record the owner
-granted. Every refusal names that command. Reads, `--help`, prose, quoted and here-document text are never refused, and
-when the guard cannot tell (a pid read from a file, a variable, a remote host, a crash) it allows and writes one line to
-`~/.agent-harness/state/kill-guard/audit.jsonl`. The hook is registered without `onFailure` (fail-open). `ah kill`
-applies the same roles and approvals and audits every pid. Tests: `python3 -m unittest tests.test_kill_guard
-tests.test_ah_proc`. Rules registry entry: `docs/rules/kill-guard.json`.
-
 ## Production-delete guard
 
-`prod_delete_guard.py` is a PreToolUse hook. It refuses destructive SQL aimed at a production database unless a recorded, user-sourced grant covers it. Rule S28, goodqa#14908.
+`prod_delete_guard.py` is a PreToolUse hook on the named database tools. It refuses destructive SQL aimed at a production database unless a live approval of the approvals store names the target. Rule S28, goodqa#14908. Release 1001 registers it on the database MCP tools and the local `db_tool_patterns` only: no hook runs on a Bash call. It stays until production credentials are scoped (docs/direction.md).
 
 ### What it matches
 
 A call matches only when it carries a destructive statement together with an identifiable production target. The destructive statements are `DELETE FROM`, `DROP TABLE|DATABASE|INDEX|SCHEMA`, `TRUNCATE`, `UPDATE ... SET` with no `WHERE` in the same statement, `dropdb` and `mysqladmin ... drop`. They are matched after `/* */` comments, backslashes (with `\x20`, `\t` and `\n` escapes read as whitespace) and shell quote characters are removed, and again with `--` line comments removed, so `DEL""ETE`, `DELETE/**/FROM`, `DELETE\ FROM` and `DELETE--x` + newline + `FROM` still match.
 
-Each production target yields the exact name a grant must give:
+Each production target yields the exact name an approval must give (as `--host`):
 
-| Target | Grant names |
+| Target | Approval names |
 |---|---|
 | `wrangler d1 execute <db> ... --remote` (value-taking flags such as `--env production`, `-c <config>`, `--persist-to`, `--command` and `--file` are skipped with their values) | `<db>` |
 | a connection string (`postgres://`, `mysql://`, `mongodb://`, `redis://`, and similar) naming `prod` or `production` as a name segment | its host when the host names prod; otherwise its host or its database (either covers it) |
@@ -824,7 +336,7 @@ Each production target yields the exact name a grant must give:
 | `PGHOST=`, `PGDATABASE=`, `DATABASE_URL=` or `MYSQL_HOST=` in the command, or the same variable in the hook's environment when the command references it or relies on it (no `-h` for `PGHOST`, no `-d` for `PGDATABASE`) | the host, or the connection string's host or database |
 | `ssh <prod-host>` running a database client or `wrangler` | the host |
 | `docker exec <prod-container>` running a database client | the container |
-| a tool that is production by construction: `mcp__*__d1_database_query` or `mcp__*__hyperdrive_*` | its `database_id` (or similar) field; with no such field the call is denied, because no grant can name it |
+| a tool that is production by construction: `mcp__*__d1_database_query` or `mcp__*__hyperdrive_*` | its `database_id` (or similar) field; with no such field the call is denied, because no approval can name it |
 
 The guard also reads the SQL in these inputs, up to 200,000 bytes each and only as regular files (a FIFO cannot hang it):
 - `--file`, and `psql -f` including grouped short flags (`-1f`, `-Xf`) and `--fi=`/`--fil=` prefixes;
@@ -832,7 +344,7 @@ The guard also reads the SQL in these inputs, up to 200,000 bytes each and only 
 - every `cat` argument anywhere in a command that has a client: `cat file | client`, the same through `ssh`, `docker exec`, `sudo`, `env` or `timeout`, `$(cat a b)` and backticks, after `-c`, `--command=` or anywhere else;
 - psql `\i`, `\ir`, `\include` and `\include_relative`, mysql `source` and `\.`, sqlite `.read` and `-init`, with or without quotes around the file.
 
-A client fed through a pipe by anything other than `cat`, `echo` or `printf` (for example `head`, `sed` or `curl`) reads SQL the guard cannot see, unless its own flag replaces stdin (psql `-c`/`-f`/`--command`/`--file`, mysql or mariadb `-e`/`--execute`, mongosh `--eval`/`--file`) or a `<` redirect does. The flag must be its own shell word, or a short cluster of that client's boolean letters (`-Xc`, `-Be`); an attached option value such as mysql `-pchangeme` or `-Dstore`, psql `-Usvc`, or a value such as `-v x=-f` does not count. Flags such as psql `-e` (echo), mysql `-f` (force) and sqlite3 `-cmd`/`-init` do not. A `$(...)` or backtick substitution after the client that is not a `cat` or `< file` read is unjudgeable in the same way. This includes harmless substitutions: `psql -h prod-db -c "SELECT '$(date)'"` is denied, and no grant can lift it; compute the value in an earlier command. A prod-targeted command is denied when it has such a pipe or substitution, or when one of its SQL files cannot be judged at hook time: the file is missing, is not a regular file, is unreadable or is larger than 200,000 bytes. It is also denied when the command has any other step besides a plain pipeline (`;`, `&&`, `||`, `&`, a newline, `cd`, `pushd`, `xargs`, `<(...)`, `>(...)`, or a substitution that is not a `cat` or `< file` read): another step could write or swap the file first, and no list of writers is complete. `&>` and `2>&1` are redirects, not steps. Because every `cat` counts as input, a read-only prod command that also cats a file it writes (`psql ... > out.txt && cat out.txt`) or a missing file is denied; split it into two commands. Write the file in an earlier command, then run it. Relative paths resolve against the event's cwd, and `~` is expanded.
+A client fed through a pipe by anything other than `cat`, `echo` or `printf` (for example `head`, `sed` or `curl`) reads SQL the guard cannot see, unless its own flag replaces stdin (psql `-c`/`-f`/`--command`/`--file`, mysql or mariadb `-e`/`--execute`, mongosh `--eval`/`--file`) or a `<` redirect does. The flag must be its own shell word, or a short cluster of that client's boolean letters (`-Xc`, `-Be`); an attached option value such as mysql `-pchangeme` or `-Dstore`, psql `-Usvc`, or a value such as `-v x=-f` does not count. Flags such as psql `-e` (echo), mysql `-f` (force) and sqlite3 `-cmd`/`-init` do not. A `$(...)` or backtick substitution after the client that is not a `cat` or `< file` read is unjudgeable in the same way. This includes harmless substitutions: `psql -h prod-db -c "SELECT '$(date)'"` is denied, and no approval can lift it; compute the value in an earlier command. A prod-targeted command is denied when it has such a pipe or substitution, or when one of its SQL files cannot be judged at hook time: the file is missing, is not a regular file, is unreadable or is larger than 200,000 bytes. It is also denied when the command has any other step besides a plain pipeline (`;`, `&&`, `||`, `&`, a newline, `cd`, `pushd`, `xargs`, `<(...)`, `>(...)`, or a substitution that is not a `cat` or `< file` read): another step could write or swap the file first, and no list of writers is complete. `&>` and `2>&1` are redirects, not steps. Because every `cat` counts as input, a read-only prod command that also cats a file it writes (`psql ... > out.txt && cat out.txt`) or a missing file is denied; split it into two commands. Write the file in an earlier command, then run it. Relative paths resolve against the event's cwd, and `~` is expanded.
 
 Commands over 64 KiB are split on whitespace instead of shlex. Every word naming prod after a client then counts as a target. Every client scan is bounded (at most 512 characters per scan, 256 words after a client and 64 clients), and a command too long to judge its database is denied when it carries a destructive statement. Adversarial 100 KB shapes decide in under 1 s on the Mac.
 
@@ -845,355 +357,34 @@ Out of scope, disclosed:
 - a libpq conninfo string (`psql "host=prod-db dbname=app"`), long-option prefixes for the host (`--hos=prod-db`), unlisted clients (`usql`, inline Python drivers), and other `$'...'` escapes than `\x20`, `\t` and `\n`;
 - a statement past the first 200,000 bytes of a command's own text is still read, but a file over that size is denied rather than read in part.
 
-It judges `Bash` commands, the `sql`, `query` and `statement` fields of database MCP tools, and the fields of any extra tool listed in `~/.agent-harness/local.json` `db_tool_patterns`.
+It judges the `sql`, `query` and `statement` fields of database MCP tools, and the fields of any extra tool listed in `~/.agent-harness/local.json` `db_tool_patterns` (the shell-shaped targets above apply to such a tool's fields). A `db_tool_patterns` entry that would match `Bash` is ignored, so no configuration puts a hook back on Bash.
 
-Prose that only mentions these words is ignored. A heredoc that also names a client and a prod host still matches, because shell text cannot be proven inert; this limitation is accepted. A grant lifts it.
+Prose that only mentions these words is ignored. A heredoc that also names a client and a prod host still matches, because shell text cannot be proven inert; this limitation is accepted. An approval lifts it.
 
 ### Fail direction
 
 - Before a match, any error allows.
-- After a match, any error denies. That includes a grant file that cannot be read or parsed, a missing or short key, and an unsigned or tampered grant.
-- If there is no grant file, there is no grant, and the call is denied.
+- After a match, any error denies, including an approvals store that cannot be read.
+- With no live approval naming the target, the call is denied.
 - The guard only allows or denies; it never returns `ask`.
 
 Register the hook without `onFailure`.
 
-### Granting
-
-When the user approves a production delete through AskUserQuestion, record the approval:
+### Approving
 
 ```
-python3 ~/.claude/hooks/prod_delete_guard.py grant --user-source answer:<session>/<uuid> \
-    --target <host-or-db literal> --wal <session WAL> [--ttl 900] [--note TEXT]
-python3 ~/.claude/hooks/prod_delete_guard.py list
+ah approve delete --host <exact host or db> --reason "<why>" [--expires 1h]    # the owner, or a supervisor in its projects
+ah approvals                                                                   # what is live
 ```
 
-- `--user-source` must be an `answer:` id: an AskUserQuestion answer. A typed `user:` turn is refused, because "do NOT touch prod-db" cannot be told apart from an approval. `ah user-msg` finds the id.
-- `provenance.py` must resolve the source to a real answer at most 1 hour old when the grant is made. At check time the bound is on `granted - source`, so a grant made near the end of that hour works for its TTL after it.
-- The user's own selected answer must name the target as a whole name: ask with an option label such as "Approve DELETE on <target>", then cite the answer. The agent's question text never counts. An answer that names the target inside a host, port or path (`prod-db.example.com:5432`, `/srv/prod-db/x`) does not name `prod-db`, and an answer with a decline word outside the target name funds nothing: no, nope, nah, not, don't (either apostrophe), never, keep, kept, cancel, skip, stop, leave, hold, wait, later, instead, abort, reject, deny, denied, untouched, preserve(d), spare or "only after". The list is a deny-list: an agent-written label that mentions a second target without such a word ("Delete on staging-db, then prod-db") still names prod-db, so write one target per option.
-- The source is resolved from the pinned `~/.claude` of the guard's home. `CLAUDE_CONFIG_DIR` is ignored.
-- `--target` must equal, case-folded, a target name the guard extracts from the command. It is never a substring match. SQL keywords, client names, bare `prod` and `production`, names starting with `-`, and names with spaces, quotes or wildcards are refused. A command with several production targets needs a grant for each. A connection string to a prod host is covered only by a grant naming that host; a database-only grant (`app`) covers a connection string only when its host does not name prod.
-- The TTL defaults to 900 seconds and cannot exceed 3600. A grant can be reused until it expires.
-- The grant is written to the WAL first, through `wal_note.py`. Then it is stored, HMAC-signed, in `~/.agent-harness/state/prod-delete-grants.json` (mode 0600). The key is `~/.agent-harness/state/prod-delete.key` (32 random bytes, mode 0600, created on first use). Writes run under a lock, and expired or unsigned grants are pruned on each write.
-- Each check verifies the signature, the scope, the expiry, the TTL bound and the source-age bound again, and resolves the grant's source again. A grant whose turn no longer resolves, or whose timestamp has changed, stops working.
-- `command_guard` refuses shell writes to the grant file and the key, as it does for the log-delete marker.
-
-Residuals, disclosed:
-- Provenance proves that the cited answer is a real AskUserQuestion answer, and the guard checks that the selected answer names the target and does not decline. It cannot prove what the user believed the option meant; the WAL record and the exact-target binding keep that claim narrow and auditable.
-- The key is used only when it is a regular file with mode 0600, owned by the caller, with one link, and it is opened without following a symlink. The store is replaced through an `O_EXCL|O_NOFOLLOW` temp file.
-- A same-user process, or the Write and Edit tools (command_guard judges Bash only), can read or plant the key and so sign a grant. That skips only the WAL record, because the `grant` command is itself agent-runnable. The key protects the audit trail against hand-edited JSON, not against an agent that sets out to forge one.
+- The approval's host must equal, case-folded, a target name the guard extracts. It is never a substring match. SQL keywords, client names, bare `prod` and `production`, names starting with `-`, and names with spaces, quotes or wildcards never count. A command with several production targets needs an approval for each. A delete approval without a host covers nothing here.
+- Release 1001 removed `prod_delete_guard.py grant` and `list`, the signed grant file and its key (they exit 2 and say so). The approvals store (docs/approvals.md) is the one record.
 
 ### Commands and rollout
 
-- `install.py --apply` copies the hook and registers it with the matcher `Bash|.*d1_database_query|mcp__.*__(execute_sql|run_sql|query|sql)|mcp__.*__hyperdrive_.*`, plus each `db_tool_patterns` tool.
-- `doctor.py` runs two canaries: an allow for `ls`, and a deny for a `psql --host=prod-db... TRUNCATE`.
+- `install.py --apply` copies the hook and registers it with the matcher `^(?:.*d1_database_query|mcp__.+__(?:execute_sql|run_sql|sql)|mcp__(?!claude_ai_Claude_Docs__).+__query|mcp__.+__hyperdrive_.+)$`, plus each `db_tool_patterns` tool that does not match `Bash`.
 - Tests: `python3 -m unittest tests.test_prod_delete_guard`. They judge text only and never run SQL.
 - Rollback: revert the commit and reinstall.
-
-## WAL cadence
-
-`wal_cadence.py` is a Stop and SubagentStop hook for rule W04. It nudges once when real work has piled up without a human-readable WAL entry. goodqa#14908.
-
-The hook prints one advisory line (a `systemMessage`, exit 0; it never blocks) when all of these hold:
-
-- The agent's worktree has at least 40 uncommitted source lines, tracked or untracked. Changes under `docs/`, `plans/`, `devstate/` and `audit/`, and `README.md` and `CONTRIBUTING.md`, do not count.
-- That agent's WAL has no `wal_note.py` entry with a note from the last 20 minutes. Hook metadata rows do not count.
-
-Which worktree and which WAL it checks depends on the event:
-
-| Event | Worktree checked | WAL checked |
-|---|---|---|
-| `Stop` | the cwd, only when it is a linked worktree (the primary checkout belongs to the user) | `main.jsonl` |
-| `SubagentStop` | only worktrees directly under `~/.agent-harness/work/<session>/agent-<id>/`, never the cwd (a subagent's cwd is often main's checkout or another owner's tree). An owner working in a tree elsewhere is not nudged. | `agent-<id>.jsonl` |
-
-The nudge names the files and gives the exact `wal_note.py` command.
-
-The nudge is bounded:
-
-- It fires once per agent per distinct diff fingerprint, and at most once per agent per 30 minutes. The state is kept in `~/.agent-harness/state/wal-cadence/<session>.json`.
-- It never fires on a repeated stop (`stop_hook_active`).
-- `HARNESS_WAL_CADENCE=off` turns it off.
-- Every internal error fails open, so the hook is registered without `onFailure`.
-
-Tests: `python3 -m unittest tests.test_wal_cadence`. They use temporary git repositories and linked worktrees only.
-
-## Worktree hygiene
-
-`worktree_hygiene.py` is a Stop and SubagentStop hook for rule S18. It stops a turn from ending while a worktree the agent created or worked in holds work that exists only on this disk. goodqa#14908.
-
-### How it works
-
-1. It reads the agent's transcript and collects the linked worktrees that the agent created (`git worktree add`) or worked in. Working in a tree means an `Edit` or `Write` under it, or a mutating `git -C <tree>` or `cd <tree> && git ...` command. Only worktrees of repos under the repos dirs count. Those default to `~/repos` and `~/.agent-harness/work`.
-2. It skips any worktree that another transcript touched more recently, because that owner answers for it.
-3. It blocks once per distinct state (exit 2) when a remaining worktree has uncommitted changes, or has commits on a detached HEAD that no local branch or tag holds (git gc can drop those once the tree moves). A detached review or rescue tree at a branch's commit is only reported. The message lists the paths and the commit commands, with the message checked by `commit_policy.py check-message`, and for a detached HEAD the `git switch -c` that names the work.
-4. Without blocking, it reports:
-   - committed work on a named branch that is on no remote branch (`UNPUSHED`), to be published through `deliver.py prepare` or `publish_feature.py` once reviewed;
-   - merged worktrees that are still on disk;
-   - duplicate worktrees;
-   - leftover detached worktrees.
-
-   Each report comes with its cleanup commands.
-
-Unpushed commits are reported, not blocked, because harness owners commit locally and publication goes through the identity-checked delivery helpers. To make unpushed commits block too, set `{"block_unpushed": true}` in `~/.agent-harness/state/worktree-hygiene.json`, or set `HARNESS_WORKTREE_HYGIENE_BLOCK_UNPUSHED=1`.
-
-### Settings
-
-| Setting | Effect |
-|---|---|
-| `HARNESS_WORKTREE_HYGIENE_REPOS_DIRS` (path list) | Overrides the repos dirs. |
-| `{"repos_dirs": [...]}` in the same config file | Overrides the repos dirs. |
-| `HARNESS_WORKTREE_HYGIENE_BUDGET_S` | Sets the time budget: 12 s by default, 15 s at most. |
-| `HARNESS_WORKTREE_GATE=off` | Disables the hook. |
-
-### Guarantees
-
-- It never blocks on a repeated stop.
-- It fails open on any error or timeout.
-- It only reads: `GIT_OPTIONAL_LOCKS=0`, no fsmonitor, and no fetch, commit or remove.
-- Its state is kept in `~/.agent-harness/state/worktree-hygiene/` and pruned after 14 days.
-
-### Tests
-
-Run `python3 -m unittest tests.test_worktree_hygiene`. This runs the 108-check scenario suite (`tests/worktree_hygiene_scenarios.py`) and the harness-default cases. Both use temporary homes, bare origins and real worktrees.
-
-## Spec-driven tickets
-
-Every want, need, finding or bug is a GoodQA ticket. When an agent picks one up, it writes a spec, gets the spec reviewed and attaches it to the ticket. As it works, it attaches proof for each acceptance criterion. After deploy, it attaches the click-test record. Once signed off, the ticket can be marked done.
-
-The ticket is the record of truth. Each step posts one comment containing a readable summary and a fenced `harness-spec-record` JSON block, with its files attached. Attaching costs four calls: `file_upload_start` (project surface), a presigned `PUT`, `file_upload_complete` with the sha256, then `comment_on_issue` with `attachmentIds`. The posting command returns `RECORDED` only after `issue_attachments_list` confirms each file is completed, active, bound to the returned comment, and has the expected server-computed SHA-256. The done gate uses the same attachment verification. An already verified content key returns `ALREADY_RECORDED`, and the comment `operationId` is derived from that key.
-
-```sh
-S=~/.claude/hooks/spec_flow.py
-python3 $S new --ticket 'GoodQA harness#168' --out ~/specs/168.md --author 'agent:<id> (<model>)'
-python3 $S lint ~/specs/168.md
-python3 $S packet ~/specs/168.md --out ~/specs/168.packet.md      # exact bytes a helper review must see
-python3 ~/.claude/hooks/peer_review.py plan --repo <clean worktree> --packet ~/specs/168.packet.md --output ~/specs/168.adv.md
-python3 $S review ~/specs/168.md --role adversarial --report ~/specs/168.adv.md
-python3 $S review ~/specs/168.md --role acceptance --agent <red-team|task-owner|fixer id> --wal <main WAL> --verdict ACCEPT --report-file <its report>
-python3 $S attach ~/specs/168.md --actor 'agent:<id>'
-python3 $S evidence --ticket 'GoodQA harness#168' --actor 'agent:<id>' --ac AC-1 --really-tested RT1 --wal <WAL> [--commit <sha> --repo <checkout> --target origin/main] [--log run.log]
-python3 $S click-test --ticket 'GoodQA harness#168' --actor 'agent:<id>' --agent-id <click-tester id> --wal-dir ~/.claude/wals/<session> --url <url> --deployed-commit <sha> --repo <checkout> --result pass --report <its report> [--log f] [--screenshot f.png]
-python3 $S signoff --ticket 'GoodQA harness#168' --actor 'agent:<main id>' --by <main id> --kind agent --source '<where it was given>'
-python3 $S done --ticket 'GoodQA harness#168' [--apply]          # status: same report, never writes
-```
-
-### Spec document
-
-- **Header lines:**
-  - `Ticket: GoodQA <project>#<n>`. The project slug is required; a bare `GoodQA #N` is rejected.
-  - `Author: agent:<id> (<model>)`, `human:<name>` or `model:<name>`.
-  - Optional `Owners: agent:<native UUID>, agent:<native UUID>`. This reviewed declaration lists all substantive component owners, includes the author, and accepts 1–8 unique lowercase native UUID identities. Changing it changes the core and stales reviews. A missing header keeps legacy conservative owner inference from posting actors; an empty or malformed header never selects legacy behavior.
-  - `Click-test: required` or `not-applicable (<reason>)`.
-  - `Sign-off: main` or `human`.
-- **Sections:** `## Outcome`, `## Scope`, `## Acceptance criteria`, `## Negative cases` and `## Risks`.
-  - Each criterion is written `- AC-n: <observable result>. Verify by: <check>.`
-  - Each negative case is written `- NEG-n (AC-n): ...`.
-  - `lint` rejects a spec that has no criteria, duplicate ids, a criterion without `Verify by:`, a negative case that names an unknown criterion, an unedited `<placeholder>`, or an unrecognized bullet.
-- **Reviews section:** `## Reviews` is generated from the sidecar `<spec>.reviews.json`. The *spec core* is everything above it, normalized to NFC and LF with trailing spaces trimmed. Reviews bind to the core's sha256. Editing the spec after review therefore makes its reviews stale, while regenerating the reviews table does not. Keep `## Reviews` last: `attach` refuses a spec with a section after it, since that section would be lost.
-
-### Reviews
-
-For an explicit native `Owners:` declaration, attachment also needs
-`--owners-wal ~/.agent-harness/codex-wals/SESSION_UUID/main.jsonl`. The attacher
-checks each owner's native parent and `harness_owner` assignment, then captures
-an owner-recorded `handoff` or `result` from its exact sibling agent WAL. This
-attestation is not native process completion or cryptographic proof of code
-ownership. Completeness of the declared owner list remains a semantic review
-duty. Missing, torn, aliased or changing evidence refuses attachment.
-
-Explicit-owner specs produce a version-2 spec record and a digest-mirrored
-`owner-provenance.json` attachment. Only identity/role, timestamps and digests
-are retained; owner notes and full WALs are not uploaded. Current remote gates
-verify the frozen proof without querying the Mac database. Missing or malformed
-explicit metadata refuses instead of choosing older legacy ownership data.
-Update participating helpers before using this record version; older helpers
-do not enforce explicit-owner semantics.
-
-Owner attestations must follow the matching native `SubagentStart` event; both
-timestamps and event digests are retained. The gate derives Author, Owners and
-the core from actual checksum-verified attached specification bytes, selected
-by server comment binding rather than mutable JSON roles/version. Stripping
-record fields, downgrading a record or remirroring a smaller owner list cannot
-turn an explicit artifact into legacy ownership. An unavailable current source
-refuses rather than selecting an older specification.
-
-Artifact reads use the existing authenticated API read-target route. A separate
-empty HTTP client fetches approved storage without API credentials, cookies,
-environment proxies or redirects, after checking the actual public peer. The
-production default permits only `https://goodqa-uploads.tor1.digitaloceanspaces.com`
-for the production `https://goodqa.app` API; development is not implicitly
-allowed. Custom deployments need an explicit trusted `artifact_download_origins`
-list. Header and body receives enforce the absolute verification deadline at
-each socket read, including final completion; slow byte streams cannot extend
-it by resetting an idle timeout. OS DNS resolution and multi-address connection
-setup are not hard wall-clock bounded: connection/TLS timeouts and post-connect
-deadline checks remain, so this is not a whole-command cancellation guarantee.
-Reads have a 64 KiB target-JSON limit, a 1 MB source
-limit, 64 markdown candidates and an 8 MB aggregate source budget. Download
-capabilities and headers are never logged. Access failures remain verification
-failures, not permission changes.
-
-In explicit mode, a coordinator can transport someone else's spec, evidence or
-tester report without becoming an inferred owner. Author, declared owners,
-current spec reviewers and all historical attachment-verified actual testers
-remain excluded from signoff through the same CLI/done-gate calculation.
-Unverified comments cannot manufacture a tester role. The actual tester must
-remain independent of the current owners, author and reviewers. Posting an
-attachment grants neither a role nor authority, and record identities retain
-their existing disclosed trust limits. Legacy specs keep conservative posting
-actor inference; CLI signoff now also refuses an actual tester immediately.
-
-- **Two roles, distinct reviewers.** The `adversarial` and `acceptance` roles each need an `ACCEPT` on the current core.
-  - The two reviewers must differ in model, agent or person. Two runs of the same helper model count as one reviewer.
-  - Neither reviewer may be the spec author.
-  - A later `BLOCK` for a role replaces an earlier `ACCEPT`.
-- **Review sources:**
-  - **Helper report.** A `peer_review.py plan` report. It must have `Stage: plan`, a body verdict `PLAN_RESULT: ...`, and `Reviewed packet SHA-256` equal to the core sha.
-  - **Native agent.** A native agent id recorded by SubagentStart in the main WAL, plus its report file. Every agent type is logged by SubagentStart; only `task-owner`, `click-tester`, `fixer` and `red-team` agents may record a review (other types are refused). An adversarial review from a native agent requires `red-team`.
-  - **Human.** A human name with `--source`. This is self-attested.
-- **What `attach` uploads:** the spec, the reviews JSON and each review report. A report that changed since its review is refused.
-
-### Evidence, click-tests and sign-off
-
-- **Evidence** must name criteria of the attached spec. Proof is any of these; a note alone is not proof:
-  - a `REALLY_TESTED <id>:` WAL note newer than its `PENDING_REAL_TEST`;
-  - a log;
-  - a commit plus a note naming the check.
-- **Commits** must exist. With `--target`, they must also be reachable from that ref.
-- **Logs:**
-  - They are regular files; symlinks are refused.
-  - A log longer than `max_log_bytes` (2 MB) is cut to its tail.
-  - The text is redacted with `integrate_local.redact_output` (tokens, cookies, bearer, URL userinfo, keys).
-  - A log is refused if private-key material remains, or if the cut lands in what looks like a key.
-  - Screenshots and recordings (`png jpg gif webm mp4`, up to 15 MB) are checked by magic number and are not redacted.
-- **Click-tests:**
-  - Logs or a report are mandatory.
-  - `--deployed-commit` names the commit that was deployed and tested. Every commit cited by evidence on the current spec must be reachable from it, or the record is refused. Evidence commits added later make `done` NOT READY until a new click-test covers them. This is a membership check, so it also applies when the later commit was already inside the deployed commit; rerun the click-test. The deployed commit is declared by whoever records the click-test and is not read back from the deployment, so `done` lists it under Self-attested.
-  - The tester must be independent: a click-test whose tester is the spec author, a spec reviewer or anyone who posted evidence does not count toward READY.
-  - **Agent click-tester:**
-    - The agent must be recorded as `click-tester` in the session's `main.jsonl`.
-    - The start time is its SubagentStart record. The end time is its first `subagent_stop` record (from the SubagentStop hook). If there is none, `ended_at` is null and `last_activity_at` is recorded.
-    - A pass counts only if it comes from the click-tester: its report (first line `CLICK_TEST_RESULT: PASS|FAIL`, matching `--result`) has its sha256 noted in the agent's own WAL, or `--really-tested <id>` is found there.
-    - Codex native `harness_click_tester` records use the exact `CLICK_TEST_WITNESS_V1` procedure above, including current spec, observation window, deployed commit and report binding. Report-digest-only final text cannot substitute for that witness.
-  - **Human click-tests** are self-attested.
-- **Sign-off:**
-  - It must come from someone other than the spec author, either spec reviewer, a click-tester, or anyone who posted spec, evidence or click-test records. By default this is the main agent. When the main agent directed the work, its independence is nominal; ask for `Sign-off: human` when that matters.
-  - It must be `--kind human` when the spec says `Sign-off: human` or the ticket text says "human sign-off".
-  - The sign-off identity is self-declared.
-  - GoodQA labels agent comments made through a user token as human, so comment authorship never proves a human.
-
-### Done gate
-
-`done` reports READY only when all of the following hold:
-
-- a verified spec is attached: its record carries the spec file (matching `spec_file_sha`), the reviews file and at least one criterion;
-- both reviews `ACCEPT` that spec's core;
-- every criterion has evidence on that core;
-- the evidence on that core cites at least one commit and attaches at least one execution log (this applies to every ticket, including documentation-only work: cite the docs commit and a check log);
-- the latest click-test on that core passed with logs, by an independent tester, on the live deployment (not a loopback URL), at a deployed commit containing every evidence commit; when the spec says not-applicable, an evidence record must cite a REALLY_TESTED run whose note names the deployed or installed sha or version and the live target it ran on, and does not say it was staging, pre-prod, local or not yet live (done means deployed to live and tested); a click-test of an older spec version is stale;
-- a valid sign-off exists on that core.
-
-Otherwise it lists each missing item with the command that fixes it. Under "Self-attested" it lists every check that rests on a name the helper cannot verify.
-
-**Exit codes:**
-
-| Code | Meaning |
-|---|---|
-| 0 | READY, or `--apply` on a ticket that is already done (`ALREADY_DONE`, safe to retry) |
-| 2 | Missing items, a refused record, a `lint` failure, or a command-line error from the argument parser |
-| 3 | Spec or input error found after parsing (for example a stale review, a refused log file, an unknown criterion) |
-| 4 | GoodQA unreachable, or the page budget ran out (fail closed) |
-| 5 | `--apply` was refused by GoodQA (`TRACKER_REFUSED`); the ticket is left unchanged |
-
-GoodQA's own independent-acceptance rule for done transitions still applies.
-
-### Gates
-
-1. **Ticket at plan review.** In tracked repositories (origin matches `ticket_systems.*.repos`), `peer_review.py plan` needs a `Ticket: GoodQA <project>#<n>` line naming a ticket that exists. The check is controlled by `plan_ticket_gate` in `spec_policy.json`:
-   - `warn` (the shipped default) prints the problem and continues.
-   - `enforce` stops before any reviewer launches, with exit 2.
-   - An unreachable GoodQA gives `TICKETS_UNVERIFIED` (exit 6 in enforce mode). A commit-policy `tickets` waiver for subject `plan-<packet sha256[:20]>` covers that case.
-   - Commits are already held to `Refs:` by the commit policy.
-2. **Done at the tracker call (Claude Code).** A PreToolUse hook (`spec_flow.py hook`, timeout 60 s, `onFailure: block`, internal budget `hook_deadline_seconds` = 40) watches `close_issue_done`, `close_issue_wont_fix`, `update_issue`, `bulk_update_issues`, `archive_issue`, `reassign_issue` and `call_api`.
-   - **Allowed without a network call:** open statuses (triage through `on_production`, which GoodQA documents as nonterminal) and `update_issue` without a status.
-   - **Gated by the spec:** `done`.
-   - **Need a reason:** `wont_fix` and `duplicate` need one of at least 20 characters.
-   - **Warn mode:** the hook allows the call and returns its findings as `additionalContext`, which Claude Code shows the agent next to the tool result (plain stderr from an allowing hook is never shown to the agent). It makes no permission decision, so normal permission rules still apply.
-   - **Blocked:** an unknown status, archiving an open ticket, a project, pipeline or stage move (`reassign_issue`, or `projectId`, `pipelineId` or `stageId` in an `update_issue` patch), and a `call_api` DELETE on an issue.
-   - **`call_api` writes:** every non-GET `call_api` call is unchecked unless the hook recognises it, and an unchecked call warns, or blocks while any project is enforced. The path is lowercased first, so a mixed-case path is gated like the canonical one; a path without a leading `/`, or with a query, fragment, `%` escape, backslash, or empty or dot segment, is unchecked. Recognised shapes: an exact `/issues/<uuid>` path with an object body whose fields are all known (`status` and `patch.status` are gated like `update_issue`, and two different values or an explicit null are an unknown status, `projectId`/`pipelineId`/`stageId` as a move, and descriptive fields such as `title`, `priority` and `labels` pass; any other field, such as `archivedAt` or `action`, is unchecked); the exact `/comments`, `/attachments` and `/time-entries` sub-paths (allowed unless the body carries a status); a collection write with an `items` list (checked like `bulk_update_issues`); and a plain create (`POST /v1/issues` or `/v1/projects/<uuid>/issues` with no status, patch, items, id or filter keys), which blocks only when the path names an enforced project. Routes that do not name issues (projects, stages, other resources) are unchecked too, because the hook cannot tell whether they move or close issues.
-   - **Bulk calls:** every item in a bulk call is checked, and one failing item blocks the call.
-   - **Where it blocks:** only in `mode: enforce`, and only for `enforced_projects`. Everywhere else it prints what is missing and allows the call.
-   - **Unreachable GoodQA:** a transport failure blocks only in enforce mode when enforced projects are configured. The status write goes to the same service, so blocking it costs little.
-   - **Refused key:** if any routed key gets `forbidden` reading the issue (a revoked or rotated key, or lost membership), the hook blocks in enforce mode while any project is enforced, and names `doctor`. Re-run `doctor` for each enforced project after any key or membership change.
-   - **Non-uuid issue id:** a missing or non-uuid `issueId` blocks while any project is enforced. Only `update_issue` and `reassign_issue` declare `issueId` as a uuid; the other tools only describe it as one.
-   - **Issue not found:** GoodQA also answers `not_found` to a key without membership. So when every routed key reports `not_found`, the hook first checks that each enforced project's key can still read its own project (`get_project`). If any cannot, it blocks and names `doctor`. If all can, the issue is outside every enforced project and the hook only warns.
-   - **Bulk calls while enforced:** one unresolvable item (a non-uuid id, or a not-found id while an enforced key is dead) blocks the whole call, including items in projects that are not enforced.
-   - **Out of reach:** the GoodQA UI, REST calls made with curl or scripts, Codex and Cursor. Codex has no SubagentStop or MCP PreToolUse hook here, and Cursor is not wired, so on Codex and Cursor the commands are run by hand and `done` is advisory. Parity is tracked in GoodQA work-tracker-automatic#35670, to be absorbed by the harness Go port.
-
-### Blockchain domain gates
-
-When a repo shows blockchain work, the spec flow and the reviewers get a data-driven checklist. All text lives in `domain_checklists.json`; `domain_gates.py` only detects and renders.
-
-- **Detection** reads file names from a capped `git ls-files` (signal paths only, up to 20,000; vendored `node_modules`, `vendor`, `third_party`, fixtures and top-level `lib/` are skipped) and at most 200 manifests of at most 256 KiB each (4 MiB total). It never follows symlinks and never runs repo code. JSON deeper than 100 levels is rejected before parsing (`domain_gates.safe_json_loads`; deep nesting can abort CPython 3.9), which counts as a failed scan. Hitting any scan cap (file list, manifest count or size, read budget, proto count) is also reported as a failure, and enforce mode fails closed on either (a skipped symlinked or unreadable manifest counts as well; a proto cap counts only when NATS is present without a ledger signal). If spec_policy.json cannot be loaded, `peer_review` warns loudly that enforce refusals are off (fail-closed is a follow-up). In enforce mode a very large repo (or one with oversized or deeply nested manifests) needs `allow_truncated` before reviews can run: `lint`, `attach` and `peer_review` behave the same: each refuses whenever a signal-hiding limit was hit (truncation or a too-deep manifest), even if some other domain was detected, and says how to proceed. With `allow_truncated`, or in warn mode, the review continues and an incomplete-scan notice goes into the reviewer prompt and the new spec block. `allow_truncated`, `mode` and `disabled` come only from the installed spec_policy.json; the repo file, environment and CLI cannot set them, and an attempt is reported as an ignored warning. A monorepo that legitimately exceeds the caps can set `"allow_truncated": true` under `domain_gates` in `spec_policy.json`, which downgrades truncation and too-deep manifests to a visible warning. Signals: `.sol`, `foundry.toml`, `hardhat.config.*` and ethers/viem/web3 (`evm`); `Anchor.toml`, `anchor-lang`, `solana-program` (`solana`); `frame-support`, `sp-runtime`, `polkadot-sdk` (`substrate`); `xrpl`, `xrpl-py`, `ripple-lib` (`xrpl`); a `.proto` file plus a NATS dependency plus a ledger, journal, posting or balance signal in a path or proto file (`ledger-messaging`). Untracked (not yet added) files count; paths changed by a diff count too. General-purpose domains `auth`, `delete`, `money`, `devices` and `release` are detected from file names only (words such as login/session/token, purge/prune/cleanup, stripe/refund/ledger, adb/enroll/pairing, deploy/rollback/updater): a domain needs at least two matching non-doc paths, or one path under a directory named for the domain, so a lone `README-release.md` does not trigger. Their checklists carry the foreseeable review findings (pre-account hijack, lookalike identifiers, device binding, verified backup before delete, idempotency keys, derived release floors, transport proof) into every new spec. Review prompts are built from the committed snapshot, and a diff that touches the opt-out file, or an unknown base, ignores that file.
-- **Checklist items** per domain: reentrancy, access control, precision, replay and chain id, nonce and idempotency, finality and reorgs, key custody, gas and DoS, upgradeability, oracle trust. Each has a NEG-case sentence and a `Verify by` hint, plus scaffolds (anvil fork, forge invariant, Echidna, `anchor test`, standalone rippled, `try-runtime`, NATS JetStream) and prompts for the review map (`domain_gates.suggested_prompts(domains)`).
-- **`spec_flow.py new --repo R`** appends a `## Domain checklist` block (with a `Domains:` line) when something is detected; nothing changes otherwise. **`spec_flow.py lint --repo R`** warns, without failing, for each item that no `## Negative cases` bullet names and that has no line `Domain-gate: <item-id> waived (<reason, 10+ chars>)`. Set `"domain_gates": {"mode": "enforce"}` in `spec_policy.json` to make `lint` and `attach` (`--repo R`) fail, and in enforce mode `peer_review` refuses to review when the reviewer checklist cannot be built (broken data, truncated scan). NEG matching counts only `- NEG-n (AC-n):` bullets in `## Negative cases` and chain-specific keywords (placeholders, code fences and generic words do not count); waivers need a 10+ character reason of at least three words, one item per line; NEG text inside code fences or HTML comments does not count. `packet` and `done` are unchanged. When `--repo` is not a git checkout lint says so instead of passing silently, and an opt-out in a repo with detected blockchain work is reported as a warning.
-- **`peer_review.py`** adds a bounded checklist (9,000 bytes) to the reviewer prompt for plan, code-inspection and PR stages. It is not part of the packet, so the packet hash and byte budget are unchanged; the report notes the section's SHA-256.
-- **Opt out:** `HARNESS_DOMAIN_GATES=off` (ignored with a warning when the policy mode is `enforce`: environment variables only tighten), `"domain_gates": {"disabled": true}`, or `.harness/domain-gates.json` with `{"disabled": true}`. The repo file may also carry `extra_checklists` (`items`, `domains`) that add items, never replace built-in ones. A diff that touches anything under `.harness/` (compared case-insensitively) cannot disable its own review or add checklist text, and the repo file can never switch off a policy-level `enforce` (use the policy file or the environment). In enforce mode a broken checklist file or an internal error fails closed. The repo file is repo-controlled, so treat a PR that adds it as a review finding.
-- **CLI:** `python3 domain_gates.py detect --repo R [--json]`, `checklist --domain D`, `scaffold --domain D` (prints commands, never runs them).
-
-### Credentials and rollout
-
-- **Keys and routing.** A GoodQA key is bound to one organization. `spec_policy.json` `projects` maps a project slug to its `project_id` and `org_id`, and to `key_file` when it needs a different key. `doctor --project <slug>` checks that the routed key can create attachments, comment and transition in that project.
-  - `member.key` reaches one org, including the `work-tracker-automatic` tracker.
-  - The Harness project lives in the maintainer's own org, and no key file reaches it yet.
-- **Shipped mode:** `mode: warn`, `plan_ticket_gate: warn`, `enforced_projects: []`. No project is enforced in this release.
-- **Before enforcing any project:** resolve the remaining items in GoodQA work-tracker-automatic#35672 (per-project plan ticket gate, a policy for tickets opened before enforcement, bulk timing with several routed keys). `doctor` reports the permissions GoodQA lists for the key; it does not try a write. Re-run it after any key or membership change.
-- **Enforcing on `harness`:** once #35672 is resolved, add `{"key_file": ...}` to its route, run `doctor --project harness`, then set `"enforced_projects": ["harness"]` and `"mode": "enforce"`.
-- **Rollback:** set the modes to `off`, or delete the `spec_flow.py hook` handler from `~/.claude/settings.json`.
-
-### Legacy done (no spec)
-
-Tickets that predate the spec flow cannot satisfy `spec_flow.py done`. `spec_flow.py done --ticket <ref> --legacy --repo <checkout> --merge <sha> --deploy <wal-id> --really-tested <wal-id> --wal <main WAL>` replaces the spec evaluation with three bound checks, and never touches the non-legacy path. READY needs: the merge sha is an ancestor of the default branch (origin/HEAD, else origin/main, origin/master, main, master) and its commit message cites the ticket; the `--deploy` WAL entry exists, mentions LIVE or deploy (and does not say it was not live) and names the ticket number or the first 7 characters of the sha; the `--really-tested` entry exists, starts with `REALLY_TESTED` and names the ticket number or sha7. Each failure is listed by name (for example `merge sha abc is not on main`). It is an evidence report only: it makes no tracker call, and `--apply` is refused, because it does not read the ticket's spec records, accepts a local default branch when no `origin/*` exists, and cannot tell who wrote the two WAL entries (review F4). Close the ticket through the spec gate, or a person closes it after reading the report.
-
-## Merge gate
-
-One real check (the user, 2026-11-24): **a merge into a protected branch needs a passing independent review of that PR, or an approval.** `harness/hooks/merge_gate.py` is a PreToolUse hook on shell tools. Everything else the earlier gate did (CI check reading, head pinning with `--match-head-commit`, review-auth stamps, the subagent rule for bound reviews, analysing every shell spelling) is gone; GitHub branch protection enforces required checks server side.
-
-**What is a merge.** `gh pr merge` (also `--auto`), `gh api -X PUT repos/<o>/<r>/pulls/<n>/merge`, `gh api graphql` with `mergePullRequest`, `enablePullRequestAutoMerge` or `enqueuePullRequest` and a literal `PR_...` id, and `git push` whose destination is a protected branch (`protected_branches`, default `main` and `master`; `HEAD`, `--all` and a bare `git push` resolve to the current branch). It also reads `sh -c`/`bash -lc` scripts, `eval`, `$( )` and backticks, `cd <dir>` before the merge, wrappers such as `env`, `timeout` and `sudo`, and a `$N` target assigned literally earlier in the command. Heredoc bodies (unless a shell reads them), quoted strings, comments, `--help`, `--dry-run` and `git push --delete` are not merges. Local `git merge` is not gated: what lands is the push.
-
-**Fast and fail-open.** Without `merge`, `push` or `waive` in the text, nothing is parsed. A command that does not parse (unbalanced quotes), is larger than 1 MB, or takes longer than `analyser_seconds` (2 s) is ALLOWED with one line on stderr and in `~/.agent-harness/logs/merge-gate.log`; so is unreadable hook input and any error inside the gate. A 200 KB heredoc is decided in milliseconds.
-
-**The check**, once a command is a merge:
-
-1. `gh pr view` reads the PR (number, URL, head, base, state, commits). A base that is not protected, or a PR that is not open, needs nothing.
-2. A PASS review receipt counts when it is a settled `peer_review.py pr` FINAL in the usage store (`~/.agent-harness/usage/runs/<id>/final.json` with a matching `settled.json`, no `invalidated.json`, result `CHECK_OK`, verdict `ACCEPT` or `ACCEPT_WITH_TICKETS`, at least one provider launch, younger than `receipt_max_age_days`) and is bound to this repo and PR (`--github-repo --pr`), or unbound with a head that is one of the PR's commits. Same-harness reviewers count; `"require_other_harness": true` restores the cross-vendor rule. A receipt for the current head allows the merge. Receipts are not single use.
-3. If the head moved after the review, the receipt still counts when the change since the reviewed head (GitHub compare) is at most `small_change_lines` (150) changed lines and touches no file matching `sensitive_paths` (CI workflows, migrations, SQL, lockfiles, auth, secret and credential paths). A delta review is simply a new receipt at the current head.
-4. Otherwise an approval allows it: `ah_approvals.allowed("merge", repo=, pr=, head=, session=, payload=)` when that module is installed, else this gate's waiver log. Approvals and waivers bind to the PR, not the commit, unless the record names an exact head.
-5. Otherwise the hook refuses with one message: what is missing (no receipt; or the size, rewritten branch or sensitive files since the reviewed head) and the command for each way through (review the current head with `peer_review.py pr ... --github-repo --pr`, or record a waiver). A GitHub lookup that fails refuses with the error and the same waiver command, because the merge is real; retry when GitHub answers.
-
-A merge whose PR cannot be named (`gh pr list | xargs gh pr merge`, a target held in an unknown variable, a remote `gh pr merge` over ssh without `-R`, a GraphQL merge without a literal id) is refused with the one command to run instead: `gh pr merge <number> -R owner/repo`. A push to a protected branch is checked against the open PR whose head is the pushed commit; with no such PR it needs a waiver for that exact head (`--head`), or open a PR. A push that adds nothing to the remote branch is allowed.
-
-**Waivers.** `python3 ~/.claude/hooks/merge_gate.py waive --repo owner/name --pr N --reason "<why>" [--head <sha>] [--approved-by <text>] [--ticket <text>]`. The reason is free text (any punctuation, up to 4000 characters, secrets redacted), the approver any text (default `$USER`), the ticket optional; the repo may be a URL and the PR `#N`. It covers the PR for `waiver_ttl_hours` (24) and is not consumed by a merge. The hook lets the main agent, a Fable or Astra caller (`ah_roles.is_top_rung`), and a supervisor whose supervised checkout is that repository (`ah_roles.supervised_roots`) run it in one command; a subagent is told to ask one of them or the user. `merge_gate.py report` lists recent waivers; `merge_gate.py check --repo o/r --pr N` prints the decision without recording anything.
-
-**Policy.** The `merge_gate` object in `commit_policy.json`, overridable key by key in `commit_policy.local.json`: `protected_branches`, `small_change_lines`, `sensitive_paths` (fnmatch patterns), `receipt_max_age_days`, `require_other_harness`, `waiver_ttl_hours`, `analyser_seconds`, `lookup_seconds`.
-
-Known limits: curl or an interpreter calling the merge endpoints, a merge built at run time from pieces, browser and MCP merges, and merge queues are not seen; the threat model is a careless agent, not one hiding a merge.
-
-## PR review map
-
-`review_map.py` builds one self-contained HTML page for pair-programming a pull request:
-
-```sh
-python3 ~/.claude/hooks/review_map.py generate --repo <checkout> --pr <N>      # or --branch <name> --no-gh
-python3 ~/.claude/hooks/review_map.py attach --map <file.html> --yes           # tickets come from the PR's commits
-python3 ~/.claude/hooks/review_map.py list --repo <checkout> --state open
-```
-
-The page has a grouped change map (tile area follows changed lines), reasoning per commit (Why, What, Testing, Risk), known edges with diff snippets (spec NEG cases, spec risks, commit Risk lines and review findings), the refinements reviews caught (finding, fix commit, test file), suggested next steps and prompts to run next. It loads nothing from the network, escapes every string, pins its single script with a CSP hash and is written with mode 0600 to `~/.agent-harness/work/review-maps/` (override with `HARNESS_REVIEW_WORK`).
-
-Sources are matched to the PR only by commit SHA (at least 8 hex characters), exact branch name or a project-qualified ticket reference; each attribution shows its basis, and a report that reviewed an older head is marked stale. Specs and reports are found under `~/.agent-harness/work`, WAL notes under `~/.claude/wals`. Refinement links (finding to fix commit) are inferred and labeled so. Text is redacted with the harness redactor plus e-mail, JWT and home-directory patterns before it is truncated, and generation refuses to write a page that an independent detector still finds token-shaped text in. Ticket references come only from the PR's commit messages, never from PR comments, and `attach` needs `--yes`. It uploads the page and comments with its sha256 once per ticket (a rerun reports `ALREADY_ATTACHED`); projects the member key cannot reach are reported `UNREACHABLE`.
-
-The console lists the selected session repository's pull requests; selecting one and pressing **Open review map** builds the page and shows it in a sandboxed frame (no access to the console token or API). **Attach to GoodQA tickets** asks you to confirm the ticket list first. The console runs `~/.claude/hooks/review_map.py` (override with `HARNESS_REVIEW_MAP`).
 
 ## Lower-level publication and local integration
 
@@ -1254,7 +445,7 @@ python3 ~/.claude/hooks/bg_job.py wait --name suite --timeout 3600 --dir /abs/ta
 - `launch` takes an argv list (no shell string), detaches into its own session behind a wrapper, and prints `STARTED name= pid= ...` with exit 0 only when the PID is alive, the log exists and the log has grown within `--deadline` seconds. Otherwise it prints `FAILED_TO_START reason=...`, exits 3 and stops the process group it started. A job that is silent for the whole deadline therefore fails to start; make it print a first line. The job record (PID, start, log, status path, argv hash, nonce) goes in `--dir`, else `$BG_JOB_DIR`, else `$AGENT_HARNESS_TASK_DIR/bg-jobs`, else `./.bg-jobs`. Argv is stored in the record: never pass secrets as arguments.
 - `wait` exit codes: 0 the status file says exit 0; 1 the job ran and failed (`EXIT_STATUS=n`); 2 no trustworthy status (missing, garbled, belongs to another job, or the process is gone without a status, including a reused PID); 3 timeout while still running. PID liveness is proven by the wrapper nonce in the process command line, never by `kill -0` alone, and the status file is written atomically by the wrapper. Never use the last command of a loop, or a systemd unit `Result` alone, as the outcome.
 - Per-stage pipeline status: use `set -o pipefail`, or read `PIPESTATUS` immediately after the pipeline itself (not after `X=$(...)`), or write each stage's status to its own file.
-- `bg_lint.py` is an advisory PreToolUse hook (Claude Code only; Codex ships `bg_job.py` as a helper but has no lint hook). It warns, never blocks, and names `bg_job.py` for: a success echo after `;` or `&`; a wait/poll loop whose last command is `ls`, `cat` or `tail`; `PIPESTATUS` after a command-substitution assignment; a while/until loop polling `pgrep -f PATTERN` or `ps | grep PATTERN` (without `grep -v grep`) where the pattern also occurs in the loop's own shell command line, so it never exits (one ran 12 h on the worker host on 2026-11-06; use `pgrep -f "[t]sc ..."`, a PID wait or an exit file). It is a heuristic over a shell string, so it can miss wrapped or generated commands; the helper itself is opt-in.
+- The advisory bg_lint hook that warned on shell patterns was removed in release 1001 (no hook reads a shell command); `bg_job.py` itself is unchanged.
 
 For unattended evidence delivery, launch a single, predeclared task script that runs the bounded job, validates its exact versioned evidence, posts it to the named ticket, and exits with the verified posting result. Keep its inputs, log, and receipt under the private task directory. Record the job name and receipt path in the WAL before handing off. `STARTED` confirms launch. A successful terminal receipt confirms the script completed its requested checks. Reconcile an interrupted or uncertain external write by checking GoodQA before restarting a script.
 
@@ -1313,7 +504,7 @@ Two tiers, two markers (as in the reviewed live script): tier 1 (transcripts, WA
 
 Freshness: `~/.agent-harness/logs/log-backup.last-ok` holds the run start time and is written, atomically, only after every source copied and at least one primary source (`.claude/projects` or `.codex/sessions`) was copied. A run skipped because another holds the lock writes `log-backup.last-skip` and never counts as success. `python3 ~/.claude/hooks/log_backup.py check` exits 0 fresh (1 hour or less), 1 stale, 2 missing or invalid (garbage or future); `status` prints the success, run, skip and lock state; a SessionStart hook prints a visible alert when the backup is not fresh (a very long session will not see staleness arrive).
 
-Shared Dropbox write budget (goodqa#15218): `~/.claude/hooks/dropbox_budget.conf` holds the account's write budget in operations per second and each uploader's share: `account 6` (an ASSUMPTION: Dropbox does not publish the limit; throttling appeared at about 7/s on 2026-11-07, so the total sits below that), `log-backup.Mac-2 2`, `log-backup.the worker host 1`, `agent-bulk 2` and `reserve 1`. log-backup.sh uses the share named `log-backup.<host>` as its `--tpslimit` when LOG_BACKUP_TPSLIMIT is unset (the systemd unit) and otherwise only lowers that setting; heavy_job_guard caps the agent upload lane at `agent-bulk` (never above its built-in 4). Both readers apply one line rule (CRLF accepted; anything odd, a symlink or a file over 64 KiB makes the file invalid). A missing or invalid file, or one without a share for the reader, leaves today's values (LOG_BACKUP_TPSLIMIT or 1; 4). The agent-bulk share is enforced per host (one agent upload at a time on each host), not yet across hosts. heavy_job_guard enforces this lane rule on every host (goodqa#15246); its other rules stay Mac-only. Off the Mac the hook reads only commands that mention rclone, and the Mac's heavy-job count and hourly hatch limit do not apply there. It does not see uploads started from a script (`bash up.sh`, `systemd-run`), and it is still one lane per host, so three hosts can each run one agent upload at once. A run whose copy fails or is cut short on the rate limit stops copying (the transcripts, `.claude/projects` and `.codex/sessions`, still get their own copy), writes `log-backup.throttled` and withholds last-ok; status and the backup alert name it.
+Shared Dropbox write budget (goodqa#15218): `~/.claude/hooks/dropbox_budget.conf` holds the account's write budget in operations per second and each uploader's share: `account 6` (an ASSUMPTION: Dropbox does not publish the limit; throttling appeared at about 7/s on 2026-11-07, so the total sits below that), `log-backup.Mac-2 2`, `log-backup.the worker host 1`, `agent-bulk 2` and `reserve 1`. log-backup.sh uses the share named `log-backup.<host>` as its `--tpslimit` when LOG_BACKUP_TPSLIMIT is unset (the systemd unit) and otherwise only lowers that setting. The reader applies one line rule (CRLF accepted; anything odd, a symlink or a file over 64 KiB makes the file invalid). A missing or invalid file, or one without a share for the reader, leaves LOG_BACKUP_TPSLIMIT or 1. Release 1001 deleted heavy_job_guard, so the `agent-bulk` share is advice only. A run whose copy fails or is cut short on the rate limit stops copying (the transcripts, `.claude/projects` and `.codex/sessions`, still get their own copy), writes `log-backup.throttled` and withholds last-ok; status and the backup alert name it.
 
 Machine-readable status: `python3 ~/.claude/hooks/log_backup.py status --json` prints one JSON object, `{"schema": 1, "transcripts": {"state", "age_seconds", "max_age_seconds", "marker"}, "bulk": {same}, "last_run", "last_skip", "last_throttled", "lock", "ok"}`, and exits 0 when `ok` (transcripts fresh and bulk fresh or pending), 1 otherwise. States are fresh, stale, missing, invalid or (bulk only) pending. Other tools should read the marker names and limits from `log_backup.py` (`LAST_OK`, `BULK_OK`, `MAX_AGE_SECONDS` = 3600, `BULK_MAX_AGE_SECONDS` = 21600) and keep these names stable.
 
@@ -1336,257 +527,6 @@ work directory (`git -C <repo> worktree add -b <branch> ~/.agent-harness/work/<s
 `WorktreeCreate` hook is deliberately not installed: it replaces Claude's worktree logic for every worktree, including
 owners already working in real repositories, and Claude never auto-removes the worktrees such a hook makes for subagents.
 
-## Mission coverage
-
-Every active mission goal must be held by someone, wait on something named, or be done with evidence (goodqa#15565).
-The dropped-owner gate only sees owners that existed and stopped; on 2026-11-10 the leads goal (goodqa#15095) had no
-owner all night and nothing said so. `harness/hooks/mission_coverage.py` holds the rule, `mission_gate.py` enforces it
-at main's Stop (and stamps main's main-only commands), and the ops-watch `mission` check alerts on it.
-
-### Goals file
-
-One canonical file, `~/.agent-harness/mission/goals.json` (directory 0700 and not a symlink, file 0600, at most 1 MiB,
-500 goals, nesting depth 8; a symlink, FIFO or any wrong type makes the whole file unreadable). It is a JSON object
-`{"mission_session": "<session id>", "goals": [...]}` (a bare list, the first format, has no mission session):
-
-| field | type | meaning |
-| --- | --- | --- |
-| `mission_session` | session id | the main session the Stop hook holds to the mission; set by the first `import-initiatives` or by `set-session` (main only; see the hand-over rule below) |
-| `id` | `[a-z0-9][a-z0-9_-]{0,63}` | unique goal id (the dashboard initiative id) |
-| `title` | text, up to 300 | what the goal is |
-| `ticket` | `goodqa#N`, `Project#N` or `""` | the stream ticket; owners are matched by it, never by name. Changing it is main only |
-| `priority` | integer 1..9 | 1 is the most important |
-| `status` | `imported`, `active`, `done`, `deferred`, `retired` | `imported` is reported, not enforced, until `activate`; `done` only through `done`, `deferred` only through `defer --user-source`, `retired` only through `retire` |
-| `deferral` | `{by: user\|ask\|ticket, ref, until, source, renewal}` | what the goal waits on; `ref` must be an ask id (`ask`) or a ticket (`ticket`), `until` an ISO time, or the file is unreadable |
-| `wait_count` | integer | ask/ticket waits in a row without the user's word |
-| `bound` | list of full agent ids | owners main bound to the goal (`bind`) |
-| `retire` | `{source}` | the user's words that cancelled the goal |
-| `done_evidence` | `[{kind: deploy\|really_tested, ref, session}]` | WAL ids proving it is live and tested |
-| `repos` | list of paths, optional | repositories whose commits naming the ticket count as progress (main only) |
-| `dashboard` | object, informational | copied from the dashboard on import; never read by the rule (its `owner` field covers nothing) |
-
-Write it only through the tool. Each write appends a hash-chained row to
-`~/.agent-harness/state/mission-goals-audit.jsonl`: `prev` is the sha256 of the previous row, the last row's hash is in
-`mission-goals-audit.head`, the goals file's sha256 is in `after_sha`, and the mission session is in `session`. Past
-16 MiB the file is renamed to `mission-goals-audit.NNNNNN.jsonl` and the chain continues in a new file. A goals file
-that does not match the chain head is treated as tampered: a goal removed or edited by hand, or an audit row edited or
-deleted in any segment. The gate then blocks the session the chain names (never a session the edited file names), and
-every write is refused until main runs `reseal --reason`.
-
-Readers take a shared lock on `mission-goals.lock`, so a concurrent write is never read as tampered.
-
-    mission_coverage.py import-initiatives ~/.agent-harness/work/<session>/dashboard/initiatives.json   # main
-    mission_coverage.py activate --goal leads                                                             # main
-    mission_coverage.py add --goal leads --title "1,000 leads in the CRM view" --ticket goodqa#15095 --priority 1
-    mission_coverage.py set --goal leads [--title T] [--priority N] [--status active] [--clear-deferral]
-    mission_coverage.py set --goal leads --ticket T | --repo PATH...                                      # main
-    mission_coverage.py bind --goal leads --agent <full agent id> --source ticket:goodqa#15095 [--remove] # main
-    mission_coverage.py defer --goal leads --ask <open ask naming the goal> --until <ISO, at most 7 days ahead>
-    mission_coverage.py defer --goal leads --ticket <open blocking ticket> --until <ISO, at most 7 days ahead>  # main
-    mission_coverage.py defer --goal leads --user-source "<user: or answer: source>" [--until <ISO>]     # main
-    mission_coverage.py retire --goal leads --user-source "<user: or answer: source>"                    # main
-    mission_coverage.py done --goal leads --deploy <deploy WAL id> --live-test <REALLY_TESTED id>
-    mission_coverage.py set-session [--session S] | --user-source "<user: source in this session>"       # main
-    mission_coverage.py reseal --reason "<what changed and why>" [--force]                                # main
-    mission_coverage.py verify | report [--json] | check
-
-Main-only commands need a one-shot stamp (`caller_identity.put_stamp`, purpose `mission-main`, single use, 60 s,
-bound to main's tool call) that `mission_gate.py pretool` writes only when the PreToolUse payload proves main
-(`caller_identity.is_main`) and the Bash command runs `mission_coverage.py` itself:
-
-- The stamp carries the call's `tool_use_id`, main's transcript path and the transcript size at that moment
-  (goodqa#15754 red-team F1). The command honours it only while that call is still running: once main's transcript
-  holds the call's `tool_result` (the call ended, or another hook denied it, or the user rejected it), the stamp is
-  dead for every process. Claude Code's own copy records (`api-request-blob`, `data-flow-records`) do not count
-  (goodqa#16811 round 2: a `data-flow-records` line can name a call before its result). `mission_gate.py posttool` (PostToolUse, PostToolUseFailure and PermissionDenied, Bash) also
-  deletes the call's unconsumed stamps. A payload without `tool_use_id` gets no stamp. Run main-only commands in the
-  foreground: a `run_in_background` call returns its tool_result at once, so its command is refused.
-- `take_stamp` runs every check (purpose, TTL, the call still running) before it claims the stamp; a caller that fails
-  one leaves the stamp in place, so a probe cannot burn main's stamp (PR 226 review M1).
-- What the stamp proves today, and its window (PR 226 review M1, not closed): "main's PreToolUse hook saw exactly this
-  argument list in a main call that has not ended yet, at most 60 s ago". It does not prove that the consuming process
-  is main's. Any same-user process that runs the identical argument list inside that window (from PreToolUse until the
-  call's tool_result or Post hook, at most 60 s, including while a permission prompt is open) is taken for main. A
-  per-call nonce (PreToolUse `updatedInput` prefixing `AH_MAIN_NONCE=<random>`, the stamp holding only its hash) would
-  close it: Claude Code 2.1.322 applies `updatedInput` from a settings hook without a permission decision, but it also
-  stores every PreToolUse hook's stdout verbatim in main's transcript, so the nonce would sit in clear text in a Claude
-  log during the call. It was not shipped for that reason; it is the design to reuse for the `review-auth` and
-  `ack-handoff` stamps (goodqa#15829) if that copy is accepted.
-- Since 2026-11-24 there is no `review-auth` stamp: merge_gate reads the settled review receipt itself (see Merge
-  gate) and peer_review.py no longer takes or burns one (`--no-main-stamp` is accepted and ignored).
-
-- The stamp is keyed by the sha256 of the exact argument list after the script (`argv_key`; `--flag=value` reads as
-  `--flag value`), so it covers that one command and nothing else.
-- The hook stamps only a script at command position: the first word of a simple command (after `;`, `&&`, `||`, `|`,
-  `(` or a newline), optionally after `VAR=x` words and `python3 [-flags]`. Redirections and their targets (`2>&1`,
-  `> out`) and `#` comments are left out of the argument list. Text that only mentions the script is never stamped:
-  `echo`, `grep`, `printf '...'`, `bash -c '...'`, and any command with a here-document (`<<`). `goodqa#9` is one word,
-  as in bash.
-- The line is split by a quote-aware tokenizer (`mission_gate.shell_tokens`), not by shlex: a quoted or backslash-escaped
-  `;`, `&&`, `|`, `(`, `)` or newline is part of a word and never starts a command, so `echo ";" mission_coverage.py
-  reseal ...` gets no stamp (r14 F1). A line with `$(...)`, backticks, `<(...)`, `$'...'`, a here-document or an
-  unbalanced quote gets no stamp at all, nor does an argument the shell computes (`$VAR`, an unquoted glob or brace).
-- The command takes (consumes) its stamp first, before argparse or any validation. A main command that then fails,
-  prints `--help` or exits on an argparse error leaves nothing a later process could use.
-- Once goals.json names a mission session, the stamp must come from that session. Another top-level session (another
-  main, or a sub-agent's own `claude -p`) is refused even with a stamp of its own.
-- A leading unquoted `~/` is expanded as bash does. Other arguments the shell computes (`$VAR`, `$(...)`, globs) differ
-  from what the hook saw, so such a command is refused. Run main-only commands with literal arguments.
-
-A sub-agent's shell, a copied script or a cron job finds no stamp and gets a refusal naming main. Every main-only
-change, and every ask or ticket wait, raises a high `mission:goals:changed` alert (source `mission-coverage`) with the
-old and new value.
-
-Hand-over (`set-session`): with no mission session yet, any main sets it. The mission main may move it, to itself or to
-another session id. Any other session may take it only for itself, with `--user-source`: a `user:` or `answer:` source
-from its own transcript whose whole sentence says to move the mission ("take over the mission in this session"), as a
-one-segment quote with no condition or refusal. The sentence must say take over the mission, or hand, move, transfer,
-pass or bring the mission here or to this session, and either name this session as the destination ("here", "this
-session", "you") or be an imperative ("Take over the mission."). A refusal, condition or question anywhere in it, a
-cancelling word (stop, cancel, drop, abort, keep, leave, block) or another destination ("the other session", "to
-session <id>") refuses it (r14 F2). The same shared checker (`user_words_ok`) judges defer, retire and takeover
-quotes. That is the recovery when the old main died. The change re-checks the
-mission session under the write lock.
-
-Limit (threat model): stamps are not signed. A same-user process can write a stamp file into
-`~/.agent-harness/state/main-stamps/` itself, as it can edit the hooks or the HMAC key. Stamps stop careless agents and
-the copied-command, leftover-stamp and other-session cases above, not a same-user agent that sets out to forge them. A
-stamp left by a main command that never ran (for example `false && mission_coverage.py reseal ...`) can still be used
-within 10 minutes by a process that runs exactly the same argument list. `reseal` is refused while the chain is intact unless
-main passes `--force`; its audit row records the sealed hash, the hand-edited file's hash and the removed goal ids.
-
-`ah task register` rows no longer bind owners: ah records the caller from the environment (`AH_AGENT_ID`, else
-`unknown`), so a registration cannot prove that main wrote it. Use `bind`, which needs main's stamp, a full agent id
-(16+ characters, never a prefix) and a `user:`, `answer:`, `queue:` or `ticket:` source. The binding covers only while
-`ah owners` reports that exact id as a live owner-type row.
-
-`import-initiatives` is an idempotent merge. New ids come in as `imported`: reported, not enforced. Dashboard rows whose
-state starts with done, live, complete, shipped or retired are marked `needs_evidence`. Existing goals keep every field,
-their status included, and only gain a missing ticket and the informational `dashboard` block. Nothing is removed and
-nothing is marked done (a dashboard "Done" is not evidence).
-
-### The rule
-
-A goal with status `active` (or `deferred`) is covered by
-
-1. a live owner: an `ah owners` row of an owner type (never a helper such as red-team, click-tester, fixer, Explore,
-   Plan) in state live, working, quiet or SILENT (SILENT not after an ending disposition), whose stream ticket (the
-   first GoodQA ticket in its WAL) equals the goal's ticket, or whose exact agent id main bound to the goal;
-2. a live disposition:
-   - an `ah task dispose` waiting, resumed or reassigned disposition that ah reports live, on such an owner row;
-   - a wait on an ask that is open in main's WAL and whose text names the goal id or ticket;
-   - a wait on another ticket (main only) that was open in GoodQA when it was recorded (checked through ah's adapter,
-     10 s bound). The Stop gate and `report` check it again: a waited-on ticket that is now closed or missing no longer
-     covers. Those lookups run in parallel within 2.5 s; an "open" answer is reused for 10 minutes, and no answer in time
-     keeps the wait with "open state not confirmed this turn";
-   - an ask or ticket wait needs `until` in the future and at most 7 days ahead, and at most 2 waits in a row
-     without the user's word; the third makes the goal UNCOVERED again;
-   - a deferral the user decided: its `user:`/`answer:` source resolves through provenance.py to the user's own words,
-     quoted as one segment (no `...`). The verb must sit right next to the goal (id, also hyphenated or spaced, or
-     `#<ticket number>`, with "the", "goal", "work" and the project name folded in): defer, park, pause, postpone or
-     shelve the goal, hold off on it, put it on hold, "<goal> can wait", or "<goal> is deferred/parked/paused/on hold".
-     The whole sentence of the user's turn that holds the quote (not only the quoted fragment) must contain no refusal,
-     condition or negation (don't, not, no, never, any "n't" form, if, unless, maybe, should, might, a question mark,
-     stop, quit, resume, restart, abort, except, instead, never mind). The sentence is judged as written: no word is
-     removed first, so "Do not now pause leads" and "do not pause leads, not now" are refusals (r14 F3). "wait",
-     "later", "hold" and "stop" alone are not a decision. `report` prints the quoted
-     words. `retire` follows the same rules with drop, cancel, retire, abandon or scrap (or the word kill) next to the
-     goal, or "<goal> is dropped/cancelled/retired/dead";
-3. done evidence (status `done`): a deploy record and a later REALLY_TESTED entry against a live target, both from the
-   mission session's WALs and both naming the goal's ticket, checked with `ah`'s own evidence resolvers (the DONE_LIVE
-   rule).
-
-`retired` counts only while the user's quoted words name the goal and say drop, cancel, retire or stop. `imported`
-never blocks. Anything else is UNCOVERED.
-
-A covered goal is STALLED when none of its owners wrote an own WAL entry for more than 45 minutes and no commit in its
-`repos` names the ticket in that time. Hook lifecycle rows and rows another agent wrote into the owner's WAL do not
-count. The report gives the age.
-
-When the owner cap (`resource_budget.owner_cap()`) is full and a goal is uncovered, the message names the
-owner to free or queue: owners on no mission goal first (most idle first), then owners of the lowest-priority, most
-stalled goal, plus the option to queue the goal on its ticket.
-
-### Owner lists and signatures
-
-`ah owners` has no cheaper mode; on a 2,089-owner session it takes 10-25 s, more than a Stop hook can spend.
-
-- ops-watch (every 10 minutes) runs the full scan, bounded by `mission.timeout_s` (default 120). It writes the scan to
-  `~/.agent-harness/state/mission/owners-<session>.json`, signed with HMAC-SHA256 and carrying `by: ops_watch` and a
-  monotone `seq` that is kept in a signed seq file. ops-watch is the only writer; the gate never writes it.
-- The Stop gate uses that snapshot when its signature, session, writer and seq check out and it is at most 15 minutes
-  old. Otherwise it scans live within 9 s.
-- A missing, forged, replayed, foreign or stale snapshot plus an overrun scan never counts as coverage. The turn may
-  end with "owner list unavailable", and the gate raises a high `mission:scan:unavailable` alert.
-- The verification cache (`state/mission/verify-cache.json`) is signed the same way. It remembers a pass for a day and
-  a failure for 60 s; a failure is never cached as a pass.
-- Limit: the key (`state/mission/hmac.key`, 0600) is readable by every process of the same user. The signatures stop a
-  stray write or a careless agent, not a same-user agent that sets out to forge them. Such an agent can also edit the
-  hooks (see `caller_identity.py`).
-
-### Enforcement
-
-- Stop hook (`mission_gate.py`, registered next to the dropped-owner gate; 2026-11-24): main only, mission session
-  only, never blocks. When the set of uncovered goals changes it adds one advisory line naming them; the fixes are in
-  `mission_coverage.py report`. Silent where no goals file exists.
-- ops-watch `mission` check (enabled by default; `{"mission": {"enabled": false}}` in ops-watch.json turns it off):
-  - It checks the session in `mission_session` and raises `mission:<goal>:uncovered` (high, `stop_block`),
-    `mission:<goal>:stalled` (warning) and `mission:goals:unreadable` (high). Alerts clear when the goal is covered.
-  - When the owner scan is unavailable, it keeps the last mission alerts, raises `mission:scan:unavailable`
-    (warning) and sends no "covered again" notice.
-- Waking main: when the uncovered set gains a goal, `notify_main` raises `mission:notify` (source `mission-coverage`).
-  Where `mc_chat` (Mission Control, goodqa#15585) is installed and main registered a target, it also drops an inbox
-  message marked as coming from the harness, not the user. It clears when nothing is uncovered.
-- Checkpoint: `mission_coverage.py report --json` lists goals slowest first: UNCOVERED by priority, STALLED oldest
-  first, covered by least recent progress, then waiting, deferred, imported, done and retired. It includes a
-  `coverage` map for Mission Control, keyed by goal id and ticket, with `{status: uncovered|stalled|moving, reason,
-  action}`.
-
-### Goal status: `ah goals` and the status lint (goodqa#15754)
-
-- `ah goals` reports every goal of the ledger with its state and its evidence of any age (`--json` for all of it,
-  `--candidates` for unattached deploy and REALLY_TESTED rows that name a goal, read only). It is the source for a
-  "whats left" answer; `ah status --since` lists recent evidence only.
-- Evidence: main attaches rows with `mission_coverage.py attach --goal G --evidence wID --kind test|live_test|deploy`;
-  owners may attach rows from WALs that name the goal, with an explicit PASS or FAIL, and never re-attach main's
-  rows. Owners tag rows with `wal_note.py --goal G --result PASS|FAIL [--live]` and write deploy records with
-  `--event deploy` (naming a sha or version). States: DONE_LIVE (main-attached deploy and a later main-attached live
-  PASS), LIVE_TESTED (main-attached live PASS, no deploy), LIVE_UNTESTED, VERIFIED, FAILING (a main-attached FAIL
-  clears only with a main-attached PASS of the same check), IN_PROGRESS, UNKNOWN (no record, never "not started").
-- Attach pins the row (red-team F2): the ledger entry stores `row_sha` (sha256 of the row as canonical JSON with
-  ASCII escapes), `row_verdict` and `row_at`. A row whose WAL content changed after attach shows as `TAMPERED` in
-  `ah goals`, a pinned row that no longer resolves as `MISSING`; both are named on a WARNING line.
-- A TAMPERED or MISSING pinned row is scored by its pin (PR 226 review H1): its pinned verdict at its pinned `at`, so
-  rewriting or deleting a FAIL row never removes the FAIL. The goal is also capped at `UNCONFIRMED` (unless it is
-  FAILING), with `cap.would_be` and the row ids in `ah goals --json` and a `capped:` line in the text, until main reads
-  the row and re-attaches it or removes it with `--remove`. An owner cannot re-attach (re-pin) a row that changed
-  since it was attached. The Stop lint treats UNCONFIRMED like any state below DONE_LIVE ("done" is an over-claim).
-  `ah status --since` does not read the goal ledger, so the cap shows in `ah goals` and the status-truth hooks only.
-- Entries attached before pinning still count but are flagged `(unpinned)`, and an unpinned row cannot carry a goal to
-  DONE_LIVE (review L3: the goal reads UNCONFIRMED with `cap.unpinned`). Rollout, once per host that has a ledger
-  (`~/.agent-harness/mission/goals.json`; the Mac has none yet): run `ah goals --json`, and for every id in a goal's
-  `unpinned` list main reads the WAL row and runs `mission_coverage.py attach --goal G --evidence ID --kind KIND`
-  (the same kind) to pin it, or `--remove` to drop it. A row edited before that re-pin cannot be detected; read it.
-- Pins written by the first PR 226 build (ensure_ascii=False digest) still match: `row_matches` accepts that digest
-  for any row without a lone surrogate (the only rows where it collided).
-- One pass per WAL file (red-team F5): `ah goals` and the hooks read each WAL file once for all attached ids and goal
-  tags, within one time budget (hooks 5 s, `ah goals` 20 s). A read that runs out of time is the state `timeout`
-  (`GOALS UNAVAILABLE (timeout)`, exit 2), never a partial answer. So is a WAL file cut at its 256 MB scan cap while
-  attached rows in it are still unresolved (PR 226 review H2); a capped file whose attached rows all resolved only
-  adds a warning.
-  `ah status` calls a deploy record linked to a REALLY_TESTED row LINKED_LIVE; prose live claims are LIVE_LEGACY.
-- `status_truth.py` hooks, mission session only (decided from the ledger, remembered in
-  `~/.agent-harness/state/status-truth/mission-session` so a broken ledger never widens it; before the first remembered
-  value, from the verified ledger header, so a first-run timeout still says GOALS UNAVAILABLE there): UserPromptSubmit injects
-  the goals for a status question; SessionStart re-injects them after a compaction. The Stop lint is no longer
-  registered (2026-11-24). Injected text holds only fixed-pattern fields (ids, check names, enums, ages, the main-set
-  target).
-  `status_truth.py calibrate <transcript>` replays both rules over a transcript.
-- `ah owners` lists in `attention` each SILENT owner whose recorded wait expired, or that has been silent 6 h with no
-  disposition (row reason `wait-expired` or `silent-undisposed`); `ah status` prints the same list on its owners line.
-  It is a report for main to look at: it does not set `decision_required`, so the dropped-owner Stop gate and ahd
-  successor requests ignore it (a silent owner may be a long build that writes no WAL lines).
-
 ## Design limits
 
 The policy is intentionally risk-scaled. The small fix path skips worktrees and review loops. A normal code task gets only relevant tests and documents. The agents must not infer that the presence of a test or a reviewer PASS proves quality. Independent checks, reviewer availability, UI tool access and remote permissions vary by environment; handoffs must say exactly what ran and what did not.
@@ -1600,7 +540,7 @@ These were specified on the redesign branch. Items marked landed are on main; th
 
 ### One-command merge (B3.8)
 
-`ah merge --pr N [--repo owner/name]` replaces the three-command ritual (`merge_gate.py waive`, `gh pr ready`,
+`ah merge --pr N [--repo owner/name]` replaces the three-command ritual (the old merge-gate waiver, `gh pr ready`,
 `gh pr merge --match-head-commit`). It fetches the PR head, requires a fresh exact-head `peer_review.py pr` ACCEPT
 receipt (PR #133 item 1 makes that receipt the waiver), marks the PR ready, merges with `--match-head-commit`, and
 writes one gate record. A stale or missing receipt refuses with the exact command to produce one. Not implemented. Since #141 (goodqa#15282) a merge in a repository with CI switched off needs that exact-head waiver or a bound PR review.
@@ -1636,19 +576,6 @@ only when the entry exists in the main WAL, names it, and is newer than its own 
 hash, applies a fleet-wide daily budget per filer class (runner briefs, key filers, liveness), batches related
 findings into one ticket, and keeps an audited lane that is never throttled for security, data-loss and P0 reports.
 
-### command_guard log-delete classification (B3.11)
-
-The `log_delete` category keeps every protected path (Claude and Codex transcripts and WALs, harness audit logs,
-usage receipts, deploy evidence). What changes is the operation test: a command that only creates or appends a new
-file under `~/.agent-harness/work/<session>/` is never a log delete, and a repository's own `install.sh` moving its
-own hook file inside its checkout is not a log rewrite. Deletion, truncation, move and write-through-link on a
-protected path stay blocked. The blocks observed on 2026-11-07/08 (transcript, eight `log_delete` refusals) fall in two
-classes: a path the guard cannot resolve (`$T` from `mktemp`, `$C`, `.pc.$$.$1.$2`) is treated as protected, and the
-whole `~/.agent-harness` tree counts as a protected harness directory (`gitrelay.git`, review worktrees `wt-*`). The
-rule change: an unresolvable variable blocks only when the same command also names a protected root or a log glob; a
-directory under `~/.agent-harness/work/<session>/` that is a clean, pushed worktree or a scratch dir is not a log.
-`tests/test_command_guard_workdir_write.py` holds these rows as a regression guard: they pass on main and fail if a row blocks again. The scratchpad delete case is goodqa#15280.
-
 ### Missing scenarios from the external review (B25-B29)
 
 - B25 quota: when a provider returns the weekly limit, owners checkpoint (WAL handoff with the exact resume point)
@@ -1665,16 +592,3 @@ directory under `~/.agent-harness/work/<session>/` that is a clean, pushed workt
   expiry, and replay tests for the ten known repo-guard bypasses (#128).
 
 
-### Main-idle guard (goodqa#15943)
-
-`idle_guard.py` stops main from sitting idle while work that does not need the user exists. A user rejecting one question pauses that question only.
-
-- Stop hook (`idle_guard.py stop`, main only, never blocks, fails open; 2026-11-24): one advisory line naming the streams, only when the problem changed, when no progress happened for `AH_IDLE_GUARD_MIN` minutes (default 30) and a stream holds a non-user next step; also when every owner waits on a user ask while another owner holds a returned result nobody took. A Bash-only checkpoint script is not progress.
-- ops-watch check `idle_guard` raises the high `idle-guard:<session8>` alert from the same `assess()`.
-- `ah owners` is the only judge of whether an owner needs main; `assess()` re-derives no rule. An owner is actionable exactly when its row is `decision_required` or has `attention`, and a user wait only when it is not actionable and its `wait_on` is an open ask. `attention` now also carries `result-unacked` (a done, handoff or returned result younger than 24 h that nobody took: taken only by a resume, reassignment, terminal disposition or main's `--ack-handoff` wait recorded at or after the result's own WAL time (whole seconds, no slack; each row's `result_at`), or by the live parent of a nested helper; later owner notes neither revoke an ack nor restart the 24 h window) and `wait-not-user` (a live wait on a ticket, agent or main). An owner's own `waiting` disposition never takes its result. `decision_required` is unchanged.
-- `idle_guard.py reject` (PostToolUseFailure, PermissionDenied, UserPromptSubmit) adds "A rejected question pauses only that question; keep every independent stream moving." after a user rejection, at most once per 30 minutes per session. A rejection may produce no Post event, so the next prompt and the Stop hook also catch it from the transcript. A turn starts only at a human prompt as `provenance.user_authorship()` defines one (string or text blocks, origin `human`); task notifications, peer messages, reminders and tool results do not end the rejected turn.
-- A `waiting` disposition on an ask is per owner: `ah task dispose --kind waiting` refuses an ask that names another owner (`wal_note.py --event ask --owner <agent>`) or is already another owner's live wait.
-- `ah owners` carries `agents_active_1h` (and each row `active_1h`); `ah status` repeats it under `owners`. Collectors that read transcripts skip an unreadable file, never the section.
-- Limits: unreviewed PRs and specs are not looked up over the network; SendMessage is not hooked, so it is not progress.
-
-- **Scoped Go checks (`integrate_local.approved_check`):** `approved_check` also accepts scoped `go vet <pkg...>` and `go test [-race|-count=1|-v] <pkg...>`, where each package is a relative `./` pattern (`./pkg`, `./pkg/...`, `./...`) made of `[A-Za-z0-9_][A-Za-z0-9_.-]*` segments; flags after packages, other flags, absolute, `..` or shell-metacharacter patterns are refused. A fleet `testrun` receipt is not accepted in place of a check.

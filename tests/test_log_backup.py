@@ -177,23 +177,6 @@ class Freshness(Base):
         self.assertEqual(done.returncode, 0)
         self.assertIn(b"ever completed", done.stdout)
 
-    def test_installed_settings_hook_command_prints_the_alert(self):
-        (self.tmp / "inst").mkdir()
-        install.install(self.tmp / "inst", apply=True, durable_tmp=False, log_backup=True)
-        settings = json.loads((self.tmp / "inst" / ".claude" / "settings.json").read_text())
-        hooks = [h for group in settings["hooks"]["SessionStart"] for h in group["hooks"]
-                 if "log_backup.py" in " ".join(h.get("args", []))]
-        self.assertEqual(len(hooks), 1)
-        hook = hooks[0]
-        self.assertEqual(hook["args"][-1], "session-start")
-        (self.tmp / "inst" / ".agent-harness" / "logs").mkdir(parents=True)
-        (self.tmp / "inst" / ".agent-harness" / "logs" / "log-backup.last-ok").write_text(stamp(time.time() - 9000))
-        done = subprocess.run([hook["command"], *hook["args"]], input=b"{}", stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              env={"HOME": str(self.tmp / "inst"), "PATH": os.environ["PATH"]}, timeout=30)
-        self.assertEqual(done.returncode, 0)
-        self.assertIn("LOG BACKUP ALERT", json.loads(done.stdout)["systemMessage"])
-
-
 class Status(Base):
     def test_status_with_no_state_files_does_not_raise(self):
         out = io.StringIO()

@@ -15,7 +15,6 @@ ROOT = Path(__file__).resolve().parents[1]
 HOOKS = ROOT / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
 import ah  # noqa: E402
-import ahd  # noqa: E402
 import workdir  # noqa: E402
 
 NOW = 1_800_000_000.0
@@ -54,31 +53,6 @@ class Base(unittest.TestCase):
 
     def owners(self, now=NOW):
         return ah.owners(self.home, SESSION, now=now)
-
-
-class Deadlines(Base):
-    def test_missed_deadline_is_gated_and_alerted_until_done_or_disposed(self):
-        r = ah.write(self.home, "deadline.add", {"session": SESSION, "at": iso(NOW + 1800), "ref": "GoodQA goodqa#14791",
-                                                 "owner": "handoffowner", "note": "cutover check"}, SESSION, "dl-key-000001")
-        did = r["deadline"]
-        self.assertTrue(did.startswith("dl"))
-        doc = self.owners(now=NOW)
-        self.assertEqual([d["state"] for d in doc["deadlines"]], ["due"])
-        self.assertNotIn(did, doc["undisposed"])
-        alerts = ahd.deadline_alerts({SESSION: doc}, NOW)
-        self.assertEqual(alerts[f"deadline:{did}:due"]["severity"], "warning")
-        doc = self.owners(now=NOW + 3600)
-        self.assertEqual(doc["deadlines"][0]["state"], "missed")
-        self.assertIn(did, doc["undisposed"])
-        alerts = ahd.deadline_alerts({SESSION: doc}, NOW + 3600)
-        self.assertTrue(alerts[f"deadline:{did}:missed"]["detail"]["stop_block"])
-        ah.write(self.home, "deadline.done", {"session": SESSION, "id": did, "note": "checked"}, SESSION, "dl-done-000001")
-        doc = self.owners(now=NOW + 3600)
-        self.assertEqual(doc["deadlines"][0]["state"], "done")
-        self.assertNotIn(did, doc["undisposed"])
-        with self.assertRaises(ah.AhError):
-            ah.write(self.home, "deadline.add", {"session": SESSION, "at": iso(NOW), "ref": "whatever", "owner": "x", "note": "n"},
-                     SESSION, "dl-bad-000001")
 
 
 class HandoffAck(Base):
@@ -196,23 +170,6 @@ class ReviewRound1(Base):
         self.assertEqual(r["result"], "applied")
         audit = [json.loads(x) for x in (ah.store_dir(self.home) / "audit.jsonl").read_text().splitlines()]
         self.assertEqual(audit[-1]["actor"]["agent_id"], "unknown")  # never a claimed "main"
-
-    def test_pretool_hook_denies_a_sub_agent_acknowledgement_by_payload_identity(self):
-        import dropped_gate
-        cmd = "python3 ~/.claude/hooks/ah.py task dispose --agent a1b2c3d4e5f6a7b8c --kind {} --reason x"
-        for kind in ("resumed", "reassigned", "closed"):
-            out = dropped_gate.cmd_pretool({"tool_name": "Bash", "agent_id": "a1b2c3d4e5f6a7b8c",
-                                            "tool_input": {"command": cmd.format(kind)}})
-            self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny", kind)
-        out = dropped_gate.cmd_pretool({"tool_name": "Bash", "agent_id": "a1", "tool_input": {"command": cmd.format("waiting")}})
-        self.assertEqual(out, {})  # a wait is open to everyone
-        out = dropped_gate.cmd_pretool({"tool_name": "Bash", "tool_input": {"command": cmd.format("closed")}})
-        self.assertEqual(out, {})  # main: no agent_id in the payload
-        out = dropped_gate.cmd_pretool({"tool_name": "Bash", "agent_id": "a1", "tool_input": {"command": "ah task list"}})
-        self.assertEqual(out, {})
-        p = subprocess.run([sys.executable, str(HOOKS / "dropped_gate.py"), "pretool"], capture_output=True, text=True, timeout=30,
-                           input=json.dumps({"tool_name": "Bash", "agent_id": "a1", "tool_input": {"command": cmd.format("closed")}}))
-        self.assertIn('"permissionDecision": "deny"', p.stdout)
 
     def test_a_wait_is_bounded_and_its_ticket_must_exist(self):
         """Round 3 M-b: `waiting` was the open path with no upper bound and any ticket text."""
@@ -380,9 +337,14 @@ class ReviewRound5(Base):
         self.assertEqual(ah.write(self.home, "task.dispose", dict(args, ref=self.OPEN_ASK), SESSION, "wait-open-01")["result"],
                          "applied")
         self.stopped_with_note("plaindrop002", "work", NOW - 86400)
-        ah.write(self.home, "task.dispose", dict(args, agent="plaindrop002", ref=self.OPEN_ASK), SESSION, "wait-open-02")
+        with self.assertRaises(ah.AhError):   # goodqa#15943: one open ask excuses one owner, and it is handoffowner's
+            ah.write(self.home, "task.dispose", dict(args, agent="plaindrop002", ref=self.OPEN_ASK), SESSION,
+                     "wait-open-02")
+        second = "w0aaaaaaaaab"
+        jl(self.w / "main.jsonl", [{"at": iso(NOW - 6900), "event": "ask", "id": second, "note": "which region?"}])
+        ah.write(self.home, "task.dispose", dict(args, agent="plaindrop002", ref=second), SESSION, "wait-open-03")
         self.assertNotIn("plaindrop002", self.owners()["undisposed"])
-        jl(self.w / "main.jsonl", [{"at": iso(NOW - 10), "event": "ask_resolved", "ref": self.OPEN_ASK, "note": "answered"}])
+        jl(self.w / "main.jsonl", [{"at": iso(NOW - 10), "event": "ask_resolved", "ref": second, "note": "answered"}])
         self.assertIn("plaindrop002", self.owners()["undisposed"])  # the answer ends the wait; the owner needs a decision
 
     def test_a_retry_with_the_same_key_is_a_duplicate_after_the_clock_or_reachability_moves(self):
@@ -397,48 +359,6 @@ class ReviewRound5(Base):
     def test_abbreviated_flags_are_refused(self):
         with self.assertRaises(SystemExit):
             ah.build_parser().parse_args(["task", "dispose", "--agent", "a1", "--kin", "closed", "--reaso", "x"])
-
-    def test_pretool_matches_real_invocations_only_and_stays_linear(self):
-        import dropped_gate
-
-        def decide(cmd):
-            out = dropped_gate.cmd_pretool({"tool_name": "Bash", "agent_id": "a1", "tool_input": {"command": cmd}})
-            return (out.get("hookSpecificOutput") or {}).get("permissionDecision", "allow")
-        for cmd in ("cd /x && ah task dispose --agent a2 --kind=closed --reason r",
-                    "AH_X=1 python3 /h/ah.py --text task dispose --agent a2 --kind 'resumed'",
-                    "nice -n 5 ~/.claude/hooks/ah.py task dispose --agent a2 --kind legacy",
-                    "ah task dispose --agent a2 --kin closed",
-                    'ah task dispose --agent a2 --kind "$K"',
-                    "echo ok; ah task dispose --agent a2 --kind reassigned --ref a3",
-                    "bash -c 'ah task dispose --agent a2 --kind closed'",
-                    "ah task dispose --agent a2 \\\n  --kind resumed",
-                    "eval \"ah task dispose --agent a2 --kind closed\"",
-                    "bash <<'EOF'\nah task dispose --agent a2 --kind closed\nEOF",
-                    "python3 -c 'import ah; ah.write(h, \"task.dispose\", {\"kind\": \"closed\"}, s)'",
-                    # PR review of 24a786c, F2: combined shell flags and backticks
-                    "bash -lc 'ah task dispose --agent a2 --kind closed'",
-                    "sh -ec 'ah task dispose --agent a2 --kind wontdo --ref x'",
-                    "/bin/zsh -xc \"ah task dispose --agent a2 --kind superseded\"",
-                    "echo `ah task dispose --agent a2 --kind closed`",
-                    "X=`ah task dispose --agent a2 --kind legacy`; echo $X"):
-            self.assertEqual(decide(cmd), "deny", cmd)
-        for cmd in ("grep -n 'task dispose --kind closed' docs/ah-query-spec.md",
-                    "ah task dispose --agent a2 --kind waiting --ref w0123456789a --until 2027-01-01T00:00:00Z "
-                    "--reason 'not --kind closed'",
-                    'git commit -m "docs: ah task dispose --kind closed needs a deploy"',
-                    "cat > notes.md <<'EOF'\nah task dispose --agent a2 --kind closed\nEOF\nwc -l notes.md",
-                    "bash -lc 'ah task dispose --agent a2 --kind waiting --ref w0123456789a --until 2027-01-01T00:00:00Z'",
-                    "bash -l ./script.sh closed"):
-            self.assertEqual(decide(cmd), "allow", cmd)
-        t0 = time.monotonic()
-        decide("task dispose " * 70000)
-        self.assertLess(time.monotonic() - t0, 3.0)
-        big = json.dumps({"tool_name": "Bash", "agent_id": "a1",
-                          "tool_input": {"command": "ah task dispose --agent a2 --kind closed --reason " + "x" * (2 << 20)}})
-        p = subprocess.run([sys.executable, str(HOOKS / "dropped_gate.py"), "pretool"], capture_output=True, text=True,
-                           timeout=60, input=big)  # over the old 1 MiB read cap, which failed open
-        self.assertIn('"permissionDecision": "deny"', p.stdout)
-
 
 if __name__ == "__main__":
     unittest.main()

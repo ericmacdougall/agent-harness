@@ -18,7 +18,6 @@ ROOT = HERE.parent
 HOOKS = ROOT / "harness" / "hooks"
 sys.path.insert(0, str(HOOKS))
 sys.path.insert(0, str(HERE))
-import merge_gate as mg  # noqa: E402
 import peer_review as review  # noqa: E402
 import usage_guard as guard  # noqa: E402
 
@@ -39,15 +38,6 @@ def main_transcript(root):
     return transcript
 
 
-def main_call_stamp(root, repo="o/r", pr=5, age=0, tool_use_id=MAIN_CALL, background=False):
-    """What merge_gate's hook writes for main's peer_review call (goodqa#16811 round 2): a stamp bound to that call.
-    No record of the call is in the transcript yet, so the call is still running when the review takes it."""
-    import caller_identity
-    transcript = main_transcript(root)
-    flags = {"background": True} if background else {}  # passed only when set, so the fixture runs on older bases
-    caller_identity.put_stamp("review-auth", [repo, pr], session=MAIN_SID, home=root, now=time.time() - age,
-                              tool_use_id=tool_use_id, transcript=str(transcript), **flags)
-    return transcript
 
 
 class FakePr:
@@ -194,37 +184,6 @@ class EvidenceFixture(unittest.TestCase):
         return store, reference
 
 
-class ReceiptGateTests(EvidenceFixture):
-    """merge_gate.receipts reads settled PR PASS receipts straight from a real usage store."""
-
-    def found(self, store, repo="o/r", pr=5, commits=(HEAD,)):
-        with mock.patch.dict(os.environ, {"AGENT_HARNESS_USAGE_DIR": str(store.root)}):
-            return mg.receipts(repo, pr, list(commits), mg.load_policy(), time.monotonic() + 5)
-
-    def test_settled_bound_pass_counts(self):
-        store, _ = self.evidence()
-        self.assertEqual([r["head"] for r in self.found(store)], [HEAD])
-        self.assertEqual(self.found(store, repo="O/R"), self.found(store), "owner/repo compares case-insensitively")
-
-    def test_other_pr_block_unsettled_and_invalidated_do_not_count(self):
-        store, _ = self.evidence()
-        self.assertEqual(self.found(store, pr=6), [])
-        self.assertEqual(self.found(store, repo="o/other"), [])
-        blocked, _ = self.evidence({"verdict": "BLOCK", "findings": ["F1"]}, result="CHECK_FAILED",
-                                   reason="CODE_FINDINGS")
-        self.assertEqual(self.found(blocked), [])
-        unsettled, _ = self.evidence(settle=False)
-        self.assertEqual(self.found(unsettled), [])
-        invalid, reference = self.evidence()
-        invalid.invalidate_review(reference, reason="fixture")
-        self.assertEqual(self.found(invalid), [])
-
-    def test_same_harness_review_counts_unless_policy_asks_for_the_other_harness(self):
-        store, _ = self.evidence({"reviewer": "Claude fixture", "reviewer_harness": "claude"})
-        self.assertEqual(len(self.found(store)), 1)
-        policy = dict(mg.load_policy(), require_other_harness=True)
-        with mock.patch.dict(os.environ, {"AGENT_HARNESS_USAGE_DIR": str(store.root)}):
-            self.assertEqual(mg.receipts("o/r", 5, [HEAD], policy, time.monotonic() + 5), [])
 
 
 class SnapshotBaseTests(EvidenceFixture):
@@ -289,7 +248,18 @@ class EndToEndTests(unittest.TestCase):
                            "Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('VERDICT: PASS\\nReviewed.')\n")
         self.fake("claude", "import sys\nsys.stdin.read()\nprint('VERDICT: PASS\\nReviewed.')\n")
         value = {"number": 5, "url": "https://github.com/o/r/pull/5", "headRefOid": self.head, "state": "OPEN"}
-        self.fake("gh", "import json\nprint(json.dumps(" + repr(value) + "))\n")
+        self.fake_gh(value)
+
+    def fake_gh(self, value):
+        """`gh pr view` answers `value`; a bound PR review also posts harness/review and reads it back (2026-11-25)."""
+        statuses = str(self.root / "gh-statuses.json")
+        self.fake("gh", "import json, os, sys\nargs = sys.argv[1:]\nstate = " + repr(statuses) + "\n"
+                        "rows = json.load(open(state)) if os.path.exists(state) else []\n"
+                        "if args[:1] == ['api'] and 'POST' in args:\n"
+                        "    row = dict(json.loads(sys.stdin.read()), id=len(rows) + 1)\n"
+                        "    json.dump([row] + rows, open(state, 'w'))\n    print(json.dumps(row))\n"
+                        "elif args[:1] == ['api']:\n    print(json.dumps(rows))\n"
+                        "else:\n    print(json.dumps(" + repr(value) + "))\n")
 
     def fake(self, name, body):
         path = self.bin / name
@@ -297,73 +267,7 @@ class EndToEndTests(unittest.TestCase):
         path.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + " -c " + shlex.quote(body) + ' "$@"\n')
         path.chmod(0o700)
 
-    def test_review_pass_then_merge_without_separate_waive(self):
-        # A plain bound review (no stamp, no waive) writes the receipt the merge gate reads.
-        output = self.root / "review.md"
-        env = dict(os.environ, HOME=str(self.root), PATH=str(self.bin) + os.pathsep + "/usr/bin:/bin",
-                   AGENT_HARNESS_USAGE_DIR=str(self.root / "usage"),
-                   AGENT_HARNESS_REVIEW_POLICY=str(ROOT / "harness" / "hooks" / "review_policy.json"))
-        result = subprocess.run([
-            sys.executable, str(HOOKS / "peer_review.py"), "pr", "--repo", str(self.repo),
-            "--packet", str(self.packet), "--output", str(output), "--expected-head", self.head,
-            "--github-repo", "o/r", "--pr", "5", "--author-harness", "claude"],
-            text=True, capture_output=True, env=env, timeout=45)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        report = output.read_text()
-        self.assertIn("Reviewed repository: o/r", report)
-        self.assertIn("Reviewed PR: 5", report)
-        final = json.loads(next((self.root / "usage" / "runs").glob("*/final.json")).read_text())
-        self.assertEqual((final["review"]["repo"], final["review"]["pr"], final["review"]["head"]),
-                         ("o/r", 5, self.head))
-        view = {"number": 5, "url": "https://github.com/o/r/pull/5", "headRefOid": self.head, "baseRefName": "main",
-                "state": "OPEN", "commits": [{"oid": self.head}]}
 
-        def gh(args, cwd=None, timeout=None):
-            self.assertNotEqual(args[1:3], ["pr", "merge"], "the gate never merges")
-            return (0, json.dumps(view), "") if args[1:3] == ["pr", "view"] else (1, "", "fixture: no answer")
-        payload = {"tool_name": "Bash", "tool_input": {"command": "gh pr merge 5 --squash"}, "cwd": str(self.repo)}
-        with mock.patch.dict(os.environ, {"AGENT_HARNESS_USAGE_DIR": str(self.root / "usage"),
-                                          "HOME": str(self.root)}):
-            self.assertEqual(mg.decide(payload, self.root / "state", runner=gh)[0], 0)
-            self.assertEqual(mg.decide(payload, self.root / "state", runner=gh)[0], 0, "a receipt is not single use")
-            other = dict(payload, tool_input={"command": "gh pr merge 6"})
-            view.update(number=6, url="https://github.com/o/r/pull/6")
-            self.assertEqual(mg.decide(other, self.root / "state", runner=gh)[0], 2, "another PR is not covered")
-
-    def test_no_main_stamp_leaves_mains_stamp_and_mints_nothing(self):
-        # goodqa#16049: the ahc daemon's bound run on a host where main has a stamp for this exact repo and PR
-        import caller_identity
-        main_call_stamp(self.root)
-        folder = caller_identity.stamp_dir(self.root)
-        before = sorted(p.name for p in folder.iterdir())
-        output = self.root / "daemon.md"
-        env = dict(os.environ, HOME=str(self.root), PATH=str(self.bin) + os.pathsep + "/usr/bin:/bin",
-                   AGENT_HARNESS_USAGE_DIR=str(self.root / "usage"),
-                   AGENT_HARNESS_REVIEW_POLICY=str(ROOT / "harness" / "hooks" / "review_policy.json"))
-        result = subprocess.run([
-            sys.executable, str(HOOKS / "peer_review.py"), "pr", "--repo", str(self.repo),
-            "--packet", str(self.packet), "--output", str(output), "--expected-head", self.head,
-            "--github-repo", "o/r", "--pr", "5", "--no-main-stamp", "--snapshot-base", self.baseline],
-            text=True, capture_output=True, env=env, timeout=45)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertNotIn("Merge authorization:", result.stdout)
-        self.assertEqual(sorted(p.name for p in folder.iterdir()), before, "main's stamp is neither taken nor burnt")
-        self.assertFalse((self.root / ".agent-harness" / "state" / "merge-gate-waivers.jsonl").exists())
-        self.assertIn("Reviewed PR: 5", output.read_text(), "the run still binds to the PR")
-        self.assertIsNotNone(caller_identity.take_stamp("review-auth", ["o/r", 5], home=self.root),
-                             "main can still use its stamp afterwards")
-        # the daemon's own settled FINAL is still merge-eligible evidence for the shared predicate (M-1 C6 needs it)
-        line = next(l for l in result.stdout.splitlines() if l.startswith("Usage receipt: "))
-        reference = json.loads(line[len("Usage receipt: "):])
-        evidence = guard.UsageStore(self.root / "usage").inspect(reference)
-        self.assertEqual((evidence["review"]["repo"], evidence["review"]["pr"], evidence["review"]["head"]),
-                         ("o/r", 5, self.head))
-        self.assertEqual(evidence["review"]["author_harness"], "claude", "derived from the trailers")
-        merge_base = subprocess.check_output(["git", "-C", str(self.repo), "merge-base", self.head,
-                                              "refs/remotes/origin/main"], text=True).strip()
-        self.assertEqual(merge_base, self.baseline, "fixture: the explicit base IS the merge-base")
-        self.assertEqual(evidence["review"]["snapshot_base"], self.baseline,
-                         "explicit base == merge-base still records the key (v2g, main's ruling)")
 
     def reviewed_two_commit_pr(self, *extra):
         # a second PR commit, so the merge-base (baseline) differs from head^1 (self.head)
@@ -374,7 +278,7 @@ class EndToEndTests(unittest.TestCase):
         self.packet.write_text("Scope and evidence.\nReviewed HEAD " + head +
                                "\n$ python3 -m unittest discover tests\nRan 1 test in 0.1s\nOK\nexit 0\n")
         value = {"number": 5, "url": "https://github.com/o/r/pull/5", "headRefOid": head, "state": "OPEN"}
-        self.fake("gh", "import json\nprint(json.dumps(" + repr(value) + "))\n")
+        self.fake_gh(value)
         output = self.root / "two.md"
         env = dict(os.environ, HOME=str(self.root), PATH=str(self.bin) + os.pathsep + "/usr/bin:/bin",
                    AGENT_HARNESS_USAGE_DIR=str(self.root / "usage"),
@@ -404,7 +308,7 @@ class EndToEndTests(unittest.TestCase):
         self.packet.write_text("Scope and evidence.\nReviewed HEAD " + head +
                                "\n$ python3 -m unittest discover tests\nRan 1 test in 0.1s\nOK\nexit 0\n")
         value = {"number": 5, "url": "https://github.com/o/r/pull/5", "headRefOid": head, "state": "OPEN"}
-        self.fake("gh", "import json\nprint(json.dumps(" + repr(value) + "))\n")
+        self.fake_gh(value)
         output = self.root / ("review-%s.md" % head[:12])
         env = dict(os.environ, HOME=str(self.root), PATH=str(self.bin) + os.pathsep + "/usr/bin:/bin",
                    AGENT_HARNESS_USAGE_DIR=str(self.root / "usage"),
@@ -484,21 +388,12 @@ class EndToEndTests(unittest.TestCase):
         self.packet.write_text("Scope and evidence.\nReviewed HEAD " + self.head +
                                "\n$ python3 -m unittest discover tests\nRan 1 test in 0.1s\nOK\nexit 0\n")
         value = {"number": 5, "url": "https://github.com/o/r/pull/5", "headRefOid": self.head, "state": "OPEN"}
-        self.fake("gh", "import json\nprint(json.dumps(" + repr(value) + "))\n")
+        self.fake_gh(value)
         result = self.run_review("--author-harness", "claude")
         self.assertNotIn("Merge authorization:", result.stdout, result.stdout + result.stderr)
         self.assertIn("do not prove the author harness", result.stderr)
 
 
-class GateNoLongerPolicesReviewRuns(unittest.TestCase):
-    """The review-auth stamp and the subagent rule are gone: running a bound review is never a merge."""
-
-    def test_a_subagent_bound_review_is_not_refused(self):
-        command = ("python3 ~/.claude/hooks/peer_review.py pr --repo /w --packet /p --output /o --expected-head "
-                   + HEAD + " --github-repo o/r --pr 5")
-        payload = {"tool_name": "Bash", "tool_input": {"command": command}, "agent_id": "sub1"}
-        with tempfile.TemporaryDirectory() as state:
-            self.assertEqual(mg.decide(payload, Path(state)), (0, ""))
 
 
 if __name__ == "__main__":

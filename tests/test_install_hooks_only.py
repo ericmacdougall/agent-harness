@@ -38,11 +38,11 @@ class HooksOnly(unittest.TestCase):
         install.install(self.home, True, hooks_only=True)
         self.assertEqual((claude / "CLAUDE.md").read_bytes(), user_md)
         self.assertEqual((claude / "settings.json").read_bytes(), user_settings)
-        self.assertTrue((claude / "hooks" / "commit_policy.py").is_file())
+        self.assertTrue((claude / "hooks" / "peer_review.py").is_file())
         self.assertTrue((claude / "hooks" / "ah_kill.py").is_file())
         # a second hooks-only run backs up the replaced hook files
         install.install(self.home, True, hooks_only=True)
-        backups = list((claude / "agent-harness-backups").glob("*/hooks/commit_policy.py"))
+        backups = list((claude / "agent-harness-backups").glob("*/hooks/peer_review.py"))
         self.assertTrue(backups)
         self.assertEqual((claude / "CLAUDE.md").read_bytes(), user_md)
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Mission Control chat store (GoodQA #15585): the file inbox/outbox shared by the dashboard server, the
-`mc_inbox.py` CLI that Claude main and Codex use, and read-only mirrors.
+`mc_inbox.py` CLI that Claude main and Codex used (deleted in release 1001: the Claude route is gone; the Codex switch
+remains), and read-only mirrors.
 
 Layout under MC_HOME (default ~/.agent-harness/mission-control, directories 0700, files 0600, atomic renames):
 
@@ -9,7 +10,7 @@ Layout under MC_HOME (default ~/.agent-harness/mission-control, directories 0700
     chat/outbox/<rid>.json    mc.chat/1 reply (reply_to = inbox id); Codex rewrites it while streaming
     chat/state/<id>.json      delivery status of an inbox message
     chat/keys/<sha>.json      client idempotency key -> inbox id
-    chat/targets/<sid>.json   Claude sessions that registered with `mc_inbox.py wait`
+    chat/targets/<sid>.json   Claude sessions that registered with `mc_inbox.py wait` (none since release 1001)
     chat/blocks/<sid>.json    Stop-hook block ledger (cooldown and hourly cap)
     chat/approvals/<sha>.json the one decision record of a session's ask (sha of session and ask id)
     chat/nudges/<sid>.json    when the hook last told a session its waiter is not running
@@ -913,7 +914,9 @@ def frame(record: dict) -> str:
         fence = "=" * 4 + secrets.token_hex(6) + "=" * 4
     owner = owner_recipient(record.get("owner"), record.get("to"), record.get("session"))
     route = ""
-    reply_instruction = f"Reply with: python3 ~/.claude/hooks/mc_inbox.py reply {record.get('id')}  (reply text on stdin)"
+    # Release 1001 deleted mc_inbox.py, so a Claude main can no longer attach to the dashboard or reply through it.
+    reply_instruction = ("Answer in your session; the dashboard has no Claude reply route since release 1001 (mc_inbox.py "
+                         "was removed), so the owner reads the answer there")
     if supervised(record):
         route = f" owner=openai:{owner['name']} generation={owner['generation']}"
         reply_instruction = "Return your answer normally. The supervisor captures it; the verified dashboard bridge publishes the reply."
@@ -1013,7 +1016,7 @@ def deliver_block(records, root: Path | None = None, home_dir: Path | None = Non
     out = []
     for record in sorted(records, key=lambda r: (str(r.get("created") or ""), str(r.get("id") or ""))):
         rid = record.get("id")
-        close = f"python3 ~/.claude/hooks/mc_inbox.py reply {rid} --text '<one line: answered in ...>'"
+        close = f"say so in your session (dashboard message {rid}; no Claude reply route since release 1001)"
         approval = record.get("approval")
         if isinstance(approval, dict) and _approval_ok(approval, str(record.get("session"))):
             closed = ask_closed_at(str(record.get("session")), approval["wal"], approval["ask_id"], home_dir)

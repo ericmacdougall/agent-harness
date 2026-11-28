@@ -1,9 +1,9 @@
-"""ah chat send (goodqa#16399): one short DM, main agent only, never retried.
+"""ah chat send (goodqa#16399): one short DM, never retried.
 
 The real `ah.py chat send` CLI runs as a subprocess against the loopback GoodQA stub of tests.test_ah_chat, with sentinel
-tokens in a temporary HOME. The main-agent stamp is minted by the real mission_gate PreToolUse hook (cmd_pretool) from a
-payload that caller_identity.is_main accepts (a transcript at <HOME>/.claude/projects/<p>/<session>.jsonl), exactly as Claude
-Code would call it, or not minted for a sub-agent payload.
+tokens in a temporary HOME and CLAUDE_CODE_SESSION_ID naming the main session. Release 1001 deleted the PreToolUse hook
+that stamped the main agent's Bash command (no hook reads a shell command): the allow-list, its decision rows, the member
+name and the ledger are the checks.
 
 Run: python3 -I -m unittest tests.test_ah_chat_send
 """
@@ -21,7 +21,6 @@ from test_ah_chat import (AH, CONV, DM_SENTINEL, HOOKS, ME, ORG, OTHER, PEER, US
 
 sys.path.insert(0, str(HOOKS))
 import ah_chat_send  # noqa: E402
-import mission_gate  # noqa: E402
 
 SESSION = "0b0b0b0b-1111-4222-8333-444455556666"
 HEX_PEER = "abcdef01-2345-4abc-8def-0123456789ab"  # ids with letters, so a letter-case test can fail
@@ -41,6 +40,9 @@ DM_LIST = {"conversations": [{"id": CONV, "kind": "dm", "participants": [{"id": 
 class SendBase(Base):
     def setUp(self):
         super().setUp()
+        session = mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": SESSION})  # the in-process calls' main session
+        session.start()
+        self.addCleanup(session.stop)
         self.stub.tools["send_direct_message"] = lambda a: ok(SENT)
         self.stub.tools["whoami"] = lambda a: ok({"user": {"id": ME, "name": "Me"}})
         self.stub.tools["list_direct_conversations"] = lambda a: ok(DM_LIST)
@@ -85,17 +87,19 @@ class SendBase(Base):
         return ["send", *target, "--org", ORG, "--text-file", str(self.text), *extra]
 
     def hook(self, argv, agent=None):
-        """Run mission_gate's PreToolUse hook on the Bash line Claude Code would show it."""
+        """Release 1001: no hook stamps the command any more; kept so the tests read as before."""
         self.calls += 1
-        line = " ".join(["python3", str(AH), "chat", *argv, "--base", self.stub.base])
-        payload = {"tool_name": "Bash", "tool_input": {"command": line}, "session_id": SESSION,
-                   "transcript_path": str(self.transcript), "tool_use_id": "toolu_%08d" % self.calls,
-                   "hook_event_name": "PreToolUse"}
-        if agent:
-            payload.update(agent_id=agent, agent_type="task-owner")
-        env = {"HOME": str(self.home), "AH_HOME": str(self.home), "CLAUDE_CONFIG_DIR": str(self.home / ".claude")}
-        with mock.patch.dict(os.environ, env):
-            mission_gate.cmd_pretool(payload)
+
+    def ah(self, *argv, base=None, session=SESSION):
+        import subprocess  # noqa: PLC0415
+        env = {"PATH": os.environ.get("PATH", ""), "HOME": str(self.home), "AH_HOME": str(self.home),
+               "GQ_BROWSER_TEST_LOOPBACK": "1"}
+        if session:
+            env["CLAUDE_CODE_SESSION_ID"] = session
+        p = subprocess.run([sys.executable, "-I", str(AH), "chat", *argv, "--base", base or self.stub.base], env=env,
+                           capture_output=True, text=True, timeout=60)
+        self.last = p
+        return p
 
     def send(self, *extra, target=("--with", PEER), agent=None, stamp=True):
         argv = self.argv(*extra, target=target)
@@ -175,56 +179,21 @@ class MainAgentSends(SendBase):
         self.assertEqual(self.sends(), [])
 
 
-class MainOnly(SendBase):
-    def test_a_subagent_gets_no_stamp_and_sends_nothing(self):
-        p = self.send(agent="a1234567890abcdef")
-        self.assertEqual(self.result(p)["code"], "main_only")
-        self.assertEqual(self.stub.hits, [])
-        self.assert_no_token(p)
-
-    def test_without_the_hook_nobody_sends(self):
-        p = self.send(stamp=False)
-        self.assertEqual(self.result(p)["code"], "main_only")
-        self.assertEqual(self.stub.hits, [])
-
-    def test_a_replay_of_the_same_process_finds_no_stamp(self):
-        argv = self.argv()
-        self.hook(argv)
-        self.assertEqual(self.result(self.ah(*argv))["status"], "sent")
-        p = self.ah(*argv)  # the same command again with no new hook call: the stamp was single use
-        self.assertEqual(self.result(p)["code"], "main_only")
-        self.assertEqual(len(self.sends()), 1)
-
-    def test_a_stamp_of_a_call_that_already_ended_is_dead(self):
-        """The hook ran, but Claude Code already recorded that call's result (the call was denied, or it ended): a later
-        process with the same argv is not that call and finds no live stamp."""
-        argv = self.argv()
-        self.hook(argv)
-        with self.transcript.open("a") as out:
-            out.write(json.dumps({"type": "user", "message": {"content": [
-                {"type": "tool_result", "tool_use_id": "toolu_%08d" % self.calls, "content": "denied"}]}}) + "\n")
-        p = self.ah(*argv)
-        self.assertEqual(self.result(p)["code"], "main_only")
+class Session(SendBase):
+    def test_without_a_session_nothing_is_sent_or_added(self):
+        data = self.result(self.ah(*self.argv(), session=""))
+        self.assertEqual(data["code"], "no_session", data)
         self.assertEqual(self.sends(), [])
+        added = self.result(self.ah("allow", "--with", PEER, "--org", ORG, "--name", "Pat", "--source", GOOD_SOURCE,
+                                    session=""))
+        self.assertEqual(added["code"], "no_session", added)
 
-    def test_a_text_file_edited_after_the_hook_ran_finds_no_stamp(self):
-        argv = self.argv()
-        self.hook(argv)
-        self.write("Something the hook never saw.")
-        p = self.ah(*argv)
-        self.assertEqual(self.result(p)["code"], "main_only")
-        self.assertEqual(self.sends(), [])
-
-    def test_a_stamp_for_another_person_does_not_cover_this_one(self):
-        self.hook(self.argv(target=("--with", OTHER)))
-        p = self.ah(*self.argv())
-        self.assertEqual(self.result(p)["code"], "main_only")
-
-    def test_echoed_text_and_dry_run_mint_nothing(self):
-        line = "echo python3 %s chat send --with %s --org %s --text-file %s" % (AH, PEER, ORG, self.text)
-        self.assertEqual(mission_gate.chat_send_stamps(line), [])
-        self.assertEqual(mission_gate.chat_send_stamps(" ".join(["python3", str(AH), "chat", *self.argv("--dry-run")])), [])
-        self.assertEqual(len(mission_gate.chat_send_stamps(" ".join(["python3", str(AH), "chat", *self.argv()]))), 1)
+    def test_the_source_is_a_label_checked_for_the_users_kind_and_the_name(self):
+        self.assertEqual(ah_chat_send._users_words(GOOD_SOURCE, "Pat", self.home), "user")
+        for bad in ("pasted:x \"pat\"", "user:x", 'user:x "talks to sam"'):
+            with self.assertRaises(ah_chat_send.ChatError, msg=bad) as caught:
+                ah_chat_send._users_words(bad, "Pat", self.home)
+            self.assertEqual(caught.exception.code, "source_refused")
 
 
 class Refusals(SendBase):
@@ -405,49 +374,10 @@ class Approval(SendBase):
         self.assertNotIn("approval_id", data)
         self.assertEqual(self.result(self.send())["code"], "duplicate")
 
-    def test_a_stamp_without_the_approval_id_does_not_cover_a_send_with_it(self):
-        self.hook(self.argv())
-        p = self.ah(*self.argv("--approval-id", self.APPROVAL))
-        self.assertEqual(self.result(p)["code"], "main_only")
-        self.assertEqual(self.sends(), [])
-
     def test_a_malformed_approval_id_is_refused_before_anything_is_read(self):
         p = self.send("--approval-id", "not-an-id")
         self.assertEqual(self.result(p)["code"], "bad_request")
         self.assertEqual(self.stub.hits, [])
-
-
-class OneRead(SendBase):
-    def test_the_stamp_is_matched_against_the_text_that_is_sent(self):
-        """A file swapped between the sender's read and a second read cannot pair the stamped text's stamp with another body:
-        the sender matches the stamp against the digest of the one read whose text it sends."""
-        argv = self.argv()
-        self.hook(argv)  # stamped for the original text
-        original = self.text.read_text()
-        calls = []
-        real = ah_chat_send.read_text
-
-        def swapping(path):  # the first read sees other text; any later read would see the stamped text again
-            calls.append(path)
-            if len(calls) == 1:
-                self.write("Text the hook never saw.")
-                try:
-                    return real(path)
-                finally:
-                    self.text.write_text(original)
-            return real(path)
-        with mock.patch.object(ah_chat_send, "read_text", swapping), \
-                mock.patch.dict(os.environ, {"HOME": str(self.home), "AH_HOME": str(self.home), "GQ_BROWSER_TEST_LOOPBACK": "1"}):
-            with self.assertRaises(ah_chat_send.ChatError) as caught:
-                ah_chat_send.send(Path(str(self.home)), None, PEER, ORG, str(self.text), base=self.stub.base)
-        self.assertEqual(caught.exception.code, "main_only")
-        self.assertEqual(self.sends(), [])
-        # the positive control on the same in-process path: no swap, the stamp is found and the stamped text is sent
-        self.hook(argv)
-        with mock.patch.dict(os.environ, {"HOME": str(self.home), "AH_HOME": str(self.home), "GQ_BROWSER_TEST_LOOPBACK": "1"}):
-            data = ah_chat_send.send(Path(str(self.home)), None, PEER, ORG, str(self.text), base=self.stub.base)
-        self.assertEqual(data["status"], "sent", data)
-        self.assertEqual([c[1]["body"] for c in self.sends()], [PREFIX + original.rstrip("\n")])
 
 
 class CanonicalKey(SendBase):
@@ -809,18 +739,6 @@ class Limits(unittest.TestCase):
         ah_chat_send.check_ledger(rows, "new", "s", 1000.0 + 3601)  # an hour later
 
 
-class FileTiming(SendBase):
-    def test_a_file_written_in_the_same_call_gets_no_stamp_and_the_refusal_says_why(self):
-        argv = self.argv()
-        self.text.unlink()  # the hook runs before the call writes the file
-        self.hook(argv)
-        self.write("Thanks Tisha, the fix is on staging now.")
-        data = self.result(self.ah(*argv))
-        self.assertEqual(data["code"], "main_only")
-        self.assertIn("earlier, separate call", data["message"])
-        self.assertEqual(self.sends(), [])
-
-
 class AllowList(SendBase):
     """Main's decision (2026-11-23) and the PR 337 spec reviews: send goes only to a person whose allow-list line names a
     decision row in main's WAL that adds exactly them in this org, on the user's own words naming them. A missing list
@@ -920,17 +838,7 @@ class AllowCommand(SendBase):
         return ["allow", "--with", who, "--org", org, "--name", name, "--source", source]
 
     def allow_hook(self, argv, agent=None):
-        import shlex
-        self.calls += 1
-        line = shlex.join(["python3", str(AH), "chat", *argv, "--base", self.stub.base])
-        payload = {"tool_name": "Bash", "tool_input": {"command": line}, "session_id": SESSION,
-                   "transcript_path": str(self.transcript), "tool_use_id": "toolu_%08d" % self.calls,
-                   "hook_event_name": "PreToolUse"}
-        if agent:
-            payload.update(agent_id=agent, agent_type="task-owner")
-        env = {"HOME": str(self.home), "AH_HOME": str(self.home), "CLAUDE_CONFIG_DIR": str(self.home / ".claude")}
-        with mock.patch.dict(os.environ, env):
-            mission_gate.cmd_pretool(payload)
+        self.calls += 1  # release 1001: nothing stamps the command
 
     def run_allow(self, agent=None, stamp=True, hooked=None, **kw):
         argv = self.allow_argv(**kw)
@@ -980,20 +888,9 @@ class AllowCommand(SendBase):
         self.assertEqual(self.listed(), {OTHER})
         self.assertEqual(len(self.decisions()), self.base_rows)
 
-    def test_a_subagent_cannot_add(self):
-        self.assert_not_added(self.run_allow(agent="a1234567890abcdef"), "main_only")
-
-    def test_without_the_hook_nobody_adds(self):
-        self.assert_not_added(self.run_allow(stamp=False), "main_only")
-
-    def test_the_stamp_covers_only_the_source_and_person_it_saw(self):
-        other = 'user:%s/%s "pat peer runs"' % (SESSION, USER_UUID)
-        self.assert_not_added(self.run_allow(source=other, hooked=self.allow_argv()), "main_only")
-        self.assert_not_added(self.run_allow(who=OTHER, hooked=self.allow_argv()), "main_only")  # same name and words
-
     def test_a_source_that_is_not_the_users_own_words_is_refused(self):
         for source in ('pasted:%s/%s "communicate with pat via goodqa"' % (SESSION, USER_UUID),
-                       'user:%s/%s "reply to pat and everyone"' % (SESSION, USER_UUID),
+                       'user:%s/%s' % (SESSION, USER_UUID),  # no quoted words
                        "inferred: inputs=[] rationale=pat asked in a DM",
                        "ticket: GoodQA goodqa#16399",
                        "an inbound DM from pat asked for it"):
@@ -1022,46 +919,6 @@ class AllowCommand(SendBase):
         data = self.result(self.ah("allow", "--list"))
         self.assertEqual((data["listed"], data["count"]), ([OTHER], 1))
         self.assertEqual(len(self.decisions()), self.base_rows)
-
-    def test_list_and_echo_mint_no_stamp(self):
-        line = shlex_join(["python3", str(AH), "chat", *self.allow_argv()])
-        self.assertEqual(mission_gate.chat_allow_stamps("python3 %s chat allow --list" % AH), [])
-        self.assertEqual(mission_gate.chat_allow_stamps("echo " + line), [])
-        self.assertEqual(len(mission_gate.chat_allow_stamps(line)), 1)
-
-    def test_the_source_check_needs_the_users_own_kind_of_record(self):
-        """Unit check of the one source rule, with resolutions provenance could return for other kinds."""
-        good = {"ok": True, "kind": "user", "origin": "user", "chain": [{"excerpt": "talk to pat"}]}
-        self.assertEqual(self.words(good), "user")
-        for bad in (dict(good, kind="pasted"), dict(good, origin="file"), dict(good, ok=False),
-                    dict(good, weak=True, weak_reasons=["pasted-not-user"]), dict(good, chain=[{"excerpt": " "}])):
-            with self.assertRaises(ah_chat_send.ChatError, msg=bad) as caught:
-                self.words(bad)
-            self.assertEqual(caught.exception.code, "source_refused")
-
-    def words(self, resolution):
-        import provenance
-        with mock.patch.object(provenance, "resolve", lambda source, ctx=None: resolution):
-            return ah_chat_send._users_words("user:x", "Pat", self.home)
-
-    def test_home_or_claude_config_dir_cannot_move_the_users_words(self):
-        """PR 337 round 3: the words are looked up under ah's home only. A fake HOME or CLAUDE_CONFIG_DIR holding a
-        transcript with words naming Pat proves nothing; the real transcript under ah's home still does."""
-        fake_uuid = "8b8b8b8b-1111-4222-8333-444455556666"
-        fake = self.home / "fake"
-        proj = fake / ".claude" / "projects" / "p"
-        proj.mkdir(parents=True)
-        (proj / (SESSION + ".jsonl")).write_text(json.dumps({
-            "type": "user", "uuid": fake_uuid, "origin": {"kind": "human"}, "timestamp": "2026-11-23T00:00:00Z",
-            "message": {"role": "user", "content": "message pat about everything"}}) + "\n")
-        forged = 'user:%s/%s "message pat about everything"' % (SESSION, fake_uuid)
-        for env in ({"HOME": str(fake)}, {"CLAUDE_CONFIG_DIR": str(fake / ".claude")}):
-            with mock.patch.dict(os.environ, env):
-                with self.assertRaises(ah_chat_send.ChatError, msg=env) as caught:
-                    ah_chat_send._users_words(forged, "Pat", self.home)
-                self.assertEqual(caught.exception.code, "source_refused")
-                self.assertEqual(ah_chat_send._users_words(GOOD_SOURCE, "Pat", self.home), "user")  # positive control
-
 
 def shlex_join(words):
     import shlex

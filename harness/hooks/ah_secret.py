@@ -8,8 +8,10 @@ model, an argv, an environment of this process's children (except `exec`'s), a l
     ah secret list [--store ...] [--project P]
     ah secret rm NAME [--store ...] [--project P]
 
-Any agent may run put, exec and list: the value never reaches its output. `rm` is gated by the command guard (Fable,
-Astra or a supervisor session); this tool cannot tell who calls it.
+Any agent may run put, exec and list: the value never reaches its output. `rm` deletes, so it runs only for the owner
+(a terminal outside any agent) or a session launched or recorded as a supervisor (ah_roles.launch_role); a worker or
+reviewer is refused with the command the owner runs. The command guard that once judged these commands is deleted;
+this tool runs outside the sandbox (sandbox_base.json harness_tools), so the role check here is the only gate.
 
 put prints only name, store, version id and byte length per secret, never the value or a hash of it. The value is
 stripped of surrounding whitespace (a copied key often carries a newline) unless --raw. After every secret is stored
@@ -432,9 +434,19 @@ def cmd_list(args, conf):
     return {'ok': True, 'store': store.kind, 'names': store.names()}
 
 
+RM_ROLES = ('owner', 'supervisor')
+
+
 def cmd_rm(args, conf):
     if not NAME_RE.match(args.name):
         raise SecretError('bad_request', 'NAME must be 1-255 letters, digits, _ or -')
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import ah_roles  # noqa: PLC0415 - a sibling module
+    role, source = ah_roles.role_and_source()
+    if role not in RM_ROLES:
+        raise SecretError('refused', 'ah secret rm deletes a secret, which only the owner or a supervisor does; this '
+                          f'session is a {role} ({source}). The owner runs `ah secret rm {args.name}` in his own '
+                          'terminal', 3)
     store = open_store(args.store, args.project, conf)
     store.remove(args.name)
     return {'ok': True, 'removed': args.name, 'store': store.kind}
@@ -463,7 +475,7 @@ def parser():
     ls = sub.add_parser('list', help='secret names only')
     ls.add_argument('--store')
     ls.add_argument('--project')
-    rm = sub.add_parser('rm', help='delete a secret (the guard allows it for Fable, Astra and supervisors)')
+    rm = sub.add_parser('rm', help='delete a secret (the owner or a supervisor only)')
     rm.add_argument('name')
     rm.add_argument('--store')
     rm.add_argument('--project')

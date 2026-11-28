@@ -58,7 +58,7 @@ SECRET_NAMES = (".env*", "*.pem", "*.key", "id_rsa*", "id_dsa*", "id_ecdsa*", "i
                 "*.jks", "*kubeconfig*", ".htpasswd", ".dockercfg", "*.docker/config.json", ".s3cfg", ".boto",
                 ".git-credentials")
 REBUILDABLE = frozenset(("node_modules", ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
-                         ".next", ".nuxt", ".turbo", ".parcel-cache", ".gradle", ".tox"))
+                         ".next", ".nuxt", ".turbo", ".parcel-cache", ".gradle", ".tox", ".build"))
 _DEADLINE = [None, None]   # set by save(): no git call outlives the caller's budget, no network step its share
 _HOOKS_OFF: dict = {}
 
@@ -535,6 +535,13 @@ def _bundle(f, want, saved, path):
         raise SaveError("the bundle would be written inside the checkout")
     refs = {("refs/" if name.startswith(("heads/", "tags/")) else "refs/heads/rescue/") + name: sha
             for name, sha in want.items()}
+    # a ref whose commit is already reachable from a commit proven on the remote needs no bundle (git bundle would
+    # leave it out, or refuse an empty bundle when every ref is like that)
+    where = f["toplevel"] or f["git_dir"]
+    refs = {ref: sha for ref, sha in refs.items()
+            if not any(_git(where, "merge-base", "--is-ancestor", sha, s)[0] == 0 for s in saved)}
+    if not refs:
+        return {}
     _mkdirs(os.path.dirname(path))
     part = "%s.%d.tmp" % (path, os.getpid())
     try:
@@ -619,6 +626,8 @@ def _store(repo, f, tips, where, checked) -> dict:
             return dict(out, where="remote", url=ah_log_push.shown_url(dest["url"]), refs=refs)
     path = _home("rescue", where + ".bundle")
     refs = _bundle(f, want, saved, path)
+    if not refs:   # every unsaved tip is already inside what the remote holds: nothing to save
+        return out
     origin = ah_log_push.shown_url(f["real_remote"] or f["origin"] or "")
     restore = ("git clone %s back && git -C back fetch %s 'refs/*:refs/rescued/*'" % (origin, path)
                if saved and origin else "git clone %s back" % path)   # leaving out commits gives prerequisites

@@ -1,8 +1,9 @@
 """Dropped-owner gate: a Stop hook that blocks the main agent's turn from ending, once per set of owners, while a
 DROPPED owner of the session (one that stopped without a handoff) has no live disposition (GoodQA goodqa#14791,
 NEVER-LOSE.md invariant I1). Since 2026-11-24 this is the one blocking Stop case the context budget keeps: a missed
-deadline or an unacknowledged handoff gets one advisory line instead, a set already blocked once stays silent, and
-the SubagentStop side never blocks (one advisory line, and the owner is marked DROPPED at once).
+deadline or an unacknowledged handoff gets one advisory line instead, and a set already blocked once stays silent.
+Release 1001 registers only this Stop side (and Codex's Stop through codex/hooks/wal.py): the SubagentStop advisory and
+the PreToolUse(Bash) check that read `ah task dispose` commands are deleted, because no hook reads a shell command.
 
 Evidence: on 2026-11-05 21:10Z `ah owners` listed 12 DROPPED owners and the main agent wrote "0 dropped"; the
 half-hourly prompt only advised. This hook is deterministic: it reads `ah.owners` (the shared liveness rule and the
@@ -16,7 +17,6 @@ import contextlib
 import hashlib
 import json
 import os
-import re
 import sys
 import time
 from pathlib import Path
@@ -65,21 +65,23 @@ def is_dead(agent: str, r: dict) -> bool:
 
 
 def message(undisposed: list, rows: dict) -> str:
-    """At most CONTEXT_CAP characters: the owners, then the one command (with its kinds) that records a decision."""
-    names = []
-    for agent in undisposed:
-        r = rows.get(agent) or {}
-        if agent.startswith("dl") and not r:
-            names.append(f"deadline {agent} missed")
-        elif "handoff-unacked" in (r.get("flags") or []):
-            names.append(f"{agent} handed off {_age(r)} ago, unacknowledged")
-        else:
-            names.append(f"{agent} DROPPED {_age(r)} ({r.get('ticket') or 'no ticket'})")
-    shown = "; ".join(names[:6]) + (f"; +{len(names) - 6} more" if len(names) > 6 else "")
-    text = (f"Owner(s) with no recorded decision (goodqa#14791): {shown}. Record one each: `ah task dispose --agent ID "
-            "--kind resumed` (after resuming), or --kind reassigned --ref NEW_ID, --kind waiting --ref ASK_OR_TICKET "
-            "--until ISO, --kind closed --reason R --deployed WAL_ID --live-test TEST_ID, --kind superseded|wontdo --ref "
-            "TICKET --reason R. Detail: ah owners.")
+    """At most CONTEXT_CAP characters: one line per kind of subject, each with the command that settles it. A
+    finished owner takes a free-text reason, nothing else (release 1001: no deploy evidence, no ticket grammar)."""
+    deadlines = [a for a in undisposed if a.startswith("dl") and not rows.get(a)]
+    handoffs = [a for a in undisposed if a not in deadlines and "handoff-unacked" in ((rows.get(a) or {}).get("flags") or [])]
+    dropped = [a for a in undisposed if a not in deadlines and a not in handoffs]
+    lines = ["Owner(s) with no recorded decision (detail: ah owners):"]
+    if deadlines:
+        lines.append(f"deadline {', '.join(deadlines[:3])} missed: `ah deadline done --id {deadlines[0]}` once it is met")
+    for agent in handoffs[:3]:
+        lines.append(f"{agent} handed off {_age(rows.get(agent) or {})} ago, unacknowledged: `ah task dispose --agent "
+                     f"{agent} --kind resumed` (you took it) or --kind reassigned --ref NEW_ID")
+    if dropped:
+        shown = ", ".join(f"{a} ({_age(rows.get(a) or {})})" for a in dropped[:4])
+        more = f" +{len(dropped) - 4} more" if len(dropped) > 4 else ""
+        lines.append(f"DROPPED {shown}{more}: `ah task dispose --agent ID --kind finished --reason 'WHY'`, or --kind "
+                     "resumed, reassigned --ref NEW_ID, waiting --ref 'WHAT' --until ISO, superseded|wontdo --reason 'WHY'")
+    text = "\n  - ".join(lines)
     return text if len(text) <= CONTEXT_CAP else text[:CONTEXT_CAP - 3] + "..."
 
 
@@ -155,380 +157,18 @@ def cmd_stop(payload: dict, now: float | None = None) -> dict:
     return {"decision": "block", "reason": text}
 
 
-PENDING_EVENTS = ("intent", "scope", "status", "check", "risk", "decision", "commit", "blocker")
-LIFECYCLE_EVENTS = ("pretool", "subagent", "subagent_stop", "prompt", "session", "pending_stop")  # wal.py metadata (review Part 3 #8)
-
-
-def pending_work(home: Path, session: str, agent: str) -> str | None:
-    """Why the agent's own WAL says its work is unfinished, or None (handoff/result/named wait/empty)."""
-    import ah  # noqa: PLC0415
-    import liveness  # noqa: PLC0415
-    path = ah.session_dir(home, session) / f"agent-{agent}.jsonl"  # either WAL root
-    if not path.is_file():
-        return None
-    last = None
-    with open(path, "rb") as fh:
-        for raw in fh:
-            try:
-                rec = json.loads(raw)
-            except ValueError:
-                continue
-            if (isinstance(rec, dict) and rec.get("event") and not rec.get("by")
-                    and rec.get("event") not in LIFECYCLE_EVENTS):  # hook metadata rows are not the owner's own entries
-                last = rec
-    if not last:
-        return None
-    event, note = str(last.get("event")), str(last.get("note") or "")
-    if event in ("handoff", "result") or liveness.waiting_on(note):
-        return None
-    if event in PENDING_EVENTS:
-        return f"last WAL entry is an open {event}"
-    return None
-
-
-def armed_waiter(agent: str, home: Path | None = None) -> bool:
-    """A live ah-run job attributed to the agent counts as an armed waiter: its completion record will notify.
-    Read from the launcher's ledger directory (~/.agent-harness/reserve/ledger/<run>.json, one row per run, `agent`
-    attribution, `end` set when the run finished; docs/observer.md). No ledger dir, or no live row: not armed."""
-    import safe_input  # noqa: PLC0415
-    home = home or Path(os.environ.get("AH_HOME") or Path.home())
-    ledger = home / ".agent-harness" / "reserve" / "ledger"
-    try:
-        entries = sorted(os.scandir(ledger), key=lambda e: e.name)[-500:]
-    except OSError:
-        return False
-    for entry in entries:
-        if not entry.name.endswith(".json") or not entry.is_file(follow_symlinks=False):
-            continue
-        try:
-            row = safe_input.safe_json_loads(safe_input.read_bounded(Path(entry.path), 65536).decode("utf-8", "replace"))
-        except Exception:  # noqa: BLE001 - a torn row is not a waiter
-            continue
-        if isinstance(row, dict) and row.get("agent") == agent and not row.get("end"):
-            return True
-    return False
-
-
-def cmd_subagent_stop(payload: dict, now: float | None = None) -> dict:
-    session = str(payload.get("session_id") or "")
-    agent = str(payload.get("agent_id") or "")
-    if not session or not agent or "/" in session or "/" in agent:
-        return {}
-    home = Path(os.environ.get("AH_HOME") or Path.home())
-    try:
-        why = pending_work(home, session, agent)
-    except Exception:  # noqa: BLE001
-        return {}
-    if not why or armed_waiter(agent, home):
-        return {}
-    state = load_state(session)
-    seen = state.setdefault("subagent_blocks", {})
-    if payload.get("stop_hook_active") or seen.get(agent):
-        return {}
-    seen[agent] = (now or time.time())
-    save_state(session, state)
-    try:  # advisory, never a block (2026-11-24): the owner is DROPPED now, so main's gate asks for its decision
-        import ah  # noqa: PLC0415
-        import datetime as dt  # noqa: PLC0415
-        ts = dt.datetime.fromtimestamp(now or time.time(), dt.timezone.utc).isoformat()  # microseconds, like wal.py
-        ah.write(home, "task.pending", {"agent": agent, "session": session, "at": ts}, session,
-                 f"pending:{session[:16]}:{agent}:{int((now or time.time()) // 600)}")
-    except Exception:  # noqa: BLE001 - the marker is best effort; the message still says what happened
-        pass
-    text = (f"Sub-agent {agent} ended with pending work ({why}) and no handoff; it is now DROPPED. Record the wait "
-            f"with `ah task dispose --agent {agent} --kind waiting --ref <ask id or GoodQA ticket> --until <ISO>`, or "
-            "write a handoff.")
-    return {"systemMessage": "dropped-owner gate: " + text[:CONTEXT_CAP]}
-
-
-ACK_KINDS = ("resumed", "reassigned", "closed", "legacy", "superseded", "wontdo")
-PRETOOL_MAX = 100_000  # larger commands are judged by a cheap substring test (round 5, minor 2: no regex backtracking)
-_WRAPPERS = {"env", "nice", "command", "exec", "time", "nohup", "timeout", "sudo", "stdbuf", "builtin"}
-_WRAPPER_VALUE_OPTIONS = {"-u", "-n", "-s", "-k", "-g", "-C", "-U", "-S", "-p", "-D", "-o", "-e", "-i"}
-_DURATION = re.compile(r"^[0-9]+(?:\.[0-9]+)?[smhd]?$")
-_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-_SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "fish"}
-_SHELL_C = re.compile(r"^-[A-Za-z]*c[A-Za-z]*$")  # a short-option cluster that carries -c
-_KIND_WORD = re.compile(r"\b(?:" + "|".join(ACK_KINDS) + r")\b|ack[-_]handoff")
-
-
-def _segments(cmd: str, bodies=None):
-    """Simple commands (lenient shell words, shellwords.py): split at unquoted ; & | && || ( ) and newlines, a quoted or
-    escaped `;` is part of a word, a balanced `$(...)` or backtick span is one computed word (its text goes to
-    `bodies`), a here-document is recognised only as the shell would see one and rides on its Command. None when
-    the words cannot be known without running the shell: an unbalanced quote or `<(`, or an oversized line."""
-    from shellwords import split_commands  # noqa: PLC0415
-    return split_commands(cmd, lenient=True, bodies=bodies, limit=PRETOOL_MAX)
-
-
-def _skip_wrappers(seg: list) -> int:
-    """Index of the first word after leading VAR=x assignments and wrapper commands (env, nice, timeout, sudo ...) with
-    their options, option values and `timeout`'s duration. `command -v ah` runs nothing: len(seg)."""
-    i = 0
-    while i < len(seg):
-        word = seg[i]
-        if _ASSIGNMENT.match(word):
-            i += 1
-        elif word in _WRAPPERS:
-            i += 1
-            while i < len(seg) and seg[i].startswith("-") and seg[i] != "--":
-                if word in ("command", "builtin") and seg[i] in ("-v", "-V"):
-                    return len(seg)
-                i += 2 if seg[i] in _WRAPPER_VALUE_OPTIONS and i + 1 < len(seg) else 1
-            if word == "timeout" and i < len(seg) and _DURATION.match(seg[i]):
-                i += 1
-            elif word in ("nice", "stdbuf", "time") and i < len(seg) and seg[i].lstrip("-").isdigit():
-                i += 1
-        else:
-            break
-    return i
-
-
-def _after_python(seg: list, i: int) -> int:
-    """Index after `python3 [options]` (-X, -W and -Q take a value) with i at the interpreter word."""
-    i += 1
-    while i < len(seg) and seg[i].startswith("-"):
-        i += 2 if seg[i] in ("-X", "-W", "-Q") else 1
-    return i
-
-
-def _dispose_rest(seg: list):
-    """The words after `ah` when this simple command directly runs `[wrappers] [python] .../ah[.py] ... task dispose`
-    (no shell -c, eval or python -c), else None."""
-    i = _skip_wrappers(seg)
-    if i < len(seg) and os.path.basename(seg[i]).startswith("python"):
-        if "-c" in seg[i + 1:]:
-            return None
-        i = _after_python(seg, i)
-    if i >= len(seg) or os.path.basename(seg[i]) not in ("ah", "ah.py"):
-        return None
-    rest = list(seg[i + 1:])
-    return rest if [t for t in rest if not t.startswith("-")][:2] == ["task", "dispose"] else None
-
-
-def _says(text: str) -> bool:
-    """The conservative text rule: the text mentions dispose and an acknowledging kind (or `--ack-handoff`)."""
-    return "dispose" in text and bool(_KIND_WORD.search(text))
-
-
-# Options of `ah task dispose` whose value cannot change what it acknowledges. A computed value of one of these, when
-# the shell cannot split it (quoted), reaches ah as that option's value; argparse refuses an option-looking value.
-_SAFE_VALUE_OPTIONS = {"--agent", "--ref", "--until", "--reason", "--deployed", "--live-test", "--evidence",
-                       "--session", "--key"}
-
-
-def _computed(word) -> bool:
-    return bool(getattr(word, "computed", False))
-
-
-def _read_rest(rest: list):
-    """(literal positional words, a computed word sits where the subcommand is read, any unsafe computed word, a
-    literal `--kind`/`--ack...` flag) for the words after the program. A computed word is unsafe unless it is the
-    unsplittable value of a _SAFE_VALUE_OPTIONS option (`--until "$(date)"`, `--agent="$A"`): anywhere else it may be
-    `task`, `dispose`, a kind, or (unquoted) several words such as `--kind closed`."""
-    literal, pos_unsafe, unsafe, kind_flag, value_of = [], False, False, False, None
-    for tok in rest:
-        opt, value_of = value_of, None
-        if opt is not None:  # the value of the option before it
-            if _computed(tok) and (opt == "--kind" or getattr(tok, "splits", False)):
-                unsafe = True
-            continue
-        name, eq, _ = tok.partition("=")
-        if name.startswith(("--kind", "--ack")):
-            kind_flag = True
-        if _computed(tok):
-            if eq and name in _SAFE_VALUE_OPTIONS and not getattr(tok, "splits", False):
-                continue  # `--until="$(date)"`: the literal option name, an unsplittable value
-            unsafe = True
-            pos_unsafe = pos_unsafe or len(literal) < 2
-        elif tok.startswith("-"):
-            if not eq and (tok in _SAFE_VALUE_OPTIONS or tok == "--kind"):
-                value_of = tok
-        else:
-            literal.append(tok)
-    return literal, pos_unsafe, unsafe, kind_flag
-
-
-def _computed_acks(seg: list, i: int, ctx: str) -> bool:
-    """The conservative judgement for a simple command whose program (seg[i]) may be ah and whose words hold a computed
-    word in a position that can change what ah receives (red-team r2 F1, r3 F1: one position at a time was not enough).
-    `ctx` is this command's own text plus every `NAME=value` word of the line (`K=closed; $AH ... --kind "$K"`).
-    - A literal ah whose literal words already name another subcommand (`ah ticket comment ... "$(cat f)"`) is not a
-      dispose. Otherwise a literal ah with an unsafe computed word is denied when it may be the dispose.
-    - A computed program (`"$(command -v ah)"`, `$AH`, a glob, a computed python script) is denied when the line can
-      say dispose and an ack (as text, or through an unsafe computed word in the subcommand or kind positions)."""
-    literal, pos_unsafe, unsafe, kind_flag = _read_rest(seg[i + 1:])
-    if not _computed(seg[i]):
-        if not unsafe:
-            return False  # judged on its words by the caller
-        if not pos_unsafe and len(literal) >= 2 and literal[:2] != ["task", "dispose"]:
-            return False
-        return pos_unsafe or "dispose" in ctx
-    acks = bool(_KIND_WORD.search(ctx))
-    return ("dispose" in ctx and (acks or unsafe)) or (pos_unsafe and (acks or kind_flag))
-
-
-def _acks(seg: list, depth: int = 0, ctx: str = "") -> bool:
-    """Whether one simple command is `[wrappers] [python] .../ah[.py] [global opts] task dispose ... --kind <ack>`, or
-    may be one: any word the shell computes is judged by the conservative rules (_computed_acks, _says)."""
-    outer, ctx = ctx, " ".join(seg) + " " + ctx  # outer: the NAME=value words of the enclosing lines
-    i = _skip_wrappers(seg)
-    if i < len(seg) and _computed(seg[i]):
-        return _computed_acks(seg, i, ctx)
-    flag = None
-    if i < len(seg) and os.path.basename(seg[i]) in _SHELLS:  # `bash -c`, and clusters: `bash -lc`, `sh -ec` (24a786c F2)
-        flag = next((j for j in range(i + 1, len(seg)) if _SHELL_C.match(seg[j])), None)
-    if i < len(seg) and (seg[i] == "eval" or flag is not None):
-        words = seg[flag + 1:] if flag is not None else seg[i + 1:]
-        code = " ".join(words)  # judged with the line's NAME=value words: `X='...'; eval "$X"` (r3 F1, r1 F1)
-        return acknowledges(code, depth + 1, outer) if depth < 3 else _says(code + " " + outer)
-    if i < len(seg) and os.path.basename(seg[i]).startswith("python"):
-        rest = seg[i + 1:]
-        if "-c" in rest:  # inline code: judged by what it says
-            code = " ".join(rest[rest.index("-c") + 1:])
-            return _says(code) or (any(_computed(w) for w in rest) and _says(ctx))
-        i = _after_python(seg, i)
-        if i < len(seg) and _computed(seg[i]):  # `python3 "$AHPY" task dispose ...`: a computed script
-            return _computed_acks(seg, i, ctx)
-    if i >= len(seg) or os.path.basename(seg[i]) not in ("ah", "ah.py"):
-        return False  # a literal program that is not ah: computed arguments cannot make it run ah (bodies are judged)
-    if _computed_acks(seg, i, ctx):
-        return True
-    rest = list(seg[i + 1:])
-    words = [t for t in rest if not t.startswith("-")]
-    if words[:2] != ["task", "dispose"]:
-        return False
-    for j, tok in enumerate(rest):
-        name, eq, val = tok.partition("=")
-        if len(name) >= 5 and "--ack-handoff".startswith(name) and name.startswith("--a"):
-            return True  # #134 red-team P4: a wait that acknowledges a handoff is main's
-        if len(name) >= 3 and "--kind".startswith(name) and name.startswith("--"):
-            value = val if eq else (rest[j + 1] if j + 1 < len(rest) else "")
-            if value in ACK_KINDS or "$" in value or "`" in value:  # an expansion cannot be judged: deny
-                return True
-    return False
-
-
-def _runs_text(seg: list):
-    """What this simple command executes from its input: 'shell' (a shell, eval, source or `.`), 'python', 'any' (a
-    computed program: it may be either) or None. A here-document, here-string or pipe feeding it is code, not data."""
-    i = _skip_wrappers(seg)
-    if i >= len(seg):
-        return None
-    if _computed(seg[i]):
-        return "any"
-    name = os.path.basename(seg[i])
-    if name in _SHELLS or seg[i] in ("eval", "source", "."):
-        return "shell"
-    return "python" if name.startswith("python") else None
-
-
-def acknowledges(cmd: str, depth: int = 0, ctx: str = "") -> bool:
-    """Whether a Bash command runs an `ah task dispose` that resumes, reassigns, closes, supersedes, wontdoes or legacies
-    an owner. `ctx`: the NAME=value words of the lines that enclose this one (a here-document, here-string, `eval` or
-    `-c` body), so `X='...'; bash <<< "$X"` is judged with what X holds (receipt r1 at 37f481d, F1).
-
-    Residual (red-team r3 F3, goodqa#15734): code that builds the words at run time (python `"clo" + "sed"`, printf
-    escapes piped into a shell, a script file, a variable set by an earlier command) is judged only by the text the
-    line holds. The gate is advisory against a sub-agent that hides the call; the dispose guard does not rely on it."""
-    if len(cmd) > PRETOOL_MAX:
-        return _says(cmd)
-    bodies = []
-    segs = _segments(cmd, bodies)
-    if segs is None:
-        return _says(cmd)
-    assigned = " ".join([w for s in segs for w in s if _ASSIGNMENT.match(w)] + ([ctx] if ctx else []))
-    if depth < 3 and any(acknowledges(body, depth + 1, assigned) for body in bodies):
-        return True  # `$(ah task dispose ...)` and backticks run too (24a786c F2); judged as their own command line
-    if any(_acks(s, depth, assigned) for s in segs):
-        return True
-    kinds = {kind for kind in (_runs_text(s) for s in segs) if kind}
-    if any(s.piped and _runs_text(s) for s in segs) and _says(cmd):
-        return True  # `printf '...' | python3`, `echo ... | sh`: text piped into a shell or python is code (r3 F2)
-    shell, python = bool(kinds & {"shell", "any"}), bool(kinds & {"python", "any"})
-    for s in segs:  # `bash <<EOF`, `cat <<'EOF' | bash`, `python3 - <<EOF`, `bash <<< '...'`: code on stdin
-        for body in s.heredocs:
-            if (shell or python) and ("$" in body or "`" in body) and _says(cmd + " " + assigned):
-                return True  # a body with an expansion is code computed from text the line holds (r1 F1, as pipes)
-            if shell and (acknowledges(body, depth + 1, assigned) if depth < 3 else _says(body)):
-                return True
-            if python and _says(body):
-                return True  # python code is judged by what it says, as `-c` is
-    return False
-
-
-def _parse_dispose(rest: list):
-    """`ah`'s own parser applied to the words after `ah` (nothing runs): the namespace, or None when ah would refuse
-    them or only print help."""
-    import contextlib  # noqa: PLC0415
-    import io  # noqa: PLC0415
-    try:
-        import ah  # noqa: PLC0415
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            return ah.build_parser().parse_args([str(word) for word in rest])
-    except (SystemExit, Exception):  # noqa: BLE001 - a refusal, --help or an import problem mints nothing
-        return None
-
-
-def _stamp_ack(cmd: str, payload: dict) -> None:
-    """One stamp per `--agent ID` of a main command that really runs `ah task dispose --ack-handoff` (#134 red-team
-    B4). A simple command is stamped only when ah's own parser accepts its words as `task dispose ... --ack-handoff`,
-    and only for the agent that parser reads: echoed, grepped or printed text, `--help`, `command -v`, an `--agent=`
-    inside another option's value, another segment's words and a line the shell alone can read mint nothing. A
-    computed word (`--until "$(date ...)"`) is fine; a computed `--agent` fails the id pattern."""
-    if "ack-handoff" not in cmd and "ack_handoff" not in cmd:
-        return
-    import caller_identity  # noqa: PLC0415
-    segments = _segments(cmd)
-    if segments is None:
-        return
-    for seg in segments:
-        rest = _dispose_rest(seg)
-        if rest is None:
-            continue
-        args = _parse_dispose(rest)
-        if args is None or getattr(args, "cmd", None) != "task" or getattr(args, "sub", None) != "dispose" \
-                or not getattr(args, "ack_handoff", False):
-            continue
-        agent = getattr(args, "agent", None)
-        if isinstance(agent, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", agent):
-            caller_identity.put_stamp("ack-handoff", [agent], session=str(payload.get("session_id") or ""))
-
-
-def cmd_pretool(payload: dict) -> dict:
-    """PreToolUse(Bash): a sub-agent (the payload carries its agent_id) may not resume, reassign or close an owner;
-    main records those. A wait (`--kind waiting`) stays open to everyone, but not one that acknowledges a handoff
-    (`--ack-handoff`). The identity is the hook's, not the
-    shell's: main's shell carries the same environment as a sub-agent's (review round 3, B1). The text match is
-    advisory against an agent that hides the call; the dispose guard's evidence and burst rules do not rely on it."""
-    if payload.get("tool_name") != "Bash":
-        return {}
-    tool_input = payload.get("tool_input")
-    cmd = str((tool_input if isinstance(tool_input, dict) else {}).get("command") or "")
-    import caller_identity  # noqa: PLC0415
-    if caller_identity.is_main(payload):
-        _stamp_ack(cmd, payload)  # B4: `ah task dispose --ack-handoff` needs this stamp
-        return {}
-    if not acknowledges(cmd):  # anything not proven main: sub-agents, Codex payloads, a payload with no transcript
-        return {}
-    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                                   "permissionDecisionReason": "dropped-owner gate (goodqa#14791): a sub-agent cannot "
-                                   "resume, reassign or close an owner, its own or another's; main records that. "
-                                   "Record what you wait on with `ah task dispose --kind waiting`, or write a handoff."}}
-
-
 def main(argv=None) -> int:
     mode = (argv or sys.argv[1:] or ["stop"])[0]
+    if mode != "stop":
+        return 0  # `pretool` and `subagent-stop` were removed in release 1001; a stale registration does nothing
     try:
         import safe_input  # noqa: PLC0415
-        limit = (16 << 20) if mode == "pretool" else (1 << 20)  # a 2 MB command must not skip the pretool check
-        payload = safe_input.safe_json_loads(safe_input.read_stdin_bounded(limit).decode("utf-8", "replace"))
+        payload = safe_input.safe_json_loads(safe_input.read_stdin_bounded(1 << 20).decode("utf-8", "replace"))
     except Exception:  # noqa: BLE001 - oversized or malformed hook input: gate nothing, never block on garbage
         payload = {}
     try:
         payload = payload if isinstance(payload, dict) else {}
-        out = (cmd_subagent_stop(payload) if mode == "subagent-stop" else cmd_pretool(payload) if mode == "pretool"
-               else cmd_stop(payload))
+        out = cmd_stop(payload)
     except Exception as exc:  # noqa: BLE001 - a gate crash must not block the turn silently
         out = {"systemMessage": f"dropped-owner gate failed open ({type(exc).__name__})"}
     if out:

@@ -86,37 +86,31 @@ class TrackedPolicyIsGeneric(unittest.TestCase):
     PERSONAL = tuple("".join(parts) for parts in (("frame", "bright"), ("goodqa-", "28dd3"), ("a19d", "343e"),
                                                   ("eric", "macdougall"), ("eric", "-org")))
 
+    def test_local_overlay_sets_the_org_but_never_the_endpoint(self):
+        sys.path.insert(0, str(ROOT / "harness" / "hooks"))
+        import ah
+        import ah_local
+        with tempfile.TemporaryDirectory() as temp:
+            local = Path(temp) / "local.json"
+            local.write_text(json.dumps({"ticket_systems": {"goodqa": {
+                "endpoint": "https://elsewhere.invalid/mcp", "org_id": "00000000-0000-4000-8000-00000000000a"}}}))
+            with mock.patch.dict(os.environ, {"AH_LOCAL_CONFIG": str(local)}):
+                ah_local.reset()
+                try:
+                    cfg = ah.goodqa_config()
+                finally:
+                    ah_local.reset()
+        self.assertEqual(cfg["endpoint"], ah.GOODQA_TICKETS["endpoint"])
+        self.assertEqual(cfg["org_id"], "00000000-0000-4000-8000-00000000000a")
+
     def test_tracked_policy_has_no_personal_identifiers(self):
-        text = (ROOT / "harness" / "hooks" / "commit_policy.json").read_text().lower()
+        sys.path.insert(0, str(ROOT / "harness" / "hooks"))
+        import ah  # the GoodQA defaults moved here from commit_policy.json in release 1001
+        text = json.dumps(ah.GOODQA_TICKETS).lower()
         for needle in self.PERSONAL:
             self.assertNotIn(needle, text)
 
-    @mock.patch.dict(os.environ, clear=False)
-    def test_local_profile_overrides_and_merges(self):
-        os.environ.pop("AGENT_HARNESS_POLICY_LOCAL", None)  # other modules set it; this test uses the sibling file
-        import commit_policy as cp
-        with tempfile.TemporaryDirectory() as tmp:
-            base = Path(tmp) / "commit_policy.json"
-            base.write_text((ROOT / "harness" / "hooks" / "commit_policy.json").read_text())
-            (Path(tmp) / "commit_policy.local.json").write_text(json.dumps(
-                {"backstop_repos": ["example\\.invalid/"],
-                 "ticket_systems": {"goodqa": {"org_id": "00000000-0000-4000-8000-000000000001"}}}))
-            policy = cp.load_policy(base)
-        self.assertEqual(policy["backstop_repos"], ["example\\.invalid/"])
-        goodqa = policy["ticket_systems"]["goodqa"]
-        self.assertEqual(goodqa["org_id"], "00000000-0000-4000-8000-000000000001")
-        self.assertIn("ref_pattern", goodqa)  # deep merge keeps tracked keys
 
-    @mock.patch.dict(os.environ, clear=False)
-    def test_bad_local_profile_fails_closed(self):
-        os.environ.pop("AGENT_HARNESS_POLICY_LOCAL", None)  # other modules set it; this test uses the sibling file
-        import commit_policy as cp
-        with tempfile.TemporaryDirectory() as tmp:
-            base = Path(tmp) / "commit_policy.json"
-            base.write_text((ROOT / "harness" / "hooks" / "commit_policy.json").read_text())
-            (Path(tmp) / "commit_policy.local.json").write_text("{not json")
-            with self.assertRaises(ValueError):
-                cp.load_policy(base)
 
 
 
@@ -274,65 +268,8 @@ class ReviewFindings(unittest.TestCase):
             self.assertEqual(code, 2, out)
 
 
-class PolicyOverrideIsNotABypass(unittest.TestCase):
-    """Review F3: a variable on one command line must not swap the enforcement profile."""
-
-    def setUp(self):
-        sys.path.insert(0, str(ROOT / "harness" / "hooks"))
-        import commit_policy
-        self.cp = commit_policy
-        self.tmp = tempfile.mkdtemp()
-        self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
-        self.base = Path(self.tmp) / "commit_policy.json"
-        self.base.write_text((ROOT / "harness" / "hooks" / "commit_policy.json").read_text())
-
-    def test_override_outside_tests_data_is_ignored(self):
-        outside = Path(self.tmp) / "evil.json"
-        outside.write_text(json.dumps({"backstop_repos": ["attacker\\.invalid/"]}))
-        with mock.patch.dict(os.environ, {"AGENT_HARNESS_POLICY_LOCAL": str(outside)}):
-            policy = self.cp.load_policy(self.base)
-        self.assertNotIn("attacker\\.invalid/", policy.get("backstop_repos", []))
-
-    def test_profile_cannot_set_enforcement_keys(self):
-        (Path(self.tmp) / "commit_policy.local.json").write_text(json.dumps({"enforcement": "off"}))
-        with mock.patch.dict(os.environ):
-            os.environ.pop("AGENT_HARNESS_POLICY_LOCAL", None)
-            with self.assertRaises(ValueError):
-                self.cp.load_policy(self.base)
-
-    def test_override_inside_tests_data_is_honoured_and_missing_file_raises(self):
-        fixture = ROOT / "tests" / "data" / "policy_profile_fixture.json"
-        with mock.patch.dict(os.environ, {"AGENT_HARNESS_POLICY_LOCAL": str(fixture)}):
-            self.assertTrue(self.cp.load_policy(self.base)["backstop_repos"])
-        missing = ROOT / "tests" / "data" / "does_not_exist.json"
-        with mock.patch.dict(os.environ, {"AGENT_HARNESS_POLICY_LOCAL": str(missing)}):
-            with self.assertRaises(ValueError):
-                self.cp.load_policy(self.base)
 
 
-class SpecPolicyProfile(unittest.TestCase):
-    def setUp(self):
-        sys.path.insert(0, str(ROOT / "harness" / "hooks"))
-        import spec_flow
-        self.sf = spec_flow
-        self.tmp = Path(tempfile.mkdtemp())
-        self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
-        self.base = self.tmp / "spec_policy.json"
-        self.base.write_text((ROOT / "harness" / "hooks" / "spec_policy.json").read_text())
-
-    def test_tracked_spec_policy_names_no_projects(self):
-        self.assertEqual(self.sf.load_spec_policy(self.base)["projects"], {})
-
-    def test_local_profile_supplies_projects_and_bad_one_fails_closed(self):
-        local = self.tmp / "spec_policy.local.json"
-        local.write_text(json.dumps({"projects": {"demo": {"project_id": "p", "org_id": "o"}}}))
-        self.assertIn("demo", self.sf.load_spec_policy(self.base)["projects"])
-        local.write_text("{nope")
-        with self.assertRaises(ValueError):
-            self.sf.load_spec_policy(self.base)
-        local.write_text(json.dumps({"mode": "off"}))  # cannot weaken enforcement
-        with self.assertRaises(ValueError):
-            self.sf.load_spec_policy(self.base)
 
 
 class RoundTwoFindings(unittest.TestCase):
@@ -396,34 +333,7 @@ class RoundTwoFindings(unittest.TestCase):
             self.assertNotIn(host, out)
             self.assertIn("skipped=0", out)  # binary diffs are scanned as text (-a), not skipped
 
-    def test_ticket_system_overlay_cannot_change_endpoint(self):
-        import commit_policy as cp
-        with tempfile.TemporaryDirectory() as tmp:
-            base = Path(tmp) / "commit_policy.json"
-            base.write_text((ROOT / "harness" / "hooks" / "commit_policy.json").read_text())
-            (Path(tmp) / "commit_policy.local.json").write_text(json.dumps(
-                {"ticket_systems": {"goodqa": {"endpoint": "https://attacker.invalid/"}}}))
-            with mock.patch.dict(os.environ):
-                os.environ.pop("AGENT_HARNESS_POLICY_LOCAL", None)
-                with self.assertRaises(ValueError):
-                    cp.load_policy(base)
 
-    def test_installed_copy_ignores_override_even_with_home_tests_data(self):
-        """An agent can create ~/tests/data; the override must still do nothing on an installed copy."""
-        with tempfile.TemporaryDirectory() as tmp:
-            home = Path(tmp)
-            hooks = home / ".claude" / "hooks"
-            hooks.mkdir(parents=True)
-            for name in ("commit_policy.py", "commit_policy.json", "safe_input.py"):
-                (hooks / name).write_text((ROOT / "harness" / "hooks" / name).read_text())
-            (home / "tests" / "data").mkdir(parents=True)
-            evil = home / "tests" / "data" / "x.json"
-            evil.write_text(json.dumps({"backstop_repos": ["attacker\\.invalid/"]}))
-            code = ("import sys; sys.path.insert(0, %r); import commit_policy as cp; "
-                    "print('attacker' in repr(cp.load_policy().get('backstop_repos')))" % str(hooks))
-            done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
-                                  env=dict(os.environ, HOME=str(home), AGENT_HARNESS_POLICY_LOCAL=str(evil)))
-            self.assertEqual(done.stdout.strip(), "False", done.stdout + done.stderr)
 
 
 class RoundThreeFindings(unittest.TestCase):
@@ -469,56 +379,6 @@ class RoundThreeFindings(unittest.TestCase):
                 repo, _ = make_git(tmp, {"a.txt": "ok\n"}, allow=pattern + "\n")
                 self.assertEqual(scan_repo(repo, tmp)[0], 2, pattern)
 
-    def test_profile_that_is_not_a_regular_file_fails_closed(self):
-        import commit_policy as cp
-        with tempfile.TemporaryDirectory() as tmp:
-            base = Path(tmp) / "commit_policy.json"
-            base.write_text((ROOT / "harness" / "hooks" / "commit_policy.json").read_text())
-            os.symlink(Path(tmp) / "nowhere", Path(tmp) / "commit_policy.local.json")
-            with mock.patch.dict(os.environ):
-                os.environ.pop("AGENT_HARNESS_POLICY_LOCAL", None)
-                with self.assertRaises(ValueError):
-                    cp.load_policy(base)
-
-    def test_project_route_cannot_carry_an_endpoint(self):
-        import commit_policy as cp
-        import spec_flow as sf
-        with tempfile.TemporaryDirectory() as tmp:
-            base = Path(tmp) / "commit_policy.json"
-            base.write_text((ROOT / "harness" / "hooks" / "commit_policy.json").read_text())
-            (Path(tmp) / "commit_policy.local.json").write_text(json.dumps({"ticket_systems": {"goodqa": {
-                "projects": {"evil": {"project_id": "p", "endpoint": "https://attacker.invalid/"}}}}}))
-            with mock.patch.dict(os.environ):
-                os.environ.pop("AGENT_HARNESS_POLICY_LOCAL", None)
-                with self.assertRaises(ValueError):
-                    cp.load_policy(base)
-            sbase = Path(tmp) / "spec_policy.json"
-            sbase.write_text((ROOT / "harness" / "hooks" / "spec_policy.json").read_text())
-            (Path(tmp) / "spec_policy.local.json").write_text(json.dumps(
-                {"projects": {"evil": {"project_id": "p", "endpoint": "https://attacker.invalid/"}}}))
-            with self.assertRaises(ValueError):
-                sf.load_spec_policy(sbase)
-
-    def test_installer_migrates_existing_personal_values_before_overwrite(self):
-        sys.path.insert(0, str(ROOT))
-        import install
-        with tempfile.TemporaryDirectory() as tmp:
-            claude = Path(tmp) / ".claude"
-            (claude / "hooks").mkdir(parents=True)
-            (claude / "hooks" / "commit_policy.json").write_text(json.dumps({
-                "backstop_repos": ["example\\.invalid/"], "enforcement": "on",
-                "ticket_systems": {"goodqa": {"repos": ["example\\.invalid/"], "org_id": "o", "endpoint": "https://x.invalid/"}}}))
-            notes = install.migrate_local_profiles(claude)
-            target = claude / "hooks" / "commit_policy.local.json"
-            self.assertTrue(notes and target.is_file())
-            self.assertEqual(oct(target.stat().st_mode & 0o777), "0o600")
-            data = json.loads(target.read_text())
-            self.assertEqual(data["backstop_repos"], ["example\\.invalid/"])
-            self.assertNotIn("endpoint", data["ticket_systems"]["goodqa"])
-            self.assertNotIn("enforcement", data)
-            before = target.read_text()
-            self.assertEqual(install.migrate_local_profiles(claude), [])  # never overwrites
-            self.assertEqual(target.read_text(), before)
 
 
 class RoundFourFindings(unittest.TestCase):
@@ -542,96 +402,10 @@ class RoundFourFindings(unittest.TestCase):
                 self.assertEqual(code, 1, (where, out))
                 self.assertNotIn("realperson", out)
 
-    def test_non_dict_projects_is_value_error_in_both_loaders(self):
-        import commit_policy as cp
-        import spec_flow as sf
-        with tempfile.TemporaryDirectory() as tmp:
-            base = Path(tmp) / "commit_policy.json"
-            base.write_text((ROOT / "harness" / "hooks" / "commit_policy.json").read_text())
-            sbase = Path(tmp) / "spec_policy.json"
-            sbase.write_text((ROOT / "harness" / "hooks" / "spec_policy.json").read_text())
-            for bad in (["x"], "x", 7):
-                (Path(tmp) / "commit_policy.local.json").write_text(json.dumps({"ticket_systems": {"goodqa": {"projects": bad}}}))
-                (Path(tmp) / "spec_policy.local.json").write_text(json.dumps({"projects": bad}))
-                with mock.patch.dict(os.environ):
-                    os.environ.pop("AGENT_HARNESS_POLICY_LOCAL", None)
-                    with self.assertRaises(ValueError):
-                        cp.load_policy(base)
-                with self.assertRaises(ValueError):
-                    sf.load_spec_policy(sbase)
-
-    def test_hook_exits_2_on_non_dict_projects(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            hooks = Path(tmp) / ".claude" / "hooks"
-            hooks.mkdir(parents=True)
-            for name in ("commit_policy.py", "commit_policy.json", "safe_input.py", "ticket_adapters.py", "spec_flow.py",
-                         "spec_policy.json", "provenance.py", "wal.py", "redact.py"):
-                src = ROOT / "harness" / "hooks" / name
-                if src.exists():
-                    (hooks / name).write_text(src.read_text())
-            (hooks / "spec_policy.local.json").write_text(json.dumps({"projects": ["x"]}))
-            code = ("import sys; sys.path.insert(0, %r); import spec_flow as sf\n"
-                    "try:\n    sf.load_spec_policy(); print('LOADED')\nexcept ValueError:\n    print('VALUEERROR')" % str(hooks))
-            done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=dict(os.environ, HOME=tmp))
-            self.assertEqual(done.stdout.strip(), "VALUEERROR", done.stdout + done.stderr)
-
-    def test_migration_filters_route_keys_so_the_loader_accepts_the_result(self):
-        sys.path.insert(0, str(ROOT))
-        import install
-        import commit_policy as cp
-        with tempfile.TemporaryDirectory() as tmp:
-            claude = Path(tmp) / ".claude"
-            (claude / "hooks").mkdir(parents=True)
-            (claude / "hooks" / "commit_policy.json").write_text(json.dumps({"ticket_systems": {"goodqa": {
-                "repos": ["example\\.invalid/"], "org_id": "o",
-                "projects": {"p": {"project_id": "1", "org_id": "o", "endpoint": "https://x.invalid/", "note": "n"}}}}}))
-            install.migrate_local_profiles(claude)
-            data = json.loads((claude / "hooks" / "commit_policy.local.json").read_text())
-            self.assertEqual(set(data["ticket_systems"]["goodqa"]["projects"]["p"]), {"project_id", "org_id"})
-            base = Path(tmp) / "commit_policy.json"
-            base.write_text((ROOT / "harness" / "hooks" / "commit_policy.json").read_text())
-            (Path(tmp) / "commit_policy.local.json").write_text((claude / "hooks" / "commit_policy.local.json").read_text())
-            with mock.patch.dict(os.environ):
-                os.environ.pop("AGENT_HARNESS_POLICY_LOCAL", None)
-                cp.load_policy(base)  # must not raise
 
 
 class CodexInstallKeepsEnforcement(unittest.TestCase):
     """Native review F1: install_codex copied the generic policies over a host's personal values."""
-
-    def test_upgrade_over_a_legacy_codex_home_keeps_repos_backstop_and_org(self):
-        sys.path.insert(0, str(ROOT))
-        import install_codex
-        import commit_policy as cp
-        if sys.version_info < (3, 11):
-            self.skipTest("install_codex needs Python 3.11+ (tomllib)")
-        with tempfile.TemporaryDirectory() as tmp:
-            home = Path(tmp)
-            harness = home / ".codex" / "agent-harness"
-            harness.mkdir(parents=True)
-            legacy = json.loads((ROOT / "harness" / "hooks" / "commit_policy.json").read_text())
-            legacy["backstop_repos"] = ["example\\.invalid/"]
-            legacy["ticket_systems"]["goodqa"].update({"repos": ["example\\.invalid/"], "org_id": "00000000-0000-4000-8000-000000000042"})
-            (harness / "commit_policy.json").write_text(json.dumps(legacy))
-            install_codex.install(home, True)
-            with mock.patch.dict(os.environ):
-                os.environ.pop("AGENT_HARNESS_POLICY_LOCAL", None)
-                policy = cp.load_policy(harness / "commit_policy.json")
-            self.assertEqual(policy["backstop_repos"], ["example\\.invalid/"])
-            goodqa = policy["ticket_systems"]["goodqa"]
-            self.assertEqual(goodqa["repos"], ["example\\.invalid/"])
-            self.assertEqual(goodqa["org_id"], "00000000-0000-4000-8000-000000000042")
-            self.assertEqual(oct((harness / "commit_policy.local.json").stat().st_mode & 0o777), "0o600")
-            self.assertTrue((harness / "commit_policy.local.json.example").is_file())
-            self.assertIn("spec_policy.local.json", install_codex.local_profile_status(home, harness))  # the one still missing is named
-
-    def test_status_line_reports_missing_profiles_for_codex(self):
-        sys.path.insert(0, str(ROOT))
-        import install
-        with tempfile.TemporaryDirectory() as tmp:
-            line = install.local_profile_status(Path(tmp), Path(tmp) / "agent-harness")
-            self.assertIn("MISSING", line)
-
 
 if __name__ == "__main__":
     unittest.main()

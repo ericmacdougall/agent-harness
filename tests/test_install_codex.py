@@ -12,11 +12,20 @@ from pathlib import Path
 from unittest.mock import patch
 
 from codex.hooks import wal
-from install_codex import (AGENTS, CONFIG_END, CONFIG_START, DELIVERY_HELPERS, HOOK_EVENTS, SKILL_FILES, SOURCE, install,
-                           managed_command, merge_config, merge_marked, tomllib)
+from install_codex import (AGENTS, CONFIG_END, CONFIG_START, DELIVERY_HELPERS, SKILL_FILES, SOURCE, install,
+                           legacy_profile, managed_command, managed_groups, merge_config, merge_marked, sandbox_module,
+                           tomllib)
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def profiles(home=Path('/nonexistent-ah-home')):
+    """The three sandbox profiles the installer writes for this home (ah_sandbox.codex_profiles)."""
+    return sandbox_module().codex_profiles(home=home)
+
+
+P = profiles()
 
 
 @unittest.skipUnless(tomllib is not None, 'Codex installer requires Python 3.11+')
@@ -56,70 +65,70 @@ class CodexInstallerTests(unittest.TestCase):
 
     def test_toml_multiline_marker_text_is_preserved(self):
         original = 'note = """literal # agent-harness-codex:profile-start data # agent-harness-codex:profile-end retained"""\n'
-        merged = merge_config(original, Path('/tmp/private-wals'))
+        merged = merge_config(original, Path('/tmp/private-wals'), P)
         self.assertEqual(tomllib.loads(merged)['note'], tomllib.loads(original)['note'])
 
     def test_toml_marker_lines_inside_value_survive_reinstallation(self):
         original = ('note = """before\n# agent-harness-codex:profile-start\n'
                     'user value\n# agent-harness-codex:profile-end\nafter"""\n')
-        first = merge_config(original, Path('/tmp/private-wals'))
-        second = merge_config(first, Path('/tmp/private-wals'))
+        first = merge_config(original, Path('/tmp/private-wals'), P)
+        second = merge_config(first, Path('/tmp/private-wals'), P)
         self.assertEqual(tomllib.loads(first)['note'], tomllib.loads(original)['note'])
         self.assertEqual(tomllib.loads(second)['note'], tomllib.loads(original)['note'])
         self.assertEqual(first, second)
 
     def test_toml_profile_comment_collision_refuses_without_erasure(self):
-        original = merge_config('note = "preserve"\n', Path('/tmp/private-wals'))
-        modified = original.replace('[permissions.agent-harness]\n',
-                                    '[permissions.agent-harness]\n# user comment that must survive\n')
+        original = merge_config('note = "preserve"\n', Path('/tmp/private-wals'), P)
+        modified = original.replace('[permissions.ah-worker]\n',
+                                    '[permissions.ah-worker]\n# user comment that must survive\n')
         with self.assertRaisesRegex(ValueError, 'managed profile was edited'):
-            merge_config(modified, Path('/tmp/private-wals'))
+            merge_config(modified, Path('/tmp/private-wals'), P)
         extra_marker = original + '\n# agent-harness-codex:profile-start\n'
         with self.assertRaisesRegex(ValueError, 'ambiguous or malformed'):
-            merge_config(extra_marker, Path('/tmp/private-wals'))
+            merge_config(extra_marker, Path('/tmp/private-wals'), P)
 
     def test_reinstall_moves_unrelated_sections_out_of_managed_profile(self):
         wal_dir = Path('/tmp/private-wals')
-        original = merge_config('model = "gpt-6-sol"\n', wal_dir)
+        original = merge_config('model = "gpt-6-sol"\n', wal_dir, P)
         extra = ('\n[tui]\nanimations = false\n\n[hooks.state]\n'
                  'trusted_hash = "synthetic-value"  # retained spaces  \n\n')
         with_inside = original.replace(CONFIG_END, extra + CONFIG_END, 1)
-        merged = merge_config(with_inside, wal_dir)
+        merged = merge_config(with_inside, wal_dir, P)
         self.assertEqual(tomllib.loads(merged), tomllib.loads(with_inside))
         self.assertIn(extra, merged)
         self.assertLess(merged.index(extra), merged.index(CONFIG_START))
         self.assertEqual(merged.count(CONFIG_START), 1)
         self.assertEqual(merged.count(CONFIG_END), 1)
-        self.assertEqual(merge_config(merged, wal_dir), merged)
+        self.assertEqual(merge_config(merged, wal_dir, P), merged)
 
     def test_reinstall_preserves_mixed_endings_and_multiline_user_value(self):
         wal_dir = Path('/tmp/private-wals')
-        original = merge_config('model = "gpt-6-sol"\n', wal_dir)
+        original = merge_config('model = "gpt-6-sol"\n', wal_dir, P)
         extra = ('\r\n[tui]\r\nnote = """before\n'
                  '# agent-harness-codex:profile-end\n[permissions.agent-harness]\n'
                  'after"""\r\n\r\n[[hooks.plugins]]\r\nname = "synthetic"\r\n')
         with_inside = original.replace(CONFIG_END, extra + CONFIG_END, 1)
-        merged = merge_config(with_inside, wal_dir)
+        merged = merge_config(with_inside, wal_dir, P)
         self.assertIn(extra, merged)
         self.assertEqual(tomllib.loads(merged), tomllib.loads(with_inside))
-        self.assertEqual(merge_config(merged, wal_dir), merged)
+        self.assertEqual(merge_config(merged, wal_dir, P), merged)
 
     def test_reinstall_preserves_quoted_unrelated_tables_and_outer_suffix(self):
         wal_dir = Path('/tmp/private-wals')
-        original = merge_config('model = "gpt-6-sol"\n', wal_dir)
+        original = merge_config('model = "gpt-6-sol"\n', wal_dir, P)
         extra = ('\n["hooks"."state.v2"]\ntrusted_hash = "synthetic"\n'
                  '\n[permissionsExtra]\nflag = true\n')
         outside = '\n[features]\nforeign = true\n'
         with_inside = original.replace(CONFIG_END, extra + CONFIG_END, 1) + outside
-        merged = merge_config(with_inside, wal_dir)
+        merged = merge_config(with_inside, wal_dir, P)
         self.assertIn(extra, merged)
         self.assertTrue(merged.endswith(outside))
         self.assertEqual(tomllib.loads(merged), tomllib.loads(with_inside))
-        self.assertEqual(merge_config(merged, wal_dir), merged)
+        self.assertEqual(merge_config(merged, wal_dir, P), merged)
 
     def test_reinstall_refuses_managed_edits_and_ambiguous_suffix(self):
         wal_dir = Path('/tmp/private-wals')
-        original = merge_config('model = "gpt-6-sol"\n', wal_dir)
+        original = merge_config('model = "gpt-6-sol"\n', wal_dir, P)
         extra = '\n[tui]\nanimations = false\n'
         with_inside = original.replace(CONFIG_END, extra + CONFIG_END, 1)
         cases = (
@@ -133,65 +142,63 @@ class CodexInstallerTests(unittest.TestCase):
         )
         for text in cases:
             with self.subTest(text=text[:35]), self.assertRaises(ValueError):
-                merge_config(text, wal_dir)
+                merge_config(text, wal_dir, P)
 
-    def test_reinstall_preserves_removed_root_default_without_changing_unrelated(self):
+    def test_a_fresh_install_selects_no_role_and_a_reinstall_keeps_the_users_choice(self):
         wal_dir = Path('/tmp/private-wals')
-        original = merge_config('model = "gpt-6-sol"\n', wal_dir)
-        without_default = original.replace('default_permissions = "agent-harness" # agent-harness-codex\n', '', 1)
+        original = merge_config('model = "gpt-6-sol"\n', wal_dir, P)
+        parsed = tomllib.loads(original)
+        self.assertNotIn('default_permissions', parsed)  # turning the boundary on is the owner's step
+        self.assertEqual(set(parsed['permissions']), {'ah-worker', 'ah-reviewer', 'ah-supervisor'})
         extra = '\n[tui]\nanimations = false\n'
-        with_inside = without_default.replace(CONFIG_END, extra + CONFIG_END, 1)
-        merged = merge_config(with_inside, wal_dir)
+        with_inside = original.replace(CONFIG_END, extra + CONFIG_END, 1)
+        merged = merge_config(with_inside, wal_dir, P)
+        self.assertEqual(tomllib.loads(merged)['tui']['animations'], False)
+        self.assertEqual(merge_config(merged, wal_dir, P), merged)
+        chosen = 'default_permissions = "ah-supervisor"\n' + merged  # the user's own line, not an owned one
+        self.assertEqual(merge_config(chosen, wal_dir, P), chosen)
+
+    def test_the_retired_profile_is_replaced_and_its_owned_default_becomes_ah_worker(self):
+        wal_dir = Path('/tmp/private-wals')
+        old = ('default_permissions = "agent-harness" # agent-harness-codex\nmodel = "gpt-6-sol"\n\n'
+               + CONFIG_START + '\n' + legacy_profile(wal_dir) + '\n' + CONFIG_END + '\n')
+        merged = merge_config(old, wal_dir, P)
         parsed = tomllib.loads(merged)
-        self.assertNotIn('default_permissions', parsed)
-        self.assertEqual(parsed['tui']['animations'], False)
-        self.assertNotIn('default_permissions = "agent-harness"', merged)
-        self.assertEqual(merge_config(merged, wal_dir), merged)
+        self.assertEqual(parsed['default_permissions'], 'ah-worker')
+        self.assertNotIn('agent-harness', parsed['permissions'])
+        self.assertEqual(set(parsed['permissions']), {'ah-worker', 'ah-reviewer', 'ah-supervisor'})
+        self.assertEqual(parsed['model'], 'gpt-6-sol')
+        self.assertEqual(merged.count(CONFIG_START), 1)
+        self.assertEqual(merge_config(merged, wal_dir, P), merged)
 
-    def test_explicit_full_access_default_and_unflagged_reinstall(self):
+    def test_an_owned_full_access_line_is_kept_with_a_note(self):
+        from install_codex import full_access_note
         wal_dir = Path('/tmp/private-wals')
-        original = merge_config('model = "gpt-6-sol"\n', wal_dir)
-        full = merge_config(original, wal_dir, default_full_access=True)
-        parsed = tomllib.loads(full)
-        self.assertEqual(parsed['default_permissions'], ':danger-full-access')
+        old = ('approval_policy = "never" # agent-harness-codex\n'
+               'default_permissions = ":danger-full-access" # agent-harness-codex\n'
+               + CONFIG_START + '\n' + legacy_profile(wal_dir) + '\n' + CONFIG_END + '\n')
+        merged = merge_config(old, wal_dir, P)
+        parsed = tomllib.loads(merged)
+        self.assertEqual(parsed['default_permissions'], ':danger-full-access')  # no silent change of a live default
         self.assertEqual(parsed['approval_policy'], 'never')
-        self.assertIn('agent-harness', parsed['permissions'])
-        self.assertEqual(full.count('default_permissions = ":danger-full-access" # agent-harness-codex'), 1)
-        self.assertEqual(full.count('approval_policy = "never" # agent-harness-codex'), 1)
-        self.assertEqual(merge_config(full, wal_dir), full)
-        self.assertEqual(merge_config(full, wal_dir, default_full_access=True), full)
+        self.assertIn('--default-role worker', full_access_note(merged))
+        self.assertIsNone(full_access_note(merge_config('', wal_dir, P)))
+        role = merge_config(merged, wal_dir, P, default_role='worker')  # the owner chooses a role instead
+        self.assertEqual(tomllib.loads(role)['default_permissions'], 'ah-worker')
+        self.assertEqual(role.count('default_permissions'), 1)
 
-    def test_full_access_reinstall_preserves_independently_removed_owned_settings(self):
-        wal_dir = Path('/tmp/private-wals')
-        original = merge_config('', wal_dir)
-        full = merge_config(original, wal_dir, default_full_access=True)
-        no_default = full.replace('default_permissions = ":danger-full-access" # agent-harness-codex\n', '', 1)
-        no_approval = full.replace('approval_policy = "never" # agent-harness-codex\n', '', 1)
-        edited_approval = full.replace('approval_policy = "never" # agent-harness-codex\n',
-                                       'approval_policy = "on-request" # agent-harness-codex\n', 1)
-        self.assertNotIn('default_permissions', tomllib.loads(merge_config(no_default, wal_dir)))
-        self.assertNotIn('approval_policy', tomllib.loads(merge_config(no_approval, wal_dir)))
-        self.assertEqual(tomllib.loads(merge_config(edited_approval, wal_dir))['approval_policy'],
-                         'on-request')
-        with self.assertRaisesRegex(ValueError, 'approval policy'):
-            merge_config(edited_approval, wal_dir, default_full_access=True)
-
-    def test_full_access_owned_line_detection_ignores_multiline_and_nested_spoofs(self):
+    def test_owned_line_detection_ignores_multiline_and_nested_spoofs(self):
         wal_dir = Path('/tmp/private-wals')
         original = ('note = """before\n'
-                    'default_permissions = ":danger-full-access" # agent-harness-codex\n'
-                    'approval_policy = "never" # agent-harness-codex\n'
+                    'default_permissions = "agent-harness" # agent-harness-codex\n'
                     'after"""\n'
                     '[view]\n'
-                    'default_permissions = ":danger-full-access" # agent-harness-codex\n'
-                    'approval_policy = "never" # agent-harness-codex\n')
-        merged = merge_config(original, wal_dir, default_full_access=True)
+                    'default_permissions = "agent-harness" # agent-harness-codex\n')
+        merged = merge_config(original, wal_dir, P)
         parsed = tomllib.loads(merged)
-        self.assertIn('default_permissions = ":danger-full-access"', parsed['note'])
-        self.assertEqual(parsed['view']['default_permissions'], ':danger-full-access')
-        self.assertEqual(parsed['view']['approval_policy'], 'never')
-        self.assertEqual(parsed['default_permissions'], ':danger-full-access')
-        self.assertEqual(parsed['approval_policy'], 'never')
+        self.assertIn('default_permissions = "agent-harness"', parsed['note'])
+        self.assertEqual(parsed['view']['default_permissions'], 'agent-harness')
+        self.assertNotIn('default_permissions', parsed)
 
     def test_permissions_scalar_is_refused_cleanly(self):
         # permissions = "..." is malformed for Codex too; refuse it like the other
@@ -199,7 +206,7 @@ class CodexInstallerTests(unittest.TestCase):
         for text in ('permissions = "oops"\n',
                      'permissions = "x agent-harness y"\n'):
             with self.subTest(text=text), self.assertRaisesRegex(ValueError, 'permissions must be a table'):
-                merge_config(text, Path('/tmp/example'))
+                merge_config(text, Path('/tmp/example'), P)
 
     def test_rejected_apply_leaves_synthetic_config_unchanged(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -207,7 +214,7 @@ class CodexInstallerTests(unittest.TestCase):
             codex_home = home / '.codex'
             codex_home.mkdir()
             wal_dir = home / '.agent-harness' / 'codex-wals'
-            original = merge_config('model = "gpt-6-sol"\n', wal_dir)
+            original = merge_config('model = "gpt-6-sol"\n', wal_dir, profiles(home))
             tampered = original.replace('extends = ":workspace"', 'extends = ":unsafe"')
             config_path = codex_home / 'config.toml'
             config_path.write_text(tampered)
@@ -222,7 +229,7 @@ class CodexInstallerTests(unittest.TestCase):
             codex_home = home / '.codex'
             codex_home.mkdir()
             wal_dir = home / '.agent-harness' / 'codex-wals'
-            original = merge_config('model = "gpt-6-sol"\n', wal_dir)
+            original = merge_config('model = "gpt-6-sol"\n', wal_dir, profiles(home))
             extra = '\n[tui]\nanimations = false\n\n[hooks.state]\ntrusted_hash = "synthetic"\n'
             with_inside = original.replace(CONFIG_END, extra + CONFIG_END, 1)
             config_path = codex_home / 'config.toml'
@@ -345,21 +352,19 @@ class CodexInstallerTests(unittest.TestCase):
             self.assertEqual((codex_home / 'agent-harness' / 'wal.py').read_bytes(),
                              (SOURCE / 'hooks' / 'wal.py').read_bytes())
             config = (codex_home / 'config.toml').read_text()
-            self.assertEqual(tomllib.loads(config)['default_permissions'], 'agent-harness')
+            self.assertNotIn('default_permissions', tomllib.loads(config))
             self.assertIn('model = "gpt-6-sol"', config)
             self.assertIn('example = true', config)
-            self.assertEqual(config.count('default_permissions = "agent-harness"'), 1)
-            self.assertEqual(config.count('[permissions.agent-harness]'), 1)
-            self.assertIn('".git" = "write"', config)
-            self.assertIn(str(home / '.agent-harness' / 'codex-wals'), config)
+            self.assertEqual(config.count('[permissions.ah-worker]'), 1)
+            self.assertEqual(config.count(CONFIG_START), 1)
+            self.assertIn(P.rstrip('\n'), config)
             self.assertEqual(stat.S_IMODE((home / '.agent-harness' / 'codex-wals').stat().st_mode), 0o700)
             hooks = json.loads((codex_home / 'hooks.json').read_text())
             self.assertEqual(hooks['custom'], {'keep': True})
             self.assertEqual(hooks['hooks']['Stop'][0], {'hooks': [foreign]})
-            for event in HOOK_EVENTS:
-                commands = [item['command'] for group in hooks['hooks'][event]
-                            for item in group['hooks'] if item['type'] == 'command']
-                self.assertEqual(commands.count(managed_command(codex_home)), 1)
+            self.assertEqual(hooks['hooks']['PreToolUse'], [{'matcher': 'Bash', 'hooks': [foreign]}])  # the user's only
+            for event, groups in managed_groups(codex_home).items():
+                self.assertEqual([g for g in hooks['hooks'][event] if g in groups], groups)
             backups = sorted((codex_home / 'agent-harness' / 'backups').iterdir())
             self.assertEqual(len(backups), 2)
             self.assertTrue(all(stat.S_IMODE(path.stat().st_mode) == 0o700 for path in backups))
@@ -459,22 +464,23 @@ class CodexInstallerTests(unittest.TestCase):
             installed = tomllib.loads((codex_home / 'config.toml').read_text())
             self.assertEqual(installed['default_permissions'], 'custom')
             self.assertEqual(installed['permissions']['custom']['extends'], ':workspace')
-            self.assertIn('agent-harness', installed['permissions'])
+            self.assertIn('ah-worker', installed['permissions'])
         with self.assertRaisesRegex(ValueError, 'legacy sandbox'):
-            merge_config('sandbox_mode = "read-only"\n', Path('/tmp/example'))
+            merge_config('sandbox_mode = "read-only"\n', Path('/tmp/example'), P)
         for legacy in ('"sandbox_mode" = "danger-full-access"\n',
                        '[profiles.locked]\nsandbox_mode = "read-only"\n',
                        '[profiles.locked.sandbox_workspace_write]\nwritable_roots = []\n'):
             with self.subTest(legacy=legacy), self.assertRaisesRegex(ValueError, 'legacy sandbox'):
-                merge_config(legacy, Path('/tmp/example'))
-        quoted = merge_config('"default_permissions" = "custom"\n', Path('/tmp/example'))
+                merge_config(legacy, Path('/tmp/example'), P)
+        quoted = merge_config('"default_permissions" = "custom"\n', Path('/tmp/example'), P)
         self.assertEqual(tomllib.loads(quoted)['default_permissions'], 'custom')
         with self.assertRaisesRegex(ValueError, 'selects a profile'):
-            merge_config('profile = "locked"\n', Path('/tmp/example'))
+            merge_config('profile = "locked"\n', Path('/tmp/example'), P)
+        with self.assertRaisesRegex(ValueError, 'outside the managed markers'):
+            merge_config('[permissions.ah-worker]\nextends = ":workspace"\n', Path('/tmp/example'), P)
 
-    def test_full_access_refuses_conflicting_user_owned_settings_before_any_write(self):
+    def test_default_role_refuses_a_user_owned_default_before_any_write(self):
         for text in ('default_permissions = "custom"\n[permissions.custom]\nextends = ":workspace"\n',
-                     '"approval_policy" = "on-request"\n',
                      'default_permissions = "agent-harness"\n'):
             with self.subTest(text=text[:30]), tempfile.TemporaryDirectory() as temporary:
                 home = Path(temporary).resolve()
@@ -482,39 +488,44 @@ class CodexInstallerTests(unittest.TestCase):
                 codex_home.mkdir()
                 config = codex_home / 'config.toml'
                 config.write_text(text)
-                with self.assertRaises(ValueError):
-                    install(home, apply=True, default_full_access=True)
+                with self.assertRaisesRegex(ValueError, 'user-owned permission default'):
+                    install(home, apply=True, default_role='worker')
                 self.assertEqual(config.read_text(), text)
                 self.assertFalse((codex_home / 'agent-harness').exists())
+        with self.assertRaisesRegex(ValueError, 'default-role'):
+            merge_config('', Path('/tmp/example'), P, default_role='reviewer')
 
-    def test_full_access_preserves_matching_user_owned_policy(self):
+    def test_default_role_writes_one_owned_line_and_a_plain_reinstall_keeps_it(self):
         wal_dir = Path('/tmp/private-wals')
-        original = ('"default_permissions" = ":danger-full-access"\n'
-                    '"approval_policy" = "never"\n')
-        merged = merge_config(original, wal_dir, default_full_access=True)
-        self.assertTrue(merged.startswith(original))
-        self.assertEqual(tomllib.loads(merged)['default_permissions'], ':danger-full-access')
-        self.assertEqual(tomllib.loads(merged)['approval_policy'], 'never')
-        self.assertEqual(merge_config(merged, wal_dir), merged)
+        merged = merge_config('model = "gpt-6-sol"\n', wal_dir, P, default_role='supervisor')
+        self.assertEqual(tomllib.loads(merged)['default_permissions'], 'ah-supervisor')
+        self.assertEqual(merged.count('default_permissions = "ah-supervisor" # agent-harness-codex'), 1)
+        self.assertEqual(merge_config(merged, wal_dir, P), merged)
+        worker = merge_config(merged, wal_dir, P, default_role='worker')
+        self.assertEqual(tomllib.loads(worker)['default_permissions'], 'ah-worker')
+        self.assertEqual(worker.count('default_permissions'), 1)
 
-    def test_full_access_cli_preview_apply_and_unflagged_reinstall(self):
+    def test_removed_flags_fail_loudly_and_default_role_cli_applies(self):
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary).resolve()
             codex_home = home / '.codex'
             codex_home.mkdir()
             original = 'model = "gpt-6-sol"\n'
             (codex_home / 'config.toml').write_text(original)
-            command = [sys.executable, str(ROOT / 'install_codex.py'), '--home', str(home),
-                       '--default-full-access']
-            preview = subprocess.run(command, capture_output=True, text=True)
-            self.assertEqual(preview.returncode, 0, preview.stderr)
-            self.assertIn('Full Access default requested', preview.stdout)
-            self.assertEqual((codex_home / 'config.toml').read_text(), original)
-            applied = subprocess.run([*command, '--apply'], capture_output=True, text=True)
+            for flag in ('--default-full-access', '--no-command-guard'):
+                done = subprocess.run([sys.executable, str(ROOT / 'install_codex.py'), '--home', str(home), '--apply',
+                                       flag], capture_output=True, text=True, timeout=120)
+                self.assertNotEqual(done.returncode, 0)
+                self.assertIn(f'install_codex.py: {flag} was removed in release 1001:', done.stderr)
+                self.assertEqual((codex_home / 'config.toml').read_text(), original)
+                self.assertFalse((codex_home / 'agent-harness').exists())
+            command = [sys.executable, str(ROOT / 'install_codex.py'), '--home', str(home), '--default-role', 'worker',
+                       '--no-netwatch']
+            applied = subprocess.run([*command, '--apply'], capture_output=True, text=True, timeout=120)
             self.assertEqual(applied.returncode, 0, applied.stderr)
+            self.assertIn('/hooks', applied.stdout)
             config = (codex_home / 'config.toml').read_text()
-            self.assertEqual(tomllib.loads(config)['default_permissions'], ':danger-full-access')
-            self.assertEqual(tomllib.loads(config)['approval_policy'], 'never')
+            self.assertEqual(tomllib.loads(config)['default_permissions'], 'ah-worker')
             backup = next((codex_home / 'agent-harness' / 'backups').rglob('*-config.toml'))
             self.assertEqual(backup.read_text(), original)
             install(home, apply=True)
@@ -531,8 +542,8 @@ class CodexInstallerTests(unittest.TestCase):
             install(home, apply=True)
             parsed = tomllib.loads(config_path.read_text())
             self.assertEqual(parsed['features']['foreign_feature'], True)
-            self.assertEqual(parsed['default_permissions'], 'agent-harness')
-            self.assertIn('agent-harness', parsed['permissions'])
+            self.assertNotIn('default_permissions', parsed)
+            self.assertIn('ah-worker', parsed['permissions'])
 
     def test_symlinked_destination_is_refused_without_touching_outside(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -638,7 +649,9 @@ class CodexWalTests(unittest.TestCase):
                 with patch.object(wal.sys, 'stdin', io.StringIO(json.dumps(event))), \
                      patch.object(wal.sys, 'stdout', new_callable=io.StringIO) as output:
                     wal.hook()
-                if event['hook_event_name'] != 'PreToolUse':
+                if event['hook_event_name'] in ('UserPromptSubmit', 'PreToolUse'):
+                    self.assertEqual(output.getvalue(), '')  # no longer registered: a stale call writes nothing
+                else:
                     context = json.loads(output.getvalue())['hookSpecificOutput']
                     self.assertEqual(context['hookEventName'], event['hook_event_name'])
                     self.assertIn('WAL:', context['additionalContext'])
@@ -646,9 +659,7 @@ class CodexWalTests(unittest.TestCase):
             main = root / 'fixture' / 'main.jsonl'
             agent = root / 'fixture' / 'agent-owner-1.jsonl'
             records = [json.loads(line) for line in main.read_text().splitlines()]
-            self.assertEqual(len(records), 4)
-            self.assertEqual(records[1]['prompt_chars'], len(secret))
-            self.assertEqual(records[2]['input_chars'], len(json.dumps({'command': f'echo {secret}'})))
+            self.assertEqual([r['event'] for r in records], ['SessionStart', 'SubagentStart'])
             self.assertNotIn(secret, main.read_text())
             self.assertTrue(agent.exists())
             self.assertEqual(stat.S_IMODE(root.stat().st_mode), 0o700)
@@ -704,9 +715,7 @@ if __name__ == '__main__':
 
 
 class CodexCopiesTheDropboxBudget(unittest.TestCase):
-    def test_budget_file_ships_next_to_the_codex_heavy_guard(self):
-        # PR #132 review L2: the Codex guard reads dropbox_budget.conf from its own directory; without it the lane
-        # limit falls back to 4 instead of the agent-bulk share.
+    def test_budget_file_ships_and_the_heavy_guard_does_not(self):
         import install_codex
-        self.assertIn('heavy_job_guard.py', install_codex.DELIVERY_HELPERS)
-        self.assertIn('dropbox_budget.conf', install_codex.DELIVERY_HELPERS)
+        self.assertNotIn('heavy_job_guard.py', install_codex.DELIVERY_HELPERS)  # deleted in release 1001
+        self.assertIn('dropbox_budget.conf', install_codex.DELIVERY_HELPERS)  # log-backup.sh still reads it

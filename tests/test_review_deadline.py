@@ -24,7 +24,6 @@ HOOKS = HERE.parent / 'harness/hooks'
 sys.path.insert(0, str(HOOKS))
 sys.path.insert(0, str(HERE))
 
-import escalation as esc  # noqa: E402
 import model_tiers as tiers  # noqa: E402
 import review_diagnostics as rd  # noqa: E402
 import test_peer_review as tpr  # noqa: E402
@@ -229,22 +228,6 @@ class DeadlineReachesTheProvider(unittest.TestCase):
         self.assertIn('--timeout must be between 1 and 3600', err)
         self.assertEqual((seen['run'], seen['begin']), ([], []))
 
-    def test_guard_a_daemon_shaped_call_stays_inside_the_ahc_review_wall(self):
-        # Guard (holds at base too): ahc_runner passes --timeout 720 and leases for core.TIMEOUTS['review'].
-        import ahc_core
-        code, seen, out, err = self.review('--author-rung', 'R3', '--timeout', '720', '--no-main-stamp')
-        self.assertEqual(code, 0, err)
-        self.assertEqual(seen['begin'], [(1440, 2880)])
-        self.assertLessEqual(seen['begin'][0][0], ahc_core.TIMEOUTS['review'])
-
-    def test_the_daemon_timeout_fits_its_wall_at_every_rung(self):
-        import ahc_core
-        policy = rd.load_policy(HOOKS / 'review_policy.json')
-        for rung, entry in tiers.load_policy()['rungs'].items():
-            with self.subTest(rung=rung):
-                seconds = rd.provider_deadline(policy, rung, entry['effort'], requested=720)[0]
-                self.assertLessEqual(2 * seconds, ahc_core.TIMEOUTS['review'])
-
     def test_the_timeout_message_names_run_rung_provider_and_both_steps(self):
         # AC-3, from the dominant real shape: Codex hit its usage limit, then the Claude fallback timed out.
         def outcome(name):
@@ -264,11 +247,9 @@ class DeadlineReachesTheProvider(unittest.TestCase):
         self.assertIn('per-provider deadline 2700 s from provider_timeout by_effort max', timing)
         self.assertRegex(timing, r'snapshot step \d+ s of its \d+ s deadline')
         self.assertEqual(final['usage']['timing']['run_id'], run_id)
-        self.assertIn('A timeout is not counted as a ladder failure', err)
-        ladder_line = next(line for line in err.splitlines() if line.startswith('Ladder: '))
-        self.assertIn('NOT_COUNTED (infrastructure or uncertain result (TIMEOUT))', ladder_line)
-        self.assertIn('a timeout is not counted as a ladder failure, but it spent review launch 1 of 8', ladder_line)
-        self.assertNotIn('Ladder limit:', err)
+        # 2026-11-25: no ladder any more; a timeout is no result, so nothing is counted and no status is posted
+        self.assertIn('A timeout is not a verdict: no harness/review status is posted', err)
+        self.assertNotIn('Ladder', err)
 
     # Every started provider step is timed (PR 339 review follow-up): the Kimi fallback step too, and a step whose
     # call raised after the spawn. Failing first against 9822b621, except the guard.
@@ -392,80 +373,6 @@ def block_receipt(salt):
                       sort_keys=True).encode()
 
 
-class TimeoutsOnTheLadder(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix='ladder-')
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name) / 'state'
-        self.root.mkdir(mode=0o700)
-        self.policy = tiers.load_policy()
-        self.ledger = esc.Ledger(self.root, self.policy)
-        environment = patch.dict(os.environ, {'AGENT_HARNESS_ESCALATION_DIR': str(self.root)})
-        environment.start()
-        self.addCleanup(environment.stop)
-
-    def test_guard_a_real_timeout_receipt_is_never_a_ladder_failure(self):
-        # Guard (holds at base too): three timeouts never climb, but each one spends a launch.
-        for salt in range(3):
-            status = self.ledger.record('h22-t', timeout_receipt(str(salt)), kind='review', source='test')
-            self.assertEqual((status['rung'], status['failures_at_rung'], status['climbs']), ('R0', 0, 0))
-        state = self.ledger.load('h22-t')
-        self.assertEqual({event['class'] for event in state['events']}, {'NOT_COUNTED'})
-        self.assertEqual(state['launches'], 3)
-
-    def test_the_ladder_line_says_a_timeout_is_not_a_failure_but_spent_a_launch(self):
-        status = self.ledger.record('h22-n', timeout_receipt('1'), kind='review', source='test')
-        note = esc.event_note(status, self.policy)
-        self.assertIn('NOT_COUNTED (infrastructure or uncertain result (TIMEOUT))', note)
-        self.assertIn('not counted as a ladder failure, but it spent review launch 1 of 8', note)
-        self.assertIn('($5 of $60)', note)
-        block = self.ledger.record('h22-n', block_receipt('2'), kind='review', source='test')
-        self.assertNotIn('timeout', esc.event_note(block, self.policy))  # positive control
-
-    def test_timeouts_at_the_launch_ceiling_say_so_and_name_the_way_on(self):
-        for salt in range(8):
-            status = self.ledger.record('h22-l', timeout_receipt(str(salt)), kind='review', source='test')
-        self.assertEqual((status['blocked_by'], status['timeout_launches']), (['max_review_launches'], 8))
-        note = esc.limit_note(status, self.policy)
-        self.assertIn('ladder limit reached for task h22-l (max_review_launches): 8 of 8 review launches spent', note)
-        self.assertIn('8 of the 8 spent launches were reviewer timeouts', note)
-        self.assertIn('not counted as ladder failures', note)
-        self.assertIn('human sign-off needed', note)
-        self.assertIn('no waiver or reset for a ladder limit', note)
-        import tier_gate
-        decision, reason, _, _ = tier_gate.decide_spawn(
-            {'tool_name': 'Agent', 'tool_input': {'prompt': 'fix it [task:h22-l]', 'description': 'owner',
-                                                  'subagent_type': 'task-owner'}, 'session_id': 's1'},
-            self.policy, self.ledger, session_id='s1')
-        self.assertEqual((decision, reason), ('deny', note))
-        import rescue
-        with self.assertRaises(esc.LedgerError) as refused:
-            rescue.rescue_rung(self.policy, 'h22-l', None)
-        self.assertEqual(refused.exception.message, note)
-
-    def test_findings_at_the_launch_ceiling_do_not_mention_timeouts(self):
-        # Positive control: eight distinct findings spend the same ceiling without a timeout sentence.
-        for salt in range(8):
-            status = self.ledger.record('h22-f', block_receipt(str(salt)), kind='review', source='test')
-        self.assertIn('max_review_launches', status['blocked_by'])
-        self.assertEqual(status['timeout_launches'], 0)
-        note = esc.limit_note(status, self.policy)
-        self.assertNotIn('timeout', note)
-        self.assertIn('human sign-off needed', note)
-
-    def test_timeouts_at_the_spend_ceiling_say_so(self):
-        policy = {**self.policy, 'ladder_limits': {**self.policy['ladder_limits'], 'max_review_launches': 100}}
-        ledger = esc.Ledger(self.root, policy)
-        for salt in range(12):
-            status = ledger.record('h22-s', timeout_receipt(str(salt)), kind='review', source='test')
-        self.assertEqual(status['blocked_by'], ['max_total_review_usd'])
-        note = esc.limit_note(status, policy)
-        self.assertIn('$60 of $60 review budget spent', note)
-        self.assertIn('12 of the 12 spent launches were reviewer timeouts', note)
-
-    def test_a_task_below_every_limit_gets_no_note(self):
-        status = self.ledger.record('h22-ok', timeout_receipt('1'), kind='review', source='test')
-        self.assertEqual(esc.limit_note(status, self.policy), '')
 
 
 if __name__ == '__main__':

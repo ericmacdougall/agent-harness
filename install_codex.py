@@ -9,6 +9,7 @@ import json
 import os
 import secrets
 import shlex
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -17,8 +18,8 @@ try:
 except ModuleNotFoundError:  # Codex installer requires Python 3.11+.
     tomllib = None
 
-from install import (DirectoryPins, DowngradeRefused, local_profile_status, migrate_local_profiles, netwatch_status, atomic_write,
-                     git_hook_status, markdown_marker_lines, read_regular, safe_unlink, switch_module)
+from install import (HOOKS, REMOVED_IN, DirectoryPins, DowngradeRefused, atomic_write, markdown_marker_lines, netwatch_status,
+                     read_regular, remove_git_backstop, removed_flag_message, safe_unlink, sandbox_module, switch_module)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -31,49 +32,12 @@ AGENTS = ('harness_owner.toml', 'harness_reviewer.toml', 'harness_red_team.toml'
           'harness_click_tester.toml', 'harness_fixer.toml', 'harness_rescue.toml')
 SKILL_FILES = ('SKILL.md', 'references/owner-workflow.md',
                'references/testing-and-evals.md', 'references/delivery.md')
-DELIVERY_HELPERS = ('process.py', 'git_safety.py', 'github_identity.py', 'report_file.py',
-                    'usage_guard.py', 'publish_feature.py', 'integrate_local.py', 'node_check_reporter.mjs', 'deliver.py',
-                    'ticket_adapters.py', 'commit_policy.py', 'commit_policy.json',
-                    # Spec flow commands work by hand in Codex; its done hook is Claude Code only.
-                    'spec_flow.py', 'spec_policy.json', 'spec_template.md', 'provenance.py', 'provenance_policy.json',
-                    'provenance_hooks.py', 'safe_input.py', 'caller_identity.py', 'domain_gates.py', 'domain_checklists.json',
-                    'native_context.py', 'native_user_source.py', 'native_admission.py', 'native_main.py', 'ah_local.py',
-                    'idle_guard.py',  # ops_watch's default idle_guard check imports it (goodqa#15943)
-                    'wal_note.py',  # ah task/ticket writes and doctor import this helper.
-                    'commit_policy.local.json.example', 'spec_policy.local.json.example',
-                    'model_tiers.py', 'model_tiers.json', 'escalation.py', 'tier_gate.py',
-                    # Destructive and config-dump command guard (GoodQA #14471): launcher plus analyser.
-                    'command_guard.py', 'command_guard_hook.py', 'redact.py', 'kill_guard.py', 'kill_guard_policy.json', 'merge_gate.py', 'bg_job.py', 'task_recovery.py',
-                    'copy_hygiene.py', 'lifecycle_cleanup.py',
-                    'shell_words.py',  # the shell reader merge_gate and copy_hygiene share (goodqa#16811)
-                    # Dropped-owner gate on Codex Stop and its reads (goodqa#14791 P18)
-                    'dropped_gate.py', 'ah.py', 'ah_worktree.py', 'ah_install.py', 'guard_selftest.py', 'liveness.py',
-                    # ah export and ah status: status_report imports goals_view (goodqa#15788)
-                    'ah_export.py', 'goals_view.py',
-                    # goals_view imports mission_coverage at load; spec_flow and others import these lazily
-                    # (tests/test_ah_export.py walks the chain).
-                    'mission_coverage.py', 'resource_budget.py', 'workdir.py',
-                    'shellwords.py',  # dropped_gate's pretool path imports it (PR 208 red-team)
-                    # Heavy-job guard (goodqa#14817): keeps large copies, suites and builds off the Mac for Codex too.
-                    'heavy_job_guard.py', 'dropbox_budget.conf', 'resource_limits.json',
-                    # deliver.py prepare --scan trivy imports it (goodqa#15295)
-                    'trivy_gate.py',
-                    # AGENTS.md tells Codex to scan third-party installers first (goodqa#15253 step 4)
-                    'installer_scan.py',
-                    # Mission Control chat by hand from a Codex main session: wait, read, reply --from codex (goodqa#15585).
-                    # No Codex Stop hook: Codex keys hook trust by position and the dashboard's Codex chat uses codex exec.
-                    'mc_chat.py', 'mc_inbox.py',
-                    # Stall-watcher answer inbox (UserPromptSubmit + SessionStart only; appended so trust positions stay).
-                    'owner_inbox.py',
-                    # The launcher every Codex hook runs through (the off switch), roles, and the switch itself.
-                    'ah_hook.py', 'ah_roles.py', 'ah_switch.py',
-                    # imported by the helpers above (tests/test_shipped_modules.py walks the imports)
-                    'ah_approvals.py', 'ah_secret.py', 'ah_log_push.py', 'ah_kill.py', 'ah_ticket.py', 'ah_chat.py',
-                    'ah_chat_send.py', 'central_decisions.py', 'gq_browser.py', 'successor.py', 'worktree_hygiene.py',
-                    # Session folders, saved work and the reaper (docs/lifecycle.md): the save library, `ah reap` and
-                    # `ah co`, the SessionStart hook and the Stop save hook.
-                    'git_save.py', 'ah_reap.py', 'session_env.py', 'autosave.py')
+# The Claude hooks directory's shipped set (install.HOOKS, the import closure of the entry points), minus what only
+# Claude Code runs: Codex copies its own wal.py (codex/hooks/wal.py) and ops_watch.py by name below.
+CLAUDE_ONLY = frozenset({'wal.py', 'ops_watch.py', 'prod_delete_guard.py'})
+DELIVERY_HELPERS = tuple(name for name in HOOKS if name not in CLAUDE_ONLY)
 GIT_HOOK_KEY = 'agent-harness-commit-policy-codex'  # independent of the Claude install's key
+# Every event an earlier release registered a handler on: an upgrade strips those handlers wherever they are.
 HOOK_EVENTS = ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'SubagentStart', 'Stop', 'Interrupt')
 
 
@@ -107,27 +71,11 @@ def managed_command(codex_home: Path, launcher: bool = True) -> str:
     return launch(codex_home, 'wal.py', ' hook', launcher)
 
 
-def policy_command(codex_home: Path, launcher: bool = True) -> str:
-    return launch(codex_home, 'commit_policy.py', ' hook', launcher)
-
-
-def gate_command(codex_home: Path, launcher: bool = True, legacy: bool = False) -> str:
-    """Merge gate. Fails open since 2026-11-24: a crash allows. legacy=True gives the older `|| exit 2` form (a crash
-    blocked), which known_commands still recognises so an upgrade replaces it."""
-    return launch(codex_home, 'merge_gate.py', ' hook || exit 2' if legacy else ' hook', launcher)
-
-
-def guard_command(codex_home: Path, verb: str = ' hook', launcher: bool = True) -> str:
-    # The hook verb names the gate for the Go front door (cmd/harness/gates.json); the launcher ignores it.
-    return launch(codex_home, 'command_guard_hook.py', verb, launcher)
-
-
-def kill_guard_command(codex_home: Path, launcher: bool = True) -> str:
-    return launch(codex_home, 'kill_guard.py', ' hook', launcher)
-
-
-def heavy_guard_command(codex_home: Path, launcher: bool = True) -> str:
-    return launch(codex_home, 'heavy_job_guard.py', '', launcher)
+# Handlers earlier releases registered for scripts release 1001 deleted (commit policy, merge gate, command guard,
+# kill guard, heavy-job guard): recognised only, so an upgrade strips them. Nothing builds them for registration.
+RETIRED_COMMANDS = (('commit_policy.py', ' hook'), ('merge_gate.py', ' hook'), ('merge_gate.py', ' hook || exit 2'),
+                    ('command_guard_hook.py', ' hook'), ('command_guard_hook.py', ''), ('kill_guard.py', ' hook'),
+                    ('heavy_job_guard.py', ''))
 
 
 def owner_inbox_command(codex_home: Path, launcher: bool = True) -> str:
@@ -154,12 +102,9 @@ def known_commands(codex_home: Path) -> set[str]:
     """Every command string this installer owns, in the launcher form and in the direct form of older installs."""
     out = set()
     for launcher in (True, False):
-        out |= {managed_command(codex_home, launcher), policy_command(codex_home, launcher),
-                guard_command(codex_home, launcher=launcher), guard_command(codex_home, '', launcher),
-                gate_command(codex_home, launcher), gate_command(codex_home, launcher, legacy=True),
-                kill_guard_command(codex_home, launcher),
-                heavy_guard_command(codex_home, launcher), owner_inbox_command(codex_home, launcher),
+        out |= {managed_command(codex_home, launcher), owner_inbox_command(codex_home, launcher),
                 session_env_command(codex_home, launcher), autosave_command(codex_home, launcher)}
+        out |= {launch(codex_home, script, rest, launcher) for script, rest in RETIRED_COMMANDS}
     return out
 
 
@@ -167,32 +112,50 @@ MANAGED_SCRIPTS = ('wal.py', 'commit_policy.py', 'command_guard_hook.py', 'merge
                    'heavy_job_guard.py', 'owner_inbox.py', 'session_env.py', 'autosave.py')
 
 
-def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) -> dict:
+def managed_groups(codex_home: Path) -> dict:
+    """The seven Codex handlers of release 1001, one group each, in order. No PreToolUse group at all: a shell call
+    starts no harness hook (docs/direction.md). Codex keys hook trust by position, so this layout needs one review in
+    /hooks after the upgrade (the installer says so)."""
+    def group(command: str, timeout: int) -> dict:
+        return {'hooks': [{'type': 'command', 'command': command, 'timeout': timeout}]}
+    wal = managed_command(codex_home)
+    inbox = owner_inbox_command(codex_home)
+    return {
+        'SessionStart': [group(wal, 10), group(inbox, 5), group(session_env_command(codex_home), 10)],
+        'UserPromptSubmit': [group(inbox, 5)],
+        'SubagentStart': [group(wal, 10)],
+        # wal.py on Stop: the continuation checkpoint and the dropped-owner part; autosave saves the checkouts
+        'Stop': [group(wal, 10), group(autosave_command(codex_home), 30)],
+    }
+
+
+def merge_hooks(existing: dict, codex_home: Path) -> dict:
     if not isinstance(existing, dict):
         raise ValueError('hooks.json must contain an object')
     result = json.loads(json.dumps(existing))
     hooks = result.setdefault('hooks', {})
     if not isinstance(hooks, dict):
         raise ValueError('hooks.json hooks must be an object')
-    command = managed_command(codex_home)
-    policy = policy_command(codex_home)
-    guard = guard_command(codex_home)
-    kill_guard = kill_guard_command(codex_home)
-    heavy_guard = heavy_guard_command(codex_home)
-    gate = gate_command(codex_home)
-    owner_inbox = owner_inbox_command(codex_home)
-    # Session lifecycle (docs/lifecycle.md): the session folder and its one line at SessionStart, and a save of what
-    # the session's checkouts hold nowhere else at Stop. Both always exit 0 and print no decision.
-    session_env = {'hooks': [{'type': 'command', 'command': session_env_command(codex_home), 'timeout': 10}]}
-    autosave = {'hooks': [{'type': 'command', 'command': autosave_command(codex_home), 'timeout': 30}]}
     known = known_commands(codex_home)
-    for event in HOOK_EVENTS:
-        lifecycle = event in {'Stop', 'Interrupt'}
-        managed = {'hooks': [{'type': 'command', 'command': command,
-                              'timeout': 1 if event == 'Interrupt' else 10}]}
+    wanted = managed_groups(codex_home)
+
+    def ours(group: dict, event: str) -> bool:
+        """A lifecycle group exactly as this or an earlier installer wrote it (launcher or direct form)."""
+        shapes = []
+        for launcher in (True, False):
+            shapes.append({'hooks': [{'type': 'command', 'command': managed_command(codex_home, launcher),
+                                      'timeout': 1 if event == 'Interrupt' else 10}]})
+            shapes.append({'hooks': [{'type': 'command', 'command': autosave_command(codex_home, launcher),
+                                      'timeout': 30}]})
+        return group in shapes
+
+    for event in sorted(set(HOOK_EVENTS) | set(wanted), key=lambda e: (e not in HOOK_EVENTS, e)):
+        if event not in hooks and event not in wanted:
+            continue
         groups = hooks.setdefault(event, [])
         if not isinstance(groups, list):
             raise ValueError(f'hooks.json {event} must be a list')
+        had = bool(groups)
         preserved = []
         for group in groups:
             if not isinstance(group, dict) or not isinstance(group.get('hooks'), list):
@@ -200,41 +163,16 @@ def merge_hooks(existing: dict, codex_home: Path, command_guard: bool = True) ->
             handlers = [handler for handler in group['hooks']
                         if not (isinstance(handler, dict) and handler.get('type') == 'command'
                                 and handler.get('command') in known)]
-            legacy = {'hooks': [{**managed['hooks'][0], 'command': managed_command(codex_home, False)}]}
-            if lifecycle and len(handlers) != len(group['hooks']) and group not in (managed, legacy, autosave):
+            if event in {'Stop', 'Interrupt'} and len(handlers) != len(group['hooks']) and not ours(group, event):
                 raise ValueError(f'hooks.json has a custom {event} hook invoking the managed command; '
                                  'reconcile that group explicitly before installing')
             if handlers:
                 preserved.append({**group, 'hooks': handlers})
-        preserved.append(managed)
-        if event == 'PreToolUse':
-            # Commit message policy for every tool (no matcher): shell argv, strings, stdin writes.
-            preserved.append({'hooks': [{'type': 'command', 'command': policy, 'timeout': 60}]})
-            preserved.append({'hooks': [{'type': 'command', 'command': gate, 'timeout': 60}]})
-        if event == 'PreToolUse' and command_guard:
-            # Command guard for every tool (no matcher): write_stdin text typed into a running shell is never checked
-            # again by the host. It refuses on effect and allows with a note when it cannot read a command. Appended last:
-            # Codex keys hook trust by position (hooks.state "<file>:pre_tool_use:<group>:<handler>"), so adding
-            # it after the existing groups keeps their trusted hashes valid (GoodQA #14590). Codex runs every
-            # matching hook, so position does not change whether the guard can block.
-            preserved.append({'hooks': [{'type': 'command', 'command': guard, 'timeout': 30}]})
-            # Kill guard after the command guard, so main's trusted positions above it do not move (GoodQA #14590,
-            # GoodQA #14506). --no-command-guard leaves out both.
-            preserved.append({'hooks': [{'type': 'command', 'command': kill_guard, 'timeout': 30}]})
-        if event == 'PreToolUse':
-            # Heavy-job guard last, so every trusted position above keeps its hash; independent of --no-command-guard.
-            # It fails open on its own errors and denies with exit 2 only for heavy work on the Mac. Codex trust for
-            # this hook needs the user to review it in /hooks; until then Codex skips it (ops-watch codex:trust).
-            preserved.append({'hooks': [{'type': 'command', 'command': heavy_guard, 'timeout': 30}]})
-        # Appended last so existing Codex hook-trust positions do not move. No Stop hook for Codex.
-        if event in {'SessionStart', 'UserPromptSubmit'}:
-            preserved.append({'hooks': [{'type': 'command', 'command': owner_inbox, 'timeout': 5}]})
-        # Appended after everything else, for the same reason: Codex asks the user to review a new hook in /hooks.
-        if event == 'SessionStart':
-            preserved.append(session_env)
-        if event == 'Stop':
-            preserved.append(autosave)
-        hooks[event] = preserved
+        preserved.extend(json.loads(json.dumps(wanted.get(event, []))))
+        if preserved:
+            hooks[event] = preserved
+        elif had or event not in wanted:
+            del hooks[event]  # a retired event (PreToolUse, Interrupt) leaves nothing behind
     return result
 
 
@@ -262,19 +200,44 @@ def owned_root_line(text: str, key: str, value: str) -> int | None:
     return matches[0] if matches else None
 
 
-def merge_config(existing: str, wal_dir: Path, *, default_full_access: bool = False) -> str:
-    """Install the optional profile; change the default only on a fresh or opted-in install."""
+LEGACY_PROFILE = 'agent-harness'  # the one profile releases before 1001 managed
+ROLE_DEFAULTS = ('worker', 'supervisor')  # --default-role: a reviewer is launched for a review, never a default
+OWNED = ' # agent-harness-codex'
+
+
+def legacy_profile(wal_dir: Path) -> str:
+    """The [permissions.agent-harness] text releases before 1001 wrote between the markers (recognised to upgrade it)."""
+    return ('[permissions.agent-harness]\n'
+            'description = "Workspace with private Agent Harness WAL and Git commits"\n'
+            'extends = ":workspace"\n\n'
+            '[permissions.agent-harness.filesystem]\n'
+            f'{json.dumps(str(wal_dir))} = "write"\n\n'
+            '[permissions.agent-harness.filesystem.":workspace_roots"]\n'
+            '".git" = "write"')
+
+
+def profile_names(profiles: str) -> set:
+    parsed = tomllib.loads(profiles)
+    names = set((parsed.get('permissions') or {}).keys())
+    if not names or set(parsed) != {'permissions'}:
+        raise ValueError('the generated Codex profiles must be [permissions.*] tables only')
+    return names
+
+
+def merge_config(existing: str, wal_dir: Path, profiles: str, *, default_role: str | None = None) -> str:
+    """Put `profiles` (ah_sandbox.codex_profiles(): [permissions.ah-worker], ah-reviewer, ah-supervisor) between the
+    managed markers, replacing this or an earlier release's managed text. Selects no role unless default_role:
+    an owned `default_permissions = "agent-harness"` line (the retired profile) becomes "ah-worker"; an owned
+    ":danger-full-access" line is kept as it is (install() prints a note); a user's own line is never changed."""
     if tomllib is None:
         raise RuntimeError('Codex installer requires Python 3.11+ for TOML validation')
-    profile = ('[permissions.agent-harness]\n'
-               'description = "Workspace with private Agent Harness WAL and Git commits"\n'
-               'extends = ":workspace"\n\n'
-               '[permissions.agent-harness.filesystem]\n'
-               f'{json.dumps(str(wal_dir))} = "write"\n\n'
-               '[permissions.agent-harness.filesystem.":workspace_roots"]\n'
-               '".git" = "write"')
+    if default_role is not None and default_role not in ROLE_DEFAULTS:
+        raise ValueError(f'--default-role must be one of {", ".join(ROLE_DEFAULTS)}')
+    profiles = profiles.rstrip('\n')
+    new_names = profile_names(profiles)
     original_parsed = tomllib.loads(existing)
     lines = existing.splitlines(keepends=True)
+
     # A standalone-looking marker can be literal text inside a multiline
     # string. Removing a real TOML comment leaves parsed values unchanged.
     def comment_marker_indices(marker: str) -> list[int]:
@@ -295,14 +258,15 @@ def merge_config(existing: str, wal_dir: Path, *, default_full_access: bool = Fa
     permissions = original_parsed.get('permissions', {})
     if not isinstance(permissions, dict):
         raise ValueError('config.toml permissions must be a table')
-    managed_profile = permissions.get('agent-harness')
-    managed_result = None
-    if managed_profile is not None:
+    managed_names = (new_names | {LEGACY_PROFILE}) & set(permissions)
+    prefix_suffix = None
+    if starts or ends:
         if len(starts) != 1 or len(ends) != 1 or starts[0] >= ends[0]:
             raise ValueError('config.toml has ambiguous or malformed Agent Harness markers')
         inside = ''.join(lines[starts[0] + 1:ends[0]])
-        generated = profile + '\n'
-        if not inside.startswith(generated):
+        known = [text + '\n' for text in (profiles, legacy_profile(wal_dir))]
+        generated = next((text for text in known if inside.startswith(text)), None)
+        if generated is None:
             raise ValueError('config.toml managed profile was edited; resolve manually')
         extra = inside[len(generated):]
         if extra.strip():
@@ -317,23 +281,22 @@ def merge_config(existing: str, wal_dir: Path, *, default_full_access: bool = Fa
             raise ValueError('config.toml has ambiguous text after the managed profile')
         prefix = ''.join(lines[:starts[0]])
         suffix = ''.join(lines[ends[0] + 1:])
+        owned_here = profile_names(generated)
         expected = copy.deepcopy(original_parsed)
-        del expected['permissions']['agent-harness']
-        if not expected['permissions']:
+        for name in owned_here:
+            expected.get('permissions', {}).pop(name, None)
+        if 'permissions' in expected and not expected['permissions']:
             del expected['permissions']
         candidate = prefix + extra + suffix
         if tomllib.loads(candidate) != expected:
             raise ValueError('config.toml managed profile collides with user data; resolve manually')
-        managed_result = prefix + extra + lines[starts[0]] + generated + lines[ends[0]] + suffix
-        if tomllib.loads(managed_result) != original_parsed:
+        check = prefix + extra + lines[starts[0]] + generated + lines[ends[0]] + suffix
+        if tomllib.loads(check) != original_parsed:
             raise ValueError('config.toml unrelated sections would change meaning; resolve manually')
+        managed_names -= owned_here
+        prefix_suffix = (prefix + extra, lines[starts[0]], lines[ends[0]], suffix)
         existing = candidate
-    elif starts or ends:
-        raise ValueError('config.toml has stray Agent Harness comment markers; resolve manually')
     parsed = tomllib.loads(existing)
-    result_permissions = parsed.get('permissions', {})
-    if not isinstance(result_permissions, dict):
-        raise ValueError('config.toml permissions must be a table')
     if 'sandbox_mode' in parsed or 'sandbox_workspace_write' in parsed:
         raise ValueError('config.toml uses legacy sandbox settings; merge manually')
     if 'profile' in parsed:
@@ -341,37 +304,48 @@ def merge_config(existing: str, wal_dir: Path, *, default_full_access: bool = Fa
     for settings in parsed.get('profiles', {}).values():
         if isinstance(settings, dict) and ('sandbox_mode' in settings or 'sandbox_workspace_write' in settings):
             raise ValueError('config.toml has a profile with legacy sandbox settings; merge manually')
-    if 'agent-harness' in result_permissions:
-        raise ValueError('config.toml already defines the agent-harness profile outside managed markers')
-    result = (managed_result if managed_result is not None else
-              existing.rstrip() + '\n\n' + CONFIG_START + '\n' + profile + '\n' + CONFIG_END + '\n')
+    if managed_names:
+        raise ValueError('config.toml already defines ' + ', '.join(sorted(managed_names))
+                         + ' outside the managed markers; resolve manually')
+    if prefix_suffix is not None:
+        head, start_line, end_line, suffix = prefix_suffix
+        result = head + start_line + profiles + '\n' + end_line + suffix
+    else:
+        result = existing.rstrip() + ('\n\n' if existing.strip() else '') + CONFIG_START + '\n' + profiles + '\n' + CONFIG_END + '\n'
     current = tomllib.loads(result)
-    owned_default = owned_root_line(result, 'default_permissions', 'agent-harness')
-    if default_full_access:
-        selected = current.get('default_permissions')
-        if (selected not in (None, ':danger-full-access')
-                and not (selected == 'agent-harness' and owned_default is not None)):
+    selected = current.get('default_permissions')
+    owned = next((i for value in (LEGACY_PROFILE, ':danger-full-access', *('ah-' + r for r in ROLE_DEFAULTS))
+                  for i in [owned_root_line(result, 'default_permissions', value)] if i is not None), None)
+    wanted = None
+    if default_role is not None:
+        if selected is not None and owned is None:
             raise ValueError('config.toml selects a user-owned permission default; resolve manually')
-        if current.get('approval_policy') not in (None, 'never'):
-            raise ValueError('config.toml selects a user-owned approval policy; resolve manually')
-        if owned_default is not None:
+        wanted = 'ah-' + default_role
+    elif owned is not None and selected == LEGACY_PROFILE:
+        wanted = 'ah-worker'  # the retired profile's successor: workspace writes, secrets unreadable
+    if wanted is not None:
+        line = f'default_permissions = {json.dumps(wanted)}{OWNED}\n'
+        if owned is not None:
             lines = result.splitlines(keepends=True)
-            lines[owned_default] = 'default_permissions = ":danger-full-access" # agent-harness-codex\n'
+            lines[owned] = line
             result = ''.join(lines)
-        elif selected is None:
-            result = 'default_permissions = ":danger-full-access" # agent-harness-codex\n' + result
-        if 'approval_policy' not in current:
-            result = 'approval_policy = "never" # agent-harness-codex\n' + result
-    elif 'default_permissions' not in current and managed_profile is None:
-        result = 'default_permissions = "agent-harness" # agent-harness-codex\n' + result
-    # A normal reinstall keeps explicit defaults and approval choices. Missing
-    # root settings in an existing install are intentional.
+        else:
+            result = line + result
     tomllib.loads(result)
     return result
 
 
-def install(home: Path, apply: bool, *, default_full_access: bool = False, command_guard: bool = True,
-            hooks_only: bool = False, allow_downgrade: bool = False, release: int | None = None) -> list[str]:
+def full_access_note(config: str) -> str | None:
+    """An owned `default_permissions = ":danger-full-access"` line an earlier --default-full-access wrote is left
+    alone (no silent change of a live default); one line says so and how to choose a role instead."""
+    if tomllib is None or owned_root_line(config, 'default_permissions', ':danger-full-access') is None:
+        return None
+    return ('config.toml keeps default_permissions = ":danger-full-access" (written by an earlier --default-full-access); '
+            'run with --default-role worker to select the ah-worker profile instead')
+
+
+def install(home: Path, apply: bool, *, default_role: str | None = None, hooks_only: bool = False,
+            allow_downgrade: bool = False, release: int | None = None) -> list[str]:
     """hooks_only: install the harness files only; AGENTS.md, hooks.json and config.toml are never read or written.
 
     Like install.py: refuses a release below the host's Codex floor unless allow_downgrade; while OFF the AGENTS.md
@@ -426,15 +400,18 @@ def install(home: Path, apply: bool, *, default_full_access: bool = False, comma
                                                                block=f'{START}\n{addition.rstrip()}\n{END}\n')
             else:
                 instructions = merge_marked(existing_instructions, addition)
-            hooks = merge_hooks(existing_hooks, codex_home, command_guard)
-            config = merge_config(existing_config, wal_dir, default_full_access=default_full_access)
+            hooks = merge_hooks(existing_hooks, codex_home)
+            config = merge_config(existing_config, wal_dir, sandbox_module().codex_profiles(home=home),
+                                  default_role=default_role)
             payloads += [(instructions_path, instructions.encode()),
                          (hooks_path, (json.dumps(hooks, indent=2) + '\n').encode()),
                          (config_path, config.encode())]
         changes = [str(path) for path in managed]
+        note = None if hooks_only else full_access_note(config)
+        if note:
+            changes.append(note)
         if not apply:
             return changes
-        migrate_local_profiles(codex_home, harness_dir)  # before the generic policies overwrite personal values
         for directory in directories[1:]:
             pins.create(directory)
         for directory in (codex_home, harness_dir, backup_root, wal_parent, wal_dir):
@@ -500,10 +477,7 @@ def install(home: Path, apply: bool, *, default_full_access: bool = False, comma
             settings_spec, instructions_spec = prior.get('settings'), prior.get('instructions')
         else:
             settings_spec = {'path': '.codex/hooks.json', 'hooks_dir': str(harness_dir), 'names': list(MANAGED_SCRIPTS),
-                             'groups': {event: [g for g in hooks['hooks'][event]
-                                                if any(h.get('command') in known_commands(codex_home)
-                                                       for h in g.get('hooks', []) if isinstance(h, dict))]
-                                        for event in HOOK_EVENTS}}
+                             'groups': managed_groups(codex_home)}
             instructions_spec = {'block': f'{START}\n{(SOURCE / "AGENTS.md").read_text().rstrip()}\n{END}\n'}
         commit = switch.source_commit(ROOT)
         switch.record_install(home, 'codex', release, commit, [d for _, d in files], settings_spec, instructions_spec,
@@ -516,44 +490,49 @@ def install(home: Path, apply: bool, *, default_full_access: bool = False, comma
 
 
 def install_git_backstop(home: Path, apply: bool) -> str:
-    home = home.expanduser().resolve()  # runs through ah_hook.py beside the script (install.git_hook_status)
-    return git_hook_status(home, GIT_HOOK_KEY, home / '.codex' / 'agent-harness' / 'commit_policy.py', apply=apply)
+    """Release 1001 registers no git hook; an upgrade unsets the one earlier releases added."""
+    return remove_git_backstop(home, GIT_HOOK_KEY, apply)
 
 
-def main() -> None:
+REMOVED_FLAGS = {
+    '--no-command-guard': 'the command guard is deleted; no hook reads a shell command',
+    '--default-full-access': 'choose a sandbox profile instead: --default-role worker|supervisor (docs/sandbox.md)',
+}
+
+
+def main(argv=None) -> None:
+    argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description=__doc__)
+    message = removed_flag_message('install_codex.py', argv, REMOVED_FLAGS)
+    if message:
+        parser.exit(2, message + '\n')
     parser.add_argument('--apply', action='store_true')
-    parser.add_argument('--default-full-access', action='store_true',
-                        help='Explicitly select built-in Full Access and no approval prompts for new sessions')
+    parser.add_argument('--default-role', choices=ROLE_DEFAULTS,
+                        help='write an owned default_permissions = "ah-<role>" line: new sessions run in that '
+                             'sandbox profile (docs/sandbox.md); without it no role is selected')
     parser.add_argument('--home', type=Path, default=Path.home())
     parser.add_argument('--hooks-only', action='store_true',
-                        help='install the harness files and the commit-msg backstop only; never read or write '
-                             'AGENTS.md, hooks.json or config.toml, and skip netwatch (per-file backups are kept)')
+                        help='install the harness files only; never read or write AGENTS.md, hooks.json or '
+                             'config.toml, and skip netwatch (per-file backups are kept)')
     netwatch = parser.add_mutually_exclusive_group()
     netwatch.add_argument('--no-netwatch', dest='netwatch', action='store_false', default=None,
                           help='do not install or upgrade the netwatch monitor (remembered)')
     netwatch.add_argument('--netwatch', dest='netwatch', action='store_true',
                           help='install or upgrade the pinned netwatch monitor (the default; remembered)')
-    parser.add_argument('--no-command-guard', dest='command_guard', action='store_false',
-                        help='do not register the command guard and remove an earlier registration (rollback); '
-                             'the files stay installed; not remembered')
     parser.add_argument('--allow-downgrade', action='store_true',
                         help="install even though this checkout's harness/RELEASE is below the host's Codex floor "
                              '(~/.agent-harness/floor.json); the floor then moves down to this release')
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
-        if args.hooks_only and args.default_full_access:
-            raise ValueError('--hooks-only cannot be combined with --default-full-access')
-        changes = install(args.home, args.apply, default_full_access=args.default_full_access,
-                          command_guard=args.command_guard, hooks_only=args.hooks_only,
+        if args.hooks_only and args.default_role:
+            raise ValueError('--hooks-only cannot be combined with --default-role')
+        changes = install(args.home, args.apply, default_role=args.default_role, hooks_only=args.hooks_only,
                           allow_downgrade=args.allow_downgrade)
     except DowngradeRefused as error:
         parser.exit(1, f'install_codex.py: {error}\n')
-    except (ValueError, RuntimeError) as error:
+    except (ValueError, RuntimeError, ImportError) as error:
         parser.exit(2, f'error: {error}\n')
     print(('Installed' if args.apply else 'Would install') + f' Codex Agent Harness in {args.home / ".codex"}')
-    if args.default_full_access:
-        print('Full Access default requested: unrestricted local filesystem and network; approval prompts disabled.')
     for path in changes:
         print(f'  {path}')
     print(f'  {install_git_backstop(args.home, args.apply)}')
@@ -561,9 +540,10 @@ def main() -> None:
         print('  AGENTS.md, hooks.json and config.toml: not touched (--hooks-only)')
         return
     print(f'  {netwatch_status(args.home, args.apply, args.netwatch)}')
-    print(f'  {local_profile_status(args.home, args.home / ".codex" / "agent-harness")}')
     if args.apply:
-        print('Review and trust the new user hooks with /hooks in a new Codex session.')
+        print('REQUIRED: Codex skips every harness hook until you trust it. Start a new Codex session, open /hooks '
+              f'and trust the harness hooks (release {REMOVED_IN} changed the hook layout, so '
+              'the trust hashes changed); `ah doctor` (codex-trust) counts the ones still untrusted.')
 
 
 if __name__ == '__main__':

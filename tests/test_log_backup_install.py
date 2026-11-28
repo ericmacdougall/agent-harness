@@ -331,28 +331,6 @@ class MacPersistentOptOut(Case):
         message = lbi.status(self.home, True, system="Darwin", run=refusing, uid=501, activate=True)
         self.assertIn("disable failed", message)
 
-    def test_alert_hook_stays_registered_when_the_backup_is_switched_off_on_purpose(self):
-        import json
-        base = [sys.executable, str(ROOT / "install.py"), "--home", str(self.home), "--apply", "--no-netwatch", "--no-durable-tmp"]
-        env = {**os.environ, "HOME": str(self.home)}
-
-        def run(*extra):
-            done = subprocess.run(base + list(extra), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120, env=env)
-            self.assertEqual(done.returncode, 0, done.stderr)
-
-        def alert_count():
-            settings = json.loads((self.home / ".claude/settings.json").read_text())
-            return sum(1 for g in settings["hooks"].get("SessionStart", []) for h in g["hooks"]
-                       if "log_backup.py" in " ".join(h.get("args", [])))
-        run("--no-log-backup")
-        self.assertEqual(alert_count(), 0)          # never installed here: nothing to warn about
-        run("--log-backup")
-        run("--no-log-backup")
-        self.assertEqual(alert_count(), 1)          # installed, then switched off: a stale backup must still be visible
-        run()
-        self.assertEqual(alert_count(), 1)
-
-
 class FakeScheduler:
     """launchd or systemd --user, reduced to the facts that matter: is the job loaded, is it disabled (persistent), and
     what a reboot does. fail = set of verbs that return 1; boom = (verb, exception) raised for that verb."""
@@ -721,34 +699,6 @@ class OptIn(Case):
         self.assertIn("deferred", message)
         self.assertEqual(runner.calls, [])
 
-    def test_cli_default_registers_no_alert_and_flag_registers_it_and_no_flag_removes_it(self):
-        import json
-        def alert_count():
-            settings = json.loads((self.home / ".claude/settings.json").read_text())
-            return sum(1 for g in settings["hooks"].get("SessionStart", []) for h in g["hooks"]
-                       if "log_backup.py" in " ".join(h.get("args", [])))
-        base = [sys.executable, str(ROOT / "install.py"), "--home", str(self.home), "--apply", "--no-netwatch", "--no-durable-tmp"]
-        env = {**os.environ, "HOME": str(self.home)}
-        def run(*extra):
-            done = subprocess.run(base + list(extra), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120, env=env)
-            self.assertEqual(done.returncode, 0, done.stderr)
-            return done.stdout
-        out = run()
-        self.assertEqual(alert_count(), 0)
-        self.assertIn(b"not installed on this host", out)
-        self.assertFalse((self.home / SCRIPT).exists())
-        run("--log-backup")
-        self.assertEqual(alert_count(), 1)
-        self.assertTrue((self.home / SCRIPT).exists())
-        run()  # remembered
-        self.assertEqual(alert_count(), 1)
-        run("--no-log-backup")
-        self.assertEqual(alert_count(), 1)  # switched off on purpose: the alert stays, a stale backup must be visible
-        self.assertTrue((self.home / SCRIPT).exists())  # files stay
-        run()
-        self.assertEqual(alert_count(), 1)  # the opt-out survives a plain reinstall (and the alert with it)
-
-
 class UnitContents(unittest.TestCase):
     def test_timer_and_service_are_exactly_as_intended(self):
         timer = (ROOT / "harness/schedulers/log-backup.timer").read_text().splitlines()
@@ -807,25 +757,6 @@ class Refusals(Case):
 
 
 class Wiring(Case):
-    def test_install_registers_one_session_start_hook_and_is_idempotent(self):
-        import json
-        install.install(self.home, apply=True, durable_tmp=False, log_backup=True)
-        install.install(self.home, apply=True, durable_tmp=False, log_backup=True)
-        settings = json.loads((self.home / ".claude/settings.json").read_text())
-        found = [h for g in settings["hooks"]["SessionStart"] for h in g["hooks"] if "log_backup.py" in " ".join(h.get("args", []))]
-        self.assertEqual(len(found), 1)
-        self.assertTrue((self.home / ".claude/hooks/log_backup.py").exists())
-
-    def test_foreign_session_start_hook_survives(self):
-        import json
-        (self.home / ".claude").mkdir()
-        foreign = {"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "echo", "args": ["mine"]}]}]}}
-        (self.home / ".claude/settings.json").write_text(json.dumps(foreign))
-        install.install(self.home, apply=True, durable_tmp=False, log_backup=True)
-        settings = json.loads((self.home / ".claude/settings.json").read_text())
-        commands = [h.get("args") for g in settings["hooks"]["SessionStart"] for h in g["hooks"]]
-        self.assertIn(["mine"], commands)
-
     def test_main_prints_a_log_backup_line_and_never_touches_the_real_scheduler(self):
         done = subprocess.run([sys.executable, str(ROOT / "install.py"), "--home", str(self.home), "--apply",
                                "--no-netwatch", "--no-durable-tmp", "--log-backup"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,

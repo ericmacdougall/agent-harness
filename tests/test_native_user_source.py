@@ -85,23 +85,6 @@ class NativeCandidates(unittest.TestCase):
                              input="{}", text=True, capture_output=True, timeout=5)
         self.assertNotEqual(bad.returncode, 0)
 
-    def test_weak_native_candidate_cannot_approve_even_an_exact_pid_stop(self):
-        data = snapshot()
-        data["turns"][0]["items"][0]["content"][0]["text"] = "Stop pid 4242"
-        candidate = ns.list_candidates(data)[0]
-        class ImportedLedger:
-            def ledger(self, session, home):
-                return [{"id": "ask-fixture", "_closed": {"source": candidate["citation"]}}]
-            def resolve(self, source, options):
-                # Even a permissive external resolver cannot lift the existing
-                # strong-human requirement from this weak candidate.
-                return {"ok": True, "origin": "user", "weak": candidate["weak"],
-                        "chain": [{"kind": "user", "timestamp": "2026-01-01T00:00:00Z", "text": "Stop pid 4242"}]}
-        with self.assertRaises(ak.KillError) as caught:
-            ak.resolve_approval("ask-fixture", "fixture-session", Path("/nonexistent"), prov=ImportedLedger())
-        self.assertEqual(caught.exception.code, "approval_invalid")
-
-
 class ReviewPrivacyRegressions(unittest.TestCase):
     def test_value_only_excerpt_from_credential_source_rejects(self):
         data = snapshot()

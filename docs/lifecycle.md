@@ -200,8 +200,11 @@ What this does not cover:
 - `reap.jsonl` stays on this machine unless you ship it with `ah log-push`.
 - Codex sessions get no `TMPDIR` and no `AH_WORK`.
 - A docker container is tied to a session only by the label `ah.session` or a bind mount under the session folder.
-- The command guard still refuses a typed `rm` of a `*.jsonl` file under `~/.agent-harness/tmp`. Other files in the
-  session's own temp directory are the session's to delete.
+- Nothing refuses a typed `rm` of a `*.jsonl` file under `~/.agent-harness/tmp` (release 1001 deleted the command
+  guard); files in the session's own temp directory are the session's to delete.
+- The project a session was launched in (the owner's own checkout, or `~`) is writable in the worker sandbox and is
+  never saved: only checkouts under `~/.agent-harness/work/<session>/` and the session temp are. Uncommitted work
+  there can be lost to that session's own `git checkout -- .` or `git clean`.
 - A remote that never answers is given half the save's time budget; then the save falls back to a bundle.
 
 ## Running it on a timer (your choice)

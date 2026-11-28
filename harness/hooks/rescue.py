@@ -20,7 +20,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import escalation as ladder  # noqa: E402
 import model_tiers as tiers  # noqa: E402
 
 from wal import append as append_wal
@@ -229,21 +228,30 @@ def run(cmd: list[str], prompt: str, repo: Path) -> tuple[int, str, str]:
         return 125, "", str(error)
 
 
-def rescue_rung(policy, task, override):
-    """The writing rung a rescue runs at: the task ledger's computed rung, an explicit override, or the lowest."""
-    permission = None
-    if task:
-        status = ladder.Ledger(policy=policy).status(task)
-        permission = status.get("permission")
-        if status.get("blocked_by"):
-            raise ladder.LedgerError("unclassifiable_evidence", ladder.limit_note(status, policy))
-        if override is None:
-            return status["rung"], permission, "ledger rung for task " + task
+def top_rung_permission(task, project=None):
+    """{"approval": id} when the user recorded `ah approve top-rung --task T` (the approvals store), else None."""
+    if not task:
+        return None
+    try:
+        import ah_approvals  # noqa: PLC0415 - a sibling module
+        facts = {"task": task}
+        if project is not None:
+            facts["project"] = str(project)
+        record = ah_approvals.allowed("top-rung", **facts)
+    except Exception:  # noqa: BLE001 - a broken store is no permission
+        return None
+    return {"approval": record.get("id"), "granted_by": record.get("granted_by")} if record else None
+
+
+def rescue_rung(policy, task, override, project=None):
+    """The writing rung a rescue runs at: an explicit override, else the lowest. The user's top-rung permission comes
+    from the approvals store; the model-ladder ledger is gone (2026-11-25), so a task no longer picks a rung."""
+    permission = top_rung_permission(task, project)
     if override is not None:
         if override not in policy["rungs"]:
             raise tiers.TierError("undefined rung " + override)
         return override, permission, "explicit --rung"
-    return policy["lowest_rung"], permission, "no task or rung given: lowest rung"
+    return policy["lowest_rung"], permission, "no rung given: lowest rung"
 
 
 def model_label(harness, spec):
@@ -264,8 +272,8 @@ def main() -> int:
     parser.add_argument("--packet", required=True, type=Path, help="Scope, repeated findings, and acceptance tests")
     parser.add_argument("--output", required=True, type=Path, help="Private handoff report")
     parser.add_argument("--wal", type=Path, help="Main-session or rescue WAL")
-    parser.add_argument("--task", help="Ladder task key: the rung comes from its ledger and the top rung needs its permission")
-    parser.add_argument("--rung", help="Writing rung override (R0, R1, R2, R3, R5); the lowest rung when neither this nor --task is given")
+    parser.add_argument("--task", help="Task key: a top rung needs `ah approve top-rung --task T`, recorded by the user")
+    parser.add_argument("--rung", help="Writing rung (R0, R1, R2, R3, R5); the lowest rung when not given")
     parser.add_argument("--author-harness", choices=("claude", "openai", "unknown"), default="unknown",
                         help="Harness that wrote the failing work; the other harness rescues when available")
     args = parser.parse_args()
@@ -312,15 +320,15 @@ def main() -> int:
     )
     try:
         policy = tiers.load_policy()
-        rung, permission, rung_why = rescue_rung(policy, args.task, args.rung)
-    except (tiers.TierError, ladder.LedgerError) as error:
-        parser.error(f"ladder state unusable: {getattr(error, 'message', error)}")
+        rung, permission, rung_why = rescue_rung(policy, args.task, args.rung, repo)
+    except tiers.TierError as error:
+        parser.error(f"rung table unusable: {getattr(error, 'message', error)}")
     entry = policy["rungs"][rung]
     if not entry["writable"]:
         parser.error(f"rung {rung} is review-only; a rescue writes")
     if entry["needs_user_permission"] and not permission:
         parser.error(f"rung {rung} ({entry['models']['claude']}/{entry['models']['openai']}) needs the user's permission "
-                     f"recorded by escalation.py approve-top for task {args.task or '(none)'}; never launched automatically")
+                     f"recorded as `ah approve top-rung --task {args.task or '<task>'}`; never launched automatically")
     preferred = policy["preferred_review_harness"].get(args.author_harness, "openai")
     other = "claude" if preferred == "openai" else "openai"
     executables = {"openai": "codex", "claude": "claude"}

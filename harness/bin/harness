@@ -1,19 +1,14 @@
 #!/bin/sh
-# agent-harness switch shim: `harness off [--reason TEXT] [--services]`, `harness on`, `harness status`,
-# `harness floor-check [--repair]` (docs/off-switch.md). Installed by install.py at ~/.agent-harness/bin/harness.
-# Any other word goes to a Go `harness` binary elsewhere on PATH (cmd/harness), when there is one.
+# agent-harness switch shim: `harness off [--reason TEXT] [--keep-services]`, `harness on`, `harness status`,
+# `harness floor-check` (docs/off-switch.md). Installed by install.py at ~/.agent-harness/bin/harness.
+# It answers these four words and nothing else.
 case "$1" in
-  off|on|status|floor-check|-h|--help|"")
+  off|on|status|floor-check)
     for f in "$HOME/.claude/hooks/ah_switch.py" "$HOME/.codex/agent-harness/ah_switch.py"; do
       [ -f "$f" ] && exec python3 "$f" "$@"
     done
     echo "harness: ah_switch.py is not installed (run install.py --apply)" >&2
     exit 1 ;;
 esac
-self=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
-IFS=:
-for d in $PATH; do
-  [ -n "$d" ] && [ "$d" != "$self" ] && [ -x "$d/harness" ] && exec "$d/harness" "$@"
-done
-echo "harness: unknown command '$1' (try: harness off | on | status | floor-check)" >&2
+echo "usage: harness off [--reason TEXT] [--keep-services] | on | status | floor-check" >&2
 exit 2

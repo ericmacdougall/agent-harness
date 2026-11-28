@@ -661,21 +661,5 @@ class KimiReviewTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 25)
         self.assertIn(result.returncode, (0, 3), result.stderr)
 
-    def test_advisory_reports_are_never_parsed_as_review_verdicts(self):
-        sys.path.insert(0, str(DEFAULT.parent))
-        import review_map
-        import spec_flow
-        report = ('Reviewer: kimi-code/x\nStage: plan\nReviewed HEAD: ' + HEAD + '\nAdvisory: yes; NOT a signoff\n\n'
-                  'PLAN_RESULT: ACCEPT\n')
-        self.assertIsNone(review_map.parse_report(report)['verdict'])
-        self.assertIsNotNone(review_map.parse_report(report.replace('yes; NOT a signoff', 'no'))['verdict'])
-        path = self.work / 'advisory-report.md'
-        path.write_text(report)
-        self.assertIsNone(spec_flow.parse_review_report(path)[1])
-        path2 = self.work / 'plain-report.md'
-        path2.write_text(report.replace('Advisory: yes; NOT a signoff\n', ''))
-        self.assertEqual(spec_flow.parse_review_report(path2)[1], 'ACCEPT')
-
-
 if __name__ == '__main__':
     unittest.main()
