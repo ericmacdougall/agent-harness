@@ -58,7 +58,7 @@ SECRET_NAMES = (".env*", "*.pem", "*.key", "id_rsa*", "id_dsa*", "id_ecdsa*", "i
                 "*.jks", "*kubeconfig*", ".htpasswd", ".dockercfg", "*.docker/config.json", ".s3cfg", ".boto",
                 ".git-credentials")
 REBUILDABLE = frozenset(("node_modules", ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
-                         ".next", ".nuxt", ".turbo", ".parcel-cache", ".gradle", ".tox"))
+                         ".next", ".nuxt", ".turbo", ".parcel-cache", ".gradle", ".tox", ".build"))
 _DEADLINE = [None, None]   # set by save(): no git call outlives the caller's budget, no network step its share
 _HOOKS_OFF: dict = {}
 
